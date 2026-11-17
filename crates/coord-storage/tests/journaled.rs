@@ -23,7 +23,8 @@ use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::group::GroupLimits;
 use coord_journal_api::record::{
-    JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordOrigin,
+    GroupOutcomeV1, JOURNAL_RECORD_FORMAT_GROUPS, JournalRecordV1, LifecycleRecordV1, RecordBody,
+    RecordDraft, RecordError, RecordOrigin,
 };
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
@@ -825,13 +826,47 @@ fn replay_restores_the_exact_state_results_and_events_from_the_records_alone() {
     );
 }
 
+/// The journaled store's open builds the key index it publishes (task-d105;
+/// #245 review): a restarted voter reads past revisions through it, and
+/// without the build it would find no key there. Event rows materialized
+/// before the restart, and those of records replayed at the attach when
+/// the projection was left behind, are in the index after it, as the
+/// projection holds them.
+#[test]
+fn the_journaled_stores_open_builds_the_key_index_from_the_projection() {
+    for materialize_inline in [true, false] {
+        let next = workload_store(materialize_inline);
+        let view = next.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        assert_eq!(
+            live.versions(),
+            4,
+            "inline {materialize_inline}: the four event rows of the workload"
+        );
+        assert_eq!(
+            live,
+            coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+            "inline {materialize_inline}"
+        );
+    }
+}
+
 /// Journal a fixed workload of protocol transitions and application
 /// outcomes. When `materialize_inline` is false the projection is left
 /// behind and the pipeline is reopened, which replays `(M, J]`.
 fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+    workload_store(materialize_inline)
+        .projection(A)
+        .unwrap()
+        .durable_rows()
+}
+
+/// [`run_workload`]'s store, reopened and attached after the boot ends.
+fn workload_store(materialize_inline: bool) -> JournaledStore<ModelJournal, ModelEngine> {
     let mut world = World::new();
     let events = coord_store_api::registry::Collection::EventsV1.id();
-    let executed = coord_store_api::registry::Collection::ExecutedV1.id();
     for step in 1..=4u64 {
         world.protocol(A, ballot(step), promise(step));
         if materialize_inline {
@@ -845,16 +880,45 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
             position(step),
             vec![
                 kv_update(format!("key-{step}").as_bytes(), b"value"),
+                // A real event row: lowering reads each one into the key
+                // index (task-d105).
                 StoreUpdate {
                     collection: events,
-                    key: step.to_be_bytes().to_vec(),
-                    value: Some(vec![step as u8; 8]),
+                    key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+                    value: Some(
+                        coord_storage::codecs::encode_event(
+                            &coord_storage::codecs::EventRecordV1 {
+                                kind: coord_state::KvEventKind::Put,
+                                namespace: NamespaceId([0; 16]),
+                                key: format!("key-{step}").into_bytes(),
+                                entry: Some(coord_state::KvEntry {
+                                    value: b"value".to_vec(),
+                                    create_revision: KvRevision::new(step).unwrap(),
+                                    mod_revision: KvRevision::new(step).unwrap(),
+                                    version: 1,
+                                    lease: None,
+                                    lease_generation: None,
+                                }),
+                                prev: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
                 },
+                // Its payload, then its executed row, which moves the
+                // payload to the position (task-d113, step 2).
                 StoreUpdate {
-                    collection: executed,
+                    collection: coord_store_api::registry::Collection::PayloadV1.id(),
                     key: command(step as u8).as_bytes().to_vec(),
-                    value: Some(step.to_be_bytes().to_vec()),
+                    value: Some(vec![step as u8; 16]),
                 },
+                coord_storage::retry::executed_update(
+                    &command(step as u8),
+                    position(step),
+                    None,
+                    coord_types::identity::Digest32([step as u8; 32]),
+                )
+                .unwrap(),
             ],
         );
         if materialize_inline {
@@ -885,7 +949,408 @@ fn run_workload(materialize_inline: bool) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
     let recovered = next.frontiers(A).unwrap();
     assert_eq!(recovered.materialized(), recovered.durable());
     assert_eq!(next.status(A), Some(DomainStatus::Ready));
-    next.projection(A).unwrap().durable_rows()
+    next
+}
+
+/// The four application updates of [`workload_store`]'s step `step`: a
+/// put, its event row, the payload and the executed row that moves it.
+fn workload_updates(step: u64) -> Vec<StoreUpdate> {
+    let events = coord_store_api::registry::Collection::EventsV1.id();
+    vec![
+        kv_update(format!("key-{step}").as_bytes(), b"value"),
+        StoreUpdate {
+            collection: events,
+            key: coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0),
+            value: Some(
+                coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                    kind: coord_state::KvEventKind::Put,
+                    namespace: NamespaceId([0; 16]),
+                    key: format!("key-{step}").into_bytes(),
+                    entry: Some(coord_state::KvEntry {
+                        value: b"value".to_vec(),
+                        create_revision: KvRevision::new(step).unwrap(),
+                        mod_revision: KvRevision::new(step).unwrap(),
+                        version: 1,
+                        lease: None,
+                        lease_generation: None,
+                    }),
+                    prev: None,
+                })
+                .unwrap(),
+            ),
+        },
+        StoreUpdate {
+            collection: coord_store_api::registry::Collection::PayloadV1.id(),
+            key: command(step as u8).as_bytes().to_vec(),
+            value: Some(vec![step as u8; 16]),
+        },
+        coord_storage::retry::executed_update(
+            &command(step as u8),
+            position(step),
+            None,
+            Digest32([step as u8; 32]),
+        )
+        .unwrap(),
+    ]
+}
+
+/// How [`regrouped`] rewrites the run of application records.
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    /// The next `n` outcomes as one group record.
+    Group(usize),
+    /// The next outcome as its own record, as it was written.
+    Single,
+}
+
+/// Four promises, then four application outcomes in a row, journaled and
+/// left unmaterialized, so the next boot replays every outcome. Returns
+/// the journal, the projection, and how many records precede the
+/// outcomes.
+fn outcomes_unmaterialized() -> (ModelJournal, ModelEngine, usize) {
+    let mut world = World::new();
+    for step in 1..=4u64 {
+        world.protocol(A, ballot(step), promise(step));
+        world.store.append_pending().unwrap();
+    }
+    for step in 1..=4u64 {
+        world.application(A, 4, position(step), workload_updates(step));
+        world.store.append_pending().unwrap();
+    }
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let stream = journal_stream(&journal);
+    let records = journal.records(stream);
+    let prefix = records.len() - 4;
+    assert!(
+        records[prefix..]
+            .iter()
+            .all(|r| matches!(r.body(), RecordBody::ApplicationOutcome { .. })),
+        "the last four records are the outcomes"
+    );
+    (journal, engine, prefix)
+}
+
+fn journal_stream(journal: &ModelJournal) -> coord_journal_api::stream::StorageStreamId {
+    // One domain, one stream: the one the boot record names.
+    let mut streams = BTreeSet::new();
+    for id in 0..64 {
+        if let Ok(stream) = coord_journal_api::stream::StorageStreamId::from_durable(id)
+            && !journal.records(stream).is_empty()
+        {
+            streams.insert(stream);
+        }
+    }
+    assert_eq!(streams.len(), 1, "one stream");
+    streams.into_iter().next().unwrap()
+}
+
+/// The journal of [`outcomes_unmaterialized`] with its outcomes rewritten
+/// in the given forms, sealed at [`JOURNAL_RECORD_FORMAT_GROUPS`]: what the
+/// writer of groups (step 1b) would have left.
+fn regrouped(journal: &mut ModelJournal, prefix: usize, forms: &[Form]) {
+    let stream = journal_stream(journal);
+    let records = journal.records(stream).to_vec();
+    let mut outcomes = records[prefix..].iter();
+    let mut last = records[prefix - 1].clone();
+    journal.truncate_records(stream, prefix);
+    let mut place = |body: RecordBody, last: &mut JournalRecordV1| {
+        let record = JournalRecordV1::seal_as(
+            JOURNAL_RECORD_FORMAT_GROUPS,
+            RecordDraft {
+                origin: *last.origin(),
+                seq: last.seq().checked_next().unwrap(),
+                predecessor: last.digest(),
+                body,
+            },
+        )
+        .unwrap();
+        journal.inject_record(stream, record.clone());
+        *last = record;
+    };
+    for form in forms {
+        match *form {
+            Form::Single => place(outcomes.next().unwrap().body().clone(), &mut last),
+            Form::Group(n) => {
+                let (mut context, mut base) = (None, None);
+                let (mut group, mut updates) = (Vec::new(), Vec::new());
+                for record in outcomes.by_ref().take(n) {
+                    let RecordBody::ApplicationOutcome {
+                        context: c,
+                        base: b,
+                        position,
+                        revision,
+                        result_digest,
+                        updates: u,
+                    } = record.body()
+                    else {
+                        panic!("an outcome")
+                    };
+                    assert_eq!(*context.get_or_insert(*c), *c, "one context a group");
+                    base.get_or_insert(*b);
+                    group.push(GroupOutcomeV1 {
+                        position: *position,
+                        revision: *revision,
+                        result_digest: *result_digest,
+                        updates: u.len() as u32,
+                    });
+                    updates.extend(u.iter().cloned());
+                }
+                assert_eq!(group.len(), n);
+                place(
+                    RecordBody::ApplicationGroup {
+                        context: context.unwrap(),
+                        base: base.unwrap(),
+                        outcomes: group,
+                        updates,
+                    },
+                    &mut last,
+                );
+            }
+        }
+    }
+    assert!(outcomes.next().is_none(), "every outcome placed");
+}
+
+/// The projection's rows but its stamp, which names the last record by
+/// its sequence and digest: those differ between the two forms, and
+/// nothing else may.
+fn rows_but_the_stamp(engine: &ModelEngine) -> Vec<(u16, Vec<u8>, Vec<u8>)> {
+    let meta = coord_store_api::registry::Collection::MetaV1.id().0;
+    engine
+        .durable_rows()
+        .into_iter()
+        .filter(|(c, k, _)| {
+            !(*c == meta && k.as_slice() == coord_store_api::registry::meta_fields::APPLIED_STAMP)
+        })
+        .collect()
+}
+
+/// Reopen over `journal`, replay, then run a fifth command on the frontier
+/// the replay leaves.
+fn replay_and_continue(
+    journal: ModelJournal,
+    engine: ModelEngine,
+) -> JournaledStore<ModelJournal, ModelEngine> {
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    next.attach(A, shard(), engine).unwrap();
+    let recovered = next.frontiers(A).unwrap();
+    assert_eq!(recovered.materialized(), recovered.durable());
+    assert_eq!(next.status(A), Some(DomainStatus::Ready));
+    // The outcomes extend the initial configuration (`World::application`),
+    // and comparing the rows holds a grouped journal's frontier to the
+    // per-command one's configuration as well.
+    assert_eq!(
+        next.application_base(A).map(|base| base.execution_position),
+        Some(position(4)),
+        "the replay leaves the frontier at the last outcome's position"
+    );
+    let mut world = World {
+        store: next,
+        barriers: BarrierAllocator::new(inc(), BootId([0x88; 16])),
+    };
+    world.application(A, 4, position(5), workload_updates(5));
+    world.store.flush().unwrap();
+    let frontiers = world.store.frontiers(A).unwrap();
+    assert_eq!(frontiers.materialized(), frontiers.durable());
+    world.store
+}
+
+/// A journal holding groups of application outcomes replays to the same
+/// state as one holding a record a command, and the store goes on from
+/// there (the batching-rule doc's 10.7, step 1a). This build writes no
+/// group; the journals here are rewritten as its successor would write
+/// them: one group of four, groups of one, and groups beside per-command
+/// records.
+#[test]
+fn a_journal_of_grouped_outcomes_replays_to_the_state_of_per_command_records() {
+    let (journal, engine, _) = outcomes_unmaterialized();
+    let reference = replay_and_continue(journal, engine);
+    let expected = rows_but_the_stamp(reference.projection(A).unwrap());
+    assert!(
+        expected
+            .iter()
+            .any(|(c, ..)| *c == coord_store_api::registry::Collection::EventsV1.id().0),
+        "the workload writes revision events"
+    );
+    for forms in [
+        &[Form::Group(4)][..],
+        &[
+            Form::Group(1),
+            Form::Group(1),
+            Form::Group(1),
+            Form::Group(1),
+        ],
+        &[Form::Group(2), Form::Single, Form::Single],
+        &[Form::Single, Form::Group(3)],
+        &[Form::Single, Form::Group(2), Form::Single],
+    ] {
+        let (mut journal, engine, prefix) = outcomes_unmaterialized();
+        regrouped(&mut journal, prefix, forms);
+        assert_eq!(
+            journal.records(journal_stream(&journal)).len(),
+            prefix + forms.len(),
+            "{forms:?}: a record a form"
+        );
+        let store = replay_and_continue(journal, engine);
+        assert_eq!(
+            rows_but_the_stamp(store.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+    }
+}
+
+/// The stream a voter leaves when it goes back from its successor to
+/// this build: genesis and promises at format 1, the outcomes at 2 as its
+/// successor wrote them, and this build's next command at 1 again. It
+/// opens, and opens again after that, each time with the frontier at the
+/// fifth command and the per-command journal's rows, but for the stamp
+/// (the batching-rule doc's 10.7, step 1a; review's scratch test on #286).
+#[test]
+fn a_stream_of_formats_one_two_one_opens_and_opens_again() {
+    fn reopen(
+        journal: ModelJournal,
+        engine: ModelEngine,
+    ) -> JournaledStore<ModelJournal, ModelEngine> {
+        let mut next = JournaledStore::open(
+            journal,
+            CLUSTER,
+            REPLICA,
+            inc(),
+            BootId([0x99; 16]),
+            JournalLimits::default(),
+        )
+        .unwrap();
+        next.attach(A, shard(), engine).unwrap();
+        let f = next.frontiers(A).unwrap();
+        assert_eq!(f.materialized(), f.durable());
+        assert_eq!(next.status(A), Some(DomainStatus::Ready));
+        assert_eq!(
+            next.application_base(A).map(|b| b.execution_position),
+            Some(position(5))
+        );
+        next
+    }
+    let (journal, engine, _) = outcomes_unmaterialized();
+    let (j, mut e) = replay_and_continue(journal, engine).into_parts();
+    let reference = reopen(j, e.pop().unwrap().1);
+    let expected = rows_but_the_stamp(reference.projection(A).unwrap());
+    for forms in [
+        &[Form::Group(4)][..],
+        &[Form::Single, Form::Group(2), Form::Single],
+    ] {
+        let (mut journal, engine, prefix) = outcomes_unmaterialized();
+        regrouped(&mut journal, prefix, forms);
+        let (j, mut e) = replay_and_continue(journal, engine).into_parts();
+        let formats: Vec<u16> = j
+            .records(journal_stream(&j))
+            .iter()
+            .map(|r| r.format())
+            .collect();
+        assert_eq!(formats[0], 1, "{formats:?}");
+        assert!(formats.contains(&2), "{formats:?}");
+        assert_eq!(
+            *formats.last().unwrap(),
+            1,
+            "{formats:?}: this build writes 1"
+        );
+        let again = reopen(j, e.pop().unwrap().1);
+        assert_eq!(
+            rows_but_the_stamp(again.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+        let (j, mut e) = again.into_parts();
+        let third = reopen(j, e.pop().unwrap().1);
+        assert_eq!(
+            rows_but_the_stamp(third.projection(A).unwrap()),
+            expected,
+            "{forms:?}"
+        );
+    }
+}
+
+/// A group whose base isn't the projection's frontier is refused at
+/// replay, as a per-command outcome's would be: the record checks its
+/// outcomes against one another, and the materializer checks the group
+/// against what the projection holds.
+#[test]
+fn a_group_that_does_not_extend_the_projection_is_refused_at_replay() {
+    let (mut journal, engine, prefix) = outcomes_unmaterialized();
+    // The first outcome dropped: the group of the other three names a
+    // base the projection never reached.
+    let stream = journal_stream(&journal);
+    let records = journal.records(stream).to_vec();
+    journal.truncate_records(stream, prefix);
+    let last = &records[prefix - 1];
+    let RecordBody::ApplicationOutcome { context, base, .. } = records[prefix + 1].body() else {
+        panic!("an outcome")
+    };
+    let mut group = Vec::new();
+    let mut updates = Vec::new();
+    for record in &records[prefix + 1..] {
+        let RecordBody::ApplicationOutcome {
+            position,
+            revision,
+            result_digest,
+            updates: u,
+            ..
+        } = record.body()
+        else {
+            panic!("an outcome")
+        };
+        group.push(GroupOutcomeV1 {
+            position: *position,
+            revision: *revision,
+            result_digest: *result_digest,
+            updates: u.len() as u32,
+        });
+        updates.extend(u.iter().cloned());
+    }
+    let record = JournalRecordV1::seal_as(
+        JOURNAL_RECORD_FORMAT_GROUPS,
+        RecordDraft {
+            origin: *last.origin(),
+            seq: last.seq().checked_next().unwrap(),
+            predecessor: last.digest(),
+            body: RecordBody::ApplicationGroup {
+                context: *context,
+                base: *base,
+                outcomes: group,
+                updates,
+            },
+        },
+    )
+    .unwrap();
+    journal.inject_record(stream, record);
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    let attached = next.attach(A, shard(), engine);
+    let refused = matches!(
+        attached,
+        Err(JournaledError::Quarantined(what)) if what.contains("does not extend")
+    ) || next.status(A) == Some(DomainStatus::Quarantined);
+    assert!(
+        refused,
+        "a group past a gap is not replayed: {:?}",
+        attached.err()
+    );
 }
 
 #[test]
@@ -934,7 +1399,7 @@ fn end_a_boot_with_a_baseline() -> (
     let pointer = CheckpointPointerV1 {
         origin: world.store.origin(A).unwrap(),
         represented,
-        format: 1,
+        format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
         manifest_digest: Digest32([0x5a; 32]),
         checkpoint_id: Digest32([0x5b; 32]),
     };
@@ -1841,4 +2306,229 @@ fn an_uncertain_entry_of_several_records_reconciles_all_or_none() {
             seq(if applied { 5 } else { 2 })
         );
     }
+}
+
+/// The event row of a put of `key-<step>` at revision `step` (task-d105).
+fn event_row(step: u64) -> StoreUpdate {
+    let at = KvRevision::new(step).unwrap();
+    StoreUpdate {
+        collection: coord_store_api::registry::Collection::EventsV1.id(),
+        key: coord_storage::codecs::event_key(at, 0),
+        value: Some(
+            coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+                kind: coord_state::KvEventKind::Put,
+                namespace: NamespaceId([0; 16]),
+                key: format!("key-{step}").into_bytes(),
+                entry: Some(coord_state::KvEntry {
+                    value: b"value".to_vec(),
+                    create_revision: at,
+                    mod_revision: at,
+                    version: 1,
+                    lease: None,
+                    lease_generation: None,
+                }),
+                prev: None,
+            })
+            .unwrap(),
+        ),
+    }
+}
+
+/// The commits the journaled store's materializer makes keep the key
+/// index it publishes (task-d105) as the projection has it (#244 review):
+/// each event row lowered is observed, a deleted one through the rows of
+/// its own commit. Steps 2 and 3 go in one commit, and step 3 deletes
+/// step 2's event row, which only that commit holds, and step 1's, which
+/// the store holds. Not observed, the published index stays as the open
+/// built it, without any of them.
+#[test]
+fn the_materializers_commits_keep_the_published_key_index_as_the_projection_has_it() {
+    let mut world = World::new();
+    let events = coord_store_api::registry::Collection::EventsV1.id();
+    let step = |world: &mut World, step: u64, mut updates: Vec<StoreUpdate>| {
+        world.protocol(A, ballot(step), promise(step));
+        updates.extend([
+            StoreUpdate {
+                collection: coord_store_api::registry::Collection::PayloadV1.id(),
+                key: command(step as u8).as_bytes().to_vec(),
+                value: Some(vec![step as u8; 16]),
+            },
+            coord_storage::retry::executed_update(
+                &command(step as u8),
+                position(step),
+                None,
+                coord_types::identity::Digest32([step as u8; 32]),
+            )
+            .unwrap(),
+        ]);
+        world.application(A, step, position(step), updates);
+    };
+    let published = |world: &World| {
+        let view = world.store.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        let rebuilt = coord_storage::kv_index::KvIndex::build(view.view()).unwrap();
+        (live, rebuilt)
+    };
+    step(&mut world, 1, vec![event_row(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "step 1's event row is in the index");
+    assert_eq!(live, rebuilt);
+
+    step(&mut world, 2, vec![event_row(2)]);
+    let delete = |revision: u64| StoreUpdate {
+        collection: events,
+        key: coord_storage::codecs::event_key(KvRevision::new(revision).unwrap(), 0),
+        value: None,
+    };
+    step(&mut world, 3, vec![event_row(3), delete(2), delete(1)]);
+    world.store.flush().unwrap();
+    let (live, rebuilt) = published(&world);
+    assert_eq!(live.versions(), 1, "only step 3's event row is left");
+    assert_eq!(live, rebuilt);
+}
+
+/// Each `meta_v1` key is written once a commit, with the value its last
+/// command put, not once a command (task-d117 step 1, design Section
+/// 17.17 point 5). Three commands put the key revision, two the retention
+/// floor and two the lease authority. Taken in one commit, the projection
+/// holds what one commit a command leaves, and so does a projection the
+/// attach rebuilds from the journal alone after a crash that loses every
+/// commit. The key index the store publishes after the restart is the one
+/// the projection builds.
+#[test]
+fn a_commit_writes_each_meta_key_once_with_its_last_value() {
+    use coord_store_api::registry::{Collection, meta_fields};
+    let meta = Collection::MetaV1.id();
+    let counter = |n: u64| coord_storage::codecs::encode_counter(n).unwrap();
+    let meta_row = |key: &[u8], n: u64| StoreUpdate {
+        collection: meta,
+        key: key.to_vec(),
+        value: Some(counter(n)),
+    };
+    let step = |world: &mut World, step: u64| {
+        world.protocol(A, ballot(step), promise(step));
+        let mut updates = vec![
+            kv_update(format!("key-{step}").as_bytes(), b"value"),
+            event_row(step),
+            StoreUpdate {
+                collection: Collection::PayloadV1.id(),
+                key: command(step as u8).as_bytes().to_vec(),
+                value: Some(vec![step as u8; 16]),
+            },
+            coord_storage::retry::executed_update(
+                &command(step as u8),
+                position(step),
+                None,
+                Digest32([step as u8; 32]),
+            )
+            .unwrap(),
+            meta_row(meta_fields::KV_REVISION, step),
+        ];
+        if step >= 2 {
+            updates.push(meta_row(meta_fields::RETENTION_FLOOR, step - 1));
+            updates.push(meta_row(meta_fields::LEASE_AUTHORITY, 10 + step));
+        }
+        world.application(A, step, position(step), updates);
+    };
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Run {
+        CommitEach,
+        OneCommit,
+        Replayed,
+    }
+    let run = |how: Run| {
+        let mut world = World::new();
+        for s in 1..=3 {
+            step(&mut world, s);
+            match how {
+                Run::CommitEach => {
+                    world.store.flush().unwrap();
+                }
+                Run::OneCommit => {}
+                Run::Replayed => {
+                    world.store.append_pending().unwrap();
+                }
+            }
+        }
+        let before = world.store.projection(A).unwrap().writes_to(meta);
+        match how {
+            Run::CommitEach => {}
+            Run::OneCommit => {
+                world.store.flush().unwrap();
+            }
+            Run::Replayed => {
+                let frontiers = world.store.frontiers(A).unwrap();
+                assert!(frontiers.materialized() < frontiers.durable());
+            }
+        }
+        let one_commit = world.store.projection(A).unwrap().writes_to(meta) - before;
+        if how != Run::Replayed {
+            // The key index the commits kept is the one their rows build:
+            // it saw every revision and floor the meta rows carried.
+            let view = world.store.reader(A).unwrap().snapshot().unwrap();
+            let live = view
+                .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+                .unwrap();
+            assert_eq!(
+                live,
+                coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+                "{how:?}, before the restart"
+            );
+        }
+        // The boot ends, so every run's journal holds the same records. The
+        // replayed one's projection loses every commit to a crash, and the
+        // attach rebuilds it from the journal.
+        let (journal, mut engines) = world.store.into_parts();
+        let mut engine = engines.pop().expect("one domain").1;
+        if how == Run::Replayed {
+            engine.crash_and_reopen();
+        }
+        let mut store = JournaledStore::open(
+            journal,
+            CLUSTER,
+            REPLICA,
+            inc(),
+            BootId([0x89; 16]),
+            JournalLimits::default(),
+        )
+        .unwrap();
+        store.attach(A, shard(), engine).unwrap();
+        let frontiers = store.frontiers(A).unwrap();
+        assert_eq!(frontiers.materialized(), frontiers.durable(), "{how:?}");
+        let view = store.reader(A).unwrap().snapshot().unwrap();
+        let live = view
+            .with_kv_index(coord_storage::kv_index::KvIndex::clone)
+            .unwrap();
+        assert_eq!(
+            live,
+            coord_storage::kv_index::KvIndex::build(view.view()).unwrap(),
+            "{how:?}"
+        );
+        drop(view);
+        (store.projection(A).unwrap().durable_rows(), one_commit)
+    };
+    let (each, _) = run(Run::CommitEach);
+    let (one, meta_writes) = run(Run::OneCommit);
+    let (replayed, _) = run(Run::Replayed);
+    let value_of = |rows: &[(u16, Vec<u8>, Vec<u8>)], key: &[u8]| {
+        rows.iter()
+            .find(|(c, k, _)| *c == meta.0 && k.as_slice() == key)
+            .map(|(.., v)| v.clone())
+    };
+    assert_eq!(value_of(&each, meta_fields::KV_REVISION), Some(counter(3)));
+    assert_eq!(
+        value_of(&each, meta_fields::RETENTION_FLOOR),
+        Some(counter(2))
+    );
+    assert_eq!(
+        value_of(&each, meta_fields::LEASE_AUTHORITY),
+        Some(counter(13))
+    );
+    assert_eq!(one, each, "one commit leaves what a commit a command does");
+    assert_eq!(replayed, each, "replay leaves what a commit a command does");
+    // The three keys once each, and the stamp and the frontier.
+    assert_eq!(meta_writes, 3 + 2, "meta rows written by the one commit");
 }

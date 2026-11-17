@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use coord_collector::wire::{ReadV1, decode_read_answer, read_frame};
+use coord_collector::wire::{ReadV1, decode_read_answer, decode_release, read_frame};
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, ReadOutcomeV1, Submitted};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -20,7 +20,7 @@ use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
-use coord_daemon::reads::ROUND_IN_FLIGHT_MILLIS;
+use coord_daemon::reads::ROUND_SPACING_MILLIS;
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -34,7 +34,9 @@ use coord_types::ids::{
     Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, PolicyRuleId,
     PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
 };
-use coord_types::logical_v1::{CanonicalOperation, KeyRange, LogicalRequest, PutOp, RangeOp};
+use coord_types::logical_v1::{
+    BranchOp, CanonicalOperation, KeyRange, LogicalRequest, PutOp, RangeOp, TxnOp,
+};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole, RequestV1};
 
 const NS: NamespaceId = NamespaceId([5; 16]);
@@ -241,7 +243,11 @@ fn logical(sequence: u64) -> LogicalRequest {
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
 fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+    admitted_request(RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap())
+}
+
+/// `request`, admitted as the collector's admission gate hands it on.
+fn admitted_request(request: RequestV1) -> AdmittedRequest {
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -291,11 +297,53 @@ fn read(sequence: u64) -> Frame {
     )
 }
 
+/// A current read of `k1` and `k2` in one transaction, as the Jepsen
+/// client's read of more than one key is (task-d83).
+fn txn_logical() -> LogicalRequest {
+    let range = |key: &[u8]| {
+        BranchOp::Range(RangeOp {
+            range: KeyRange {
+                key: key.to_vec(),
+                range_end: None,
+            },
+            revision: None,
+            limit: 1,
+            keys_only: false,
+            count_only: false,
+        })
+    };
+    let mut logical = LogicalRequest::new(
+        NS,
+        CanonicalOperation::Txn(TxnOp {
+            compares: Vec::new(),
+            success: vec![range(b"k1"), range(b"k2")],
+            failure: Vec::new(),
+        }),
+    );
+    logical.canonicalize();
+    logical
+}
+
+/// [`txn_logical`] as a read for the leader's barrier.
+fn txn_read(sequence: u64) -> Frame {
+    let request = RequestV1::new(retry_key(sequence), &txn_logical(), 0, 0).unwrap();
+    frame(
+        &read_frame(&ReadV1 {
+            ballot: ballot(),
+            request,
+        })
+        .expect("a read frame"),
+    )
+}
+
 struct Cluster {
     voters: Vec<Voter<StoreWorker<ModelEngine>>>,
     collector: Collector,
     peers: std::collections::VecDeque<(usize, PeerProvenance, Vec<u8>)>,
     sequence: u64,
+    /// The response bytes of every result a voter released to the
+    /// collector, in order: what the ordered path hands the client.
+    released: Vec<Vec<u8>>,
 }
 
 impl Cluster {
@@ -310,10 +358,16 @@ impl Cluster {
             }),
             peers: std::collections::VecDeque::new(),
             sequence: 0,
+            released: Vec::new(),
         }
     }
 
     fn carry(&mut self, from: usize, out: Outbound) {
+        for bytes in &out.frontend {
+            if let Ok(release) = decode_release(&frame(bytes)) {
+                self.released.push(release.response().to_vec());
+            }
+        }
         for (to, frame) in out.peer {
             let prov = self.voters[from].provenance();
             self.peers
@@ -324,9 +378,14 @@ impl Cluster {
     /// One put, submitted to every voter.
     fn submit(&mut self) {
         self.sequence += 1;
+        self.submit_admitted(&admitted(self.sequence));
+    }
+
+    /// `request` as an ordered command, submitted to every voter.
+    fn submit_admitted(&mut self, request: &AdmittedRequest) {
         let Submitted::FanOut(fan_out) = self
             .collector
-            .submit(MonotonicMillis::ZERO, &admitted(self.sequence))
+            .submit(MonotonicMillis::ZERO, request)
             .expect("submitted")
         else {
             panic!("not new work")
@@ -367,9 +426,9 @@ impl Cluster {
 
 /// Two reads due in one pump are served from one snapshot (task-d58).
 ///
-/// The second read arrives once the first one's round has been in flight
-/// for [`ROUND_IN_FLIGHT_MILLIS`], so it starts a round of its own, and
-/// that round covers both. Once it confirms, one pump finds both due:
+/// The second read arrives once the first one's round has been out for
+/// [`ROUND_SPACING_MILLIS`], so it starts a round of its own, and that
+/// round covers both. Once it confirms, one pump finds both due:
 /// one snapshot is pinned and both are served from it, where each used to
 /// pin its own.
 #[test]
@@ -378,7 +437,7 @@ fn the_reads_due_in_one_pump_are_served_from_one_snapshot() {
     cluster.submit();
     cluster.settle();
     let t0 = MonotonicMillis::ZERO;
-    let later = t0.plus(ROUND_IN_FLIGHT_MILLIS);
+    let later = t0.plus(ROUND_SPACING_MILLIS);
 
     let out = cluster.voters[0].on_read(&read(2), Origin::Connection(9), t0);
     assert!(out.reads.is_empty(), "the first read is held, not answered");
@@ -413,4 +472,368 @@ fn the_reads_due_in_one_pump_are_served_from_one_snapshot() {
     let out = cluster.voters[0].pump_reads(later);
     assert!(out.reads.is_empty());
     assert_eq!(cluster.voters[0].read_counts().snapshots, 1);
+}
+
+/// task-d83: a read-only transaction of current ranges is served at the
+/// barrier, both of its reads from the one snapshot, with the outcome the
+/// ordered path would record: the success branch's ranges, in order.
+#[test]
+fn a_read_only_transaction_is_served_at_the_barrier() {
+    let mut cluster = Cluster::new();
+    cluster.submit();
+    cluster.settle();
+    let t0 = MonotonicMillis::ZERO;
+
+    let out = cluster.voters[0].on_read(&txn_read(2), Origin::Connection(9), t0);
+    assert!(out.reads.is_empty(), "the read is held, not answered");
+    assert!(!out.peer.is_empty(), "the read starts a round");
+    cluster.carry(0, out);
+    cluster.settle();
+
+    let out = cluster.voters[0].pump_reads(t0.plus(ROUND_SPACING_MILLIS));
+    let counts = cluster.voters[0].read_counts();
+    assert_eq!(counts.served, 1, "{counts:?}");
+    assert_eq!(counts.refused, 0, "{counts:?}");
+    let [(_, bytes)] = &out.reads[..] else {
+        panic!("one answer: {:?}", out.reads.len());
+    };
+    let answer_bytes = bytes.clone();
+    let answer = decode_read_answer(&frame(bytes)).expect("a read answer");
+    let ReadOutcomeV1::Served { response } = answer.outcome else {
+        panic!("{answer:?}");
+    };
+    let response: coord_state::Response = postcard::from_bytes(&response).expect("a response");
+    let coord_state::Outcome::Txn { succeeded, results } = response.outcome else {
+        panic!("{response:?}");
+    };
+    assert!(succeeded);
+    let keys: Vec<Vec<Vec<u8>>> = results
+        .iter()
+        .map(|r| match r {
+            coord_state::Outcome::Range { items, .. } => {
+                items.iter().map(|i| i.key.clone()).collect()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(keys, vec![vec![b"k1".to_vec()], Vec::new()]);
+
+    // The same transaction as an ordered command, with nothing in
+    // between, is answered with the same bytes: revision, each branch's
+    // items, count and `more` (review, task-d83's acceptance).
+    let served = response_bytes(&answer_bytes);
+    let before = cluster.released.len();
+    let request = RequestV1::new(retry_key(3), &txn_logical(), 0, 0).unwrap();
+    cluster.submit_admitted(&admitted_request(request));
+    cluster.settle();
+    let ordered = &cluster.released[before..];
+    assert_eq!(ordered.len(), 1, "one release for the ordered transaction");
+    assert_eq!(
+        ordered[0], served,
+        "the barrier's bytes are the ordered path's"
+    );
+}
+
+/// The `Response` bytes a served read answer carries.
+fn response_bytes(answer: &[u8]) -> Vec<u8> {
+    let answer = decode_read_answer(&frame(answer)).expect("a read answer");
+    let ReadOutcomeV1::Served { response } = answer.outcome else {
+        panic!("{answer:?}");
+    };
+    response
+}
+
+/// The journal-first store coordd runs (task-d52).
+type Journaled =
+    coord_storage::JournaledDomain<coord_store_testkit::journal::ModelJournal, ModelEngine>;
+
+/// A lone leader -- the only voter of its ballot, so a read needs no
+/// peer's confirmation -- over the journal-first store, lowering in
+/// groups, its projection commits lent to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): what it
+/// journals is held until something asks for the commit.
+fn held_lone_leader() -> (Voter<Journaled>, coord_storage::ManualHandle<ModelEngine>) {
+    use coord_storage::Persistence as _;
+    use coord_storage::journaled::{
+        CommitHold, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
+    };
+    let boot = BootId([1; 16]);
+    let mut store = JournaledStore::open(
+        coord_store_testkit::journal::ModelJournal::new(),
+        CLUSTER,
+        r(0),
+        inc(),
+        boot,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .attach(
+            DOMAIN,
+            coord_journal_api::stream::ShardId::new(0).unwrap(),
+            ModelEngine::new(),
+        )
+        .unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = store.application_base(DOMAIN).unwrap();
+    let genesis = Ballot {
+        epoch: base.configuration,
+        number: 0,
+        leader: r(0),
+    };
+    store
+        .submit(Submission {
+            domain: DOMAIN,
+            ballot: genesis,
+            kind: TransitionKind::Application {
+                position: base.execution_position.checked_next().unwrap(),
+                revision: None,
+                result_digest: Digest32([0; 32]),
+            },
+            batch: coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: Some(base),
+                updates: bootstrap_updates(),
+            },
+        })
+        .unwrap();
+    store.flush().unwrap();
+    store
+        .replay_projection(DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: std::time::Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    store
+        .pipeline(Box::new(materializer))
+        .expect("nothing out yet");
+    let domain = coord_storage::JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
+    let applier = Applier::new(domain, alloc).unwrap();
+    let bootstrapped = applier.store().application_base().execution_position;
+    let alone = ConfigurationIdentity {
+        voters: [r(0)].into_iter().collect(),
+        ..identity(0)
+    };
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: alone,
+            quorum: BallotConfiguration::c2(
+                epoch(),
+                ballot(),
+                [r(0)].into_iter().collect(),
+                [r(0)].into_iter().collect(),
+            )
+            .unwrap(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.lower_in_groups();
+    let ingress = Ingress::new(
+        &membership(),
+        r(0),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("a committed voter");
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+    voter.boot(boot, inc()).expect("boot");
+    (voter, handle)
+}
+
+/// Submit the put of `k1` to `voter` as a collector would.
+fn submit_put(voter: &mut Voter<Journaled>) {
+    let mut collector = Collector::new(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let Submitted::FanOut(fan_out) = collector
+        .submit(MonotonicMillis::ZERO, &admitted(1))
+        .expect("submitted")
+    else {
+        panic!("not new work")
+    };
+    voter
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&fan_out.frame),
+            Origin::Connection(7),
+        )
+        .expect("driven")
+        .expect("admitted");
+}
+
+/// The one answer `out` carries, as the `Response` bytes of a served
+/// read whose range holds exactly `k1`.
+fn served_k1(out: &Outbound) -> Vec<u8> {
+    let [(_, bytes)] = &out.reads[..] else {
+        panic!("one answer: {:?}", out.reads.len());
+    };
+    let response = response_bytes(bytes);
+    let decoded: coord_state::Response = postcard::from_bytes(&response).expect("a response");
+    let coord_state::Outcome::Range { items, .. } = &decoded.outcome else {
+        panic!("{decoded:?}");
+    };
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.key.as_slice()).collect();
+    assert_eq!(keys, vec![b"k1".as_slice()], "the put is read");
+    response
+}
+
+/// A read held at the barrier is served over the groups in flight
+/// (#185, lead 17:43): once its index has executed and is in the
+/// journal, it is answered at once, with the put's group still held from
+/// the projection, and it asks for no commit. The same read once the
+/// projection has committed the put is answered with the same bytes.
+/// Before, the read waited for the projection and asked for its commit,
+/// which cut the held commit short (task-d86).
+#[test]
+fn a_read_held_at_the_barrier_is_served_over_the_held_commit_without_asking_for_it() {
+    use coord_storage::Persistence as _;
+    let (mut voter, handle) = held_lone_leader();
+    let base = voter
+        .node()
+        .applier()
+        .store()
+        .materialized_through()
+        .unwrap();
+    submit_put(&mut voter);
+    for _ in 0..8 {
+        if voter.node().executed == 1 {
+            break;
+        }
+        voter.flush().expect("journaled");
+    }
+    assert_eq!(voter.node().executed, 1);
+    voter.finish().expect("handed off");
+    voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the group's commit is held");
+
+    let t0 = MonotonicMillis::ZERO;
+    let out = voter.on_read(&read(2), Origin::Connection(9), t0);
+    let served = served_k1(&out);
+    voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the read asked for no commit");
+    assert_eq!(
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap(),
+        base,
+        "the projection holds none of the put"
+    );
+
+    // The projection commits the put; the same read is answered over it
+    // alone with the same bytes.
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .request_projection_commit();
+    voter.settle().expect("settled");
+    assert!(handle.run());
+    voter.settle().expect("settled");
+    assert!(
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap()
+            > base
+    );
+    assert_eq!(voter.node().applier().in_flight(), 0);
+    let out = voter.on_read(&read(3), Origin::Connection(9), t0);
+    assert_eq!(
+        served_k1(&out),
+        served,
+        "over the groups in flight, the bytes the projection gives"
+    );
+}
+
+/// What a read is served over is what a release has disclosed: a group
+/// whose journal append is still out is not laid over the projection
+/// (#185, lead 17:43). The read waits for the append, and is served once
+/// it is back, with the projection still holding none of the put and no
+/// commit asked for.
+#[test]
+fn a_read_whose_group_is_still_being_journaled_waits_for_the_append_and_not_the_commit() {
+    use coord_storage::Persistence as _;
+    let (mut voter, handle) = held_lone_leader();
+    let (appender, appends) = coord_storage::ManualAppender::new();
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .expect("nothing out yet");
+    let base = voter
+        .node()
+        .applier()
+        .store()
+        .materialized_through()
+        .unwrap();
+    submit_put(&mut voter);
+    // The put's record is journaled and taken back, so the leader learns
+    // it; then it executes, and its group is handed off with its own
+    // append out.
+    for _ in 0..8 {
+        if voter.node().can_execute() {
+            break;
+        }
+        voter.flush().expect("flushed");
+        while appends.run() {
+            voter.settle().expect("settled");
+        }
+    }
+    assert!(voter.node().can_execute(), "the put is learned");
+    assert_eq!(voter.node().executed, 0);
+    voter.flush().expect("staged and journaled");
+    voter.finish().expect("handed off");
+    assert_eq!(voter.node().executed, 1);
+    assert!(
+        voter.node().applier().store().appending(),
+        "the group's append is still out"
+    );
+
+    let t0 = MonotonicMillis::ZERO;
+    let out = voter.on_read(&read(2), Origin::Connection(9), t0);
+    assert!(
+        out.reads.is_empty(),
+        "a read is not served over a group the journal does not hold yet"
+    );
+
+    while appends.run() {
+        voter.settle().expect("settled");
+    }
+    let out = voter.pump_reads(t0);
+    served_k1(&out);
+    voter.settle().expect("settled");
+    assert_eq!(handle.waiting(), 0, "the read asked for no commit");
+    assert_eq!(
+        voter
+            .node()
+            .applier()
+            .store()
+            .materialized_through()
+            .unwrap(),
+        base,
+        "the projection holds none of the put"
+    );
 }

@@ -208,6 +208,11 @@ pub struct Provisioned {
     /// not the daemon's default (task-d55). Written only when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_after_records: Option<u64>,
+    /// `max_admitted_per_second` every voter's frontend was provisioned
+    /// with, where not the daemon's default (task-d26). Written only when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_per_second: Option<u32>,
 }
 
 impl Provisioned {
@@ -257,22 +262,36 @@ pub struct Plan {
     /// last local checkpoint before the next is published. Zero never
     /// publishes.
     pub checkpoint_after_records: Option<u64>,
+    /// `[limits] max_admitted_per_second` for every voter, where not the
+    /// daemon's default of 1,000 (task-d26): new requests each frontend
+    /// admits a second, the rest refused `BACKPRESSURE`.
+    pub max_admitted_per_second: Option<u32>,
 }
 
 /// The `[limits]` a voter's configuration carries when the plan sets one
 /// of them; empty otherwise, so the configuration is byte for byte what
-/// this harness has always written. The section's other fields are
-/// required, so they are written at the daemon's defaults, which
-/// `coordd`'s tests check against its own.
-fn limits_section(checkpoint_after_records: Option<u64>) -> String {
-    match checkpoint_after_records {
-        None => String::new(),
-        Some(n) => format!(
-            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
-             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
-             checkpoint_after_records = {n}\n"
-        ),
+/// this harness has always written. The section's other required fields
+/// are written at the daemon's defaults, which `coordd`'s tests check
+/// against its own; a limit the plan leaves unset is left out, so the
+/// daemon's default for it stands.
+fn limits_section(
+    checkpoint_after_records: Option<u64>,
+    max_admitted_per_second: Option<u32>,
+) -> String {
+    if checkpoint_after_records.is_none() && max_admitted_per_second.is_none() {
+        return String::new();
     }
+    let mut section = String::from(
+        "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+         max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n",
+    );
+    if let Some(n) = checkpoint_after_records {
+        section.push_str(&format!("checkpoint_after_records = {n}\n"));
+    }
+    if let Some(n) = max_admitted_per_second {
+        section.push_str(&format!("max_admitted_per_second = {n}\n"));
+    }
+    section
 }
 
 /// The journal profile a provisioned domain's voters run, written into
@@ -289,6 +308,14 @@ pub struct JournalPlan {
     pub projection_durable_records: Option<u32>,
     /// `projection_durable_ms`, where not the daemon's default.
     pub projection_durable_ms: Option<u64>,
+    /// `projection_commit_records`, where not the daemon's default: the
+    /// records a projection commit is held for (task-d86). Zero holds
+    /// nothing.
+    pub projection_commit_records: Option<u32>,
+    /// `projection_commit_ms`, where not the daemon's default: the
+    /// longest a record is held for a larger commit (task-d86). Zero
+    /// holds nothing.
+    pub projection_commit_ms: Option<u64>,
 }
 
 /// A journal profile `coordd` serves.
@@ -348,6 +375,12 @@ impl JournalPlan {
         if let Some(n) = self.projection_durable_ms {
             out.push_str(&format!("projection_durable_ms = {n}\n"));
         }
+        if let Some(n) = self.projection_commit_records {
+            out.push_str(&format!("projection_commit_records = {n}\n"));
+        }
+        if let Some(n) = self.projection_commit_ms {
+            out.push_str(&format!("projection_commit_ms = {n}\n"));
+        }
         out
     }
 }
@@ -366,6 +399,7 @@ impl Plan {
             issuer_listen: None,
             journal: JournalPlan::default(),
             checkpoint_after_records: None,
+            max_admitted_per_second: None,
         }
     }
 }
@@ -571,6 +605,17 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         journal.projection_durable_records.map(u64::from),
         journal.projection_durable_ms,
     ];
+    // The commit hold is the replay profile's too (task-d86); zero is
+    // how it is turned off, so only the profile is checked for it.
+    let hold = [
+        journal.projection_commit_records.map(u64::from),
+        journal.projection_commit_ms,
+    ];
+    if journal.profile == JournalProfile::Strict && hold.iter().any(Option::is_some) {
+        return Err(invalid(
+            "a projection commit hold is the replay profile's: name it as well".into(),
+        ));
+    }
     if journal.profile == JournalProfile::Strict && cadence.iter().any(Option::is_some) {
         return Err(invalid(
             "a projection cadence is the replay profile's: name it as well".into(),
@@ -659,8 +704,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         // it dials the others. One key per certificate, issued once, so
         // the key the genesis below commits is the key this leaf holds.
         let issue = |role| match voter_reach.get(usize::from(n) - 1) {
-            None => ca.issue_node(SERVER_NAME, cluster, node, incarnation, role),
-            Some(at) => ca.issue_node_at(SERVER_NAME, cluster, node, incarnation, role, at.clone()),
+            None => ca.issue_node(SERVER_NAME, cluster, domain, node, incarnation, role),
+            Some(at) => ca.issue_node_at(
+                SERVER_NAME,
+                cluster,
+                domain,
+                node,
+                incarnation,
+                role,
+                at.clone(),
+            ),
         };
         let issued = issue(PeerRole::Voter);
         voter_keys.push(issued.spki());
@@ -810,7 +863,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     // if the authority outlives provisioning.
     let caller_certificate = dir.join("caller.pem");
     let caller_key = dir.join("caller.key");
-    issue_caller(&ca, cluster, 0).write(&caller_certificate, &caller_key)?;
+    issue_caller(&ca, cluster, domain, 0).write(&caller_certificate, &caller_key)?;
     let authority_key = dir.join("domain-ca.key");
     std::fs::write(&authority_key, coord_sts::keys::b64url(&ca.signing_key()))?;
     restrict(&authority_key)?;
@@ -847,6 +900,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         edge,
         journal_profile: plan.journal.profile,
         checkpoint_after_records: plan.checkpoint_after_records,
+        max_admitted_per_second: plan.max_admitted_per_second,
     };
     std::fs::write(
         dir.join("harness.json"),
@@ -855,14 +909,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     Ok(provisioned)
 }
 
-/// One caller credential. `ordinal` distinguishes concurrent callers:
-/// each is a different client identity, as separate processes would be.
-pub fn issue_caller(ca: &Ca, cluster: ClusterId, ordinal: u16) -> Issued {
+/// One caller credential for `domain`. `ordinal` distinguishes concurrent
+/// callers: each is a different client identity, as separate processes
+/// would be.
+pub fn issue_caller(ca: &Ca, cluster: ClusterId, domain: DomainId, ordinal: u16) -> Issued {
     let mut node = [0x0c; 16];
     node[14..].copy_from_slice(&ordinal.to_be_bytes());
     ca.issue_node(
         "caller.tuplesky.harness",
         cluster,
+        domain,
         ReplicaId(node),
         ReplicaIncarnation::new(1).expect("one is positive"),
         PeerRole::Client,
@@ -1024,7 +1080,7 @@ namespace = "{namespace}"
 {limits}"#,
         preamble = layout.preamble(),
         journal = plan.journal.lines(),
-        limits = limits_section(plan.checkpoint_after_records),
+        limits = limits_section(plan.checkpoint_after_records, plan.max_admitted_per_second),
         manifest = layout.shared("genesis.json"),
         admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),

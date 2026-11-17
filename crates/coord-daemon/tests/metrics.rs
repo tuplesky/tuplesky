@@ -7,9 +7,11 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, Lane, LaneReading,
-    Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder,
-    Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
+    HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
+    MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path,
+    PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions,
+    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Table, Traffic,
     Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
@@ -356,6 +358,13 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             journal_appends: 6000,
             journal_syncs: Measure::Observed(6020),
             projection_commits: 6100,
+            hold_ends: coord_daemon::metrics::HoldEnds {
+                full: 100,
+                deadline: 200,
+                read: 300,
+                settle: 4,
+                other: 5,
+            },
             busy: Duration::from_secs(41),
             uptime: Duration::from_secs(60),
             recent: Measure::Observed(Interval {
@@ -381,6 +390,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 waited_confirm_ms: 450,
                 waited_index_ms: 2700,
                 waited_ms: 2800,
+                waited: distribution(&[2, 3, 3, 40]),
                 snapshots: 280,
                 behind: 12,
             },
@@ -391,6 +401,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     run_queue: Duration::from_secs(3),
                     voluntary: 5200,
                     involuntary: 410,
+                    run_queue_per_pass: distribution(&[0, 0, 1, 9]),
+                    run_queue_per_working_pass: distribution(&[1, 9]),
                 }),
             }),
             waits: Measure::Observed(PipelineWaits {
@@ -407,12 +419,16 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     queued: Duration::from_millis(30),
                     served: Duration::from_millis(1800),
                     completed: Duration::from_millis(260),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
                 materializer_jobs: Jobs {
                     count: 120,
                     queued: Duration::from_millis(40),
                     served: Duration::from_millis(700),
                     completed: Duration::from_millis(90),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
             }),
             fast_path: FastPath {
@@ -434,7 +450,25 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 commands: 1150,
                 predecessors: Duration::from_millis(900),
                 group: Duration::from_millis(300),
-                projection: Duration::from_millis(2100),
+                journal: Duration::from_millis(2100),
+                distributions: ReleaseDistributions {
+                    predecessors: distribution(&[1, 1, 4]),
+                    group: distribution(&[0, 1]),
+                    journal: distribution(&[2, 2, 3]),
+                    whole: distribution(&[3, 4, 9]),
+                    round: distribution(&[1, 2, 6]),
+                },
+            },
+            evidence_for_marked: 3,
+            early_solicits: 2,
+            answered: Answered {
+                writes: distribution(&[2, 3, 3, 14]),
+                reads: distribution(&[1, 2, 5]),
+            },
+            gate: Gate {
+                denied: 2,
+                deferred: 1,
+                remembered: 40,
             },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
@@ -450,8 +484,128 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 received_frames: 8800,
                 received_bytes: 1_900_000,
                 received_streams: 8800,
+                refused_voter_names: 0,
+                api: Datagrams {
+                    datagrams_sent: 4100,
+                    datagrams_received: 4000,
+                    send_calls: 4050,
+                    acks_sent: 1900,
+                    acks_received: 2000,
+                },
             }),
+            journal_groups: JournalGroups {
+                protocol: 3100,
+                application: 2400,
+                both: 500,
+                other: 20,
+                protocol_records: 4300,
+                payload_records: 1200,
+                application_records: 1200,
+            },
+            history: History {
+                records: 5200,
+                kept: 1400,
+                sweeps: 3,
+                entries: 9100,
+                largest_map: 1700,
+            },
+            flushes: Flushes {
+                flushes: 900,
+                api_events: 4000,
+                peer_events: 6000,
+                by_events: [0, 100, 100, 200, 200, 200, 100, 0, 0],
+            },
+            hand_offs: HandOffs {
+                bound: 40,
+                flush: 900,
+                idle: 2000,
+                answer: 3,
+                watch: 0,
+            },
+            proposals: ProposalBytes {
+                proposals: 8000,
+                proposal_bytes: 1_200_000,
+                payload_bytes: 2_000_000,
+                frames: 700,
+                framed: 6000,
+                frontiers: 900,
+                frontier_bytes: 40_000,
+            },
+            relay: Relay {
+                relayed: 4000,
+                fallbacks: 3,
+                not_leading: 1,
+                asked_leader: 5,
+                frames_taken: 500,
+                payloads_taken: 3900,
+                known: 20,
+                not_taken: 2,
+                kept: 6,
+                kept_taken: 5,
+                frame_batches: 480,
+                frame_adoptions: 3900,
+            },
+            table: Table {
+                records: 3500,
+                capacity: 4096,
+                unexecuted: 3400,
+                ready: 0,
+                catch_up_window: 64,
+                oldest_wait: Some(OldestWait::Dependency { phase: None }),
+            },
+            intake_index: coord_daemon::metrics::IntakeIndexSize {
+                entries: 7000,
+                bytes: 322_000,
+                executed: 90_000,
+                executed_bytes: 2_520_000,
+            },
+            table_full: 31,
         }),
+        // A replica is named by four bytes, as the log lines name it: not
+        // an identity-shaped run.
+        paths: vec![
+            Path {
+                plane: Plane::Peer,
+                lane: Lane::Control,
+                role: coord_types::wire_v1::PeerRole::Voter,
+                replica: Some("0a1b2c3d".to_owned()),
+                connection: 4,
+                accepted: false,
+                rtt_micros: 140_312,
+                min_rtt_micros: 139_870,
+                cwnd: 1_048_576,
+                congestion_events: 12,
+                lost_packets: 310,
+                lost_bytes: 371_000,
+                sent_packets: 31_000,
+            },
+            Path {
+                plane: Plane::Api,
+                lane: Lane::Unary,
+                role: coord_types::wire_v1::PeerRole::Frontend,
+                replica: None,
+                connection: 9,
+                accepted: true,
+                rtt_micros: 141_002,
+                min_rtt_micros: 139_901,
+                cwnd: 38_400,
+                congestion_events: 220,
+                lost_packets: 2_400,
+                lost_bytes: 1_900_000,
+                sent_packets: 240_000,
+            },
+        ],
+        paths_unreported: 3,
+        offers: Offers {
+            reoffered: 40,
+            solicited: 12,
+            refused: 7,
+            returned: 9000,
+            unreturnable: 3,
+            kept: 60,
+            returned_again: 57,
+            kept_now: 2,
+        },
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
 
@@ -483,6 +637,66 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
     let parsed: MetricsSnapshot = serde_json::from_str(&rendered).expect("round trip");
     assert_eq!(parsed, snapshot);
     assert!(parsed.stage(Stage::Admission).is_some());
+
+    // A line from before the offers moved out of the cost reading, or
+    // before the paths were capped, still parses, and both read as none.
+    let mut older: serde_json::Value = serde_json::from_str(&rendered).expect("a value");
+    let fields = older.as_object_mut().expect("an object");
+    assert!(fields.remove("offers").is_some());
+    assert!(fields.remove("paths_unreported").is_some());
+    let older: MetricsSnapshot = serde_json::from_value(older).expect("an older line parses");
+    assert_eq!(older.offers, Offers::default());
+    assert_eq!(older.paths_unreported, 0);
+}
+
+/// A snapshot reports at most [`MAX_REPORTED_PATHS`] paths, in the order
+/// the transport gave them, and counts the rest (#297 review): a node
+/// that many collectors dial keeps a bounded line, and the peer plane's,
+/// given first, stay on it.
+#[test]
+fn paths_past_the_bound_are_counted_and_left_out() {
+    let reading = |connection: u64, replica: Option<u8>| coord_transport::PathReading {
+        class: match replica {
+            Some(_) => coord_transport::Class::Peer,
+            None => coord_transport::Class::Api,
+        },
+        lane: coord_transport::Lane::Unary,
+        role: match replica {
+            Some(_) => coord_types::wire_v1::PeerRole::Voter,
+            None => coord_types::wire_v1::PeerRole::Frontend,
+        },
+        replica: replica.map(|r| coord_types::ids::ReplicaId([r; 16])),
+        connection: coord_transport::ConnectionId(connection),
+        accepted: replica.is_none(),
+        rtt: Duration::from_millis(100),
+        min_rtt: Duration::from_millis(99),
+        cwnd: 12_000,
+        congestion_events: connection,
+        lost_packets: 0,
+        lost_bytes: 0,
+        sent_packets: 10,
+    };
+    let voters = (0..4u8).map(|i| reading(u64::from(i), Some(i + 1)));
+    let collectors = (4..400).map(|i| reading(i, None));
+    let (paths, unreported) = Path::bounded(voters.chain(collectors));
+    assert_eq!(paths.len(), MAX_REPORTED_PATHS);
+    assert_eq!(unreported, 400 - MAX_REPORTED_PATHS as u64);
+    assert!(
+        paths[..4]
+            .iter()
+            .all(|p| p.plane == Plane::Peer && p.replica.is_some()),
+        "the peer plane's paths are the first"
+    );
+    assert_eq!(paths[0].replica.as_deref(), Some("01010101"));
+    assert_eq!(
+        paths.last().map(|p| p.connection),
+        Some(MAX_REPORTED_PATHS as u64 - 1),
+        "the ones reported are the first given"
+    );
+
+    // Under the bound, nothing is left out.
+    let (all, none) = Path::bounded((0..10).map(|i| reading(i, None)));
+    assert_eq!((all.len(), none), (10, 0));
 }
 
 /// Readers and writers run concurrently and the recorder stays
@@ -613,4 +827,45 @@ fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
         cpu.domain_scheduling,
         Measure::Unavailable(Unavailable::NotInstrumented)
     );
+}
+
+/// A distribution of the given milliseconds (task-d97).
+fn distribution(millis: &[u64]) -> Distribution {
+    let mut d = Distribution::default();
+    for &ms in millis {
+        d.record(Duration::from_millis(ms));
+    }
+    d
+}
+
+/// A metrics line written before task-d97 still reads: the release
+/// split, the read barrier and the loop's scheduling read with empty
+/// distributions, which say no quantile rather than zero.
+#[test]
+fn a_reading_without_distributions_reads_as_empty() {
+    let release: Release = serde_json::from_str(
+        r#"{"commands":3,"predecessors":{"secs":0,"nanos":3000000},"group":{"secs":0,"nanos":0},"journal":{"secs":0,"nanos":6000000}}"#,
+    )
+    .expect("an older release split parses");
+    assert_eq!(release.commands, 3);
+    assert_eq!(release.distributions, ReleaseDistributions::default());
+    assert_eq!(release.distributions.whole.quantile(0.99), None);
+    let scheduling: Scheduling =
+        serde_json::from_str(r#"{"run_queue":{"secs":3,"nanos":0},"voluntary":5,"involuntary":4}"#)
+            .expect("an older scheduling reading parses");
+    assert_eq!(scheduling.run_queue_per_pass.count(), 0);
+    assert_eq!(scheduling.run_queue_per_working_pass.count(), 0);
+}
+
+/// A recorded distribution goes out on the metrics line and reads back
+/// whole, so a reader can take the difference of two lines' buckets
+/// (task-d97).
+#[test]
+fn a_distribution_survives_the_metrics_line() {
+    let d = distribution(&[1, 2, 2, 3, 250]);
+    let line = serde_json::to_string(&d).expect("serializes");
+    let back: Distribution = serde_json::from_str(&line).expect("parses");
+    assert_eq!(back, d);
+    assert_eq!(back.count(), 5);
+    assert_eq!(back.quantile(1.0), Some(Duration::from_millis(250)));
 }

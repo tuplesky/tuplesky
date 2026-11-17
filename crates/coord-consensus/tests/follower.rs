@@ -7,8 +7,9 @@
 use std::collections::BTreeSet;
 
 use coord_consensus::{
-    BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
-    FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplayRefusal,
+    BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FRAME_BATCH_BYTES,
+    FRAME_BATCH_UPDATES, FastAck, Follower, FollowerConfig, FollowerRejection, FramedProposal,
+    MAX_PROPOSAL_FRAME_BYTES, PayloadRecordV1, Phase, ProtocolMessage, RelayTaken, ReplayRefusal,
     ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -21,8 +22,8 @@ use coord_sim::storage::StorageModel;
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
-use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
-use coord_types::wire_v1::{MessageV1, RequestV1};
+use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest, PutOp, TxnOp};
+use coord_types::wire_v1::{BoundedBytes, MessageV1, RequestV1};
 use coord_types::{CommandId, RetryKey};
 
 fn r(i: u8) -> ReplicaId {
@@ -121,7 +122,12 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
 
 fn peer(from: u8, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            r(from),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }
@@ -232,12 +238,16 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
     assert_eq!(batch.updates[1].key, dependency_key(epoch(), &c1));
     let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
     assert_eq!(row.phase, Phase::PreAccept);
-    assert_eq!(fast.pending_sends(), 3, "two voters and the frontend");
+    assert_eq!(
+        fast.pending_sends(),
+        2,
+        "the leader and the frontend, not the other voter (task-d74)"
+    );
     let released = fast.step(durable_of(&effects, 1).remove(0));
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 2);
     for (to, m) in &sent {
-        assert!(*to == r(0) || *to == r(2) || *to == FRONTEND.replica);
+        assert!(*to == r(0) || *to == FRONTEND.replica);
         let ProtocolMessage::FastAck(ack) = m else {
             panic!("{m:?}")
         };
@@ -380,8 +390,8 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         .collect();
     assert_eq!(
         slow.len(),
-        6,
-        "two slow acks to two voters and the frontend"
+        4,
+        "two slow acks to the leader and the frontend (task-d74)"
     );
     assert!(f.take_rejections().is_empty());
 }
@@ -429,7 +439,7 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         for d in durable_of(&effects, 5) {
             acks += sends(&f.step(d)).len();
         }
-        assert_eq!(acks, 6);
+        assert_eq!(acks, 4, "to the leader and the frontend (task-d74)");
         for c in [c1, c2] {
             let adoption = leader_adoption(f, c);
             f.step(adoption);
@@ -480,7 +490,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
         panic!()
     };
     storage.submit(batch.clone());
-    assert_eq!(f.pending_sends(), 3, "the vote waits");
+    assert_eq!(f.pending_sends(), 2, "the vote waits");
     assert_eq!(storage.crash(), 1);
     let rows = restore_rows(&storage);
     assert!(rows.is_empty());
@@ -518,7 +528,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     storage.submit(batch);
     storage.complete(effects_barrier(&effects)).unwrap();
     let released = f.step(durable_of(&effects, 1).remove(0));
-    assert_eq!(sends(&released).len(), 3);
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
     storage.crash();
     let rows = restore_rows(&storage);
     assert_eq!(rows.len(), 1);
@@ -612,6 +622,60 @@ fn restore_rows(storage: &StorageModel) -> Vec<(CommandId, CommandRecord)> {
         .collect()
 }
 
+/// task-d98: a follower outside the fast set that gets the leader's
+/// proposal before the leader's batch is durable must not complete a fast
+/// quorum with a fast-set member's acknowledgement. Only a build from
+/// before task-d74 sends one to a follower, and counted with an early
+/// proposal it would decide over a vote the leader may lose. The follower
+/// takes the decision from the leader's commit frontier instead.
+#[test]
+fn a_follower_never_counts_another_voters_fast_ack_toward_a_fast_decision() {
+    // r2 is outside the fast set {r0, r1} at three voters.
+    let mut f = booted(2);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(durable_of(&effects, 1).remove(0));
+    let record = f.table().record(&c1).unwrap().clone();
+    // r1's fast ack, equal to the leader's proposal in path and deps, as a
+    // pre-task-d74 build would send it to every voter.
+    let r1_ack = FastAck {
+        replica: r(1),
+        ballot: ballot(0, 0),
+        command: c1,
+        deps: record.deps.clone(),
+        paths: record.paths.clone(),
+        path: record.path,
+        admission: record.payload.expect("initialized"),
+        seqnum: None,
+    };
+    assert!(f.step(peer(1, ProtocolMessage::FastAck(r1_ack))).is_empty());
+    let adoption = f.step(peer(
+        0,
+        proposal(
+            c1,
+            record.deps.clone(),
+            0,
+            record.paths.clone(),
+            record.path,
+        ),
+    ));
+    f.step(durable_of(&adoption, 2).remove(0));
+    assert!(
+        f.votes(&c1).unwrap().learned().is_none(),
+        "the leader's proposal and nothing else: no fast quorum"
+    );
+    assert_ne!(
+        f.table().phase_of(&c1),
+        Some(Phase::Commit),
+        "not committed until the leader's frontier says so"
+    );
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PeerFastAck),
+        "r1's fast ack was refused, not counted"
+    );
+}
+
 #[test]
 fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     let mut f = booted(1);
@@ -637,10 +701,8 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     );
     assert_eq!(
         f.take_rejections(),
-        vec![FollowerRejection::Vote(
-            coord_consensus::VoteError::NotInFastSet
-        )],
-        "r2 is outside the fast set: its fast ack never counts"
+        vec![FollowerRejection::PeerFastAck],
+        "a follower never counts another voter's fast ack (task-d98)"
     );
     let p1 = proposal(c1, vec![], 0, record.paths.clone(), record.path);
     let adoption = f.step(peer(0, p1));
@@ -702,7 +764,7 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         .collect();
     assert_eq!(batches.len(), 2, "payload batch and adoption batch");
     let (payload, adoption) = (batches[0].clone(), batches[1].clone());
-    assert_eq!(f.pending_sends(), 3, "the adoption acknowledgement waits");
+    assert_eq!(f.pending_sends(), 2, "the adoption acknowledgement waits");
     // The adoption batch alone is not enough: the payload row is still
     // volatile, so a crash now would leave an accepted dependency row
     // without the payload it accepted.
@@ -714,14 +776,14 @@ fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
         sends(&released).is_empty(),
         "nothing leaves while the payload batch is volatile: {released:?}"
     );
-    assert_eq!(f.pending_sends(), 3);
+    assert_eq!(f.pending_sends(), 2);
     let released = f.step(Event::Storage(StorageEvent::JournalDurable {
         barrier_id: payload.barrier,
         journal_seq: LocalJournalSeq::new(2).unwrap(),
     }));
     assert_eq!(
         sends(&released).len(),
-        3,
+        2,
         "both batches durable: the acknowledgement goes out"
     );
     assert_eq!(f.pending_sends(), 0);
@@ -932,6 +994,34 @@ fn persisted(effects: &[Effect]) -> Vec<coord_core::effect::PersistBatch> {
             _ => None,
         })
         .collect()
+}
+
+/// What a step does, apart from how its rows are cut into batches: the
+/// rows it writes, in order, and its other effects, each send without the
+/// barriers it waits on. A frame writes its adoptions in one batch (step
+/// 2b of the batching rule's 10.7) where its entries one at a time write
+/// one an adoption, so only the batches and their barriers differ.
+fn rows_and_rest(effects: &[Effect]) -> (Vec<coord_core::effect::StoreUpdate>, Vec<Effect>) {
+    let rows = persisted(effects)
+        .into_iter()
+        .flat_map(|b| b.updates)
+        .collect();
+    let rest = effects
+        .iter()
+        .filter(|e| !matches!(e, Effect::Persist(_)))
+        .map(|e| match e {
+            Effect::SendWhenDurable {
+                context, to, frame, ..
+            } => Effect::SendWhenDurable {
+                context: *context,
+                requires: Vec::new(),
+                to: *to,
+                frame: frame.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect();
+    (rows, rest)
 }
 
 // ---------------------------------------------------------------------
@@ -1319,4 +1409,2502 @@ fn a_proposal_that_is_not_adopted_leaves_the_path_log_alone() {
         a.path, l1.path,
         "the leader's path for c1 runs through cz, which this replica never held"
     );
+}
+
+// ---------------------------------------------------------------------
+// task-d90 (point 4): a vote rests on the payload row, not its digest.
+// ---------------------------------------------------------------------
+
+/// Durable dependency rows and durable payload rows, as recovery reads them.
+type DurableRows = (
+    Vec<(CommandId, CommandRecord)>,
+    Vec<(CommandId, PayloadRecordV1)>,
+);
+
+/// A follower outside the fast set that admitted `c1` and made its batch
+/// durable, then crashed: its durable rows, with the dependency row and
+/// the payload row in hand separately.
+fn durable_admission() -> (CommandId, DurableRows) {
+    let mut f = booted(2);
+    let mut storage = StorageModel::default();
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    let Effect::Persist(batch) = effects[0].clone() else {
+        panic!()
+    };
+    storage.submit(batch);
+    storage.complete(effects_barrier(&effects)).unwrap();
+    f.step(durable_of(&effects, 1).remove(0));
+    storage.crash();
+    (c1, (restore_rows(&storage), restore_payloads(&storage)))
+}
+
+/// A record whose dependency row is durable and whose payload row is not
+/// -- restored from the one without the other, as after a Sync installed
+/// it or a payload batch was lost -- is initialized, with its admission
+/// digest, and holds no payload. It is reported without one, a proposal
+/// for it is adopted only once the payload is back, and the adoption's
+/// acknowledgement waits for the batch that writes it (task-d90, design
+/// Section 4.5, point 4). Adopted over the digest, its slow vote counted
+/// toward a decision no recovery could re-execute from this voter.
+#[test]
+fn an_adoption_waits_for_the_payload_row_not_only_its_digest() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    assert!(g.table().is_initialized(&c1));
+    assert!(g.payload(&c1).is_none());
+    let reported = |g: &Follower| {
+        g.report(ballot(1, 1))
+            .entries
+            .into_iter()
+            .find(|e| e.command == c1)
+            .expect("reported")
+            .payload_present
+    };
+    assert!(!reported(&g), "no payload row: none reported present");
+    // The leader's proposal is held for the payload, which is asked for.
+    let record = g.table().record(&c1).unwrap().clone();
+    let held = g.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    assert!(
+        persisted(&held).is_empty(),
+        "adopted over the digest alone: {held:?}"
+    );
+    assert_eq!(g.held().len(), 1);
+    assert!(g.missing_payloads().contains(&c1));
+    // The payload arrives: its batch and the adoption's, and the
+    // acknowledgement waits for both.
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 2, "the payload batch and the adoption");
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row is still volatile: {released:?}"
+    );
+    assert!(!reported(&g));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: payload_batch,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(sends(&released).len(), 2, "the leader and the frontend");
+    assert!(reported(&g), "durable now, and reported present");
+}
+
+/// A decided record is answered from its durable record when the leader
+/// proposes it again (task-d07), and only with its payload row durable
+/// here too (task-d90, point 4): without one the answer was a vote no
+/// recovery could re-execute from.
+#[test]
+fn a_decided_record_is_acknowledged_again_only_with_its_payload_row() {
+    let (c1, (mut rows, payloads)) = durable_admission();
+    rows[0].1.phase = Phase::Commit;
+    let record = rows[0].1.clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    let mut without = Follower::recover(
+        config(2),
+        None,
+        rows.clone(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    without.step(boot_event());
+    let out = without.step(again());
+    assert!(sends(&out).is_empty(), "acknowledged without a payload row");
+    assert_eq!(without.pending_sends(), 0);
+    let mut with = Follower::recover(config(2), None, rows, payloads, ExecutionPosition::ZERO);
+    with.step(boot_event());
+    let out = with.step(again());
+    assert!(
+        matches!(&sends(&out)[..], [(to, ProtocolMessage::SlowAck(_))] if *to == r(0)),
+        "{out:?}"
+    );
+}
+
+/// The payload batch an adoption waited on fails (#195 review): the
+/// acknowledgement it held was dropped, and kept evidence that names the
+/// failed batch would be dropped again each time it was published. It is
+/// forgotten. The acceptance is durable without its payload row, so the
+/// next event that is not a failure writes the payload row again (#197
+/// review), and the leader's next proposal is adopted again, its
+/// acknowledgement waiting on that row.
+#[test]
+fn a_failed_payload_batch_is_written_again_by_the_next_adoption() {
+    let (c1, (rows, mut payloads)) = durable_admission();
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    let record = g.table().record(&c1).unwrap().clone();
+    let again = || {
+        peer(
+            0,
+            proposal(c1, vec![], 0, record.paths.clone(), record.path),
+        )
+    };
+    g.step(again());
+    let effects = g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let batches = persisted(&effects);
+    let (payload_batch, adoption) = (batches[0].barrier, batches[1].barrier);
+    g.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: payload_batch,
+        error: StorageError::NoSpace,
+    }));
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "the payload row was never written"
+    );
+    let repair = persisted(&released);
+    assert_eq!(
+        repair.len(),
+        1,
+        "the payload row written again: {released:?}"
+    );
+    assert!(
+        repair[0]
+            .updates
+            .iter()
+            .all(|u| u.collection == Collection::PayloadV1.id())
+    );
+    // The leader proposes again, lacking this voter's vote.
+    let effects = g.step(again());
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 1, "adopted again: {effects:?}");
+    let mut sent = Vec::new();
+    for (seq, barrier) in [(2, repair[0].barrier), (3, batches[0].barrier)] {
+        sent.extend(sends(&g.step(Event::Storage(
+            StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(seq).unwrap(),
+            },
+        ))));
+    }
+    assert!(
+        sent.iter()
+            .any(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_))),
+        "{sent:?}"
+    );
+}
+
+/// A submission's own batch, which writes its payload row and its
+/// dependency row, fails (task-d90, point 4, the fault of protocol_sim's
+/// row 21): the record stays initialized in memory with its payload, and
+/// no row holds it. The adoption of the leader's proposal for it writes
+/// the payload row again, which the vote waits on.
+#[test]
+fn a_vote_after_its_submissions_batch_failed_writes_the_payload_row_again() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: effects_barrier(&effects),
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    let record = f
+        .table()
+        .record(&c1)
+        .expect("initialized in memory")
+        .clone();
+    let effects = f.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    let batches = persisted(&effects);
+    assert!(
+        batches.iter().any(|b| b
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())),
+        "the vote's batch writes the payload row again: {batches:?}"
+    );
+}
+
+/// A vote's batch fails (task-d90): the record stays in the table, so the
+/// next vote on its keys names it as a dependency. Nothing is written at
+/// the failure; the next batch that names it carries its payload and
+/// dependency rows, so they are durable with that vote or fail with it.
+/// Before, nothing wrote the record again, the later vote's row named a
+/// command a restart lost, and a recovery read the gap as another order
+/// than the leader's and re-proposed a command a fast quorum had decided
+/// (protocol_sim row 21, five voters, seed 608). A write at the failure
+/// looped on a fenced queue, which refuses every batch (#197 review).
+#[test]
+fn a_vote_carries_the_rows_of_a_dependency_whose_batch_failed() {
+    let mut g = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let first = effects_barrier(&g.step(e1));
+    assert!(
+        g.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: first,
+            error: StorageError::NoSpace,
+        }))
+        .is_empty(),
+        "nothing is written at the failure"
+    );
+    let (e2, c2) = admitted(2, 2, 2);
+    let second = persisted(&g.step(e2));
+    assert_eq!(second.len(), 1);
+    assert_eq!(g.table().record(&c2).unwrap().deps, vec![c1]);
+    let rows: Vec<(Collection, Vec<u8>)> = second[0]
+        .updates
+        .iter()
+        .map(|u| (Collection::from_id(u.collection).unwrap(), u.key.clone()))
+        .collect();
+    assert!(
+        rows.contains(&(Collection::ProtocolV1, dependency_key(epoch(), &c1))),
+        "the vote carries the dependency's row: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(c, _)| *c == Collection::PayloadV1)
+            .count(),
+        2,
+        "and its payload row, beside the vote's own"
+    );
+    let released = g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: second[0].barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    let sent = sends(&released);
+    assert_eq!(sent.len(), 2, "the leader and the frontend: {sent:?}");
+    assert!(
+        sent.iter().all(|(_, m)| matches!(m, ProtocolMessage::FastAck(a) if a.command == c2 && a.deps == vec![c1])),
+        "{sent:?}"
+    );
+    assert_eq!(
+        g.ledger().record(&c1).map(|r| r.phase),
+        Some(Phase::PreAccept)
+    );
+    // A third vote names `c2`, now written: nothing more is carried.
+    let (e3, _) = admitted(3, 3, 3);
+    let third = persisted(&g.step(e3));
+    assert_eq!(third[0].updates.len(), 2, "its own rows only");
+    // Once fenced, the queue refuses every batch, and a vote is refused
+    // once: nothing writes again at a failure.
+    let mut h = booted(1);
+    for seq in 1..=4 {
+        let (e, _) = admitted(seq, seq as u8, seq as u8);
+        let batches = persisted(&h.step(e));
+        assert_eq!(batches.len(), 1);
+        assert!(
+            h.step(Event::Storage(StorageEvent::Failed {
+                barrier_id: batches[0].barrier,
+                error: StorageError::NoSpace,
+            }))
+            .is_empty()
+        );
+    }
+}
+
+/// The record the newest batch in flight writes for a command (task-d90):
+/// what a report gives for a command executed and retired while that row
+/// is not yet durable, in place of the older durable row (protocol_sim row
+/// 22 with early proposals, five voters, seed 120, without catch-up).
+#[test]
+fn the_ledger_names_the_newest_record_in_flight() {
+    use coord_consensus::DurableLedger;
+    use coord_core::effect::BarrierId;
+    let barrier = |sequence| BarrierId {
+        node_generation: ReplicaIncarnation::new(1).unwrap(),
+        boot_id: BootId([1; 16]),
+        sequence,
+    };
+    let (_, c) = admitted(1, 1, 1);
+    let (_, d) = admitted(2, 2, 2);
+    let record = |phase, deps: Vec<CommandId>| CommandRecord {
+        phase,
+        deps,
+        keys: vec![CONSERVATIVE_KEY.to_vec()],
+        payload: Some(Digest32([7; 32])),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: Digest32([0; 32]),
+    };
+    let mut ledger = DurableLedger::new();
+    ledger.stage(barrier(1), c, record(Phase::PreAccept, Vec::new()));
+    ledger.durable(barrier(1), LocalJournalSeq::new(1).unwrap());
+    assert!(ledger.in_flight_records().is_empty());
+    ledger.stage(barrier(2), c, record(Phase::Accept, vec![d]));
+    ledger.stage(barrier(3), c, record(Phase::Commit, vec![d]));
+    let in_flight = ledger.in_flight_records();
+    assert_eq!(in_flight.len(), 1);
+    assert_eq!(in_flight[&c].phase, Phase::Commit, "the newest batch's");
+    assert_eq!(in_flight[&c].deps, vec![d]);
+    assert_eq!(ledger.record(&c).map(|r| r.phase), Some(Phase::PreAccept));
+    ledger.durable(barrier(2), LocalJournalSeq::new(2).unwrap());
+    ledger.durable(barrier(3), LocalJournalSeq::new(3).unwrap());
+    assert!(ledger.in_flight_records().is_empty());
+    assert_eq!(ledger.record(&c).map(|r| r.phase), Some(Phase::Commit));
+}
+
+/// A commit over an adoption whose batch failed (#197 review): the record
+/// is committed in memory under the leader's order while the row here is
+/// still the pre-acceptance, under other dependencies. Executed over that
+/// row, a report, and a restart, gave the command committed under
+/// dependencies it was never decided with (protocol_sim row 21 with its
+/// queue failed, three voters, seed 39). It executes only once its rows
+/// are written again, in a batch of the next event that is not a failure,
+/// and a failure of that batch holds it back again without a write.
+#[test]
+fn a_commit_whose_adoption_failed_executes_only_over_its_rows_written_again() {
+    let (e1, c1) = admitted(1, 1, 1);
+    let (e2, c2) = admitted(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let mut f = booted(1);
+    for e in [e2, e1] {
+        let effects = f.step(e);
+        f.step(durable_of(&effects, 1).remove(0));
+    }
+    assert_eq!(f.ledger().record(&c1).unwrap().deps, vec![c2]);
+    let adoption = persisted(&f.step(peer(0, proposal(c1, vec![], 0, l1.paths.clone(), l1.path))));
+    assert_eq!(adoption.len(), 1);
+    assert!(
+        persisted(&f.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: adoption[0].barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        })))
+        .is_empty(),
+        "nothing is written at the failure"
+    );
+    let ack = |from: u8, f: &Follower| {
+        peer(
+            from,
+            ProtocolMessage::SlowAck(SlowAck {
+                replica: r(from),
+                ballot: ballot(0, 0),
+                command: c1,
+                admission: f.table().record(&c1).and_then(|r| r.payload).unwrap(),
+            }),
+        )
+    };
+    let e = ack(0, &f);
+    f.step(e);
+    let e = ack(2, &f);
+    let carried = persisted(&f.step(e));
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
+    let rows: Vec<CommandRecord> = carried
+        .iter()
+        .flat_map(|b| b.updates.iter())
+        .filter(|u| u.collection == Collection::ProtocolV1.id())
+        .filter(|u| u.key == dependency_key(epoch(), &c1))
+        .map(|u| decode_dependency(u.value.as_deref().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the commit's rows go out with the event that committed it"
+    );
+    assert_eq!(rows[0].deps, vec![]);
+    assert_eq!(f.next_executable(), Some(c1), "over its row in flight");
+    // That batch fails too: held back, and nothing is written at the
+    // failure.
+    let failed = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: carried[0].barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    assert!(persisted(&failed).is_empty());
+    assert_eq!(
+        f.next_executable(),
+        None,
+        "not over the pre-acceptance's row"
+    );
+    // The next event that is not a failure writes it again.
+    let e = ack(0, &f);
+    let again = persisted(&f.step(e));
+    assert_eq!(again.len(), 1);
+    assert_eq!(f.next_executable(), Some(c1));
+    f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: again[0].barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(f.ledger().record(&c1).unwrap().deps, vec![]);
+    assert_eq!(f.next_executable(), Some(c1));
+}
+
+/// A decided command whose payload's batch failed (#243 review, rule (b)):
+/// its dependency row is durable and its payload is in memory, with no
+/// payload row durable or in flight. Executed then, the store's lowering
+/// refuses the execution (rule (b): no pending payload to move), and the
+/// voter is lost until its state is cleared. So it executes only over a
+/// payload row, written again by the next event that is not a failure.
+#[test]
+fn a_decided_command_whose_payload_batch_failed_executes_only_over_its_row_written_again() {
+    // Durable: c1's accepted dependency row, and no payload row.
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut f = booted(1);
+    let mut storage = StorageModel::default();
+    let mut seq = 0;
+    let mut durable = |f: &mut Follower, effects: &[Effect], storage: &mut StorageModel| {
+        for b in persisted(effects) {
+            storage.submit(b.clone());
+            storage.complete(b.barrier).unwrap();
+            seq += 1;
+            f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: b.barrier,
+                journal_seq: LocalJournalSeq::new(seq).unwrap(),
+            }));
+        }
+    };
+    let effects = f.step(e1);
+    durable(&mut f, &effects, &mut storage);
+    let record = f.table().record(&c1).unwrap().clone();
+    let effects = f.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    durable(&mut f, &effects, &mut storage);
+    storage.crash();
+    let (rows, mut payloads) = (restore_rows(&storage), restore_payloads(&storage));
+    let payload = payloads.remove(0).1;
+    let mut g = Follower::recover(config(1), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    g.step(boot_event());
+    assert_eq!(g.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(g.payload(&c1).is_none());
+    // The leader proposes it again, the payload arrives, and the adoption
+    // turns durable while the payload's row is still in flight.
+    let record = g.table().record(&c1).unwrap().clone();
+    g.step(peer(
+        0,
+        proposal(c1, vec![], 0, record.paths.clone(), record.path),
+    ));
+    let batches = persisted(&g.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    )));
+    assert_eq!(batches.len(), 2, "the payload row's batch and the adoption");
+    let (written, adoption) = (&batches[0], &batches[1]);
+    assert!(
+        written
+            .updates
+            .iter()
+            .all(|u| u.collection == Collection::PayloadV1.id())
+    );
+    g.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption.barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    // The leader's frontier commits it.
+    assert!(
+        persisted(&g.step(peer(
+            0,
+            ProtocolMessage::Committed {
+                ballot: ballot(0, 0),
+                through: 0,
+            },
+        )))
+        .is_empty()
+    );
+    assert_eq!(g.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(
+        g.next_executable(),
+        Some(c1),
+        "over its payload row in flight"
+    );
+    // That batch fails: nothing is written at the failure, and the
+    // payload stays in memory with no row of it durable or in flight.
+    let failed = g.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: written.barrier,
+        error: StorageError::NoSpace,
+    }));
+    assert!(
+        persisted(&failed).is_empty(),
+        "nothing is written at the failure"
+    );
+    assert!(g.payload(&c1).is_some(), "the payload stays in memory");
+    assert_eq!(
+        g.next_executable(),
+        None,
+        "not with its payload in no row, durable or in flight"
+    );
+    // The next event that is not a failure writes the payload row again.
+    let again = persisted(&g.step(peer(
+        0,
+        ProtocolMessage::Committed {
+            ballot: ballot(0, 0),
+            through: 0,
+        },
+    )));
+    assert_eq!(again.len(), 1, "the payload row written again: {again:?}");
+    assert!(
+        again[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some())
+    );
+    assert_eq!(g.next_executable(), Some(c1));
+}
+
+/// The payload record a relayed proposal of request `seq` carries
+/// (task-d102): what the collector submitted, under the admission
+/// [`admitted_under`] names.
+fn relayed_payload(seq: u64, key: u8, value: u8) -> (PayloadRecordV1, CommandId) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![key],
+            value: vec![value],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let command = CommandId::derive(&retry_key(seq), &request).unwrap();
+    let logical = RequestV1::new(retry_key(seq), &request, 0, 0)
+        .unwrap()
+        .logical
+        .as_slice()
+        .to_vec();
+    let payload = PayloadRecordV1 {
+        retry_key: retry_key(seq),
+        logical,
+        admission: Some(coord_core::capability::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
+        }),
+        ack_through: 0,
+    };
+    assert_eq!(payload.admission_digest(), admitted_under());
+    (payload, command)
+}
+
+fn relayed(proposal: ProtocolMessage, payload: PayloadRecordV1) -> ProtocolMessage {
+    let ProtocolMessage::Proposal(vote) = proposal else {
+        panic!("not a proposal");
+    };
+    ProtocolMessage::RelayedProposal { vote, payload }
+}
+
+/// task-d102: a follower that never got the submission takes the payload
+/// from the leader's relayed proposal and adopts the command at once: one
+/// batch holds the payload row and the ACCEPT row, nothing is
+/// pre-accepted or fast-acknowledged, and the one acknowledgement, a slow
+/// one, goes to the leader alone once that batch is durable.
+#[test]
+fn a_relayed_proposal_is_adopted_in_one_batch_without_pre_accepting() {
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let p1 = relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload);
+    let effects = f.step(peer(0, p1));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.answers_on_release(&c1));
+    assert!(f.held().is_empty(), "adopted at once");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    let batches: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches.len(), 1, "one batch: {effects:?}");
+    let payloads = Collection::PayloadV1.id();
+    assert!(
+        batches[0]
+            .updates
+            .iter()
+            .any(|u| u.collection == payloads && u.value.is_some()),
+        "the payload row rides the adoption batch"
+    );
+    let row = decode_dependency(batches[0].updates[0].value.as_ref().unwrap()).unwrap();
+    assert_eq!(row.phase, Phase::Accept);
+    assert!(
+        sends(&effects).is_empty(),
+        "nothing leaves before the batch"
+    );
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0].0, r(0), "to the leader alone");
+    assert!(matches!(out[0].1, ProtocolMessage::SlowAck(_)));
+    assert!(f.take_rejections().is_empty());
+}
+
+/// task-d102: a payload that does not match its relayed proposal -- under
+/// other admission facts -- is not taken. The proposal is held as one
+/// without its payload, and nothing is written or acknowledged.
+#[test]
+fn a_relayed_payload_that_does_not_match_its_proposal_is_not_taken() {
+    let mut f = booted(1);
+    let (mut payload, c1) = relayed_payload(1, 1, 1);
+    payload.ack_through = 7;
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let effects = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            not_taken: 1,
+            ..RelayTaken::default()
+        },
+        "counted as not taken (#224 review)"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(f.held().len(), 1, "held for its payload");
+    assert!(f.table().record(&c1).is_none_or(|r| r.payload.is_none()));
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
+    );
+}
+
+/// Cost pass row 16: a relayed payload's identity is the digest of its
+/// logical bytes as they came. Bytes that decode to the command's request
+/// but aren't the encoding its identity was derived from (here, one byte
+/// more) are refused. The check this replaces decoded them, encoded the
+/// request again and took them.
+#[test]
+fn a_relayed_payload_is_taken_only_as_the_bytes_its_command_names() {
+    let mut f = booted(1);
+    let (mut payload, c1) = relayed_payload(1, 1, 1);
+    payload.logical.push(0);
+    assert_eq!(
+        postcard::from_bytes::<LogicalRequest>(&payload.logical)
+            .ok()
+            .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok()),
+        Some(c1),
+        "a decode and an encoding made again find the command in these bytes"
+    );
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let effects = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths.clone(), l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(f.held().len(), 1, "held for its payload");
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::PayloadIdentityMismatch(c1))
+    );
+
+    // The bytes the command was derived from are taken.
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 1);
+}
+
+/// Review on #277: a follower's own intake takes a request's logical
+/// bytes only as the canonical encoding of the request they decode to, as
+/// the leader's `propose` does. Bytes that decode to the request with
+/// nothing left over but aren't its encoding (here, the schema version's
+/// varint written in two bytes) are refused, with nothing written, bound
+/// or sent. Taken, they would be held and, if this replica led, relayed
+/// as bytes that the identity check above refuses.
+#[test]
+fn an_admitted_request_is_taken_only_as_its_canonical_encoding() {
+    let (event, c1) = admitted(1, 1, 1);
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![1],
+            value: vec![1],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let canonical = request.canonical_bytes().unwrap();
+    assert!(canonical[0] < 0x80, "the schema version is one byte");
+    let mut long = vec![canonical[0] | 0x80, 0];
+    long.extend_from_slice(&canonical[1..]);
+    // What the intake checked before: a decode with nothing left over,
+    // and the command derived from the request decoded.
+    let (decoded, rest) = postcard::take_from_bytes::<LogicalRequest>(&long).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(CommandId::derive(&retry_key(1), &decoded).unwrap(), c1);
+    let mut wire = RequestV1::new(retry_key(1), &request, 0, 0).unwrap();
+    wire.logical = BoundedBytes::new(long).unwrap();
+    assert!(wire.logical().is_err(), "the bytes are not canonical");
+    let Event::Admitted(mut long_form) = event.clone() else {
+        unreachable!("an admitted request")
+    };
+    long_form.frame = MessageV1::Request(wire).encode().unwrap();
+
+    let mut f = booted(1);
+    let effects = f.step(Event::Admitted(long_form));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "nothing written"
+    );
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::MalformedRequest]
+    );
+    assert_eq!(f.admitted(), None);
+
+    // The canonical bytes are taken, and written.
+    let effects = f.step(event);
+    assert!(effects.iter().any(|e| matches!(e, Effect::Persist(_))));
+    assert_eq!(f.admitted(), Some(c1));
+}
+
+/// task-d102: a follower that already took the submission keeps what it
+/// accepted; the payload a relayed proposal carries is left aside and the
+/// proposal is adopted as any.
+#[test]
+fn a_relayed_proposal_of_a_command_held_already_adopts_as_any() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let votes = f.step(e1);
+    for event in durable_of(&votes, 1) {
+        f.step(event);
+    }
+    let (payload, same) = relayed_payload(1, 1, 1);
+    assert_eq!(same, c1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let adoption = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), payload),
+    ));
+    assert_eq!(f.relayed_taken(), 0);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            known: 1,
+            ..RelayTaken::default()
+        },
+        "counted as known (#224 review)"
+    );
+    assert!(!f.answers_on_release(&c1), "not marked by the relay");
+    // Its own durable fast vote and the leader's proposal are a fast
+    // quorum here: decided, as a plain proposal would leave it.
+    assert!(f.table().phase_of(&c1) >= Some(Phase::Accept));
+    assert!(f.held().is_empty());
+    assert!(adoption.len() <= 1, "at most the adoption batch");
+    assert!(f.take_rejections().is_empty());
+}
+
+fn framed(messages: Vec<ProtocolMessage>) -> ProtocolMessage {
+    let proposals = messages
+        .into_iter()
+        .map(|m| match m {
+            ProtocolMessage::Proposal(vote) => FramedProposal::of(vote, None).unwrap(),
+            ProtocolMessage::RelayedProposal { vote, payload } => {
+                FramedProposal::of(vote, Some(payload)).unwrap()
+            }
+            other => panic!("not a proposal: {other:?}"),
+        })
+        .collect();
+    ProtocolMessage::ProposalFrame {
+        replica: r(0),
+        ballot: ballot(0, 0),
+        proposals,
+    }
+}
+
+/// task-d102: a frame's proposals are taken in one step, each as the
+/// relayed proposal it stands for: both commands are adopted at once,
+/// and each gets one slow acknowledgement, to the leader alone. Their
+/// rows go in one batch, under one barrier (step 2b of the batching
+/// rule's 10.7).
+#[test]
+fn a_frames_proposals_are_adopted_in_one_step() {
+    let mut f = booted(1);
+    let (p1, c1) = relayed_payload(1, 1, 1);
+    let (p2, c2) = relayed_payload(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let frame = framed(vec![
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), p1),
+        relayed(proposal(c2, vec![c1], 1, l2.paths, l2.path), p2),
+    ]);
+    let effects = f.step(peer(0, frame));
+    assert_eq!(f.frames_taken(), 1);
+    assert_eq!(f.relayed_taken(), 2);
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            frames: 1,
+            taken: 2,
+            frame_batches: 1,
+            frame_adoptions: 2,
+            ..RelayTaken::default()
+        }
+    );
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 1, "one batch for the frame: {batches:?}");
+    assert_eq!(adopted_in(&batches[0]), vec![c1, c2]);
+    assert!(f.held().is_empty(), "adopted at once");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert!(
+        sends(&effects).is_empty(),
+        "nothing leaves before the batches"
+    );
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), 2, "{out:?}");
+    for (to, message) in &out {
+        assert_eq!(*to, r(0), "to the leader alone");
+        assert!(matches!(message, ProtocolMessage::SlowAck(_)));
+    }
+    assert!(f.take_rejections().is_empty());
+}
+
+/// task-d102: an entry a follower refuses leaves the frame's others as
+/// they are: a mismatched payload is not taken, and the next entry is
+/// adopted all the same.
+#[test]
+fn a_refused_entry_leaves_the_frames_others_as_they_are() {
+    let mut f = booted(1);
+    let (mut bad, c1) = relayed_payload(1, 1, 1);
+    bad.ack_through = 7;
+    let (p2, c2) = relayed_payload(2, 2, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let frame = framed(vec![
+        relayed(proposal(c1, vec![], 0, l1.paths, l1.path), bad),
+        relayed(proposal(c2, vec![], 1, l2.paths, l2.path), p2),
+    ]);
+    f.step(peer(0, frame));
+    assert_eq!(f.relayed_taken(), 1, "only the matching payload");
+    assert_eq!(
+        f.relay_taken(),
+        RelayTaken {
+            frames: 1,
+            taken: 1,
+            known: 0,
+            not_taken: 1,
+            kept: 0,
+            kept_taken: 0,
+            // The one adoption, in the frame's one batch (step 2b).
+            frame_batches: 1,
+            frame_adoptions: 1,
+        }
+    );
+    assert_ne!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+}
+
+/// Seed 275 of `relayed_rows` (row 9, three voters): a payload taken from
+/// a relayed proposal is held in memory, its row left to the adoption's
+/// batch. The proposal waits on a dependency this replica lacks, and the
+/// ballot changes before it is adopted; the new ballot's Sync names the
+/// command at COMMIT. The Sync's installation writes its dependency row,
+/// and its own payload row is written in the same step, in a batch of its
+/// own, before the command is executable. Before, no batch held it, and
+/// the command executed with its payload held only in memory.
+#[test]
+fn a_sync_entry_whose_payload_came_relayed_is_executed_over_its_payload_row() {
+    sync_entry_over_a_relayed_payload(Phase::Commit);
+}
+
+/// The same with the Sync's entry at ACCEPT (#306 review): its payload
+/// row is written at the installation, in a batch of its own, and the
+/// command is not executable while it is at ACCEPT.
+#[test]
+fn a_sync_entry_at_accept_whose_payload_came_relayed_has_its_payload_row_written() {
+    sync_entry_over_a_relayed_payload(Phase::Accept);
+}
+
+/// Seed 275's shape with the Sync's entry for the relayed command at
+/// `phase`.
+fn sync_entry_over_a_relayed_payload(phase: Phase) {
+    let mut seq = 1;
+    let mut f = booted(1);
+    let (_, c0) = relayed_payload(1, 1, 1);
+    let (p1, c1) = relayed_payload(2, 1, 2);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    leader_view
+        .initialize(c0, c0.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    assert_eq!(l1.deps, vec![c0]);
+    let payloads = Collection::PayloadV1.id();
+    let payload_rows = |effects: &[Effect]| -> usize {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(b) => Some(b),
+                _ => None,
+            })
+            .flat_map(|b| b.updates.iter())
+            .filter(|u| u.collection == payloads && u.value.is_some())
+            .count()
+    };
+    let taken = f.step(peer(
+        0,
+        relayed(proposal(c1, vec![c0], 1, l1.paths, l1.path), p1),
+    ));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.payload(&c1).is_some(), "held");
+    assert_eq!(payload_rows(&taken), 0, "no row yet: {taken:?}");
+    settle(&mut f, taken, &mut seq);
+    assert_eq!(f.held().len(), 1, "waiting on c0");
+    let promised = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    let entry = coord_consensus::SyncEntry {
+        command: c1,
+        phase,
+        deps: Vec::new(),
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: Some(admitted_under()),
+    };
+    let synced = f.step(peer(
+        2,
+        ProtocolMessage::Sync(coord_consensus::SyncDecision {
+            ballot: ballot(1, 2),
+            source_ballot: ballot(0, 0),
+            entries: [(c1, entry)].into_iter().collect(),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    let all = settle(&mut f, synced, &mut seq);
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(1, 2),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert_eq!(f.table().phase_of(&c1), Some(phase));
+    assert_eq!(payload_rows(&all), 1, "its own payload row: {all:?}");
+    let with_payload = persisted(&all)
+        .into_iter()
+        .find(|b| b.updates.iter().any(|u| u.collection == payloads))
+        .unwrap();
+    assert_eq!(
+        with_payload.updates.len(),
+        1,
+        "in a batch of its own: {with_payload:?}"
+    );
+    let executable = (phase == Phase::Commit).then_some(c1);
+    assert_eq!(f.next_executable(), executable);
+}
+
+/// A chain of relayed proposals for `seqs`, each depending on the one
+/// before it, as a leader whose table saw them in that order proposes
+/// them.
+fn relayed_chain(seqs: &[u64]) -> (Vec<ProtocolMessage>, Vec<CommandId>) {
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let mut entries = Vec::new();
+    let mut commands: Vec<CommandId> = Vec::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        let (payload, c) = relayed_payload(*seq, *seq as u8, *seq as u8);
+        let l = leader_view
+            .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+        let deps = commands.last().copied().into_iter().collect();
+        entries.push(relayed(
+            proposal(c, deps, i as u64, l.paths, l.path),
+            payload,
+        ));
+        commands.push(c);
+    }
+    (entries, commands)
+}
+
+/// Lever 2, step 1: a frame's entries share its learning passes. The
+/// frame makes one full pass, at its first entry, and passes over the
+/// others, after which nothing could be committed; taken one at a time,
+/// each entry makes its own. The frame leaves the same table, rows and
+/// effects either way, its adoptions in one batch (step 2b).
+#[test]
+fn a_frame_makes_one_full_learning_pass() {
+    let (entries, commands) = relayed_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = entries.len() as u64;
+    let mut f = booted(1);
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut g = booted(1);
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(after.full - before.full, 1, "one full pass for the frame");
+    assert_eq!(
+        after.skipped - before.skipped,
+        n - 1,
+        "the others passed over"
+    );
+    assert_eq!(g_after.full - g_before.full, n, "one full pass an entry");
+    assert_eq!(g_after.skipped, g_before.skipped);
+    assert_eq!(
+        rows_and_rest(&framed_effects),
+        rows_and_rest(&one_at_a_time),
+        "the same rows in order, and the same effects"
+    );
+    assert_eq!(
+        persisted(&framed_effects).len(),
+        1,
+        "one batch for the frame"
+    );
+    assert_eq!(persisted(&one_at_a_time).len() as u64, n);
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a frame's entry needs is made. The follower
+/// took c1's submission and its own fast vote is durable, so the leader's
+/// proposal of c1 decides it here: the entry's pass commits it, before
+/// the next entry, which depends on it, is taken -- as taking the entries
+/// one at a time does. The entry after it can commit nothing, and its
+/// pass is passed over.
+#[test]
+fn a_frame_commits_what_an_entry_decides_before_its_next_entry() {
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p0, c0) = relayed_payload(2, 2, 2);
+    let l0 = leader_view
+        .initialize(c0, c0.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p2, c2) = relayed_payload(3, 3, 3);
+    let l2 = leader_view
+        .initialize(c2, c2.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let (p1, same) = relayed_payload(1, 1, 1);
+    assert_eq!(same, c1);
+    let entries = vec![
+        relayed(proposal(c0, vec![], 0, l0.paths, l0.path), p0),
+        relayed(proposal(c1, vec![], 1, l1.paths, l1.path), p1),
+        relayed(proposal(c2, vec![c1], 2, l2.paths, l2.path), p2),
+    ];
+    let mut f = booted(1);
+    let mut g = booted(1);
+    for m in [&mut f, &mut g] {
+        let votes = m.step(e1.clone());
+        for event in durable_of(&votes, 1) {
+            m.step(event);
+        }
+    }
+    let before = f.learn_passes();
+    let framed_effects = f.step(peer(0, framed(entries.clone())));
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for entry in entries {
+        one_at_a_time.extend(g.step(peer(0, entry)));
+    }
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit), "decided here");
+    assert_eq!(f.table().phase_of(&c0), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert_eq!(
+        (after.full - before.full, after.skipped - before.skipped),
+        (2, 1),
+        "the frame's first pass, c1's, and c2's passed over"
+    );
+    assert_eq!(
+        rows_and_rest(&framed_effects),
+        rows_and_rest(&one_at_a_time),
+        "the same rows in order, and the same effects"
+    );
+    for c in [c0, c1, c2] {
+        assert_eq!(f.table().record(&c), g.table().record(&c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// The storage events of `events`, as a node hands a step of them over.
+fn storage_of(events: Vec<Event>) -> Vec<StorageEvent> {
+    events
+        .into_iter()
+        .map(|e| match e {
+            Event::Storage(s) => s,
+            other => panic!("not a storage event: {other:?}"),
+        })
+        .collect()
+}
+
+/// The leader's commit frontier at ballot 0, through `through`.
+fn committed_through(through: u64) -> Event {
+    peer(
+        0,
+        ProtocolMessage::Committed {
+            ballot: ballot(0, 0),
+            through,
+        },
+    )
+}
+
+/// Two followers that took the same relayed chain entry by entry, and
+/// the storage events of the batches it wrote: one an adoption. (A frame
+/// writes its adoptions in one batch since step 2b, which would make the
+/// step one event; `a_frames_one_batch_made_durable_learns_each_adoption`
+/// takes that case.)
+fn took_chain(seqs: &[u64]) -> (Follower, Follower, Vec<StorageEvent>, Vec<CommandId>) {
+    let (entries, commands) = relayed_chain(seqs);
+    let mut f = booted(1);
+    let mut g = booted(1);
+    let mut adopted = Vec::new();
+    for entry in entries {
+        let effects = f.step(peer(0, entry.clone()));
+        assert_eq!(g.step(peer(0, entry)), effects);
+        adopted.extend(effects);
+    }
+    let events = storage_of(durable_of(&adopted, 1));
+    assert!(events.len() >= commands.len(), "a batch a command at least");
+    (f, g, events, commands)
+}
+
+/// Lever 2, step 1: a step of storage events shares its learning passes.
+/// The frame's adoptions made durable in one step make one full pass, at
+/// the first event, and pass the others over, as none commits anything
+/// before the leader's frontier; one event at a time, each makes its
+/// own. Either way the same effects and records, and once the frontier
+/// comes, the same commits.
+#[test]
+fn a_step_of_storage_events_makes_one_full_learning_pass() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let g_before = g.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let g_after = g.learn_passes();
+    assert_eq!(
+        (
+            after.full - before.full,
+            after.skipped_storage - before.skipped_storage
+        ),
+        (1, n - 1),
+        "one full pass for the step, the others passed over"
+    );
+    assert_eq!(
+        (
+            g_after.full - g_before.full,
+            g_after.skipped_storage - g_before.skipped_storage
+        ),
+        (n, 0),
+        "one full pass an event"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(g.table().phase_of(c), Some(Phase::Commit));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a pass a storage event needs is made. With the
+/// leader's frontier already past the chain, each adoption made durable
+/// commits its command, which the next one depends on: no pass is passed
+/// over, and the step commits the chain as one event at a time does.
+#[test]
+fn a_step_of_storage_events_commits_what_each_event_makes_learnable() {
+    let (mut f, mut g, events, commands) = took_chain(&[1, 2, 3, 4]);
+    let through = commands.len() as u64 - 1;
+    assert_eq!(
+        f.step(committed_through(through)),
+        g.step(committed_through(through))
+    );
+    for c in &commands {
+        assert_eq!(
+            f.table().phase_of(c),
+            Some(Phase::Accept),
+            "not durable yet"
+        );
+    }
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    assert_eq!(
+        after.skipped_storage, before.skipped_storage,
+        "none passed over"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Commit));
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1: a storage event other than a vote or adoption batch
+/// made durable -- here the second batch failing -- makes its own pass
+/// and the next one full. The step leaves the same effects, records and
+/// refusals as one event at a time.
+#[test]
+fn a_failure_in_a_step_of_storage_events_makes_the_passes_around_it_full() {
+    let (mut f, mut g, mut events, commands) = took_chain(&[1, 2, 3, 4]);
+    let failed = events[1].barrier().expect("a batch");
+    events[1] = StorageEvent::Failed {
+        barrier_id: failed,
+        error: StorageError::NoSpace,
+    };
+    let n = events.len() as u64;
+    let before = f.learn_passes();
+    let stepped = f.step_storage(events.clone());
+    let after = f.learn_passes();
+    let mut one_at_a_time = Vec::new();
+    for event in events {
+        one_at_a_time.extend(g.step(Event::Storage(event)));
+    }
+    let full = after.full - before.full;
+    let skipped = after.skipped_storage - before.skipped_storage;
+    assert_eq!(full + skipped, n, "a pass an event");
+    assert!(
+        full >= 3,
+        "the first, the failure's and the next are full: {full}"
+    );
+    assert_eq!(stepped, one_at_a_time, "the same effects, in order");
+    for c in &commands {
+        assert_eq!(f.table().record(c), g.table().record(c));
+    }
+    assert_eq!(f.take_rejections(), g.take_rejections());
+}
+
+/// Lever 2, step 1, with step 2b: a frame's adoptions are one batch, so
+/// one storage event makes them all durable. That event marks each of
+/// them durable, indexes each by its sequence number for the leader's
+/// frontier, and touches each for learning, as their batches one at a
+/// time do. A chain comes in two frames, so a step holds two events, the
+/// second frame's batch after the first's:
+/// - the frontier coming after the step commits the whole chain, through
+///   the index;
+/// - the frontier coming before it, the step commits the whole chain: the
+///   second event's pass is made, as each of its adoptions was touched.
+///
+/// The debug build checks the index and every pass passed over against
+/// the walks they replace.
+#[test]
+fn a_frames_one_batch_made_durable_learns_each_adoption() {
+    for frontier_first in [false, true] {
+        let (entries, commands) = relayed_chain(&[1, 2, 3, 4, 5, 6]);
+        let through = commands.len() as u64 - 1;
+        let mut f = booted(1);
+        let mut g = booted(1);
+        let mut framed_effects = f.step(peer(0, framed(entries[..3].to_vec())));
+        framed_effects.extend(f.step(peer(0, framed(entries[3..].to_vec()))));
+        let mut one_at_a_time = Vec::new();
+        for entry in entries {
+            one_at_a_time.extend(g.step(peer(0, entry)));
+        }
+        let framed_events = storage_of(durable_of(&framed_effects, 1));
+        let single_events = storage_of(durable_of(&one_at_a_time, 1));
+        assert_eq!(framed_events.len(), 2, "one batch a frame");
+        assert_eq!(single_events.len(), commands.len());
+        if frontier_first {
+            f.step(committed_through(through));
+            g.step(committed_through(through));
+        }
+        let before = f.learn_passes();
+        let stepped = f.step_storage(framed_events);
+        let after = f.learn_passes();
+        let mut single_stepped = Vec::new();
+        for event in single_events {
+            single_stepped.extend(g.step(Event::Storage(event)));
+        }
+        assert_eq!(
+            sends(&stepped),
+            sends(&single_stepped),
+            "the same acknowledgements"
+        );
+        if frontier_first {
+            assert_eq!(
+                (
+                    after.full - before.full,
+                    after.skipped_storage - before.skipped_storage
+                ),
+                (2, 0),
+                "the second frame's batch commits, so its pass is made"
+            );
+        } else {
+            for c in &commands {
+                assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+            }
+            f.step(committed_through(through));
+            g.step(committed_through(through));
+        }
+        for c in &commands {
+            assert_eq!(
+                f.table().phase_of(c),
+                Some(Phase::Commit),
+                "frontier first: {frontier_first}"
+            );
+            assert_eq!(f.table().record(c), g.table().record(c));
+        }
+        assert_eq!(f.take_rejections(), g.take_rejections());
+    }
+}
+
+/// task-d102: a proposal held for want of its payload -- a plain copy
+/// arrived first -- is adopted when a relayed copy brings the payload,
+/// though that copy is a duplicate of one held. Found by the frames sweep
+/// (row 1 at 3 voters, seed 11): left, the hold waited on itself for ever.
+#[test]
+fn a_held_proposal_is_adopted_when_a_relayed_copy_brings_its_payload() {
+    let mut f = booted(1);
+    let (payload, c1) = relayed_payload(1, 1, 1);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let l1 = leader_view
+        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .unwrap();
+    let plain = proposal(c1, vec![], 0, l1.paths.clone(), l1.path);
+    f.step(peer(0, plain.clone()));
+    assert!(f.held().contains_key(&c1), "held without its payload");
+    let effects = f.step(peer(0, relayed(plain, payload)));
+    assert_eq!(f.relayed_taken(), 1);
+    assert!(f.held().is_empty(), "adopted once the payload came");
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "the adoption batch: {effects:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Step 2b of the batching rule's 10.7: a frame's adoptions in as few
+// batches as the frame's bounds allow.
+// ---------------------------------------------------------------------
+
+/// A follower like [`booted`], whose table holds `capacity` commands.
+fn booted_holding(me: u8, capacity: usize) -> Follower {
+    let mut f = Follower::new(FollowerConfig {
+        capacity,
+        ..config(me)
+    });
+    assert!(f.step(boot_event()).is_empty());
+    f
+}
+
+/// The payload record a relayed proposal of request `seq` carries, as
+/// [`relayed_payload`], for a transaction of `puts` puts of `value_len`
+/// bytes each.
+fn relayed_large(seq: u64, puts: usize, value_len: usize) -> (PayloadRecordV1, CommandId) {
+    let success = (0..puts)
+        .map(|i| {
+            BranchOp::Put(PutOp {
+                key: vec![i as u8, seq as u8],
+                value: vec![0xab; value_len],
+                lease: None,
+                prev_kv: false,
+            })
+        })
+        .collect();
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Txn(TxnOp {
+            compares: Vec::new(),
+            success,
+            failure: Vec::new(),
+        }),
+    );
+    let command = CommandId::derive(&retry_key(seq), &request).unwrap();
+    let logical = RequestV1::new(retry_key(seq), &request, 0, 0)
+        .unwrap()
+        .logical
+        .as_slice()
+        .to_vec();
+    let (mut payload, _) = relayed_payload(seq, 0, 0);
+    payload.logical = logical;
+    assert_eq!(payload.admission_digest(), admitted_under());
+    (payload, command)
+}
+
+/// The leader's relayed proposals of `payloads`, in that order, numbered
+/// from `first`: each ordered after the one before on the conservative
+/// key, as a leader's table orders them.
+fn leader_order(
+    leader_view: &mut coord_consensus::CommandTable,
+    payloads: Vec<(PayloadRecordV1, CommandId)>,
+    first: u64,
+) -> Vec<ProtocolMessage> {
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, (payload, c))| {
+            let l = leader_view
+                .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            relayed(
+                proposal(c, l.deps, first + i as u64, l.paths, l.path),
+                payload,
+            )
+        })
+        .collect()
+}
+
+/// The bytes task-d106's bounds count in a batch: its rows' keys and
+/// values.
+fn rows_bytes(batch: &coord_core::effect::PersistBatch) -> usize {
+    batch
+        .updates
+        .iter()
+        .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// The commands whose dependency rows `batch` writes.
+fn adopted_in(batch: &coord_core::effect::PersistBatch) -> Vec<CommandId> {
+    batch
+        .updates
+        .iter()
+        .filter(|u| {
+            u.collection == Collection::ProtocolV1.id() && u.key.len() == 41 && u.key[8] == 0x01
+        })
+        .map(|u| CommandId(Digest32(u.key[9..].try_into().unwrap())))
+        .collect()
+}
+
+/// Step 2b (6.7's property test): a frame taken whole leaves what its
+/// entries taken one at a time leave. For frames of relayed proposals,
+/// plain proposals held for their payloads, payloads refused, proposals
+/// held before the frame and duplicates, a follower taking the frame and
+/// one taking each entry as the message it stands for end with the same
+/// path logs, records, held proposals and refusals, write the same rows
+/// in the same order, and acknowledge the same commands once those rows
+/// are durable. Only the batches differ: one for the frame, one an
+/// adoption for the entries.
+#[test]
+fn a_frame_taken_whole_leaves_what_its_entries_one_at_a_time_leave() {
+    let mut frames_with_two_or_more = 0;
+    let mut own_votes = 0;
+    for seed in 0..96u64 {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let n = 1 + next(7) as usize;
+        let mut leader_view = coord_consensus::CommandTable::new();
+        let mut before = Vec::new();
+        let mut entries = Vec::new();
+        let mut commands = Vec::new();
+        for i in 0..n {
+            let (payload, c) = relayed_payload(1_000 * seed + i as u64 + 1, i as u8, seed as u8);
+            commands.push(c);
+            let l = leader_view
+                .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            let p = proposal(c, l.deps, i as u64, l.paths, l.path);
+            match next(5) {
+                // Held for its payload, which no copy brings.
+                0 => entries.push(p),
+                // Held before the frame; the frame brings its payload.
+                1 => {
+                    before.push(p.clone());
+                    entries.push(relayed(p, payload));
+                }
+                // A payload refused: held as one without it.
+                2 => {
+                    let mut other = payload;
+                    other.ack_through = 7;
+                    entries.push(relayed(p, other));
+                }
+                _ => entries.push(relayed(p, payload)),
+            }
+        }
+        if next(3) == 0 {
+            let k = next(entries.len() as u64) as usize;
+            entries.push(entries[k].clone());
+        }
+        let mut whole = booted(1);
+        let mut single = booted(1);
+        for p in &before {
+            whole.step(peer(0, p.clone()));
+            single.step(peer(0, p.clone()));
+        }
+        let whole_effects = whole.step(peer(0, framed(entries.clone())));
+        let mut single_effects = Vec::new();
+        for entry in entries {
+            single_effects.extend(single.step(peer(0, entry)));
+        }
+
+        // The same logs, records, held proposals and refusals.
+        assert_eq!(
+            whole.table().path_head(CONSERVATIVE_KEY),
+            single.table().path_head(CONSERVATIVE_KEY),
+            "seed {seed}"
+        );
+        for c in &commands {
+            assert_eq!(
+                whole.table().record(c),
+                single.table().record(c),
+                "seed {seed}"
+            );
+            assert_eq!(
+                whole.table().phase_of(c),
+                single.table().phase_of(c),
+                "seed {seed}"
+            );
+        }
+        assert_eq!(
+            whole.held().keys().collect::<Vec<_>>(),
+            single.held().keys().collect::<Vec<_>>(),
+            "seed {seed}"
+        );
+        assert_eq!(
+            whole.take_rejections(),
+            single.take_rejections(),
+            "seed {seed}"
+        );
+
+        // The same rows in the same order, in one batch for the frame.
+        let whole_batches = persisted(&whole_effects);
+        let single_batches = persisted(&single_effects);
+        let rows = |batches: &[coord_core::effect::PersistBatch]| {
+            batches
+                .iter()
+                .flat_map(|b| b.updates.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&whole_batches), rows(&single_batches), "seed {seed}");
+        let adoptions = single_batches.len();
+        assert_eq!(whole_batches.len(), adoptions.min(1), "seed {seed}");
+        assert_eq!(
+            whole.relay_taken().frame_adoptions,
+            adoptions as u64,
+            "seed {seed}"
+        );
+        assert_eq!(
+            whole.relay_taken().frame_batches,
+            adoptions.min(1) as u64,
+            "seed {seed}"
+        );
+        if adoptions >= 2 {
+            frames_with_two_or_more += 1;
+        }
+
+        // Nothing leaves before the rows are durable, and then the same
+        // acknowledgements do.
+        assert!(sends(&whole_effects).is_empty(), "seed {seed}");
+        assert!(sends(&single_effects).is_empty(), "seed {seed}");
+        let mut whole_sent = Vec::new();
+        for event in durable_of(&whole_effects, 1) {
+            whole_sent.extend(sends(&whole.step(event)));
+        }
+        let mut single_sent = Vec::new();
+        for event in durable_of(&single_effects, 1) {
+            single_sent.extend(sends(&single.step(event)));
+        }
+        assert_eq!(whole_sent, single_sent, "seed {seed}");
+        assert_eq!(whole_sent.len(), adoptions, "seed {seed}");
+        assert_eq!(
+            whole.take_rejections(),
+            single.take_rejections(),
+            "seed {seed}"
+        );
+
+        // The same votes counted (#290's review, control m3): once its
+        // batch is durable, an adopted command's set holds this replica's
+        // own vote, which `learn` counts, on the frame's path as on the
+        // one-adoption path, and a command not adopted holds none. (A
+        // duplicate entry can write a second batch for a command, so this
+        // goes by command, not by batch.)
+        for c in &commands {
+            let voted = |f: &Follower| f.votes(c).map(|v| v.voted());
+            assert_eq!(voted(&whole), voted(&single), "seed {seed}");
+            let own = voted(&whole).is_some_and(|v| v.contains(&r(1)));
+            let adopted = whole.table().phase_of(c) == Some(Phase::Accept);
+            assert_eq!(own, adopted, "seed {seed}");
+            own_votes += usize::from(own);
+        }
+    }
+    assert!(
+        frames_with_two_or_more >= 20,
+        "the seeds reach frames of several adoptions: {frames_with_two_or_more}"
+    );
+    assert!(
+        own_votes >= 96,
+        "the seeds reach adopted commands' own votes: {own_votes}"
+    );
+}
+
+/// Step 2b (10.7's pin): a 1 MiB frame of the smallest commands -- as
+/// many as the leader puts in one frame, cut at
+/// [`MAX_PROPOSAL_FRAME_BYTES`] as `publish_frame` cuts it -- is written
+/// in batches cut in frame order, each within [`FRAME_BATCH_UPDATES`] and
+/// [`FRAME_BATCH_BYTES`]. Every entry is adopted and acknowledged once its
+/// batch is durable, and nothing is refused: the follower keeps going.
+#[test]
+fn a_1_mib_frame_of_the_smallest_commands_is_written_in_batches_within_the_bounds() {
+    let offered = 8_000usize;
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let payloads: Vec<_> = (0..offered)
+        .map(|i| relayed_payload(i as u64 + 1, (i % 251) as u8, (i / 251) as u8))
+        .collect();
+    let all: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let ProtocolMessage::ProposalFrame {
+        replica,
+        ballot,
+        proposals,
+    } = framed(leader_order(&mut leader_view, payloads, 0))
+    else {
+        unreachable!()
+    };
+    let mut size = 0usize;
+    let proposals: Vec<FramedProposal> = proposals
+        .into_iter()
+        .take_while(|p| {
+            size += postcard::experimental::serialized_size(p).unwrap();
+            size <= MAX_PROPOSAL_FRAME_BYTES
+        })
+        .collect();
+    let n = proposals.len();
+    assert!(n < offered, "the frame is cut at 1 MiB");
+    let commands = all[..n].to_vec();
+    // Each adoption writes its dependency row and its payload row.
+    let per_batch = FRAME_BATCH_UPDATES / 2;
+    let mut f = booted_holding(1, 2 * n);
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::ProposalFrame {
+            replica,
+            ballot,
+            proposals,
+        },
+    ));
+    let batches = persisted(&effects);
+    assert_eq!(
+        batches.len(),
+        n.div_ceil(per_batch),
+        "cut at {per_batch} adoptions"
+    );
+    let mut taken = Vec::new();
+    for batch in &batches {
+        assert!(batch.updates.len() <= FRAME_BATCH_UPDATES);
+        assert!(rows_bytes(batch) <= FRAME_BATCH_BYTES);
+        taken.extend(adopted_in(batch));
+    }
+    assert_eq!(taken, commands, "in frame order, each once");
+    assert_eq!(adopted_in(&batches[0]).len(), per_batch);
+    assert!(
+        batches.windows(2).all(|w| w[0].barrier < w[1].barrier),
+        "written in their barriers' order"
+    );
+    for c in &commands {
+        assert_eq!(f.table().phase_of(c), Some(Phase::Accept));
+    }
+    let taken = f.relay_taken();
+    assert_eq!(
+        (taken.frame_batches, taken.frame_adoptions),
+        (batches.len() as u64, n as u64)
+    );
+    assert!(sends(&effects).is_empty());
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let out = sends(&released);
+    assert_eq!(out.len(), n, "one acknowledgement an adoption");
+    assert!(
+        out.iter()
+            .all(|(to, m)| *to == r(0) && matches!(m, ProtocolMessage::SlowAck(_)))
+    );
+    assert!(f.take_rejections().is_empty());
+}
+
+/// Step 2b: a batch of its own that one of a frame's entries writes while
+/// the frame's batch is open -- here a decided command's payload row,
+/// written again because the batch that first wrote it failed -- goes
+/// after the frame's open batch, so the journal takes the batches in
+/// their barriers' order. The decided command is acknowledged once that
+/// row is durable, as outside a frame.
+#[test]
+fn a_batch_of_its_own_written_mid_frame_follows_the_frames_open_batch() {
+    let (c1, (mut rows, mut payloads)) = durable_admission();
+    rows[0].1.phase = Phase::Commit;
+    let record = rows[0].1.clone();
+    let payload = payloads.remove(0).1;
+    let mut f = Follower::recover(config(2), None, rows, Vec::new(), ExecutionPosition::ZERO);
+    f.step(boot_event());
+    // The payload comes, and the batch of its own that writes it fails:
+    // held here, with no row durable or in flight.
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: c1,
+            payload,
+        },
+    ));
+    let first = persisted(&effects);
+    assert_eq!(first.len(), 1, "{effects:?}");
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: first[0].barrier,
+        error: StorageError::NoSpace,
+    }));
+    // A frame: a fresh command, adopted into the frame's batch, then the
+    // decided one proposed again.
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let (fresh_payload, c2) = relayed_payload(77, 7, 7);
+    let mut entries = leader_order(&mut leader_view, vec![(fresh_payload, c2)], 1);
+    entries.push(proposal(c1, vec![], 0, record.paths.clone(), record.path));
+    let effects = f.step(peer(0, framed(entries)));
+    let batches = persisted(&effects);
+    let barriers: Vec<_> = batches.iter().map(|b| b.barrier).collect();
+    assert!(batches.len() >= 2, "{batches:?}");
+    assert!(
+        barriers.windows(2).all(|w| w[0] < w[1]),
+        "written in their barriers' order: {barriers:?}"
+    );
+    assert_eq!(adopted_in(&batches[0]), vec![c2], "the frame's batch first");
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    let acked: BTreeSet<CommandId> = sends(&released)
+        .iter()
+        .filter_map(|(_, m)| match m {
+            ProtocolMessage::SlowAck(a) => Some(a.command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acked, BTreeSet::from([c1, c2]));
+}
+
+/// Step 2b: large requests cut a frame's batches by bytes, and a request
+/// past [`FRAME_BATCH_BYTES`] alone -- one of the largest a request may
+/// be, 2 MiB -- is written in a batch of its own, under the journal
+/// record's bounds.
+#[test]
+fn a_frames_large_requests_cut_its_batches_by_bytes_and_one_past_the_bound_goes_alone() {
+    use coord_types::logical_v1::limits::MAX_REQUEST_BYTES;
+    let mut f = booted_holding(1, 16);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    // A small request and two of about 400 KiB fit a batch; a third of
+    // those doesn't.
+    let mid = 400 * 1024;
+    // Two puts that take a request to within 8 KiB of its bound.
+    let half = (MAX_REQUEST_BYTES - 8 * 1024) / 2;
+    let payloads = vec![
+        relayed_payload(1, 1, 1),
+        relayed_large(2, 1, mid),
+        relayed_large(3, 1, mid),
+        relayed_large(4, 1, mid),
+        relayed_large(5, 2, half),
+        relayed_payload(6, 6, 6),
+    ];
+    assert!(payloads[4].0.logical.len() > FRAME_BATCH_BYTES);
+    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let effects = f.step(peer(0, framed(leader_order(&mut leader_view, payloads, 0))));
+    let batches = persisted(&effects);
+    let groups: Vec<Vec<CommandId>> = batches.iter().map(adopted_in).collect();
+    assert_eq!(
+        groups,
+        vec![
+            commands[0..3].to_vec(),
+            vec![commands[3]],
+            vec![commands[4]],
+            vec![commands[5]],
+        ],
+        "cut by bytes; the 2 MiB request alone"
+    );
+    for batch in &batches[..2] {
+        assert!(rows_bytes(batch) <= FRAME_BATCH_BYTES);
+    }
+    assert!(rows_bytes(&batches[2]) > FRAME_BATCH_BYTES);
+    assert_eq!(
+        batches[2].updates.len(),
+        2,
+        "its payload and dependency rows"
+    );
+    // The largest request a batch of its own holds is within what the
+    // journal's compile-time check counts for one.
+    assert!(rows_bytes(&batches[2]) <= coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD);
+    assert_eq!(f.relay_taken().frame_batches, 4);
+    let mut released = Vec::new();
+    for event in durable_of(&effects, 1) {
+        released.extend(f.step(event));
+    }
+    assert_eq!(sends(&released).len(), commands.len());
+    assert!(f.take_rejections().is_empty());
+}
+
+/// Step 2b: a frame's batch that fails takes each of its adoptions down
+/// as a batch of its own would: each is reported, none is acknowledged,
+/// and the batch before it, durable, keeps its adoptions' votes. Then a
+/// crash keeps the prefix of the frame's batches the journal made
+/// durable: a follower recovered from the durable rows holds the first
+/// batch's adoptions and none of the second's, and the leader's re-sent
+/// proposals adopt the rest.
+#[test]
+fn a_frames_batches_fail_and_crash_as_its_adoptions_one_at_a_time_would() {
+    let per_batch = FRAME_BATCH_UPDATES / 2;
+    let n = per_batch + 3;
+    let payloads: Vec<_> = (0..n)
+        .map(|i| relayed_payload(i as u64 + 1, (i % 251) as u8, (i / 251) as u8))
+        .collect();
+    let commands: Vec<CommandId> = payloads.iter().map(|(_, c)| *c).collect();
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let frame = leader_order(&mut leader_view, payloads.clone(), 0);
+
+    // The second batch fails.
+    let mut f = booted_holding(1, 2 * n);
+    let mut storage = StorageModel::default();
+    let effects = f.step(peer(0, framed(frame.clone())));
+    let batches = persisted(&effects);
+    assert_eq!(batches.len(), 2);
+    for batch in &batches {
+        storage.submit(batch.clone());
+    }
+    storage.complete(batches[0].barrier).unwrap();
+    let durable = f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: batches[0].barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert_eq!(sends(&durable).len(), per_batch, "the first batch's votes");
+    let failed = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: batches[1].barrier,
+        error: StorageError::NoSpace,
+    }));
+    assert!(sends(&failed).is_empty(), "none of the failed batch's");
+    // The first batch's adoptions count this replica's vote; the failed
+    // batch's don't (#290's review, control m3).
+    for (i, c) in commands.iter().enumerate() {
+        let own = f.votes(c).is_some_and(|v| v.voted().contains(&r(1)));
+        assert_eq!(own, i < per_batch, "command {i}");
+    }
+    assert_eq!(
+        f.take_rejections(),
+        commands[per_batch..]
+            .iter()
+            .map(|c| FollowerRejection::BatchFailed(*c))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(f.pending_sends(), 0, "its votes are dropped with it");
+
+    // A crash: the journal kept the first batch, and not the second.
+    storage.crash();
+    let rows = restore_rows(&storage);
+    let restored: BTreeSet<CommandId> = rows.iter().map(|(c, _)| *c).collect();
+    assert_eq!(
+        restored,
+        commands[..per_batch]
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    );
+    let mut recovered = Follower::recover(
+        FollowerConfig {
+            capacity: 2 * n,
+            ..config(1)
+        },
+        None,
+        rows,
+        restore_payloads(&storage),
+        ExecutionPosition::ZERO,
+    );
+    recovered.step(boot_event());
+    for c in &commands[per_batch..] {
+        assert_eq!(recovered.table().record(c), None, "lost with its batch");
+    }
+    // The leader sends the proposals it lacks a vote for again; the lost
+    // ones are adopted as they were the first time.
+    let resend = framed(frame[per_batch..].to_vec());
+    let again = recovered.step(peer(0, resend));
+    let again_batches = persisted(&again);
+    assert_eq!(again_batches.len(), 1);
+    assert_eq!(
+        adopted_in(&again_batches[0]),
+        commands[per_batch..].to_vec()
+    );
+    for c in &commands[per_batch..] {
+        assert_eq!(recovered.table().phase_of(c), Some(Phase::Accept));
+    }
+}
+
+// ---------------------------------------------------------------------
+// The follower trap (#185): a relayed payload whose command the table has
+// no room for is kept beside its held proposal, under a byte bound, and
+// taken as the room comes, with no ask.
+// ---------------------------------------------------------------------
+
+/// Make every batch in `effects` durable, and every batch that makes,
+/// until none is left; returns them all.
+fn settle(f: &mut Follower, effects: Vec<Effect>, seq: &mut u64) -> Vec<Effect> {
+    let mut all = Vec::new();
+    let mut next = effects;
+    while !next.is_empty() {
+        let events = durable_of(&next, *seq);
+        *seq += 1;
+        all.append(&mut next);
+        for event in events {
+            next.extend(f.step(event));
+        }
+    }
+    all
+}
+
+/// What the runtime asks for now: it asks while the follower counts a
+/// payload missing, `MAX_PAYLOAD_TRANSFER` at most an ask. The commands
+/// asked for.
+fn runtime_ask(f: &mut Follower) -> Vec<CommandId> {
+    if f.missing_payload_count(coord_consensus::MAX_PAYLOAD_TRANSFER) == 0 {
+        return Vec::new();
+    }
+    sends(&f.request_payloads(r(0)))
+        .into_iter()
+        .flat_map(|(_, message)| match message {
+            ProtocolMessage::PayloadRequest { commands } => commands,
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// A follower whose table of `capacity` the leader's relayed proposals
+/// fill: requests 1 to `capacity + 1` one message at a time, each made
+/// durable, then `over` more in one frame. Each of the first has its turn
+/// when it comes, so it goes into the reserve and one past the capacity;
+/// none of the frame's fits. `bound` lowers the bound on kept payloads.
+/// Returns the follower, the commands in the leader's order, and their
+/// payloads.
+fn filled_by_relay(
+    capacity: usize,
+    over: usize,
+    bound: Option<usize>,
+    seq: &mut u64,
+) -> (Follower, Vec<CommandId>, Vec<PayloadRecordV1>) {
+    let mut f = booted_holding(1, capacity);
+    if let Some(bound) = bound {
+        f.set_kept_relayed_bound(bound);
+    }
+    let all: Vec<(PayloadRecordV1, CommandId)> = (1..=(capacity + 1 + over) as u64)
+        .map(|s| relayed_payload(s, 1, 1))
+        .collect();
+    let order: Vec<CommandId> = all.iter().map(|(_, c)| *c).collect();
+    let payloads: Vec<PayloadRecordV1> = all.iter().map(|(p, _)| p.clone()).collect();
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let mut messages = leader_order(&mut leader_view, all, 0);
+    let frame = messages.split_off(capacity + 1);
+    for message in messages {
+        let effects = f.step(peer(0, message));
+        settle(&mut f, effects, seq);
+    }
+    let effects = f.step(peer(0, framed(frame)));
+    settle(&mut f, effects, seq);
+    (f, order, payloads)
+}
+
+/// Commit and execute everything `f` can, in turn: the leader's adoption
+/// commits each command adopted here (this replica's own durable
+/// adoption is the other half of the slow majority), and after each
+/// execution the runtime asks for what is missing, into `asked`. The
+/// commands executed, in order.
+fn execute_all(
+    f: &mut Follower,
+    order: &[CommandId],
+    seq: &mut u64,
+    asked: &mut Vec<CommandId>,
+) -> Vec<CommandId> {
+    let mut acked = BTreeSet::new();
+    let mut executed = Vec::new();
+    loop {
+        let mut moved = false;
+        for c in order {
+            if f.table().phase_of(c) == Some(Phase::Accept) && acked.insert(*c) {
+                let event = leader_adoption(f, *c);
+                let effects = f.step(event);
+                settle(f, effects, seq);
+                moved = true;
+            }
+        }
+        while let Some(c) = f.next_executable() {
+            let outcome = coord_consensus::AppliedOutcome {
+                position: f.executed_through().checked_next().unwrap(),
+                revision: None,
+                result_digest: Digest32(c.0.0),
+                response: c.0.0.to_vec(),
+            };
+            let effects = f.applied(c, &outcome).unwrap();
+            settle(f, effects, seq);
+            executed.push(c);
+            asked.extend(runtime_ask(f));
+            moved = true;
+        }
+        if !moved {
+            return executed;
+        }
+    }
+}
+
+/// The follower trap (#185): with its table full, a follower keeps the
+/// payloads of the leader's relayed proposals beside the proposals it
+/// holds, asks for none of them, and adopts each as an execution makes
+/// room, in the leader's order. Before, each payload was dropped and
+/// asked for, while the table that refused it was still full.
+#[test]
+fn a_full_table_keeps_relayed_payloads_and_adopts_them_as_room_frees_with_no_ask() {
+    let (capacity, over) = (8, 5);
+    let mut seq = 1;
+    let (mut f, order, _) = filled_by_relay(capacity, over, None, &mut seq);
+    let fit = capacity + 1;
+    let taken = f.relay_taken();
+    assert_eq!(taken.taken, fit as u64, "{taken:?}");
+    assert_eq!(taken.kept, over as u64, "{taken:?}");
+    assert_eq!(taken.not_taken, 0, "{taken:?}");
+    assert_eq!(f.held().len(), over);
+    assert_eq!(f.kept_relayed().0, over);
+    assert_eq!(
+        f.missing_payload_count(usize::MAX),
+        0,
+        "nothing is missing: the payloads are kept"
+    );
+    for c in &order[fit..] {
+        assert!(f.table().record(c).is_none(), "no room was taken for it");
+    }
+    let mut asked = runtime_ask(&mut f);
+    let executed = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(executed, order, "every command, in the leader's order");
+    assert!(asked.is_empty(), "nothing was asked for: {asked:?}");
+    assert_eq!(f.payload_asks(), 0);
+    assert_eq!(f.relay_taken().kept_taken, over as u64);
+    assert!(f.held().is_empty());
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
+
+/// The control for the test above: with no room to keep them
+/// (`set_kept_relayed_bound(0)`), the payloads go the old way. Each held
+/// proposal lacks its payload, the runtime asks for them at every turn
+/// while the table that refused them is full, and nothing after the room
+/// comes is adopted until an ask is answered.
+#[test]
+fn relayed_payloads_not_kept_are_asked_for_while_the_table_is_full() {
+    let (capacity, over) = (8, 5);
+    let mut seq = 1;
+    let (mut f, order, payloads) = filled_by_relay(capacity, over, Some(0), &mut seq);
+    let fit = capacity + 1;
+    let taken = f.relay_taken();
+    assert_eq!(taken.taken, fit as u64, "{taken:?}");
+    assert_eq!(taken.kept, 0, "{taken:?}");
+    assert_eq!(taken.not_taken, over as u64, "{taken:?}");
+    assert_eq!(f.missing_payload_count(usize::MAX), over);
+    let mut asked = runtime_ask(&mut f);
+    let executed = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(executed, order[..fit], "only what was taken");
+    assert_eq!(f.held().len(), over, "held until an ask is answered");
+    let wanted: BTreeSet<CommandId> = order[fit..].iter().copied().collect();
+    let asked_for: BTreeSet<CommandId> = asked.iter().copied().collect();
+    assert_eq!(asked_for, wanted, "the held commands are what is asked");
+    assert!(
+        asked.len() > over,
+        "asked again and again while the table was full: {}",
+        asked.len()
+    );
+    // Answered, they are adopted and executed as before.
+    for (c, p) in order[fit..].iter().zip(&payloads[fit..]) {
+        let effects = f.step(peer(
+            0,
+            ProtocolMessage::PayloadResponse {
+                command: *c,
+                payload: p.clone(),
+            },
+        ));
+        settle(&mut f, effects, &mut seq);
+    }
+    let mut more = Vec::new();
+    let rest = execute_all(&mut f, &order, &mut seq, &mut more);
+    assert_eq!(rest, order[fit..]);
+    assert_eq!(f.relay_taken().kept_taken, 0);
+}
+
+/// The bound on kept payloads (`MAX_KEPT_RELAYED_BYTES`) refuses past
+/// it: with room for two, the third payload is not kept, and it is the
+/// one payload asked for. The two kept are adopted as the room comes,
+/// and the third waits on its ask.
+#[test]
+fn a_relayed_payload_past_the_kept_bound_is_not_kept_and_is_asked_for() {
+    let (capacity, over) = (8, 3);
+    let fit = capacity + 1;
+    let size = coord_consensus::kept_relayed_size(&relayed_payload(1, 1, 1).0);
+    assert!(coord_consensus::MAX_KEPT_RELAYED_BYTES >= 1000 * size);
+    let mut seq = 1;
+    let (mut f, order, _) = filled_by_relay(capacity, over, Some(2 * size), &mut seq);
+    let taken = f.relay_taken();
+    assert_eq!(taken.kept, 2, "{taken:?}");
+    assert_eq!(taken.not_taken, 1, "{taken:?}");
+    assert_eq!(f.kept_relayed(), (2, 2 * size), "never past the bound");
+    assert_eq!(f.missing_payload_count(usize::MAX), 1);
+    let mut asked = runtime_ask(&mut f);
+    assert_eq!(asked, vec![order[fit + 2]], "the one past the bound");
+    let executed = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(
+        executed,
+        order[..fit + 2],
+        "the kept two, taken as room came"
+    );
+    assert_eq!(f.relay_taken().kept_taken, 2);
+    assert_eq!(f.kept_relayed(), (0, 0));
+    assert_eq!(f.held().len(), 1, "the third waits on its ask");
+    assert!(asked.iter().all(|c| *c == order[fit + 2]), "{asked:?}");
+}
+
+/// Commit everything `f` adopted of `order`, each by the leader's own
+/// adoption (the other half of each slow majority), and execute none.
+fn commit_adopted(f: &mut Follower, order: &[CommandId], seq: &mut u64) {
+    for c in order {
+        if f.table().phase_of(c) == Some(Phase::Accept) {
+            let event = leader_adoption(f, *c);
+            let effects = f.step(event);
+            settle(f, effects, seq);
+        }
+        assert!(f.table().phase_of(c) >= Some(Phase::Commit), "{c:?}");
+    }
+}
+
+/// Execute what `f` can now, asking nothing; the commands, in order.
+fn execute_ready(f: &mut Follower, seq: &mut u64) -> Vec<CommandId> {
+    let mut executed = Vec::new();
+    while let Some(c) = f.next_executable() {
+        let outcome = coord_consensus::AppliedOutcome {
+            position: f.executed_through().checked_next().unwrap(),
+            revision: None,
+            result_digest: Digest32(c.0.0),
+            response: c.0.0.to_vec(),
+        };
+        let effects = f.applied(c, &outcome).unwrap();
+        settle(f, effects, seq);
+        executed.push(c);
+    }
+    executed
+}
+
+/// `from`'s Sync for `ballot`, naming nothing.
+fn empty_sync(from: u8, ballot: Ballot) -> Event {
+    peer(
+        from,
+        ProtocolMessage::Sync(coord_consensus::SyncDecision {
+            ballot,
+            source_ballot: self::ballot(0, 0),
+            entries: std::collections::BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    )
+}
+
+/// A leader change under a full table (#296 review): the new ballot's
+/// activation drops the proposals held for the old one, and the payloads
+/// kept with them.
+#[test]
+fn a_new_ballot_drops_the_payloads_kept_with_the_old_ballots_proposals() {
+    let (capacity, over) = (8, 5);
+    let mut seq = 1;
+    let (mut f, _, _) = filled_by_relay(capacity, over, None, &mut seq);
+    assert_eq!(f.kept_relayed().0, over);
+    let promised = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(1, 2));
+    assert_eq!(
+        f.kept_relayed().0,
+        over,
+        "kept while the new ballot is not active"
+    );
+    let synced = f.step(empty_sync(2, ballot(1, 2)));
+    settle(&mut f, synced, &mut seq);
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(1, 2),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(f.held().is_empty());
+    assert_eq!(f.kept_relayed(), (0, 0));
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+}
+
+/// A catch-up page that installs a command whose payload is kept (#296
+/// review): the command is decided here now, under the page's payload,
+/// and its kept copy goes with its held proposal. The rest are kept still,
+/// and taken as the room comes.
+#[test]
+fn a_catch_up_page_that_installs_a_kept_command_drops_its_kept_copy() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, payloads) = filled_by_relay(capacity, over, None, &mut seq);
+    assert_eq!(f.kept_relayed().0, over);
+    // r2's page: everything through the first kept command, each decided
+    // in the leader's order.
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let entries: Vec<coord_consensus::CatchUpEntry> = order[..=fit]
+        .iter()
+        .zip(&payloads)
+        .enumerate()
+        .map(|(i, (c, p))| {
+            let l = leader_view
+                .initialize(*c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+                .unwrap();
+            coord_consensus::CatchUpEntry {
+                command: *c,
+                payload: p.clone(),
+                decided: Some(CommandRecord {
+                    phase: Phase::Commit,
+                    deps: l.deps,
+                    keys: vec![CONSERVATIVE_KEY.to_vec()],
+                    payload: Some(admitted_under()),
+                    paths: l.paths,
+                    synced_seq: None,
+                    path: l.path,
+                }),
+                position: ExecutionPosition::new(i as u64 + 1).unwrap(),
+                revision: None,
+                result_digest: Digest32(c.0.0),
+            }
+        })
+        .collect();
+    let effects = f.step(peer(
+        2,
+        ProtocolMessage::CatchUpPage {
+            ballot: ballot(0, 0),
+            after: ExecutionPosition::ZERO,
+            through: ExecutionPosition::new(fit as u64 + 1).unwrap(),
+            entries,
+        },
+    ));
+    settle(&mut f, effects, &mut seq);
+    let installed = order[fit];
+    assert!(
+        f.table().phase_of(&installed) >= Some(Phase::Commit),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(!f.held().contains_key(&installed));
+    assert_eq!(f.kept_relayed().0, over - 1, "its kept copy goes with it");
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+    let mut asked = runtime_ask(&mut f);
+    let executed = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(executed, order);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(f.relay_taken().kept_taken, (over - 1) as u64);
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
+
+/// A Sync that releases a kept command undecided (#296 review's u1). A
+/// payload answer passes no promise fence, so behind a promise in flight
+/// it initializes the record of a command whose payload is kept, and the
+/// held proposal waits on the promise. r2's Sync leaves the command out,
+/// and r0's higher promise is made durable before the Sync's row is: the
+/// Sync is superseded and nothing is activated, but its row releases the
+/// command undecided, and the kept copy goes with the held proposal.
+#[test]
+fn a_sync_that_releases_a_kept_command_undecided_drops_its_kept_copy() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, payloads) = filled_by_relay(capacity, over, None, &mut seq);
+    commit_adopted(&mut f, &order[..fit], &mut seq);
+    // r2 executed as far as what this replica executes behind the promise:
+    // a candidate more than a table behind it at the report's cut would be
+    // refused there, and no report cut, nothing released (task-d119).
+    let promise = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::new(fit as u64).unwrap(),
+        },
+    ));
+    // Executed behind the promise: room comes, and nothing kept is taken.
+    assert_eq!(execute_ready(&mut f, &mut seq), order[..fit]);
+    assert_eq!(f.kept_relayed().0, over);
+    // A payload answer for the first kept command takes the room.
+    let released = order[fit];
+    let effects = f.step(peer(
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: released,
+            payload: payloads[fit].clone(),
+        },
+    ));
+    settle(&mut f, effects, &mut seq);
+    assert!(
+        f.table().record(&released).is_some(),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert!(f.held().contains_key(&released));
+    assert_eq!(f.kept_relayed().0, over, "kept beside the record");
+    settle(&mut f, promise, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(1, 2));
+    let synced = f.step(empty_sync(2, ballot(1, 2)));
+    let promised = f.step(peer(
+        0,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 0),
+            executed: ExecutionPosition::new(fit as u64).unwrap(),
+        },
+    ));
+    settle(&mut f, promised, &mut seq);
+    assert_eq!(
+        f.ballots().promised(),
+        ballot(2, 0),
+        "{:?}",
+        f.take_rejections()
+    );
+    settle(&mut f, synced, &mut seq);
+    let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::SyncSuperseded(ballot(1, 2))),
+        "{rejections:?}"
+    );
+    assert!(f.table().record(&released).is_none(), "released undecided");
+    assert!(!f.held().contains_key(&released));
+    assert_eq!(f.kept_relayed().0, over - 1, "its kept copy goes with it");
+    assert_eq!(f.missing_payload_count(usize::MAX), 0);
+    // r0's Sync drops the rest with their proposals.
+    let synced = f.step(empty_sync(0, ballot(2, 0)));
+    settle(&mut f, synced, &mut seq);
+    assert_eq!(
+        f.ballots().synced(),
+        ballot(2, 0),
+        "{:?}",
+        f.take_rejections()
+    );
+    assert_eq!(f.kept_relayed(), (0, 0));
+}
+
+/// #296 review's question: a kept payload is taken only from `applied`,
+/// and never asked for. A promise row in flight stops the take; if it
+/// fails, this replica votes at its ballot again with no new ballot to
+/// drop what is kept, and here nothing is left to execute: every command
+/// taken was executed while the row was in flight. The kept payloads are
+/// taken at the failure, and the rest of the order follows.
+#[test]
+fn kept_payloads_are_taken_when_a_promise_row_fails_with_nothing_left_to_execute() {
+    let (capacity, over) = (8, 5);
+    let fit = capacity + 1;
+    let mut seq = 1;
+    let (mut f, order, _) = filled_by_relay(capacity, over, None, &mut seq);
+    commit_adopted(&mut f, &order[..fit], &mut seq);
+    let promise = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    let barrier = effects_barrier(&promise);
+    assert_eq!(execute_ready(&mut f, &mut seq), order[..fit]);
+    assert_eq!(f.kept_relayed().0, over, "not taken behind the promise");
+    assert_eq!(f.relay_taken().kept_taken, 0);
+    assert_eq!(f.next_executable(), None, "nothing left to execute");
+    let effects = f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    settle(&mut f, effects, &mut seq);
+    assert_eq!(f.ballots().promised(), ballot(0, 0));
+    assert_eq!(
+        f.relay_taken().kept_taken,
+        over as u64,
+        "taken at the failure"
+    );
+    let mut asked = runtime_ask(&mut f);
+    let rest = execute_all(&mut f, &order, &mut seq, &mut asked);
+    assert_eq!(rest, order[fit..]);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(f.kept_relayed(), (0, 0));
 }

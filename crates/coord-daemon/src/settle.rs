@@ -248,7 +248,7 @@ pub fn offer<D>(
 /// shows this node's executed rows (task-d17).
 pub const NEAR_POSITIONS: u64 = 8;
 
-/// This node's `executed_v1` rows within [`NEAR_POSITIONS`] of where it
+/// This node's executed rows within [`NEAR_POSITIONS`] of where it
 /// executed `mismatch`'s command and of where the leader's release put
 /// it, in position order (task-d17).
 ///

@@ -98,10 +98,14 @@
 #![warn(missing_docs)]
 
 pub mod apply;
+pub mod authorizations;
 pub mod codecs;
 pub mod compaction;
 pub mod cut;
+pub mod intake;
 pub mod journaled;
+pub mod kv_index;
+pub mod latency;
 pub mod lowering;
 pub mod materialize;
 pub mod persistence;
@@ -116,14 +120,15 @@ pub mod views;
 pub mod watch;
 pub mod worker;
 
-pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
+pub use apply::{AppliedOutcomeParts, Applier, ApplyError, ReadView};
+pub use authorizations::AuthorizationCacheStats;
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    AppendDone, AppendJob, Appender, CutError, DomainStatus, FlushReport, JournalLimits,
-    JournaledError, JournaledStore, LoweringCost, MaterializeDone, MaterializeJob, Materializer,
-    PublishPhases, PublishThread, Published, Replayed, Submission, SubmitRefused, ThreadClock,
-    ThreadTime, TransitionKind,
+    AppendDone, AppendJob, Appender, AskCause, CutError, DomainStatus, FlushReport, GroupMix,
+    HoldEnds, JournalLimits, JournaledError, JournaledStore, LoweringCost, MaterializeDone,
+    MaterializeJob, Materializer, PublishPhases, PublishThread, Published, Replayed, Submission,
+    SubmitRefused, ThreadClock, ThreadTime, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{
@@ -140,8 +145,8 @@ pub use speculate::{Overlay, SpeculationLimits, SpeculationRefused, speculable, 
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{
     ActiveLeasePage, StoredEvent, ViewBudget, ViewBuildError, active_leases, active_leases_page,
-    build_authorized_view, build_internal_view, build_read_view, events_at, load_authorization,
-    scan_current_page, stored_events_at,
+    build_authorized_view, build_internal_view, build_read_view, build_view_under, events_at,
+    load_authorization, scan_current_page, stored_events_at,
 };
 pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};

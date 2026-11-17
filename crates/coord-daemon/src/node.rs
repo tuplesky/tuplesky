@@ -58,11 +58,39 @@ pub enum Machine {
 }
 
 impl Machine {
+    /// The commands this machine holds below EXECUTE: every one it may
+    /// still execute, learned or not.
+    fn unexecuted(&self) -> std::collections::BTreeSet<CommandId> {
+        let table = match self {
+            Machine::Leader(m) => m.table(),
+            Machine::Follower(m) => m.table(),
+        };
+        table
+            .records()
+            .filter(|(_, record)| record.phase < coord_consensus::Phase::Executed)
+            .map(|(command, _)| *command)
+            .collect()
+    }
+
     /// Feed one event and take the effects it produced.
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         match self {
             Machine::Leader(m) => m.step(event),
             Machine::Follower(m) => m.step(event),
+        }
+    }
+
+    /// Feed a step of storage events, in order, and take the effects
+    /// they produced: what one journal group, or one apply, made known.
+    /// A follower learns once the step where an event changes nothing a
+    /// learning pass would commit (lever 2, step 1).
+    pub fn step_storage(&mut self, events: Vec<StorageEvent>) -> Vec<Effect> {
+        match self {
+            Machine::Leader(m) => events
+                .into_iter()
+                .flat_map(|event| m.step(Event::Storage(event)))
+                .collect(),
+            Machine::Follower(m) => m.step_storage(events),
         }
     }
 
@@ -80,18 +108,38 @@ impl Machine {
     /// because the two roles refuse different things and a caller of
     /// this wants to say what happened, not to match on it.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        match self {
+        self.take_rejections_counted().0
+    }
+
+    /// [`Self::take_rejections`], and how many of them were
+    /// `Backpressure`: the machine's table had no room. Counted from the
+    /// enums, before they are rendered, so the count does not depend on
+    /// how a reason reads.
+    pub fn take_rejections_counted(&mut self) -> (Vec<String>, u64) {
+        let mut backpressure = 0;
+        let rendered = match self {
             Machine::Leader(m) => m
                 .take_rejections()
                 .into_iter()
-                .map(|r| format!("{r:?}"))
+                .map(|r| {
+                    backpressure +=
+                        u64::from(matches!(r, coord_consensus::Rejection::Backpressure));
+                    format!("{r:?}")
+                })
                 .collect(),
             Machine::Follower(m) => m
                 .take_rejections()
                 .into_iter()
-                .map(|r| format!("{r:?}"))
+                .map(|r| {
+                    backpressure += u64::from(matches!(
+                        r,
+                        coord_consensus::FollowerRejection::Backpressure
+                    ));
+                    format!("{r:?}")
+                })
                 .collect(),
-        }
+        };
+        (rendered, backpressure)
     }
 
     /// Propose one of the service's own commands, where this replica
@@ -104,6 +152,96 @@ impl Machine {
         }
     }
 
+    /// Whether an admitted request reaches the derivation of its command
+    /// in this machine (task-d60, step 3).
+    pub fn takes_admission(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.takes_admission(),
+            Machine::Follower(f) => f.takes_admission(),
+        }
+    }
+
+    /// The command the last admitted request became, if this machine
+    /// derived it.
+    pub fn admitted(&self) -> Option<CommandId> {
+        match self {
+            Machine::Leader(l) => l.admitted(),
+            Machine::Follower(f) => f.admitted(),
+        }
+    }
+
+    /// Mark the command the next admitted request becomes as answered by
+    /// its collector on the leader's release alone (task-d100, step A),
+    /// once the machine derives it; see `Leader::mark_next_admitted`.
+    ///
+    /// The mark lives in this role's machine and goes with it: a
+    /// campaign replaces the machine, and the collector voids every
+    /// entry the ballot change reaches for its node's record
+    /// (`Collector::reconfigure`, task-d22), so no entry waits on a mark
+    /// the new machine lacks.
+    pub fn mark_next_admitted(&mut self) {
+        match self {
+            Machine::Leader(l) => l.mark_next_admitted(),
+            Machine::Follower(f) => f.mark_next_admitted(),
+        }
+    }
+
+    /// Mark the next admitted request as relayed to this voter alone as
+    /// its ballot's leader (task-d102, task-d100's step B): a leader
+    /// proposes it with its payload, and a voter that isn't leading
+    /// refuses it.
+    pub fn mark_next_relayed(&mut self) {
+        match self {
+            Machine::Leader(l) => l.mark_next_relayed(),
+            Machine::Follower(f) => f.mark_next_relayed(),
+        }
+    }
+
+    /// Send each follower the proposals a leader queued this turn, in one
+    /// frame (task-d102, [`Leader::cut_frames`]). A follower queues
+    /// nothing.
+    pub fn cut_frames(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(l) => l.cut_frames(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a leader holds proposals for [`Machine::cut_frames`].
+    pub fn frames_queued(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.frames_queued(),
+            Machine::Follower(_) => false,
+        }
+    }
+
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced ([`Leader::announce_advanced`]). A follower has none.
+    pub fn announce_advanced(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(l) => l.announce_advanced(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a leader's commit frontier moved since it was last
+    /// announced, and waits for the end of the turn
+    /// ([`Leader::set_frontier_at_turn_end`]).
+    pub fn frontier_owed(&self) -> bool {
+        match self {
+            Machine::Leader(l) => l.frontier_owed(),
+            Machine::Follower(_) => false,
+        }
+    }
+
+    /// Whether `command` is marked as answered on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(l) => l.answers_on_release(command),
+            Machine::Follower(f) => f.answers_on_release(command),
+        }
+    }
+
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
@@ -111,11 +249,27 @@ impl Machine {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to [`MAX_PAYLOAD_TRANSFER`], the most one ask is
+    /// for, and no further (task-d109): the runtime asks on every turn,
+    /// and needs no more than whether any are missing and how many to ask
+    /// for.
+    ///
+    /// [`MAX_PAYLOAD_TRANSFER`]: coord_consensus::messages::MAX_PAYLOAD_TRANSFER
     pub fn missing_payloads(&self) -> usize {
         match self {
             Machine::Leader(_) => 0,
-            Machine::Follower(m) => m.missing_payloads().len(),
+            Machine::Follower(m) => {
+                m.missing_payload_count(coord_consensus::messages::MAX_PAYLOAD_TRANSFER)
+            }
+        }
+    }
+
+    /// How many payload requests this replica sent, its campaign's own
+    /// included: zero for a leader, which asks for none.
+    pub const fn payload_asks(&self) -> u64 {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.payload_asks(),
         }
     }
 
@@ -181,6 +335,39 @@ impl Machine {
         }
     }
 
+    /// Count executions durable only as the node reports them
+    /// (task-d90). The command table carries it across a role change.
+    fn track_execution_durability(&mut self) {
+        match self {
+            Machine::Leader(m) => m.track_execution_durability(),
+            Machine::Follower(m) => m.track_execution_durability(),
+        }
+    }
+
+    /// The journal holds this replica's executions through `position`
+    /// (task-d90).
+    fn executions_durable_through(&mut self, position: ExecutionPosition) {
+        match self {
+            Machine::Leader(m) => m.executions_durable_through(position),
+            Machine::Follower(m) => m.executions_durable_through(position),
+        }
+    }
+
+    /// The marked commands a leader was sent again after executing them,
+    /// whose release the voter publishes again (task-d100, step A).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        match self {
+            Machine::Leader(m) => m.take_release_again(),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
     /// What a leader committed since the last call (task-d62).
     pub fn take_learned(&mut self) -> Vec<CommandId> {
         match self {
@@ -197,6 +384,33 @@ impl Machine {
         match self {
             Machine::Leader(_) => (0, std::collections::BTreeSet::new()),
             Machine::Follower(m) => m.table().unordered(),
+        }
+    }
+
+    /// The durable command records this replica holds, in either role
+    /// (task-d110).
+    pub fn ledger(&self) -> &coord_consensus::DurableLedger {
+        match self {
+            Machine::Leader(m) => m.ledger(),
+            Machine::Follower(m) => m.ledger(),
+        }
+    }
+
+    /// The table's size and its oldest unexecuted record's wait, and the
+    /// pulled commands a follower's catch-up window holds (task-d25).
+    pub fn table_waits(&self) -> (coord_consensus::TableWaits, usize) {
+        match self {
+            Machine::Leader(m) => (m.table_waits(), 0),
+            Machine::Follower(m) => m.table_waits(),
+        }
+    }
+
+    /// What this replica keeps of its history beside the ledger, map by
+    /// map, in either role (#221 review).
+    pub fn history_maps(&self) -> coord_consensus::HistoryMaps {
+        match self {
+            Machine::Leader(m) => m.history_maps(),
+            Machine::Follower(m) => m.history_maps(),
         }
     }
 
@@ -288,6 +502,24 @@ impl Machine {
         }
     }
 
+    /// How much unexecuted work this replica holds (task-d94): none for
+    /// a leader.
+    pub fn unexecuted_held(&self) -> usize {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.unexecuted_held(),
+        }
+    }
+
+    /// How much decided work this replica holds and has not executed
+    /// (#236 review): what a donor could give it. None for a leader.
+    pub fn decided_unexecuted_held(&self) -> usize {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.decided_unexecuted_held(),
+        }
+    }
+
     /// Whether a catch-up page is in hand (task-d08).
     pub fn catching_up(&self) -> bool {
         match self {
@@ -296,11 +528,47 @@ impl Machine {
         }
     }
 
+    /// Whether this replica's catch-up chain is owed more (#226 review).
+    /// A leader asks for nothing.
+    pub fn catch_up_chain_open(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.catch_up_chain_open(),
+        }
+    }
+
+    /// What this replica did with relayed payloads (#224 review). A
+    /// leader takes none.
+    pub const fn relay_taken(&self) -> coord_consensus::RelayTaken {
+        match self {
+            Machine::Leader(_) => coord_consensus::RelayTaken {
+                frames: 0,
+                taken: 0,
+                known: 0,
+                not_taken: 0,
+                kept: 0,
+                kept_taken: 0,
+                frame_batches: 0,
+                frame_adoptions: 0,
+            },
+            Machine::Follower(m) => m.relay_taken(),
+        }
+    }
+
     /// Catch-up pages taken and pulled commands executed (task-d08).
     pub const fn catch_up_counts(&self) -> (u64, u64) {
         match self {
             Machine::Leader(_) => (0, 0),
             Machine::Follower(m) => m.catch_up_counts(),
+        }
+    }
+
+    /// How this replica's catch-up asks and pages went, by path
+    /// (task-d106 step 0). A leader asks for none.
+    pub fn catch_up_paths(&self) -> coord_consensus::CatchUpPaths {
+        match self {
+            Machine::Leader(_) => coord_consensus::CatchUpPaths::default(),
+            Machine::Follower(m) => m.catch_up_paths(),
         }
     }
 
@@ -332,24 +600,32 @@ impl Machine {
         }
     }
 
-    /// Whether this replica is synchronized at `ballot` or at a later
-    /// ballot of its epoch: what it executed then includes everything
-    /// decided at `ballot`, so it can serve a voter still there its
-    /// executed history (task-d33). A voter that promised a ballot of its
-    /// own the others never followed, and was refused as behind, asks at
-    /// the ballot it last synchronized; a donor answering only its own
-    /// ballot left it behind for good.
-    pub fn synchronized_at_or_after(&self, ballot: &Ballot) -> bool {
-        let at_or_after = |own: Ballot| {
-            own.compare_same_epoch(ballot)
-                .is_some_and(|o| o != core::cmp::Ordering::Less)
+    /// Whether this replica serves a voter's ask, made at `ballot`, for
+    /// the history it executed: at any ballot of its own epoch, whichever
+    /// it is synchronized at (task-d81).
+    ///
+    /// What a replica executed is a prefix of the one executed order:
+    /// each command in it is decided, a decision is the same at every
+    /// voter, and the dependency chain is total (task-d06), so the command
+    /// at each position is too. A page from that prefix is valid at the
+    /// requester's ballot whatever ballot its donor is at; that the donor
+    /// executed everything decided at the requester's ballot is what a
+    /// whole history needs, not a prefix of one. The requester installs
+    /// each pulled command under the Sync-entry rules (task-d14), so a
+    /// second decision still stops it.
+    ///
+    /// A donor used to serve only while synchronized at the asker's
+    /// ballot or a later one (task-d33). A voter that alone executed the
+    /// newest positions but missed the ballot the others installed then
+    /// served none of them, while its campaign's frontier held them back
+    /// from campaigning until they had executed that far (12/5/148,
+    /// 2/3/281).
+    pub fn serves_catch_up_at(&self, ballot: &Ballot) -> bool {
+        let own = match self {
+            Machine::Leader(m) => m.config_quorum().ballot(),
+            Machine::Follower(m) => m.quorum().ballot(),
         };
-        match self {
-            Machine::Leader(m) => at_or_after(m.config_quorum().ballot()),
-            Machine::Follower(m) => {
-                m.quorum().ballot() == m.ballots().synced() && at_or_after(m.ballots().synced())
-            }
-        }
+        own.epoch == ballot.epoch
     }
 
     /// The highest ballot this replica refused to a candidate as behind
@@ -534,6 +810,31 @@ impl core::fmt::Display for DriveError {
 
 impl core::error::Error for DriveError {}
 
+/// Catch-up asks a donor answered with nothing, by why (task-d106
+/// step 0). Each is silent at the requester, which only stops getting
+/// pages, so a donor says it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unserved {
+    /// From this node itself, or from a peer that is not a voter.
+    pub sender: u64,
+    /// At a ballot this node does not serve at (`serves_catch_up_at`).
+    pub ballot: u64,
+    /// While this node is halted or diverged.
+    pub stopped: u64,
+    /// After this node's own frontier: nothing executed past it.
+    pub nothing_after: u64,
+    /// With no executed order readable from this node's rows. No longer
+    /// counted since task-d113's step 2, which reads a range of the rows
+    /// by position: kept, at zero, for the metrics line's readers.
+    pub no_order: u64,
+    /// With no executed row at the position after the one asked.
+    pub order_above: u64,
+    /// With no snapshot of this node's store.
+    pub no_snapshot: u64,
+    /// With the executed rows unreadable, or the first command's payload.
+    pub first_row: u64,
+}
+
 /// One voter: its machine, its store and the sends it is holding.
 ///
 /// `P` is where this replica's batches become durable. A voter on the
@@ -565,11 +866,19 @@ pub struct Node<P: Persistence> {
     /// that ballot (task-d01). A voter that was away when it was
     /// published is sent it again when it promises the ballot.
     won: Option<SyncDecision>,
-    /// This node's executed commands in position order, once a peer has
-    /// asked to catch up from them (task-d08).
-    order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// The catch-up counts of the follower roles this node has left:
+    /// pages taken, pulled commands executed, and paths.
+    catch_up_before: (u64, u64, coord_consensus::CatchUpPaths),
+    /// The domain loop's time reading and encoding those pages, in all
+    /// and the longest (diagnostic, task-d25): a page of 125 commands is
+    /// read in one step of the donor's loop, which does nothing else
+    /// meanwhile.
+    pub serve_time: (std::time::Duration, std::time::Duration),
+    /// Catch-up asks this node answered with nothing, by why
+    /// (diagnostic, task-d106 step 0).
+    pub unserved: Unserved,
     /// Storage facts reached the outbox outside a round, so it may hold
     /// sends they released that no round has handed out yet.
     unreleased: bool,
@@ -590,13 +899,43 @@ pub struct Node<P: Persistence> {
     /// projection has committed through its position (task-d52), oldest
     /// first. A group's results are not here but in `results`.
     releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
-    /// The results of groups handed to a pipelined store, each held until
-    /// the group is in the journal (task-d63): released then, before its
-    /// projection commit (design Section 4.5), oldest first.
+    /// The results and establishments of groups handed to a pipelined
+    /// store, each held until the group is in the journal (task-d63),
+    /// oldest first: the voter counts its executions durable then
+    /// (task-d90, point 2). Where the domain activated the release rule,
+    /// the results went out as each command executed instead (task-d90).
     results: VecDeque<(ExecutionPosition, Vec<Effect>)>,
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
+    /// Times this node's machine found its table full (`Backpressure`),
+    /// over every role it held since boot: counted as the driver drains
+    /// them, exactly, where the log says them only at each doubling. Not
+    /// door refusals alone: see [`crate::metrics::Cost::table_full`].
+    table_full: u64,
+    /// Whether a leader of this node sends its proposal before its batch
+    /// is durable, where it may (task-d98). The node's, not the role's:
+    /// every leader this node becomes is given it.
+    early_proposal: bool,
+    /// The followers each leader of this node may send early to: those
+    /// known to hold `EarlyProposal`'s activation (task-d99). `None` reads
+    /// every follower as holding it.
+    early_holders: Option<std::collections::BTreeSet<coord_types::ids::ReplicaId>>,
+    /// Whether this node is the build made for task-d98's local reading
+    /// alone, which sends early without an activation.
+    early_without_activation: bool,
+    /// This voter's part in activating features (task-d99).
+    features: Option<crate::feature::Features>,
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A): the collector beside it marks its
+    /// submissions as answered on the leader's release alone.
+    answer_on_release: bool,
+    /// Whether `Feature::BatchedRound` is active (task-d102): the
+    /// collector beside it may relay its submissions to the leader alone.
+    batched_round: bool,
+    /// What the fresh proposals and the frontier of the leaders this node
+    /// left cost, by kind (task-d102).
+    sent_bytes: coord_consensus::SentBytes,
     /// Commands this replica established, by the path that decided them
     /// (task-d50).
     pub established: Established,
@@ -605,8 +944,22 @@ pub struct Node<P: Persistence> {
     /// establishment is, and the acknowledgements of every role this
     /// replica left.
     fast_path: coord_consensus::FastPathCounts,
+    /// What the follower roles this node has left did with relayed
+    /// payloads (#224 review).
+    relay_before: coord_consensus::RelayTaken,
     /// From learned to released, per command this replica led (task-d62).
     release: crate::learned::ReleaseTiming,
+    /// Whether a leader's result goes out as its command executes rather
+    /// than at its execution group's `JournalDurable` (task-d90). Off
+    /// until the domain activates it as a replicated feature (task-d99):
+    /// the rule rests on every voter's build casting its votes on durable
+    /// payload rows and forgetting only what its journal holds, and an
+    /// older build in the domain does neither.
+    release_at_execution: bool,
+    /// The commands this node held unexecuted when the rule was switched
+    /// on. They keep the group's release: one may have been learned over
+    /// a vote an older build cast before its voter upgraded.
+    release_held: std::collections::BTreeSet<CommandId>,
     /// When each pre-acceptance the leader ordered a later command past
     /// was first seen (task-d62).
     unordered_since: std::collections::BTreeMap<CommandId, std::time::Instant>,
@@ -674,8 +1027,10 @@ impl<P: Persistence> Node<P> {
             recorder: None,
             awaiting: None,
             won: None,
-            order: None,
             pages_served: 0,
+            catch_up_before: (0, 0, coord_consensus::CatchUpPaths::default()),
+            serve_time: (std::time::Duration::ZERO, std::time::Duration::ZERO),
+            unserved: Unserved::default(),
             unreleased: false,
             floor: None,
             grouped: false,
@@ -684,12 +1039,26 @@ impl<P: Persistence> Node<P> {
             releases: VecDeque::new(),
             results: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
+            table_full: 0,
+            early_proposal: false,
+            early_holders: None,
+            early_without_activation: false,
+            features: None,
+            answer_on_release: false,
+            batched_round: false,
+            sent_bytes: coord_consensus::SentBytes::default(),
             established: Established::default(),
             fast_path: coord_consensus::FastPathCounts::default(),
+            relay_before: coord_consensus::RelayTaken::default(),
             release: crate::learned::ReleaseTiming::default(),
+            release_at_execution: false,
+            release_held: std::collections::BTreeSet::new(),
             unordered_since: std::collections::BTreeMap::new(),
         };
         node.machine_mut().observe_learning();
+        // A group's outcomes are taken before it is journaled, so what
+        // the machine may forget waits for the journal (task-d90).
+        node.machine_mut().track_execution_durability();
         node
     }
 
@@ -724,6 +1093,46 @@ impl<P: Persistence> Node<P> {
     /// rest of the group.
     pub fn lower_in_groups(&mut self) {
         self.grouped = true;
+        self.apply_turn_settings();
+    }
+
+    /// Read `Feature::BatchedRound` as active, or not, without the
+    /// feature's activation: what [`Node::follow_features`] sets once the
+    /// domain activates it, for a test or a local reading's build alone.
+    pub fn set_batched_round(&mut self, on: bool) {
+        self.batched_round = on;
+        self.apply_turn_settings();
+    }
+
+    /// Whether this node's leaders hold a turn's fresh proposals for one
+    /// frame to each follower (task-d102): while `Feature::BatchedRound`
+    /// is active and the node lowers in groups, since a frame is cut
+    /// where the loop lowers its group.
+    pub const fn batch_frames(&self) -> bool {
+        self.batched_round && self.grouped
+    }
+
+    /// What a leader holds for the end of the turn: its fresh proposals
+    /// while [`Node::batch_frames`], and its commit frontier while the
+    /// node lowers in groups, since a turn ends where the loop lowers its
+    /// group ([`Leader::set_frontier_at_turn_end`]).
+    fn apply_turn_settings(&mut self) {
+        let on = self.batch_frames();
+        let grouped = self.grouped;
+        if let Some(Machine::Leader(l)) = self.machine.as_mut() {
+            l.set_batch_frames(on);
+            l.set_frontier_at_turn_end(grouped);
+        }
+    }
+
+    /// What this node's leaders sent of their fresh proposals and their
+    /// frontier, by kind, since boot (task-d102).
+    pub fn sent_bytes(&self) -> coord_consensus::SentBytes {
+        let mut sent = self.sent_bytes;
+        if let Some(Machine::Leader(l)) = self.machine.as_ref() {
+            sent.add(&l.sent_bytes());
+        }
+        sent
     }
 
     /// Lower everything queued as one group and hand what that made
@@ -739,15 +1148,39 @@ impl<P: Persistence> Node<P> {
     /// execution group, which materializes anyway. When no command is
     /// ready to execute, the flush materializes it itself, so the
     /// projection never waits on execution that is not coming.
+    ///
+    /// The turn ends here: a leader's commit frontier, if it moved,
+    /// goes to each voter once, after what the flush made durable
+    /// ([`Node::announce_frontier`]).
     pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let was = core::mem::replace(&mut self.flushing, true);
         let flushed = self.flush_queued(ballot);
         self.flushing = was;
-        flushed
+        let mut out = flushed?;
+        out.absorb(self.announce_frontier(ballot)?);
+        Ok(out)
+    }
+
+    /// Announce a leader's commit frontier if it moved since it was last
+    /// announced (#242 follow-up). Lowering in groups, the leader holds
+    /// what its steps move for this, once a turn
+    /// ([`Leader::set_frontier_at_turn_end`]): a flush, and the take-back
+    /// of an append ([`Node::settle`]), which is the other place a batch
+    /// turns durable. What a step moves after that is owed a flush
+    /// ([`Machine::frontier_owed`]).
+    fn announce_frontier(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().announce_advanced();
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
     }
 
     fn flush_queued(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
-        let mut next = Vec::new();
+        // The turn ends here: a leader's proposals of it leave in one
+        // frame to each follower (task-d102), published before the group
+        // that makes their batches durable is lowered.
+        let mut next = self.machine_mut().cut_frames();
         self.lower_queued(&mut next)?;
         // A round releases what became durable, even with nothing more
         // to carry out.
@@ -832,6 +1265,27 @@ impl<P: Persistence> Node<P> {
         self.carry_out(effects, ballot)
     }
 
+    /// Answer a campaign waiting on the rows of commands this node
+    /// executed and forgot (task-d77) from its durable rows, which the
+    /// machine does not hold, as catch-up is served from them (task-d08):
+    /// each command's dependency row, or none where the store keeps no
+    /// executed row, payload or dependency row for it, or cannot be read.
+    fn read_executed_rows(&mut self) -> Vec<Effect> {
+        let Machine::Follower(follower) = self.machine() else {
+            return Vec::new();
+        };
+        let wanted = follower.executed_rows_wanted();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let epoch = self.machine().identity().epoch;
+        let rows = crate::catch_up::executed_rows(&self.applier, epoch, wanted);
+        let Machine::Follower(follower) = self.machine_mut() else {
+            return Vec::new();
+        };
+        follower.executed_rows(rows)
+    }
+
     /// Hand the floor what became of its batches, so it reclaims the
     /// images superseded by one that is durable, and only then.
     /// The batch to journal when this voter's own promise, now durable,
@@ -911,6 +1365,30 @@ impl<P: Persistence> Node<P> {
             .expect("a node always holds a machine")
     }
 
+    /// Mark the command the next admitted request becomes as answered on
+    /// the leader's release alone (task-d100, step A; see
+    /// [`Machine::mark_next_admitted`]).
+    pub fn mark_next_admitted(&mut self) {
+        self.machine_mut().mark_next_admitted();
+    }
+
+    /// See [`Machine::mark_next_relayed`] (task-d102).
+    pub fn mark_next_relayed(&mut self) {
+        self.machine_mut().mark_next_relayed();
+    }
+
+    /// The marked commands whose release the voter publishes again
+    /// (task-d100, step A; see [`Machine::take_release_again`]).
+    pub fn take_release_again(
+        &mut self,
+    ) -> Vec<(
+        CommandId,
+        coord_types::RetryKey,
+        coord_types::identity::Digest32,
+    )> {
+        self.machine_mut().take_release_again()
+    }
+
     fn machine_mut(&mut self) -> &mut Machine {
         self.machine
             .as_mut()
@@ -971,14 +1449,22 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        if let Machine::Leader(l) = self.machine() {
+            let sent = l.sent_bytes();
+            self.sent_bytes.add(&sent);
+        }
         self.leave_role();
         let machine = self.machine.take().expect("a node always holds a machine");
         let (machine, effects) = match machine {
             Machine::Follower(f) => {
                 let decision = f.won().cloned().expect("checked above");
                 let quorum = f.quorum().clone();
-                let (leader, effects) =
+                let (mut leader, effects) =
                     Leader::from_recovered(f.into_recovered(), quorum, &decision);
+                leader.set_early_proposal(self.early_proposal);
+                leader.set_early_holders(self.early_holders.clone());
+                leader.set_batch_frames(self.batched_round && self.grouped);
+                leader.set_frontier_at_turn_end(self.grouped);
                 self.won = Some(decision);
                 (Machine::Leader(Box::new(leader)), effects)
             }
@@ -986,6 +1472,7 @@ impl<P: Persistence> Node<P> {
                 let quorum = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
+                follower.set_selection_rules(self.selection_rules());
                 self.won = None;
                 let effects = match pending {
                     Some((from, decision)) => follower.on_sync(from, decision),
@@ -1005,7 +1492,41 @@ impl<P: Persistence> Node<P> {
     fn leave_role(&mut self) {
         let counts = self.machine_mut().take_fast_path_counts();
         self.fast_path.add(&counts);
+        // A follower's catch-up counts start again with the role: kept
+        // here, so the metrics line counts since the node started (#98,
+        // 6807495802: a voter's line read 0 after a heal).
+        let (pages, pulled) = self.machine().catch_up_counts();
+        let paths = self.machine().catch_up_paths();
+        self.catch_up_before.0 += pages;
+        self.catch_up_before.1 += pulled;
+        self.catch_up_before.2.add(&paths);
+        // A follower's relay counts start again with the role: kept here,
+        // so the metrics line counts since the node started.
+        let relay = self.machine().relay_taken();
+        self.relay_before.add(&relay);
         self.release.clear();
+    }
+
+    /// Catch-up pages taken, pulled commands executed, and how its asks
+    /// and pages went, since this node started, through every role it
+    /// held (task-d08, task-d106 step 0).
+    pub fn catch_up_since_start(&self) -> (u64, u64, coord_consensus::CatchUpPaths) {
+        let (pages, pulled) = self.machine().catch_up_counts();
+        let mut paths = self.catch_up_before.2;
+        paths.add(&self.machine().catch_up_paths());
+        (
+            self.catch_up_before.0 + pages,
+            self.catch_up_before.1 + pulled,
+            paths,
+        )
+    }
+
+    /// What this node did with relayed payloads since it started, through
+    /// every follower role it held (task-d102, #224 review).
+    pub fn relay_taken_since_start(&self) -> coord_consensus::RelayTaken {
+        let mut counts = self.relay_before;
+        counts.add(&self.machine().relay_taken());
+        counts
     }
 
     /// What the fast path did since boot (task-d62).
@@ -1013,6 +1534,43 @@ impl<P: Persistence> Node<P> {
         let mut counts = self.fast_path;
         counts.add(&self.machine().fast_path_counts());
         counts
+    }
+
+    /// Release a leader's results as their commands execute, rather than
+    /// at their execution group's `JournalDurable` (task-d90, design
+    /// Section 4.5): for a domain that activated it, which every voter's
+    /// build supports (task-d99). The commands this node holds unexecuted
+    /// when it is switched on keep the group's release.
+    pub fn set_release_at_execution(&mut self, on: bool) {
+        if on == self.release_at_execution {
+            return;
+        }
+        self.release_at_execution = on;
+        self.release_held = if on {
+            self.machine().unexecuted()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let rules = self.selection_rules();
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.set_selection_rules(rules);
+        }
+    }
+
+    /// The rules this node's campaigns select under: under the release
+    /// rule's activation, a re-proposal no reporter holds a payload row for
+    /// is left out (`SelectionRules::leave_out_unheld`, #197 review), since
+    /// it rests on what the release does, point 4 at every voter.
+    pub const fn selection_rules(&self) -> coord_consensus::SelectionRules {
+        coord_consensus::SelectionRules {
+            leave_out_unheld: self.release_at_execution,
+        }
+    }
+
+    /// Whether this node releases at execution (see
+    /// [`Node::set_release_at_execution`]).
+    pub const fn release_at_execution(&self) -> bool {
+        self.release_at_execution
     }
 
     /// From learned to released, over the commands this replica led
@@ -1045,6 +1603,15 @@ impl<P: Persistence> Node<P> {
         }
     }
 
+    /// `command` was submitted to this replica at `now`: stamped while it
+    /// leads, the start of the round [`crate::learned`] times to learned
+    /// (task-d97). A follower stamps nothing: it learns nothing to end it.
+    pub fn stamp_submitted(&mut self, command: CommandId, now: std::time::Instant) {
+        if matches!(self.machine(), Machine::Leader(_)) {
+            self.release.submitted(command, now);
+        }
+    }
+
     /// Stamp what the leader committed since the last stamp (task-d62).
     fn stamp_learned(&mut self) {
         let learned = self.machine_mut().take_learned();
@@ -1068,12 +1635,17 @@ impl<P: Persistence> Node<P> {
         }
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
+        if let Machine::Leader(l) = self.machine() {
+            let sent = l.sent_bytes();
+            self.sent_bytes.add(&sent);
+        }
         self.leave_role();
         let Some(Machine::Leader(l)) = self.machine.take() else {
             unreachable!("checked above")
         };
         let quorum = l.config_quorum();
-        let follower = Follower::from_recovered(l.into_recovered(), quorum);
+        let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
+        follower.set_selection_rules(self.selection_rules());
         self.won = None;
         self.machine = Some(Machine::Follower(Box::new(follower)));
         self.carry_out(Vec::new(), at)
@@ -1083,6 +1655,256 @@ impl<P: Persistence> Node<P> {
     /// for a leader of the genesis ballot, which nobody campaigned for.
     pub const fn won(&self) -> Option<&SyncDecision> {
         self.won.as_ref()
+    }
+
+    /// Have every leader of this node send its proposal before its batch
+    /// is durable, to the followers that cannot make a fast quorum from it
+    /// (task-d98): the one it holds now and every one it becomes. Only for
+    /// a domain that activated `EarlyProposal`.
+    pub fn set_early_proposal(&mut self, on: bool) {
+        self.early_proposal = on;
+        if let Machine::Leader(l) = self.machine_mut() {
+            l.set_early_proposal(on);
+        }
+    }
+
+    /// Whether this node's leaders send early (see
+    /// [`Node::set_early_proposal`]).
+    pub const fn early_proposal(&self) -> bool {
+        self.early_proposal
+    }
+
+    /// Mark this node as the build made for task-d98's local reading
+    /// alone: its leaders send early without an activation, to every
+    /// follower that cannot make a fast quorum from the proposal.
+    /// The release rule stays off in this build (`follow_features` returns
+    /// before its switch), so a local pair meant to measure both levers
+    /// runs the activated path instead (#199 review).
+    pub fn send_early_without_activation(&mut self) {
+        self.early_without_activation = true;
+        self.set_early_holders(None);
+        self.set_early_proposal(true);
+    }
+
+    fn set_early_holders(
+        &mut self,
+        holders: Option<std::collections::BTreeSet<coord_types::ids::ReplicaId>>,
+    ) {
+        if self.early_holders == holders {
+            return;
+        }
+        self.early_holders = holders.clone();
+        if let Machine::Leader(l) = self.machine_mut() {
+            l.set_early_holders(holders);
+        }
+    }
+
+    /// Take part in activating features (task-d99). From here on, this
+    /// node's own durable activation record is its switch, for early sends
+    /// and for the release rule (task-d90), and its leaders send early only
+    /// to the followers known to hold it.
+    pub fn keep_features(&mut self, features: crate::feature::Features) {
+        self.features = Some(features);
+        self.follow_features();
+    }
+
+    /// This voter's feature driver, when it takes part.
+    pub const fn features(&self) -> Option<&crate::feature::Features> {
+        self.features.as_ref()
+    }
+
+    /// The switches and the window, from what the feature driver holds now:
+    /// early sends on once this node's own activation row is durable, and
+    /// only toward the followers that said they hold it; release at
+    /// execution on once its row for `ReleaseAtExecution` is.
+    fn follow_features(&mut self) {
+        if self.early_without_activation {
+            return;
+        }
+        let Some(features) = self.features.as_mut() else {
+            return;
+        };
+        if !features.take_changed() {
+            return;
+        }
+        let on = features
+            .active()
+            .contains(&coord_types::formats::Feature::EarlyProposal);
+        let holders = features.holders(coord_types::formats::Feature::EarlyProposal);
+        let release = features
+            .active()
+            .contains(&coord_types::formats::Feature::ReleaseAtExecution);
+        let answer_on_release = features
+            .active()
+            .contains(&coord_types::formats::Feature::AnswerOnRelease);
+        let batched_round = features
+            .active()
+            .contains(&coord_types::formats::Feature::BatchedRound);
+        self.set_early_holders(Some(holders));
+        if on != self.early_proposal {
+            self.set_early_proposal(on);
+        }
+        self.set_release_at_execution(release);
+        self.answer_on_release = answer_on_release;
+        self.batched_round = answer_on_release && batched_round;
+        self.apply_turn_settings();
+    }
+
+    /// Whether this node reads `Feature::AnswerOnRelease` active
+    /// (task-d100, step A).
+    pub const fn answer_on_release(&self) -> bool {
+        self.answer_on_release
+    }
+
+    /// Whether this node reads `Feature::BatchedRound` active (task-d102,
+    /// task-d100's step B): a collector here may relay its submissions to
+    /// the leader alone. Read only beside `AnswerOnRelease`, which its
+    /// activation requires.
+    pub const fn batched_round(&self) -> bool {
+        self.batched_round
+    }
+
+    fn standing(&self, ballot: &Ballot) -> crate::feature::Standing {
+        crate::feature::Standing {
+            ballot: *ballot,
+            leading: self.machine().leads(),
+        }
+    }
+
+    /// The batches a feature step journals, each under its own barrier,
+    /// and its messages, which go now.
+    fn feature_effects(
+        &mut self,
+        step: crate::feature::FeatureStep,
+        out: &mut Outbound,
+    ) -> Vec<Effect> {
+        for (to, message) in step.sends {
+            out.peer.push((
+                PeerId {
+                    replica: to,
+                    incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
+                },
+                message.encode(),
+            ));
+        }
+        step.batches
+            .into_iter()
+            .map(|(barrier, updates)| {
+                Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates,
+                })
+            })
+            .collect()
+    }
+
+    /// Carry out a feature step.
+    fn carry_feature(
+        &mut self,
+        step: crate::feature::FeatureStep,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let mut out = Outbound::default();
+        let effects = self.feature_effects(step, &mut out);
+        out.absorb(self.carry_out(effects, ballot)?);
+        self.follow_features();
+        Ok(out)
+    }
+
+    /// A peer's feature message, over its own link (task-d99).
+    pub fn hear_feature(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        message: &coord_consensus::ProtocolMessage,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.hear(from, message));
+        self.carry_feature(step, ballot)
+    }
+
+    /// What this voter says at start (task-d99): its advertisement to
+    /// every peer, and what it holds to its leader.
+    pub fn feature_start(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let step = features.start(standing);
+        self.carry_feature(step, ballot)
+    }
+
+    /// A new link with `peer` came up (task-d99).
+    pub fn feature_linked(
+        &mut self,
+        peer: coord_types::ids::ReplicaId,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.linked(peer));
+        self.carry_feature(step, ballot)
+    }
+
+    /// The leader's paced re-send of prepares and activations (task-d99).
+    pub fn feature_resend(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut step = features.observe(standing);
+        step.absorb(features.resend());
+        self.carry_feature(step, ballot)
+    }
+
+    /// An operator's request to activate `feature` (task-d99).
+    pub fn activate_feature(
+        &mut self,
+        feature: coord_types::formats::Feature,
+        ballot: &Ballot,
+    ) -> Result<
+        Result<(crate::feature::Activation, Outbound), crate::feature::ActivateRefusal>,
+        DriveError,
+    > {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Ok(Err(crate::feature::ActivateRefusal::NotActivatable(
+                feature,
+            )));
+        };
+        let observed = features.observe(standing);
+        let result = features.activate(feature);
+        let mut out = self.carry_feature(observed, ballot)?;
+        match result {
+            Ok((activation, step)) => {
+                out.absorb(self.carry_feature(step, ballot)?);
+                Ok(Ok((activation, out)))
+            }
+            Err(refusal) => Ok(Err(refusal)),
+        }
+    }
+
+    /// Hand the feature driver what became of its batches, and what the
+    /// ones now durable lead to.
+    fn settle_features(&mut self, ballot: &Ballot, out: &mut Outbound) -> Vec<Effect> {
+        let standing = self.standing(ballot);
+        let Some(features) = self.features.as_mut() else {
+            return Vec::new();
+        };
+        let outbox = &self.outbox;
+        let mut step = features.observe(standing);
+        step.absorb(features.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b)));
+        let effects = self.feature_effects(step, out);
+        self.follow_features();
+        effects
     }
 
     /// What this replica's re-sends did since boot (task-d49).
@@ -1096,7 +1918,17 @@ impl<P: Persistence> Node<P> {
 
     /// Take what the machine refused since the last call, rendered.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        self.machine_mut().take_rejections()
+        let (rendered, table_full) = self.machine_mut().take_rejections_counted();
+        self.table_full += table_full;
+        rendered
+    }
+
+    /// Times this node's machine found its table full, since boot, as of
+    /// the last [`Self::take_rejections`]: a submission or a payload
+    /// answer refused, or at a follower a proposal or a relayed payload
+    /// held for want of room.
+    pub const fn table_full(&self) -> u64 {
+        self.table_full
     }
 
     /// The command this replica cannot execute because it does not hold
@@ -1123,7 +1955,7 @@ impl<P: Persistence> Node<P> {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to the most one ask is for (task-d109).
     pub fn missing_payloads(&self) -> usize {
         self.machine().missing_payloads()
     }
@@ -1132,6 +1964,12 @@ impl<P: Persistence> Node<P> {
     /// with.
     pub fn payloads_answered(&self) -> u64 {
         self.machine().payloads_answered()
+    }
+
+    /// How many payload requests this node's machine sent
+    /// ([`Machine::payload_asks`]).
+    pub fn payload_asks(&self) -> u64 {
+        self.machine().payload_asks()
     }
 
     /// Send the voters, again, the proposals they have not voted on
@@ -1175,11 +2013,12 @@ impl<P: Persistence> Node<P> {
     /// `ballot` (task-d08).
     ///
     /// Answered only to a voter of this configuration other than this
-    /// one, and only by a donor synchronized at the ballot the requester
-    /// asked at, that has not itself stopped: a page from anyone else, or
-    /// at another ballot, would be dropped by the requester anyway. What
-    /// is served is what this node executed and holds durable rows for,
-    /// no further than its own frontier.
+    /// one, at a ballot of this node's epoch, by a donor that has not
+    /// itself stopped (`Machine::serves_catch_up_at`, task-d81): a page
+    /// from anyone else would be dropped by the requester anyway. The page
+    /// is tagged with the ballot asked at, which the requester checks
+    /// against its own. What is served is what this node executed and
+    /// holds durable rows for, no further than its own frontier.
     pub fn serve_catch_up(
         &mut self,
         from: coord_types::ids::ReplicaId,
@@ -1189,42 +2028,54 @@ impl<P: Persistence> Node<P> {
         let mut out = Outbound::default();
         let machine = self.machine();
         let identity = machine.identity();
-        if from == identity.replica
-            || !identity.voters.contains(&from)
-            || !machine.synchronized_at_or_after(&ballot)
-            || machine.halted().is_some()
-            || machine.catch_up_divergence().is_some()
-        {
+        if from == identity.replica || !identity.voters.contains(&from) {
+            self.unserved.sender += 1;
+            return out;
+        }
+        if !machine.serves_catch_up_at(&ballot) {
+            self.unserved.ballot += 1;
+            return out;
+        }
+        if machine.halted().is_some() || machine.catch_up_divergence().is_some() {
+            self.unserved.stopped += 1;
             return out;
         }
         let epoch = identity.epoch;
         let through = machine.executed_through();
         if after >= through {
+            self.unserved.nothing_after += 1;
             return out;
         }
-        if self.order.is_none() {
-            self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
-        }
-        let Some(order) = self.order.as_ref() else {
-            return out;
+        let started = std::time::Instant::now();
+        let entries = match crate::catch_up::page(&self.applier, epoch, after, through) {
+            Ok(entries) => entries,
+            Err(why) => {
+                let count = match why {
+                    crate::catch_up::NoPage::OrderAbove => &mut self.unserved.order_above,
+                    crate::catch_up::NoPage::Snapshot => &mut self.unserved.no_snapshot,
+                    crate::catch_up::NoPage::FirstRow => &mut self.unserved.first_row,
+                };
+                *count += 1;
+                return out;
+            }
         };
-        let entries = crate::catch_up::page(&self.applier, order, epoch, after, through);
-        if entries.is_empty() {
-            return out;
-        }
         self.pages_served += 1;
+        let page = coord_consensus::ProtocolMessage::CatchUpPage {
+            ballot,
+            after,
+            through,
+            entries,
+        }
+        .encode();
+        let took = started.elapsed();
+        self.serve_time.0 += took;
+        self.serve_time.1 = self.serve_time.1.max(took);
         out.peer.push((
             PeerId {
                 replica: from,
                 incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
             },
-            coord_consensus::ProtocolMessage::CatchUpPage {
-                ballot,
-                after,
-                through,
-                entries,
-            }
-            .encode(),
+            page,
         ));
         out
     }
@@ -1293,6 +2144,12 @@ impl<P: Persistence> Node<P> {
         for _ in 0..MAX_ROUNDS {
             if queue.is_empty() && !release {
                 queue = self.settle_floor(ballot);
+                if queue.is_empty() {
+                    queue = self.settle_features(ballot, &mut out);
+                }
+                if queue.is_empty() {
+                    queue = self.read_executed_rows();
+                }
                 if queue.is_empty() {
                     return Ok(out);
                 }
@@ -1417,6 +2274,12 @@ impl<P: Persistence> Node<P> {
                 // release rule had admitted it.
                 Effect::Established(result) => {
                     let command = result.command();
+                    // Held with the group's results until the group is in
+                    // the journal (task-d63), so the execution is durable
+                    // here, and the machine may forget it in its turn
+                    // (task-d90).
+                    self.machine_mut()
+                        .executions_durable_through(result.position());
                     if result.fast_path() {
                         self.established.fast += 1;
                     } else {
@@ -1511,6 +2374,9 @@ impl<P: Persistence> Node<P> {
             outcome.events.extend(settled.events);
             outcome.indeterminate = settled.indeterminate;
         }
+        // The machine takes the group's protocol events as one step, in
+        // order, so a follower learns once the step (lever 2, step 1).
+        let mut protocol = Vec::with_capacity(outcome.events.len());
         for event in outcome.events {
             // A staged execution group's batches are journaled with the
             // protocol's (task-d47); they are the applier's to complete,
@@ -1530,6 +2396,7 @@ impl<P: Persistence> Node<P> {
                         ..
                     }
                 ) {
+                    next.extend(self.machine_mut().step_storage(protocol));
                     return Err(DriveError::Engine(
                         "an execution group was definitely not journaled".into(),
                     ));
@@ -1537,7 +2404,10 @@ impl<P: Persistence> Node<P> {
                 continue;
             }
             self.outbox.observe(&event);
-            next.extend(self.machine_mut().step(Event::Storage(event)));
+            protocol.push(event);
+        }
+        if !protocol.is_empty() {
+            next.extend(self.machine_mut().step_storage(protocol));
         }
         // Still unknown after a reconcile: an engine failure, so it
         // cannot be mistaken for a clean round.
@@ -1556,11 +2426,15 @@ impl<P: Persistence> Node<P> {
     /// this node's to deliver, and the sends they release go out with
     /// the next round.
     fn absorb_foreign(&mut self, next: &mut Vec<Effect>) {
-        for event in self.applier.take_foreign() {
-            self.unreleased = true;
-            self.outbox.observe(&event);
-            next.extend(self.machine_mut().step(Event::Storage(event)));
+        let foreign = self.applier.take_foreign();
+        if foreign.is_empty() {
+            return;
         }
+        self.unreleased = true;
+        for event in &foreign {
+            self.outbox.observe(event);
+        }
+        next.extend(self.machine_mut().step_storage(foreign));
     }
 
     /// Lower what is queued until the store has room for `batch`.
@@ -1710,11 +2584,6 @@ impl<P: Persistence> Node<P> {
                     applied => applied.map_err(|e| Self::apply_error(&command, &e))?,
                 };
             self.executed += 1;
-            if let Some(order) = self.order.as_mut()
-                && !order.note(outcome.position, command)
-            {
-                self.order = None;
-            }
             // What the apply's lowerings made durable for other batches
             // is delivered by `carry_out`, after the command's own
             // outcome. This order is an observation, not a mechanism.
@@ -1731,10 +2600,16 @@ impl<P: Persistence> Node<P> {
             //
             // Within a group the machine hears the outcome now, which is
             // what lets it name the next command, and what it answers is
-            // held for the group (task-d47): a result until the group is
-            // in the journal (task-d63), a send and everything else until
-            // it has materialized.
-            let effects = self.machine_mut().applied(command, &outcome)?;
+            // held for the group (task-d47): its establishment until the
+            // group is in the journal (task-d63), a send and everything
+            // else until it has materialized. Where the domain activated
+            // the release rule, a released result is not held: it goes
+            // out now (task-d90, below).
+            let mut effects = self.machine_mut().applied(command, &outcome)?;
+            if grouping && self.release_at_execution {
+                Self::release_executed(&mut effects, &mut out, self.frontend, &self.release_held)?;
+            }
+            self.release_held.remove(&command);
             self.release.applied(&command, std::time::Instant::now());
             self.stamp_learned();
             // At a floor boundary the view is exactly the command's: the
@@ -1763,14 +2638,58 @@ impl<P: Persistence> Node<P> {
         Ok(out)
     }
 
+    /// Send the results `effects` releases to the collector now, and leave
+    /// the rest (task-d90, design Section 4.5).
+    ///
+    /// A result is released once the leader has learned the command and
+    /// every predecessor, and has executed it in memory, which is where
+    /// this is called: its execution group's `JournalDurable` is no longer
+    /// awaited. What the release rests on instead is recovery reproducing
+    /// every decision and its inputs. Every vote that counts rests on a
+    /// payload row durable at its voter (point 4), a voter forgets only
+    /// what its journal holds (point 2, which is why the establishment
+    /// still waits for the group), and no local fault becomes an outcome
+    /// (point 3). Watch events, signatures and external calls still wait
+    /// for the projection's commit, and a retry or a resolve at this node
+    /// waits for the projection through the command's position.
+    ///
+    /// Only where the domain activated the rule
+    /// ([`Node::set_release_at_execution`]), and never for a command in
+    /// `held`, which this node held unexecuted when the rule was switched
+    /// on: its result waits for its group, as it would have.
+    fn release_executed(
+        effects: &mut Vec<Effect>,
+        out: &mut Outbound,
+        frontend: PeerId,
+        held: &std::collections::BTreeSet<CommandId>,
+    ) -> Result<(), DriveError> {
+        let mut rest = Vec::with_capacity(effects.len());
+        for effect in effects.drain(..) {
+            match (&effect, frontend_frame(&effect, frontend)) {
+                (Effect::Released(released), Some(frame))
+                    if !held.contains(&released.established().command()) =>
+                {
+                    out.frontend
+                        .push(frame.map_err(|e| DriveError::Encode(format!("{e:?}")))?);
+                }
+                _ => rest.push(effect),
+            }
+        }
+        *effects = rest;
+        Ok(())
+    }
+
     /// Close the open execution group and carry out what its commands led
     /// to once it has materialized (task-d47).
     ///
     /// On a pipelined store (task-d52) the group is journaled and its
-    /// projection commit handed to the materializer. Its results are held
-    /// until it is in the journal, and go out then (task-d63, design
-    /// Section 4.5); everything else it led to is held until the
-    /// projection has committed through it ([`Node::settle`]). Execution
+    /// projection commit handed to the materializer. Its results and
+    /// establishments are held until it is in the journal, and go out
+    /// then (task-d63): a voter forgets only executions its journal holds
+    /// (task-d90, point 2). Where the domain activated the release rule,
+    /// its results have gone out already, as each command executed
+    /// ([`Node::release_executed`]). Everything else it led to is held
+    /// until the projection has committed through it ([`Node::settle`]). Execution
     /// goes on meanwhile, planning over the groups in flight. Past
     /// `PIPELINE_RECORDS` owed it waits for them.
     fn close_group(
@@ -1791,6 +2710,12 @@ impl<P: Persistence> Node<P> {
         let mut out = match position {
             Some(position) => {
                 let (results, rest) = split_results(effects);
+                // What the group led to beyond its results goes out once
+                // its commit is back, so that commit is not held for a
+                // larger one (task-d86).
+                if !rest.is_empty() {
+                    self.applier.store_mut().request_projection_commit();
+                }
                 self.releases.push_back((position, rest));
                 self.results.push_back((position, results));
                 Outbound::default()
@@ -1801,6 +2726,9 @@ impl<P: Persistence> Node<P> {
             // with that group's, or go now if that group's have gone.
             None => {
                 let (results, rest) = split_results(effects);
+                if !rest.is_empty() {
+                    self.applier.store_mut().request_projection_commit();
+                }
                 let last = self.releases.back_mut().expect("checked above");
                 last.1.extend(rest);
                 let position = last.0;
@@ -1854,6 +2782,7 @@ impl<P: Persistence> Node<P> {
             out.absorb(self.release_through_settled(ballot)?);
             out.absorb(self.release_journaled(ballot)?);
         }
+        out.absorb(self.announce_frontier(ballot)?);
         Ok(out)
     }
 
@@ -1966,6 +2895,9 @@ impl<P: Persistence> Node<P> {
             // replica restarts from it rather than plan them again.
             coord_storage::ApplyError::GroupLost => {
                 DriveError::Engine("an execution group was definitely not journaled".into())
+            }
+            coord_storage::ApplyError::AfterGroupLost => {
+                DriveError::Engine("the applier was used after an execution group was lost".into())
             }
             other => DriveError::Engine(format!("{other:?}")),
         }

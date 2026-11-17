@@ -1,7 +1,9 @@
 //! The endpoint: TLS lifecycle, accept and connect, negotiation, lanes,
 //! links with fair queues and budgets, stream readers and owned dispatch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +12,7 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1, Frame,
+    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSIONS, CloseV1, Frame,
     HelloAckV1, HelloV1, KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1,
     PeerRole, SESSION_BIND_VERSION, decode,
 };
@@ -29,7 +31,7 @@ use crate::frames::{
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
-use crate::sched::{FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
+use crate::sched::{Datagrams, FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
 
 /// Identity of one connection at this endpoint (never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -200,6 +202,7 @@ pub struct Responder {
     link: Arc<Link>,
     node: Arc<Budget>,
     deadline: Duration,
+    received: Instant,
 }
 
 impl core::fmt::Debug for Responder {
@@ -211,6 +214,12 @@ impl core::fmt::Debug for Responder {
 }
 
 impl Responder {
+    /// When the request this answers was read off the stream whole: the
+    /// start of the server's part of a caller's wait (task-d97).
+    pub const fn received(&self) -> Instant {
+        self.received
+    }
+
     /// Write the complete response frame and finish the stream.
     ///
     /// A reply is traffic like any other: it is admitted under the
@@ -392,6 +401,24 @@ pub enum SendError {
     Stream(String),
 }
 
+impl SendError {
+    /// Whether the same frame may be admitted later as it stands: the
+    /// lane's queue was full, which drains. A frame with no connection
+    /// or too large for the lane never will be.
+    pub const fn passes(&self) -> bool {
+        matches!(self, Self::QueueFull { .. } | Self::TooManyGroups { .. })
+    }
+}
+
+/// A frame [`Transport::offer_many`] did not admit, handed back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// Why it was not admitted.
+    pub error: SendError,
+    /// The frame, as it was offered.
+    pub frame: Vec<u8>,
+}
+
 /// Why the endpoint could not be built or a connection could not be made.
 #[derive(Debug)]
 pub enum TransportError {
@@ -510,13 +537,26 @@ struct Traffic {
     received_frames: AtomicU64,
     received_bytes: AtomicU64,
     received_streams: AtomicU64,
-    /// QUIC's own counts of the peer connections already closed (task-d61);
-    /// those still open are read from the connections themselves.
-    closed: Mutex<Quic>,
+    refused_voter_names: AtomicU64,
+    /// QUIC's own counts of the connections already closed (task-d61,
+    /// task-d70); those still open are read from the connections
+    /// themselves.
+    ///
+    /// Taken before the connection table, by a reading and by a
+    /// connection leaving it alike, so a connection is counted once: as
+    /// open or as closed, never both and never neither.
+    closed: Mutex<Closed>,
 }
 
-/// What QUIC itself sent and received on peer connections: datagrams,
-/// the system calls that sent them, and ACK frames.
+/// [`Quic`] counts of closed connections, per class.
+#[derive(Clone, Copy, Debug, Default)]
+struct Closed {
+    peer: Quic,
+    api: Quic,
+}
+
+/// What QUIC itself sent and received on one class of connections:
+/// datagrams, the system calls that sent them, and ACK frames.
 #[derive(Clone, Copy, Debug, Default)]
 struct Quic {
     datagrams_sent: u64,
@@ -524,6 +564,18 @@ struct Quic {
     send_calls: u64,
     acks_sent: u64,
     acks_received: u64,
+}
+
+impl From<Quic> for Datagrams {
+    fn from(quic: Quic) -> Self {
+        Datagrams {
+            datagrams_sent: quic.datagrams_sent,
+            datagrams_received: quic.datagrams_received,
+            send_calls: quic.send_calls,
+            acks_sent: quic.acks_sent,
+            acks_received: quic.acks_received,
+        }
+    }
 }
 
 impl Quic {
@@ -542,13 +594,19 @@ impl Traffic {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
-    fn read(&self, open: &[Arc<Peer>]) -> PeerTraffic {
+    fn read(&self, peers: &Mutex<HashMap<ConnectionId, Arc<Peer>>>) -> PeerTraffic {
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        let mut quic = *self.closed.lock().unwrap();
-        for peer in open.iter().filter(|p| p.class == Class::Peer) {
-            quic.add(&peer.conn);
+        let closed = self.closed.lock().unwrap();
+        let (mut quic, mut api) = (closed.peer, closed.api);
+        for peer in peers.lock().unwrap().values() {
+            match peer.class {
+                Class::Peer => quic.add(&peer.conn),
+                Class::Api => api.add(&peer.conn),
+            }
         }
+        drop(closed);
         PeerTraffic {
+            api: api.into(),
             datagrams_sent: quic.datagrams_sent,
             datagrams_received: quic.datagrams_received,
             send_calls: quic.send_calls,
@@ -562,7 +620,97 @@ impl Traffic {
             received_frames: load(&self.received_frames),
             received_bytes: load(&self.received_bytes),
             received_streams: load(&self.received_streams),
+            refused_voter_names: load(&self.refused_voter_names),
         }
+    }
+}
+
+/// What a [`Transport`] carried, read apart from it
+/// ([`Transport::traffic_reader`]).
+#[derive(Clone)]
+pub struct TrafficReader {
+    shared: Arc<Shared>,
+}
+
+impl TrafficReader {
+    /// The same as [`Transport::peer_traffic`].
+    pub fn read(&self) -> PeerTraffic {
+        self.shared.read_traffic()
+    }
+
+    /// The same as [`Transport::path_readings`].
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
+    }
+}
+
+/// One open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185, after the +loss1 reading): whether a link is held back by its
+/// congestion window, and by how much loss.
+///
+/// Read for every connection to a voter, an observer or a learner, on
+/// either plane, and for every api connection of a collector
+/// ([`PeerRole::may_submit_for_clients`]); not for a client's, which are
+/// as many as the callers. Each lane is a connection of its own, so a
+/// link reads as one of these a lane. The counts are cumulative over the
+/// connection's life and start again with a new connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathReading {
+    /// The plane the connection is on.
+    pub class: Class,
+    /// Its lane.
+    pub lane: Lane,
+    /// The role bound to the other end.
+    pub role: PeerRole,
+    /// The replica at the other end, where the binding names one: a peer
+    /// role on either plane, or a voter this side dialed on the api
+    /// plane. A collector's connection this side accepted names none.
+    pub replica: Option<ReplicaId>,
+    /// The connection, for the reading that names no replica.
+    pub connection: ConnectionId,
+    /// Whether this side accepted it.
+    pub accepted: bool,
+    /// The smoothed round trip.
+    pub rtt: Duration,
+    /// The least raw round-trip sample over the connection's life, the
+    /// peer's ACK delay not taken out (quinn's `RttEstimator::min`). It
+    /// never expires: a sample from before a path's delay changed stays.
+    pub min_rtt: Duration,
+    /// The congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events: each a cut of the window.
+    pub congestion_events: u64,
+    /// Packets this side sent and judged lost.
+    pub lost_packets: u64,
+    /// Their bytes.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+}
+
+impl PathReading {
+    fn of(peer: &Peer) -> Self {
+        let path = peer.conn.stats().path;
+        PathReading {
+            class: peer.class,
+            lane: peer.lane,
+            role: peer.identity.role,
+            replica: peer.identity.replica,
+            connection: peer.id,
+            accepted: peer.accepted,
+            rtt: path.rtt,
+            min_rtt: path.min_rtt,
+            cwnd: path.cwnd,
+            congestion_events: path.congestion_events,
+            lost_packets: path.lost_packets,
+            lost_bytes: path.lost_bytes,
+            sent_packets: path.sent_packets,
+        }
+    }
+
+    /// Whether a connection is read: not a client's.
+    fn reads(peer: &Peer) -> bool {
+        peer.identity.replica.is_some() || peer.identity.role.may_submit_for_clients()
     }
 }
 
@@ -597,6 +745,127 @@ impl Link {
             ],
             notify: [Notify::new(), Notify::new(), Notify::new(), Notify::new()],
         }
+    }
+}
+
+/// The lane senders' wake-ups a thread is holding back, and since when
+/// (see [`WakeHold`]).
+struct Held {
+    /// How many [`WakeHold`]s this thread has open: it holds while any is.
+    holds: u32,
+    /// When the first wake-up held since the last release was held.
+    since: Option<Instant>,
+    /// Each lane whose sender is owed a wake-up, once however many frames
+    /// were queued for it.
+    lanes: Vec<(Arc<Link>, usize)>,
+}
+
+thread_local! {
+    static HELD: RefCell<Held> = const {
+        RefCell::new(Held {
+            holds: 0,
+            since: None,
+            lanes: Vec::new(),
+        })
+    };
+}
+
+/// Holds back, on the thread that made it, the wake-ups of the lane
+/// senders its sends queue frames for, until [`WakeHold::release`]
+/// (task-d115, lever 8).
+///
+/// A domain loop queues frames all through a turn, and every send woke
+/// its lane's sender at once. On a runtime with one worker, each was a
+/// wake-up of that worker whenever it had parked between two sends: the
+/// audit counted ten a turn at a leader, where one would carry the
+/// turn's frames. Under a hold a send is what it was -- the frame is
+/// admitted, queued or refused, and its result returned at once -- and
+/// only the wake-up waits for the thread to say its batch is done. A
+/// sender already awake finds the frames anyway: it drains its queue.
+///
+/// The thread releases at the points it chooses, and dropping the hold
+/// releases what it still holds. Other threads are untouched: a hold is
+/// the thread's own, and is neither `Send` nor `Sync`.
+pub struct WakeHold {
+    _thread: PhantomData<*const ()>,
+}
+
+impl WakeHold {
+    /// Start holding this thread's lane wake-ups back. Holds nest: the
+    /// thread holds until the last is dropped.
+    #[must_use]
+    pub fn new() -> Self {
+        HELD.with(|held| held.borrow_mut().holds += 1);
+        WakeHold {
+            _thread: PhantomData,
+        }
+    }
+
+    /// When the oldest wake-up held since the last release was held, or
+    /// `None` when nothing is held.
+    pub fn held_since(&self) -> Option<Instant> {
+        HELD.with(|held| held.borrow().since)
+    }
+
+    /// Wake each lane sender held since the last release, once, and go on
+    /// holding. Returns how many were woken.
+    pub fn release(&self) -> usize {
+        release_held()
+    }
+
+    /// [`WakeHold::release`] for code that has no hold at hand. A hold is
+    /// the thread's, not the value's, so this releases what the calling
+    /// thread holds, and is a no-op on a thread that holds nothing.
+    pub fn release_this_thread() -> usize {
+        release_held()
+    }
+}
+
+impl Default for WakeHold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WakeHold {
+    fn drop(&mut self) {
+        release_held();
+        HELD.with(|held| held.borrow_mut().holds -= 1);
+    }
+}
+
+fn release_held() -> usize {
+    let lanes = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        held.since = None;
+        std::mem::take(&mut held.lanes)
+    });
+    for (link, lane) in &lanes {
+        link.notify[*lane].notify_one();
+    }
+    lanes.len()
+}
+
+/// Wake `lane`'s sender on `link`, or owe it the wake-up where this
+/// thread holds them back (see [`WakeHold`]).
+fn wake(link: &Arc<Link>, lane: usize) {
+    let held = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.holds == 0 {
+            return false;
+        }
+        if !held
+            .lanes
+            .iter()
+            .any(|(l, i)| *i == lane && Arc::ptr_eq(l, link))
+        {
+            held.lanes.push((link.clone(), lane));
+        }
+        held.since.get_or_insert_with(Instant::now);
+        true
+    });
+    if !held {
+        link.notify[lane].notify_one();
     }
 }
 
@@ -651,6 +920,23 @@ struct Tls {
 }
 
 impl Shared {
+    fn read_traffic(&self) -> PeerTraffic {
+        self.traffic.read(&self.peers)
+    }
+
+    fn path_readings(&self) -> Vec<PathReading> {
+        let mut readings: Vec<PathReading> = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|peer| PathReading::reads(peer))
+            .map(|peer| PathReading::of(peer))
+            .collect();
+        readings.sort_by_key(|r| (r.class == Class::Api, r.replica, r.connection, r.lane));
+        readings
+    }
+
     /// The client configuration a dial of `class` presents now, and when
     /// the credential in it ends.
     fn client_tls(&self, class: Class) -> (Arc<QuicClientConfig>, u64) {
@@ -682,9 +968,22 @@ impl Shared {
         let _ = self.events[event.lane().index()].send(event).await;
     }
 
+    /// Which link a connection belongs to.
+    ///
+    /// Only a voter's connection is keyed by its replica. The replica's
+    /// link is the one frames to that voter go out on and the one whose
+    /// lane slot `register` lets a newcomer from the same identity take.
+    /// An observer's or learner's certificate naming the same replica
+    /// would otherwise displace the voter's connection from it. So any
+    /// other role gets a link of its own, keyed by its connection, which
+    /// nothing sends to by replica and nothing else contends for.
     fn link_key(peer: &Peer) -> LinkKey {
-        match (peer.identity.replica, peer.identity.incarnation) {
-            (Some(r), Some(i)) => LinkKey::Replica(r, i),
+        match (
+            peer.identity.role,
+            peer.identity.replica,
+            peer.identity.incarnation,
+        ) {
+            (PeerRole::Voter, Some(r), Some(i)) => LinkKey::Replica(r, i),
             _ => LinkKey::Connection(peer.id),
         }
     }
@@ -775,8 +1074,8 @@ impl Shared {
     /// its own connection, and a rule that refused would leave the link
     /// held by a connection that no longer carries anything. That is
     /// also what happens where either identity is absent -- an endpoint
-    /// with no replica of its own, or an API-class peer, whose links are
-    /// per-connection and never collide.
+    /// with no replica of its own, or an API-class or non-voter peer,
+    /// whose links are per-connection and never collide.
     fn survivor(&self, held: &Peer, newcomer: &Peer) -> bool {
         let dialler = |peer: &Peer| {
             if peer.accepted {
@@ -792,10 +1091,17 @@ impl Shared {
     }
 
     fn deregister(&self, peer: &Peer) {
+        // The counts lock before the table's, as a reading takes them
+        // (`Traffic::closed`).
+        let mut closed = self.traffic.closed.lock().unwrap();
         let removed = self.peers.lock().unwrap().remove(&peer.id);
-        if removed.is_some() && peer.class == Class::Peer {
-            self.traffic.closed.lock().unwrap().add(&peer.conn);
+        if removed.is_some() {
+            match peer.class {
+                Class::Peer => closed.peer.add(&peer.conn),
+                Class::Api => closed.api.add(&peer.conn),
+            }
         }
+        drop(closed);
         let key = Self::link_key(peer);
         let link = self.links.lock().unwrap().get(&key).cloned();
         if let Some(link) = link {
@@ -1074,12 +1380,8 @@ fn server_config(
     // Accepted connections start with the floor of every lane's
     // limits (credit can only be raised once advertised); the lane
     // declared in `Hello` raises them to its own.
-    let floor = lane::transport_config(
-        &LaneLimits::floor(&limits.lanes),
-        limits.idle_timeout,
-        limits.keep_alive,
-    )
-    .map_err(TransportError::Tls)?;
+    let floor = lane::transport_config(&LaneLimits::floor(&limits.lanes), limits)
+        .map_err(TransportError::Tls)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config
         .transport_config(floor)
@@ -1163,8 +1465,7 @@ impl Transport {
             &limits,
         )?;
         let lane_config = |i: usize| {
-            lane::transport_config(&limits.lanes[i], limits.idle_timeout, limits.keep_alive)
-                .map_err(TransportError::Tls)
+            lane::transport_config(&limits.lanes[i], &limits).map_err(TransportError::Tls)
         };
         let lane_transport: [Arc<quinn::TransportConfig>; 4] = [
             lane_config(0)?,
@@ -1397,6 +1698,13 @@ impl Transport {
         }
     }
 
+    /// Whether an event is waiting to be taken (task-d115, lever 8). A
+    /// loop holding work for the runtime hands it off once none is,
+    /// rather than taking another pass to find out.
+    pub fn has_event(&self) -> bool {
+        self.events.iter().any(|events| !events.is_empty())
+    }
+
     /// The next event of one lane only; other lanes are left untouched.
     pub async fn next_event_in(&mut self, lane: Lane) -> Option<TransportEvent> {
         self.events[lane.index()].recv().await
@@ -1451,13 +1759,40 @@ impl Transport {
     /// [`Self::send`] admits one, and has its own result; the lane's
     /// sender is woken once, after the last, so a link that carries
     /// several frames a stream takes what this turn queued together.
+    /// Where the calling thread holds a [`WakeHold`], that wake-up waits
+    /// for the hold's release.
     pub fn send_many(
         &self,
         to: Destination,
         group: DomainId,
         frames: Vec<Vec<u8>>,
     ) -> Vec<Result<(), SendError>> {
-        let refused = |n: usize, e: SendError| (0..n).map(|_| Err(e.clone())).collect();
+        self.offer_many(to, group, frames)
+            .into_iter()
+            .map(|result| result.map_err(|refused| refused.error))
+            .collect()
+    }
+
+    /// [`Self::send_many`], handing each frame it did not admit back
+    /// with why, so a caller that means to offer it again keeps it
+    /// without having copied it first.
+    pub fn offer_many(
+        &self,
+        to: Destination,
+        group: DomainId,
+        frames: Vec<Vec<u8>>,
+    ) -> Vec<Result<(), Refused>> {
+        let refused = |frames: Vec<Vec<u8>>, error: SendError| {
+            frames
+                .into_iter()
+                .map(|frame| {
+                    Err(Refused {
+                        error: error.clone(),
+                        frame,
+                    })
+                })
+                .collect()
+        };
         let (key, lane) = match to {
             Destination::Replica {
                 replica,
@@ -1467,18 +1802,19 @@ impl Transport {
             Destination::Connection(id) => {
                 let peer = self.shared.peers.lock().unwrap().get(&id).cloned();
                 let Some(peer) = peer else {
-                    return refused(frames.len(), SendError::NotConnected);
+                    return refused(frames, SendError::NotConnected);
                 };
                 (Shared::link_key(&peer), peer.lane)
             }
         };
         let link = self.shared.links.lock().unwrap().get(&key).cloned();
         let Some(link) = link else {
-            return refused(frames.len(), SendError::NotConnected);
+            return refused(frames, SendError::NotConnected);
         };
         let mut state = link.lanes[lane.index()].lock().unwrap();
         if state.peer.is_none() {
-            return refused(frames.len(), SendError::NotConnected);
+            drop(state);
+            return refused(frames, SendError::NotConnected);
         }
         let now = Instant::now();
         let mut queued = false;
@@ -1488,10 +1824,13 @@ impl Transport {
                 let bytes = frame.len();
                 for budget in [&link.budget, self.shared.node_budget.as_ref()] {
                     if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
-                        return Err(SendError::TooLarge { bytes, limit });
+                        return Err(Refused {
+                            error: SendError::TooLarge { bytes, limit },
+                            frame,
+                        });
                     }
                 }
-                let result = state.queue.push(Queued {
+                let result = state.queue.push_or_return(Queued {
                     group,
                     frame,
                     enqueued: now,
@@ -1501,13 +1840,16 @@ impl Transport {
                         queued = true;
                         Ok(())
                     }
-                    Err(QueueError::GroupFull) => {
+                    Err((error, back)) => {
                         state.stats.refused += 1;
-                        Err(SendError::QueueFull { lane })
-                    }
-                    Err(QueueError::TooManyGroups) => {
-                        state.stats.refused += 1;
-                        Err(SendError::TooManyGroups { lane })
+                        let error = match error {
+                            QueueError::GroupFull => SendError::QueueFull { lane },
+                            QueueError::TooManyGroups => SendError::TooManyGroups { lane },
+                        };
+                        Err(Refused {
+                            error,
+                            frame: back.frame,
+                        })
                     }
                 }
             })
@@ -1515,7 +1857,7 @@ impl Transport {
         state.stats.queued = state.queue.len();
         drop(state);
         if queued {
-            link.notify[lane.index()].notify_one();
+            wake(&link, lane.index());
         }
         results
     }
@@ -1546,17 +1888,26 @@ impl Transport {
             .collect()
     }
 
-    /// What this node's transport carried between voters (task-d62).
+    /// What this node's transport carried between voters (task-d62), and
+    /// the datagrams of its api connections (task-d70).
     pub fn peer_traffic(&self) -> PeerTraffic {
-        let open: Vec<Arc<Peer>> = self
-            .shared
-            .peers
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        self.shared.traffic.read(&open)
+        self.shared.read_traffic()
+    }
+
+    /// A reader of [`Transport::peer_traffic`] that can be kept apart from
+    /// the transport, by a runtime that is handed the transport only to
+    /// serve on it.
+    pub fn traffic_reader(&self) -> TrafficReader {
+        TrafficReader {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// Each open connection's path, as QUIC estimates it, for every
+    /// connection but a client's ([`PathReading`]), in plane, replica,
+    /// connection and lane order.
+    pub fn path_readings(&self) -> Vec<PathReading> {
+        self.shared.path_readings()
     }
 
     /// Accounting of one lane of a replica link, with the path RTT.
@@ -2087,7 +2438,16 @@ async fn negotiate_incoming(
     let bound = match &certs {
         Some(certs) => match shared.binder.bind(certs, &hello) {
             Ok(b) => b,
-            Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+            Err(e) => {
+                // Counted here, on the node that refused it: the peer
+                // learns only the refusal, and until a prepared transition
+                // names a staged learner (task-d39) this one means an
+                // issuer signed what it never should.
+                if e == crate::BindError::NonVoterNamesVoter {
+                    Traffic::add(&shared.traffic.refused_voter_names, 1);
+                }
+                return Err((CloseReason::Rejected(format!("{e:?}")), Some(send)));
+            }
         },
         // Without a certificate only `Client` is admissible: a frontend
         // or Kine collector acts for other principals and must prove
@@ -2344,7 +2704,12 @@ async fn deliver_peer_frame(
         .emit(TransportEvent::PeerFrame {
             connection: peer.id,
             lane: peer.lane,
-            provenance: PeerProvenance::from_transport(replica, incarnation, peer.id.0),
+            provenance: PeerProvenance::from_transport(
+                replica,
+                incarnation,
+                peer.identity.role,
+                peer.id.0,
+            ),
             kind: frame.kind,
             version: frame.version,
             payload: frame.payload,
@@ -2453,7 +2818,12 @@ async fn read_delivery(
                     // under, not anything the frame says.
                     provenance: peer.identity.replica.and_then(|replica| {
                         peer.identity.incarnation.map(|incarnation| {
-                            PeerProvenance::from_transport(replica, incarnation, peer.id.0)
+                            PeerProvenance::from_transport(
+                                replica,
+                                incarnation,
+                                peer.identity.role,
+                                peer.id.0,
+                            )
                         })
                     }),
                     identity: peer.identity.clone(),
@@ -2487,6 +2857,7 @@ async fn read_request(
     .await
     {
         Ok(frame) => {
+            let received = Instant::now();
             // Decode here, at the boundary, and accept only what a client
             // may open a request stream with. Emitting an undecodable
             // frame, a server-origin message or a handshake message as an
@@ -2532,7 +2903,7 @@ async fn read_request(
                 // out of reach of a client.
                 if !peer.identity.role.may_submit_for_clients() {
                     Some(CloseReason::Rejected("submit".into()))
-                } else if frame.version != COLLECTOR_SUBMIT_VERSION {
+                } else if !COLLECTOR_SUBMIT_VERSIONS.contains(&frame.version) {
                     Some(CloseReason::Malformed(format!(
                         "submit frame version {}",
                         frame.version
@@ -2567,6 +2938,7 @@ async fn read_request(
                         link: shared.link(Shared::link_key(&peer)),
                         node: shared.node_budget.clone(),
                         deadline: shared.limits.frame_timeout,
+                        received,
                     },
                 })
                 .await;

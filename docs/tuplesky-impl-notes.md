@@ -681,7 +681,9 @@ A node certificate binds exactly one role: `PeerBinder` refuses a
 `Hello` that declares any role other than the certificate's own
 node-identity URI. So a `coordd` running `role = "voter-frontend-..."`
 holds a voter certificate and, with only that, cannot present itself as
-a collector to anybody.
+a collector to anybody. A certificate binds exactly one domain the same
+way: the URI names it, and a `Hello` naming another domain is refused,
+since a cluster's domains share its issuer.
 
 That matters because a submission is the *collector's*, not the
 voter's. It carries admission claims minted for a client's session, and
@@ -5558,16 +5560,21 @@ behind by more than a table is sent nothing it can use.
   executed, so the pacer is the floor for an ask nobody answered. The
   pacer registers its next look as a serve-loop deadline, so an idle
   follower with held work, which has no election deadline, still wakes
-  to ask and to ask again. A voter also asks once after it starts,
+  to ask and to ask again. A voter also asks after it starts,
   whatever it holds: a restart forgets the page, and a command whose
   donor kept no row leaves none here either until it executes, so a
-  voter restarted behind can hold nothing that would prompt an ask. A
+  voter restarted behind can hold nothing that would prompt an ask. It
+  goes on asking until a page arrives or every voter has been asked
+  (the leader twice, then each of the others): a donor with nothing past
+  its frontier answers nothing, as a lost ask or page does, and with a
+  leader that has nothing for it to adopt the probe is its only ask
+  (#98, Codex on the carry). A
   page taken whole that stops short of the donor's `through` (the
   command bound or the byte bound) is followed at once.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
-  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  own `executed_through`. A page is at most 125 commands and 1 MiB beyond
   its first, each read from the donor's durable rows: the payload row,
   the epoch's dependency row if it keeps one, and the executed row
   (`coord_storage::protocol::catch_up_entry`). The page stops at the
@@ -7050,7 +7057,7 @@ never closed its gap.
 
 - **A window per batch.** `install_catch_up` installs as many of the
   page's commands as install cleanly, from its head, in one batch: at
-  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  most the page, so 125 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
   `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
   unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
   let into a full table). A window joins a command only when:
@@ -7060,7 +7067,9 @@ never closed its gap.
   - after the window's first, it names the command before it among
     those dependencies.
 - **A command the donor kept no row of is a window of its own.** It has
-  no dependencies to name. What would stop a page (a stale ballot or
+  no dependencies to name. (Seed 73 on #185 removed this: such an entry
+  is not installed, the window ends before it, and the follower asks
+  another donor.) What would stop a page (a stale ballot or
   position, a second decision, a command executed here already, a
   command not installable) ends the window instead, and is dealt with
   when it is the first of the next window, exactly as before.
@@ -7363,16 +7372,38 @@ contract needed and a test for each.
   1,000, is enforced per frontend as a token bucket with a second's
   burst. A retry of an outstanding request takes nothing, and a refused
   request is answered `BACKPRESSURE` ("admission rate").
-  - Catch-up executes up to 64 commands per durable batch (task-d25), so
-    the default leaves a returning voter most of its rate to gain on the
+  - Catch-up executes up to 125 commands per durable batch, with the
+    next page asked ahead while a page executes (task-d25), so the
+    default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
   - The default is a design target and a ceiling, not a proved bound
-    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    (review): the 64-per-10-ms rate it was set under was never measured, and
     task-d33's budget oracle is its check. It gates only client
     requests, after the session-busy check and before the pending
     insert; resolves, watches and held retries bypass it, and one bucket
-    per frontend is shared by every session. At the 35 to 100 commands a
-    second a domain sustains today it never binds.
+    per frontend is shared by every session.
+  - **It is close to binding now.** Five voters on one four-core host
+    with three frontends sustain about 1,500 to 1,700 commands a second
+    at 120 callers (#224, #225). The busiest frontend admits 630 to 770
+    a second at the median and up to 977 in its busiest second. No
+    throughput pair so far was refused (#224's and (e)'s counted no
+    refused or unknown operation), but a faster build's will be. Review's
+    stall runs, with a voter stopped under load, were (#228 review). Catch-up is
+    measured now too: about 22 ms a page plus 0.28 ms a command, so a
+    voter rejoining at full load with the relay executes about 1,600 a
+    second at 64 a page and 2,200 at 125 (#98). That is not the margin
+    the default was set with. Whether to change the limit or its default
+    is the owner's decision; nothing here changes either.
+  - **What a reading shows.** A refusal counts as refused at the
+    admission stage, and an `admission` line with every metrics
+    snapshot gives the frontend's rate and its refusals by why
+    (`rate_limited`, `session_busy`, `other`, and `collection_bound` for
+    a request the gate admitted and the collector's own bound then
+    refused). The bench counts
+    `BACKPRESSURE` as a refusal, `backpressure`, not as an unknown
+    outcome. Every script in `scripts/bench` sets the rate explicitly
+    (`ADMITTED_PER_SECOND`, default 1,000) and states it in its readings'
+    labels.
 
 ### What this does not cover
 
@@ -7926,9 +7957,16 @@ After every step, every limit of the resource contract (design Section
   - A fresh admission never lands past the reserve.
   - Tombstones never exceed capacity plus the conservative keys.
 - **Ledger and bindings.** Durable records and retry-key bindings never
-  exceed six tables. The history sweep (task-d26) runs once they pass
-  four; the peak is those four, the live table, and the retirement
-  window the sweep goes down to.
+  exceed six tables while the live records fit the table. The history
+  sweep (task-d26) keeps the live table and the retirement window, and
+  after a sweep that kept no more than that the next runs once they
+  pass four; the peak is those four, the live table, and the retirement
+  window. A voter behind keeps more live records than that. Its next
+  sweep runs once the records added and the commands executed since the
+  last come to half of what it kept (task-d110), so it holds at most
+  half again what that sweep kept, sweeps at a cost of about three
+  records per record added or command executed, and comes back under
+  six tables as it executes its backlog.
 - **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
 - **Campaigns.**
   - Report pages held never exceed what the promising voters' reports
@@ -9754,6 +9792,12 @@ round.
   and still confirms if its answers come
   (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
   when a read is due or what it may return changes.
+  *Later:* the hold is now a spacing, `ROUND_SPACING_MILLIS` (5 ms), with
+  the serve loop woken at its end. Across regions a read that arrived
+  just after a round started waited for that round and a whole new one,
+  two quorum round trips (the WAN run on #185). Spaced, it waits one
+  (`a_round_out_holds_the_next_back_only_for_the_spacing`,
+  `a_read_waits_one_quorum_round_trip_not_two`).
 - **Counted.** The `metrics` line's `reads` gains `snapshots`, the
   snapshots pinned for due reads, and `behind`, the due reads held again
   because theirs was behind them.
@@ -10083,6 +10127,90 @@ less the base:
 - task-d61's acceptance is the streams cut. The change is kept for what
   QUIC's stream limits and a WAN path care about, not for CPU.
 
+
+## The acknowledgement cadence (task-d70)
+
+`lane::transport_config` asked nothing of QUIC's acknowledgement-frequency
+extension, so every connection acknowledged every second ack-eliciting
+packet within 25 ms. With about one data datagram per peer per command an
+acknowledgement often had nothing to ride on and went alone. task-d70 put
+the cadence behind `COORDD_ACK_FREQUENCY` on both planes and counted the
+api plane's datagrams beside the peer plane's, then took three pairs of
+each setting on the Jepsen runner (#98, replay, throughput, 30 clients,
+the call graph on one pair).
+
+| The lever less unset, mean of 3 | `8,2000` | `8,25000` |
+| --- | --- | --- |
+| `ok`/s | −0.6 | +9.6 (+2%) |
+| Read p99 | +3 ms | −1 ms |
+| Voters' CPU per operation | −0.00 ms of 2.47 | −0.15 ms of 3.87 (−4%) |
+| Voters' tokio threads, CPU per operation | +0.03 ms of 1.10 | −0.14 ms of 1.77 (−8%) |
+| Leader's peer send calls per command | −0.14 | −1.03 (−17%) |
+| Leader's peer ACKs received per command | −17% | −68% |
+| Peer datagrams sent per command, all voters | +0.08 | −3.75 (−18%) |
+| Api datagrams received per command, all voters | +2.12 (+7%) | −5.02 (−17%) |
+| `api_acks_received` per command, all voters | +21% | −53% |
+| Leader's streams per command (the control) | +0.06 | +0.14 |
+
+The two columns ran on different CPUs (an Intel Xeon 6973P-C and an AMD
+EPYC 7763); each pair compares one binary with itself on one runner.
+
+- **The delay was the wrong lever.** Every quinn endpoint advertises a
+  `min_ack_delay` of 1 ms, so every connection takes a requested cadence,
+  and a requested delay of `None` keeps the peer's own `max_ack_delay`,
+  25 ms by default. A 2 ms delay is shorter than that: on the leader's
+  busy peer links the threshold bound first and its ACKs fell, but on the
+  api plane's quiet connections an ACK left alone after 2 ms instead of
+  riding the next request or reply within 25.
+- **The threshold is the lever.** At threshold 8 with QUIC's delay the
+  voters sent a sixth fewer datagrams on both planes. On the leader most
+  of the tokio threads' saving was the send system call (298 against
+  345 µs per command, 9.6 against 11.3 calls); futex and `epoll_wait`
+  hardly moved, so ACKs were not what woke the workers.
+- **The api plane's other end is mostly `coordd`.** The voters' collector
+  links carry every command a non-leader frontend takes to the leader,
+  and both ends run the lever; `api_acks_sent` falling by half is a
+  coordd peer asking it.
+- **Lost frames and streams were 0 in every run.** The runs had no
+  faults, so they say nothing of recovery under loss, which is where a
+  later ACK could show: a loss is learned after as many packets more,
+  within the same 25 ms.
+
+The runtime's worker count, `TOKIO_WORKER_THREADS=2` against the default
+four on the same 4-CPU runners, took the voters' tokio threads' CPU per
+operation down 8% and the voters' 3%, `ok`/s and read p99 flat. On the
+leader its tokio threads made 6.2 futex calls per command against 12.4
+and spent 94 µs parking and waking against 136; the sends, the receives
+and the I/O driver's `epoll_wait` did not move. Five voters with four
+workers each on four CPUs had 6.3 cores' worth of runnable tokio threads
+waiting for 1.2 cores of work, so this is the runner's oversubscription.
+The two levers cut different calls (sends against futex).
+
+Kept: threshold 8 with the delay left to the peer is the transport's
+default (`AckFrequency::DEFAULT`), on both planes and for every endpoint
+built from `Limits::default()`; `COORDD_ACK_FREQUENCY=off` asks nothing,
+for a control pair, and `<threshold>` or `<threshold>,<µs>` override it.
+Under faults it held. The runner's fault schedule (kill, pause and
+partition, 300 s, two workers) ran twice with `COORDD_ACK_FREQUENCY` at
+`8,25000`, which is the default's cadence since the peer's own delay is
+25 ms, and twice unset:
+
+| | with it | with it | unset | unset |
+| --- | --- | --- | --- | --- |
+| `:valid?`, final reads, stops | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none | true, 5 of 5, none |
+| republished, whole run / after the final start | 16 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| lost frames | 642 | 2 | 1,278 | 0 |
+| slowest voter back serving after a fault, median / most (s) | 34.0 / 134.0 | 23.3 / 95.1 | 28.0 / 124.5 | 2.2 / 89.9 |
+| `ok`/s until the final heal | 4.9 | 8.4 | 7.5 | 7.4 |
+
+The checks that move (lost frames, republishes, time back serving) move
+as much without the cadence, and the nine earlier fault runs of the
+series, all without it, republished up to 8 times and lost up to 657
+frames on one voter. The spread is the faults' overlap; two runs a side
+cannot show a cadence effect inside it, and nothing points to a later
+loss detection stretching recovery. The worker count is the runner's
+setting from here; the daemon's waits on a reading on a host of its own,
+an open row under task-d66.
 
 ## The leader's re-send past each voter's adoption (task-d59)
 
@@ -10689,3 +10817,309 @@ pairs, as task-d72's (20,000 operations):
 A follower's loop falls by 4% (0.538 to 0.516 ms a write, the means),
 the leader's by 1.5%, what the profile's share said; nothing else
 moves outside the spread.
+
+## Journal syncs a command, and what each carries (task-d84)
+
+task-d84 was planned as one journal sync a turn for a turn's acceptance
+rows and its execution group. Its entry asks for the reading first: the
+syncs a command and a turn at every voter, which of a turn's writes each
+one carries, the syncs in series on one write's path, and the
+projection's syncs under `strict`.
+
+**The counts.** Each voter's snapshot now says what its journal groups
+held (`Cost::journal_groups`, from the store's `GroupMix`): groups of
+protocol transitions only, of application outcomes only, of both, and
+of neither, and the records of each kind. `command_cost.py table` prints
+them as a third table.
+
+**The setup.** `scripts/bench/command-cost.sh` on task-d84's branch: three
+voters on one host (x86_64, 4 CPUs), strict profile, 2,500 measured
+operations of `put=15,get=55,contended=20,txn=5`. Three runs at each of
+1 and 10 callers, with the stores on tmpfs (the script's default) and
+then on the disk. A journal sync on this disk is served in 0.66 to
+0.71 ms at 1 caller and about 1.06 ms at 10, against 0.03 to 0.04 ms on
+tmpfs.
+
+| | Leader | Fast-set follower | Other follower |
+| --- | --- | --- | --- |
+| Syncs a command, 1 caller (tmpfs; disk) | 2.97; 2.91 to 2.92 | 1.93 to 1.96; 1.98 to 1.99 | 2.38 to 2.41; 2.46 to 2.49 |
+| Syncs a command, 10 callers (tmpfs; disk) | 1.17 to 1.19; 1.12 to 1.14 | 0.94 to 1.02; 1.01 to 1.09 | 1.04 to 1.06; 1.05 to 1.09 |
+| Groups holding both kinds a command, 1 caller (tmpfs; disk) | 0.03; 0.08 to 0.09 | 0.74 to 0.77; 0.98 | 0.29 to 0.30; 0.46 to 0.49 |
+| Groups holding both kinds a command, 10 callers (tmpfs; disk) | 0.34 to 0.37; 0.41 to 0.42 | 0.36 to 0.39; 0.47 to 0.48 | 0.33 to 0.36; 0.44 to 0.46 |
+
+Each voter writes two protocol transitions a command, one with the
+command's payload, and one application outcome. Syncs that are no group
+(the journal's mapping updates and compactions) are 0.001 a command.
+
+**What it says:**
+- **The leader writes three groups a command at 1 caller, and each waits
+  for the one before it.**
+  1. The proposal row: PRE-ACCEPT, with the payload.
+  2. Its ACCEPT row (`Leader::advance_pending`), which is written only once
+     the proposal row is durable. Its durability is the leader's own slow
+     acknowledgement (`Leader::adopt_own`).
+  3. The execution group, once the command is decided.
+
+  The counts show them apart: 1.91 to 1.97 groups of protocol transitions
+  only, one record each, and 0.91 to 0.97 of application outcomes only. No merge can
+  put any two of these in one sync, because each is written only after
+  the one before it is durable.
+- **A follower already shares.** Its second protocol transition goes in
+  one group with the application outcome for 74 to 99% of commands at
+  1 caller on the fast-set follower. task-d47 queues the execution group's
+  batches with the protocol's, and one append takes whatever is queued.
+- **Under load the syncs are already about one a command at every voter.**
+  At 10 callers a group holds 2.0 to 2.5 protocol transitions and 1.7 to
+  2.0 commands, and 29 to 46% of syncs carry both kinds. So what a turn
+  merge would add is small.
+- **The syncs in series on a write's path, at 1 caller on the disk:**
+  - The `put` p50 is 3.17 to 3.24 ms, against 1.69 to 1.71 on tmpfs. That is
+    1.5 ms more, about 2.3 syncs.
+  - The leader's wait from learned to released in its journal is 1.13 to
+    1.22 ms, against 0.21 to 0.22 on tmpfs. That is 1.0 ms more, about 1.5
+    syncs.
+  - So about one sync comes before learning: the proposal row at the
+    leader and the pre-acceptance rows at the followers, in parallel.
+    Then about one and a half come after it: the execution group's own,
+    behind the leader's ACCEPT row when that is the group still out.
+  - The appender has one group out at a time (task-d54). At 95% fast
+    decisions, that ACCEPT row is a write no decision read, and it delays
+    the execution group.
+- **At 10 callers p99 hardly moves with the disk.** The `put` p99 is 21.9
+  to 28.6 ms on tmpfs and 25.4 to 29.3 ms on the disk, and the p50 is
+  4.8 to 5.3 ms against 9.0 to 9.6. Locally, at this load, the tail is
+  set by queueing and CPU, not by syncs. On the runner a sync takes about
+  2.3 ms, so the two or three in series are a larger share there.
+- **The projection under `strict`:**
+  - It commits about once a journal group: 2.8 to 2.9 times a command
+    at the leader at 1 caller, and 1.0 to 1.1 at 10. Each commit uses
+    redb's two-phase durability (Section 17.3.4).
+  - Since task-d63 none of it is on a result's path.
+  - It is on the same disk, though: the materializer's commits take 2.8
+    to 2.9 ms a command at the leader at 1 caller on the disk. That is
+    more than its journal's 1.9 to 2.1 ms.
+
+**At `replay`** (review of #179). The same script, with
+`COORD_HARNESS_JOURNAL_PROFILE=replay`, on the disk and on tmpfs:
+- **The same groups and the same syncs a command.** The leader's are
+  2.90 to 2.91 at 1 caller and 1.04 to 1.10 at 10. The three groups
+  in series at the leader are unchanged.
+- **Each journal sync is faster on the disk.** It is served in 0.48 to
+  0.53 ms at 1 caller and 0.66 to 0.74 ms at 10, against `strict`'s
+  0.66 to 0.71 and about 1.06. A quarter to a third of a journal sync's
+  time under `strict` is the projection's durable commits sharing the
+  disk.
+- **The materializer's commits** take 0.58 to 0.61 ms a command at the
+  leader at 1 caller, against 2.8 to 2.9 ms. There are as many commits,
+  but they are working ones.
+- **The wait from learned to released in the journal** is 0.76 to
+  0.95 ms at 1 caller and 1.29 to 1.44 ms at 10, against 1.13 to 1.22
+  and 1.84 to 1.96.
+- **The `put` service time on the disk:**
+
+  | Callers | Profile | p50 (ms) | p99 (ms) |
+  | --- | --- | --- | --- |
+  | 1 | `replay` | 2.15 to 2.35 | 8.5 to 13.8 |
+  | 1 | `strict` | 3.17 to 3.24 | 7.4 to 14.6 |
+  | 10 | `replay` | 6.5 to 7.1 | 21.0 to 23.8 |
+  | 10 | `strict` | 9.0 to 9.6 | 25.4 to 29.3 |
+
+  On tmpfs `replay`'s p50 is 1.33 to 1.56 ms at 1 caller and 4.2 to
+  4.5 at 10.
+
+**For task-d84.** Merging a turn's groups is not built. The writes that
+take separate syncs at low load are the ones that wait on each other's
+durability, and at load they already share. Neither reaches task-d72's
+`service` p99. What is left on the path is in series. The plan's entry
+names three levers for a design step, in the order review of #179 set.
+The first is a fresh proposal's ACCEPT row in its proposal batch, which
+takes the leader's second sync off the path at low load. The second is
+a result released once it is decided at a quorum and executed in
+memory, before its execution group is durable. The third, the leader's ACCEPT
+row deferred until the fast path fails, comes only if the fast share
+proves high.
+
+## Cost a command over executed history (R2, for task-d27)
+
+The #173 carry's `service` row lost 17% of its rate over 300 s, and the
+register runs about 10% over 120 s. task-d27's note asks whether cost a
+command rises with executed history (#174 review asked for the reading
+locally, now).
+
+**The setup.** `scripts/bench/command-cost.sh` with `MEASURED=750000`,
+`REPEATS=1`, 10 callers, three voters on one host, `replay`
+(`COORD_HARNESS_JOURNAL_PROFILE=replay`), stores on tmpfs, task-d84's
+branch's release build. About 304,000 commands executed in 400 s. Each
+voter's metrics snapshot every second, reduced to CPU a command per 30 s
+window.
+
+| Window (s) | Commands | Leader: process / domain CPU ms a command | A follower: process / domain |
+| --- | --- | --- | --- |
+| 1 to 31 | 24,813 | 1.345 / 0.490 | 1.151 / 0.404 |
+| 91 to 121 | 24,247 | 1.464 / 0.489 | 1.266 / 0.414 |
+| 181 to 211 | 24,158 | 1.450 / 0.478 | 1.275 / 0.398 |
+| 241 to 271 | 19,682 | 1.892 / 0.526 | 1.671 / 0.439 |
+| 301 to 331 | 24,203 | 1.482 / 0.482 | 1.272 / 0.398 |
+| 361 to 391 | 24,059 | 1.484 / 0.481 | 1.314 / 0.403 |
+
+**What it says:**
+- **The domain loop does not grow with history.** It holds at 0.48 to
+  0.53 ms a command at the leader and 0.39 to 0.44 at a follower, from the
+  first window to the last.
+- **The process steps up, and does not slope (#174 review).** The
+  leader's process goes from 1.345 ms a command in the first window to
+  1.45 to 1.48 in every later full window but 241 to 271 s (1.892), and a
+  follower's from 1.151 to 1.27 to 1.31. The first publication falls near
+  the end of the first window, so the 10 to 14% is the publications
+  starting, not history slowing the path.
+- **A publication grows with the position it represents:**
+
+  | Records represented | Export (s) | Write (s) |
+  | --- | --- | --- |
+  | about 73,000 | 1.0 to 1.3 | 0.2 to 0.3 |
+  | about 318,000 | 4.3 to 5.5 | 1.4 to 2.7 |
+  | about 594,000 | 8.1 to 8.8 | 5.7 to 6.2 |
+  | about 789,000 | 9.3 to 11.0 | 6.5 to 8.0 |
+
+  task-d51 moved the export off the domain thread, which is why the loop
+  stays flat.
+- **Its size.** The four publications' export and write sum to about 37
+  to 44 s against 304,000 commands, 0.12 to 0.14 ms a command a voter,
+  which is the step. That is about 16 to 26 µs a record represented: 12
+  to 18 to export, and a write that rises from about 3 to 10 µs a record
+  as the image grows. On the runner's 120 s register row, one publication
+  near 65,536 records would cost a voter about 1.1 to 1.7 s, 0.15 to 0.2
+  ms an operation over five voters.
+- **Who owns it.** task-d27's trim cannot be in the batch: trimming stays
+  off by default until task-d32, which needs task-d41's chain. So the
+  batch's lever is the publication's own cost (task-d92), starting from a
+  profile of one publication's `checkpoint` thread and a per-thread split
+  of the process's CPU per window. The trim stays the long-run bound, and
+  its first reading, the rows exported by kind at two positions, waits
+  for it.
+
+## A fresh proposal's acceptance in its proposal batch (task-d89)
+
+task-d84's reading had the leader syncing three times a command at one
+caller, each once the one before it was durable: the proposal row, its
+ACCEPT row, and the execution group. When the dependency guard passes as
+the leader proposes, the proposal batch now carries the ACCEPT row
+(design Section 4.7). The leader accepts each of its own proposals as it
+proposes it, so every later command's guard passes too: in steady state
+every fresh proposal takes the merged batch, at any load. Learning starts
+from ACCEPT, so the old order also kept the leader from committing a
+command before its proposal was durable; that gate is now explicit
+(`Learner::commit_learned_where`), and a model test pins it.
+
+**The reading.** task-d84's script, base #179's head (`df72e28`)
+against the head, alternating, two runs a side, three voters on one host,
+stores on the local disk, 2,500 operations at 1 and 10 callers. CPU is
+every voter's process a command, summed. Latency is the bench's `service`
+time for puts.
+
+| profile | callers | side | `ok`/s | leader syncs/cmd | leader protocol groups/cmd | syncs/cmd, voter mean | CPU/cmd, all voters (ms) | put p50 (ms) | put p99 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| strict | 1 | base | 755, 779 | 2.91 | 2.00 | 2.45 | 6.91, 6.43 | 2.06, 1.86 | 4.11, 4.20 |
+| strict | 1 | head | 831, 785 | 2.00 | 1.00 | 2.13 | 6.00, 6.23 | 1.76, 1.83 | 3.11, 4.60 |
+| strict | 10 | base | 1648, 1632 | 1.14, 1.16 | 0.98, 1.00 | 1.10 | 3.87, 3.90 | 5.55, 5.55 | 14.6, 15.2 |
+| strict | 10 | head | 1714, 1624 | 0.99, 0.98 | 0.66 | 1.03 | 3.59, 3.71 | 5.33, 5.52 | 12.6, 16.2 |
+| replay | 1 | base | 846, 866 | 2.91 | 2.00 | 2.45 | 5.75, 5.68 | 1.68, 1.64 | 5.92, 7.98 |
+| replay | 1 | head | 884, 853 | 2.00 | 1.00 | 2.15 | 5.47, 5.55 | 1.55, 1.57 | 8.73, 9.77 |
+| replay | 10 | base | 1822, 1804 | 1.13, 1.06 | 0.93 | 1.06 | 3.29, 3.32 | 5.09, 5.13 | 15.3, 16.2 |
+| replay | 10 | head | 1780, 1892 | 0.91, 0.90 | 0.61 | 1.01 | 3.35, 3.22 | 5.21, 4.49 | 14.6, 15.6 |
+
+**What it says:**
+- **The leader's second sync is gone.** At one caller its protocol groups
+  fall from two a command to one, and its syncs from 2.91 to 2.00, as
+  task-d84's reading predicted. At ten callers its syncs fall 14 to 18%.
+- **CPU falls with them,** 3 to 10% over the voters at one caller, and
+  flat to 5% at ten.
+- **Latency moves less than a sync.** A sync on this host's disk is
+  about 0.3 ms, and at one caller the put p50 falls 0.1 to 0.3 ms. The
+  p99 at one caller under `replay` is worse in both head runs, 8.7 and
+  9.8 ms against 5.9 and 8.0, above both base runs. The base's own two
+  runs differ by 2 ms, so two runs a side do not settle it.
+- **Read again at one caller under `replay` (#180 review):** six more
+  runs a side, alternating, with the same binaries. The host was about
+  40% slower than for the table above (`ok`/s about 530 against 860), so
+  these runs are compared with each other only.
+
+  | side | `ok`/s | put p50 (ms) | put p99 (ms) | CPU/cmd, all voters (ms) |
+  | --- | --- | --- | --- | --- |
+  | base | 475 to 550 | 2.59 to 2.97 | 9.0, 10.1, 10.5, 11.5, 12.2, 14.4 (median 11.0) | 8.50 to 9.27 |
+  | head | 504 to 571 | 2.42 to 2.59 | 6.4, 6.9, 8.8, 9.5, 12.7, 13.9 (median 9.1) | 7.84 to 8.53 |
+
+  The head's p99 isn't worse: its median is lower, and the two sides'
+  ranges overlap. Its p50 and CPU are lower in every pair, and its
+  `ok`/s is higher in five pairs of six. So the first reading's p99 was
+  noise. That fits the change: the gate keeps the leader's commit where
+  it was, after the proposal is durable, so nothing should add latency
+  at one caller. On the runner's disk a sync is about 2.3 ms, which is the
+  size the plan gave this lever.
+
+**Checks.** coord-consensus's suites. The protocol simulator at 1,000
+seeds a row and size, 13 of 13 with catch-up (1,009 s) and without
+(1,107 s).
+
+## The waits' tails on the metrics line (task-d97)
+
+The `service` row's p99 is several times its p50 (task-d72's batch),
+and the metrics line could not say which wait made it: every wait on it
+is a sum, so a reader gets a mean a command and nothing about the tail.
+Three waits now also go out as distributions:
+
+- **The leader's learned to released,** in all and by part
+  (`cost.release.distributions`: `predecessors`, `group`, `journal`,
+  `whole`), over the same commands as the sums.
+- **The read barrier's wait,** arrival to answer (`cost.reads.waited`),
+  at the barrier's millisecond resolution.
+- **The domain loop's run-queue time a pass**
+  (`cost.cpu.domain_scheduling.run_queue_per_pass`): the first pass to
+  start 10 ms or more after the last sampled one reads the thread's
+  `schedstat` at its start and again at the next pass's start, so a
+  sample is the pass's own preemptions and the wait to run once
+  something woke it. Two reads of a `/proc` file every 10 ms; the total
+  run-queue time beside it is unchanged. (It was one pass in 16 until
+  task-d115: on a busy leader that was 35 of its loop's 55 system calls
+  a turn.) Idle passes
+  outnumber working ones many times over, so the samples whose pass
+  executed a command also go into `run_queue_per_working_pass`, which
+  compares with the commands' own tails.
+
+Two more close the end-to-end account (#191 review), so a tail outside
+the three parts above reads as somewhere, not as "not in these":
+
+- **Arrival to answer at the node that took the request**
+  (`cost.answered.writes`, `cost.answered.reads`). The transport stamps
+  a request when its frame has been read off the stream, the stamp rides
+  with the caller's stream while it is held, and the wait is recorded
+  when the answer is handed back to the transport. It counts answers
+  from consensus, from the read barrier and from a retained result; an
+  answer at the door, a refusal or a binding, is not an operation's and
+  is not counted. Beside the client's latency it splits the client's
+  tail into the server's and the network's, and beside the parts it
+  says how much of the server's they hold, including what runs on the
+  transport's threads rather than the domain loop's.
+- **The leader's round, submission to learned**
+  (`cost.release.distributions.round`): a submission's arrival at the
+  leading voter's loop, the first one for a command submitted twice, to
+  the leader learning it. A command learned without a submission
+  stamped, one recovered, is not in it.
+- **The journal's and the projection's jobs, at every voter**
+  (`cost.waits.appender_jobs.served_each` and `queued_each`, the same for
+  `materializer_jobs`). Each job's served time is, for the appender, an
+  append and its sync: the disk's own tail, which tells a round's p99
+  that is the disk from one that is queueing or hops (#191 review). The
+  pipeline threads count them in `coord_storage::latency`'s buckets,
+  which the daemon's distributions use too.
+
+A distribution is cumulative like the rest of the cost: log-linear
+buckets in microseconds, four an octave from 4 µs to 2^26 µs (104
+buckets, each within a fifth of its values), with the longest value
+seen. It prints sparse, as `[bucket, count]` pairs and the longest, so
+an idle voter's line hardly grows. A quantile is read as the upper edge
+of the bucket its rank falls in, never past the longest.
+`scripts/ci/command_cost.py table` prints p50, p99 and the longest of
+each, from a voter's last snapshot, in a fourth table. A line written
+before task-d97 reads with empty distributions, which have no quantile
+rather than a zero one.

@@ -1,12 +1,15 @@
-//! task-d33: a donor serves a voter's executed-history ask at the ballot
-//! that voter last synchronized, whenever the donor is synchronized there
-//! or later (`Machine::synchronized_at_or_after`, used by
-//! `Node::serve_catch_up`).
+//! task-d81: a donor serves a voter's executed-history ask at any ballot
+//! of its epoch, whichever ballot it is synchronized at
+//! (`Machine::serves_catch_up_at`, used by `Node::serve_catch_up`).
 //!
-//! A voter that promised a ballot of its own that the others never
-//! followed, and was then refused as behind, asks at the ballot it last
-//! synchronized. Donors that answered only at their own ballot left it
-//! behind for good once the domain went quiet.
+//! task-d33 let a donor serve a voter at an earlier ballot than its own.
+//! A donor at an earlier ballot than the asker's served nothing, and a
+//! voter that alone executed the newest positions, but missed the ballot
+//! the others installed, then left them behind for good: its campaign's
+//! frontier held them from campaigning until they had executed that far,
+//! and only it could serve those positions (protocol simulator 12/5/148
+//! and 2/3/281). What it executed is a prefix of the one executed order,
+//! valid at any ballot of the epoch.
 
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -57,7 +60,7 @@ fn quorum(b: Ballot) -> BallotConfiguration {
 }
 
 #[test]
-fn a_donor_serves_a_voter_at_an_earlier_ballot() {
+fn a_donor_serves_a_voter_at_any_ballot_of_its_epoch() {
     let b2 = ballot(2, 0);
     let leader = Machine::Leader(Box::new(Leader::new(
         LeaderConfig {
@@ -70,14 +73,13 @@ fn a_donor_serves_a_voter_at_an_earlier_ballot() {
         None,
         ExecutionPosition::ZERO,
     )));
-    // At its own ballot, as before, and at every earlier one: what it
-    // executed includes everything decided there.
-    assert!(leader.synchronized_at_or_after(&b2));
-    assert!(leader.synchronized_at_or_after(&ballot(1, 1)));
-    assert!(leader.synchronized_at_or_after(&ballot(0, 0)));
+    // At its own ballot, at every earlier one (task-d33), and at a later
+    // one it never saw (task-d81).
+    assert!(leader.serves_catch_up_at(&b2));
+    assert!(leader.serves_catch_up_at(&ballot(1, 1)));
+    assert!(leader.serves_catch_up_at(&ballot(0, 0)));
+    assert!(leader.serves_catch_up_at(&ballot(3, 1)));
     assert!(!leader.synchronized_at(&ballot(1, 1)));
-    // Not ahead of itself.
-    assert!(!leader.synchronized_at_or_after(&ballot(3, 1)));
 
     let follower = Machine::Follower(Box::new(Follower::new(FollowerConfig {
         identity: identity(1),
@@ -86,14 +88,18 @@ fn a_donor_serves_a_voter_at_an_earlier_ballot() {
         frontend: FRONTEND,
         capacity: 8,
     })));
-    assert!(follower.synchronized_at_or_after(&b2));
-    assert!(follower.synchronized_at_or_after(&ballot(1, 2)));
-    assert!(!follower.synchronized_at_or_after(&ballot(3, 2)));
+    assert!(follower.serves_catch_up_at(&b2));
+    assert!(follower.serves_catch_up_at(&ballot(1, 2)));
+    // The voter of 2/3/281: synchronized at an earlier ballot than the
+    // ones asking it.
+    assert!(follower.serves_catch_up_at(&ballot(3, 2)));
+    assert!(!follower.synchronized_at(&ballot(3, 2)));
     // Another epoch is never served.
     let other = Ballot {
         epoch: ConfigurationEpoch::new(2).unwrap(),
         number: 0,
         leader: r(0),
     };
-    assert!(!leader.synchronized_at_or_after(&other));
+    assert!(!leader.serves_catch_up_at(&other));
+    assert!(!follower.serves_catch_up_at(&other));
 }

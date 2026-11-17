@@ -63,16 +63,22 @@ impl FairQueue {
 
     /// Queue a frame for its group.
     pub fn push(&mut self, queued: Queued) -> Result<(), QueueError> {
+        self.push_or_return(queued).map_err(|(error, _)| error)
+    }
+
+    /// Queue a frame for its group, or hand it back with why not, so a
+    /// caller that means to offer it again need not have kept a copy.
+    pub fn push_or_return(&mut self, queued: Queued) -> Result<(), (QueueError, Queued)> {
         match self.groups.get_mut(&queued.group) {
             Some(q) => {
                 if q.len() >= self.depth {
-                    return Err(QueueError::GroupFull);
+                    return Err((QueueError::GroupFull, queued));
                 }
                 q.push_back(queued);
             }
             None => {
                 if self.groups.len() >= self.max_groups {
-                    return Err(QueueError::TooManyGroups);
+                    return Err((QueueError::TooManyGroups, queued));
                 }
                 self.ring.push_back(queued.group);
                 self.groups
@@ -195,5 +201,30 @@ pub struct PeerTraffic {
     /// ACK frames QUIC sent on peer connections.
     pub acks_sent: u64,
     /// ACK frames QUIC received on peer connections.
+    pub acks_received: u64,
+    /// The same QUIC counts on api connections, callers' and collectors'
+    /// (task-d70), so a node's datagrams split into its two planes.
+    pub api: Datagrams,
+    /// Handshakes this node refused because an observer's or learner's
+    /// certificate named a committed voter's node
+    /// ([`crate::BindError::NonVoterNamesVoter`]). No legitimate peer
+    /// today: until a prepared transition names a staged learner's
+    /// incarnation (task-d39), above zero means an issuer signed what it
+    /// never should.
+    pub refused_voter_names: u64,
+}
+
+/// What QUIC sent and received on one class of connections (task-d70).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Datagrams {
+    /// UDP datagrams sent, acknowledgements and retransmissions included.
+    pub datagrams_sent: u64,
+    /// UDP datagrams received.
+    pub datagrams_received: u64,
+    /// The system calls that sent the datagrams.
+    pub send_calls: u64,
+    /// ACK frames sent.
+    pub acks_sent: u64,
+    /// ACK frames received.
     pub acks_received: u64,
 }

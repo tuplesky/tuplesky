@@ -147,7 +147,7 @@ class ReduceTests(unittest.TestCase):
         observed["unordered"] = {"pending": 1, "reordered": 1, "oldest": duration(30)}
         observed["release"] = {
             "commands": 20, "predecessors": duration(0.04), "group": duration(0.02),
-            "projection": duration(0.1),
+            "journal": duration(0.1),
         }
         reading = cost.per_command("n1", snap)
         paths = reading["fast_path"]
@@ -156,7 +156,11 @@ class ReduceTests(unittest.TestCase):
         self.assertEqual((paths["acks"], paths["acks_reordered"]), (26, 19))
         self.assertEqual(reading["unordered"]["oldest_seconds"], 30)
         self.assertAlmostEqual(reading["release"]["predecessors_ms"], 2.0)
-        self.assertAlmostEqual(reading["release"]["projection_ms"], 5.0)
+        self.assertAlmostEqual(reading["release"]["journal_ms"], 5.0)
+        # A binary of before task-d83 names the journal wait `projection`.
+        observed["release"]["projection"] = observed["release"].pop("journal")
+        self.assertAlmostEqual(
+            cost.per_command("n1", snap)["release"]["journal_ms"], 5.0)
         observed["fast_path"]["missed_path"] = 14
         self.assertFalse(cost.per_command("n1", snap)["fast_path"]["reasons_sum"])
         self.assertNotIn("release", cost.per_command("n1", snapshot()))
@@ -169,6 +173,8 @@ class ReduceTests(unittest.TestCase):
             "sent_lost_streams": 1, "datagrams_sent": 500, "datagrams_received": 450,
             "send_calls": 480, "acks_sent": 200, "acks_received": 210,
             "received_frames": 880, "received_bytes": 190000, "received_streams": 880,
+            "api": {"datagrams_sent": 400, "datagrams_received": 390, "send_calls": 395,
+                    "acks_sent": 150, "acks_received": 160},
         }}
         jobs = lambda n, q, s, c: {"count": n, "queued": duration(q), "served": duration(s),
                                    "completed": duration(c)}
@@ -183,6 +189,8 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(traffic["sent_frames"], 9.0)
         self.assertAlmostEqual(traffic["received_bytes"], 1900.0)
         self.assertAlmostEqual(traffic["sent_lost"], 0.02)
+        self.assertAlmostEqual(traffic["api_datagrams_sent"], 4.0)
+        self.assertAlmostEqual(traffic["api_acks_sent"], 1.5)
         self.assertAlmostEqual(reading["frames_per_stream_sent"], 3.0)
         self.assertAlmostEqual(reading["frames_per_stream_received"], 1.0)
         self.assertAlmostEqual(reading["frames_per_lost_stream"], 2.0)
@@ -194,6 +202,51 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("9.00/8.80 (3.00/8.80)", table)
         self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
+
+    def test_what_a_leader_sent_is_read_per_command_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["proposals"] = {
+            "proposals": 400, "proposal_bytes": 48000, "payload_bytes": 120000,
+            "frames": 50, "framed": 300, "frontiers": 74, "frontier_bytes": 2960,
+        }
+        reading = cost.per_command("n1", snap)
+        sent = reading["proposals_per_command"]
+        self.assertAlmostEqual(sent["proposals"], 4.0)
+        self.assertAlmostEqual(sent["frames"], 0.5)
+        self.assertAlmostEqual(sent["frontiers"], 0.74)
+        self.assertAlmostEqual(sent["frontier_bytes"], 29.6)
+        table = cost.paths_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 4.00/0.50/0.74 |", table)
+        # A follower sent nothing as leader, and an older binary has no
+        # counts: neither reads as zero.
+        follower = snapshot()
+        follower["cost"]["Observed"]["proposals"] = dict.fromkeys(
+            snap["cost"]["Observed"]["proposals"], 0)
+        self.assertNotIn("proposals_per_command", cost.per_command("n2", follower))
+        self.assertNotIn("proposals_per_command", cost.per_command("n1", snapshot()))
+        row = cost.paths_table({"runs": [{"callers": 1, "voters": [
+            cost.per_command("n2", follower)]}]}).splitlines()[-1]
+        self.assertEqual(row.count("|"), cost.paths_table(
+            {"runs": []}).splitlines()[0].count("|"))
+
+    def test_journal_groups_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=100, appends=180, syncs=190)
+        snap["cost"]["Observed"]["journal_groups"] = {
+            "protocol": 90, "application": 60, "both": 20, "other": 10,
+            "protocol_records": 330, "payload_records": 100, "application_records": 100,
+        }
+        reading = cost.per_command("n1", snap)
+        groups = reading["groups_per_command"]
+        self.assertAlmostEqual(groups["protocol"], 0.9)
+        self.assertAlmostEqual(groups["both"], 0.2)
+        self.assertAlmostEqual(groups["not_a_group"], 0.1)
+        self.assertAlmostEqual(reading["protocol_records_per_group"], 3.0)
+        self.assertAlmostEqual(reading["commands_per_execution_group"], 1.25)
+        self.assertAlmostEqual(reading["payload_records_per_command"], 1.0)
+        table = cost.groups_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 1 | n1 | 1.900 | 0.900 | 0.600 | 0.200 | 0.100 | 0.100 "
+                      "| 3.30 (1.00) | 3.00 | 1.25 |", table)
+        self.assertNotIn("groups_per_command", cost.per_command("n1", snapshot()))
 
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):
@@ -233,6 +286,92 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reading["appender_wait_ms_per_command"], 0.5)
         self.assertAlmostEqual(reading["materializer_wait_ms_per_command"], 0.1)
         self.assertNotIn("appender_wait_ms_per_command", cost.per_command("n1", snapshot()))
+
+    def test_the_tails_are_read_from_the_distributions_when_reported(self):
+        snap = snapshot()
+        # 98 waits of 1 ms (bucket 35: 896 to 1023 us), one of 12 ms
+        # (bucket 49: 10240 to 12287 us) and one of 40 ms (bucket 56).
+        waits = {"buckets": [[35, 98], [49, 1], [56, 1]], "max": duration(0.040)}
+        snap["cost"]["Observed"]["release"] = {
+            "commands": 100, "predecessors": duration(0.1), "group": duration(0.0),
+            "journal": duration(0.2),
+            "distributions": {"whole": waits, "journal": {"buckets": [], "max": duration(0)}},
+        }
+        snap["cost"]["Observed"]["reads"] = {
+            "served": 1, "refused": 0, "rounds": 1, "confirmed": 1,
+            "waited_confirm_ms": 1, "waited_index_ms": 2, "waited_ms": 3,
+            "waited": {"buckets": [[41, 1]], "max": duration(0.003)},
+        }
+        snap["cost"]["Observed"]["cpu"] = {"Observed": {
+            "domain": duration(0.3), "process": duration(0.9),
+            "domain_scheduling": {"Observed": {
+                "run_queue": duration(1.0), "voluntary": 1, "involuntary": 1,
+                "run_queue_per_pass": {"buckets": [[0, 30], [28, 2]],
+                                       "max": duration(0.000300)},
+            }},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        whole = tails["release_whole"]
+        self.assertEqual(whole["count"], 100)
+        self.assertAlmostEqual(whole["p50_ms"], 1.024)
+        self.assertAlmostEqual(whole["p99_ms"], 12.288)
+        self.assertAlmostEqual(whole["max_ms"], 40.0)
+        # A distribution that counted nothing has no quantile, not zero.
+        self.assertNotIn("release_journal", tails)
+        self.assertAlmostEqual(tails["read_waited"]["p99_ms"], 3.0)
+        per_pass = tails["run_queue_per_pass"]
+        self.assertAlmostEqual(per_pass["p50_ms"], 0.001)
+        self.assertAlmostEqual(per_pass["max_ms"], 0.3)
+        table = cost.tails_table({"runs": [{"callers": 1, "voters": [
+            {"node": "n1", "tails": tails}]}]})
+        self.assertIn("| 1 | n1 | -- | -- | -- | 1.02/12.29/40.00 (100) | -- |", table)
+        self.assertNotIn("tails", cost.per_command("n1", snapshot()))
+
+    def test_the_end_to_end_tails_are_read_when_reported(self):
+        snap = snapshot()
+        one_ms = {"buckets": [[35, 4]], "max": duration(0.001)}
+        snap["cost"]["Observed"]["answered"] = {"writes": one_ms, "reads": one_ms}
+        snap["cost"]["Observed"]["release"] = {
+            "commands": 4, "predecessors": duration(0), "group": duration(0),
+            "journal": duration(0), "distributions": {"round": one_ms},
+        }
+        snap["cost"]["Observed"]["cpu"] = {"Observed": {
+            "domain": duration(0.3), "process": duration(0.9),
+            "domain_scheduling": {"Observed": {
+                "run_queue": duration(1.0), "voluntary": 1, "involuntary": 1,
+                "run_queue_per_working_pass": one_ms,
+            }},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        for name in ("answered_writes", "answered_reads", "release_round",
+                     "run_queue_per_working_pass"):
+            self.assertEqual(tails[name]["count"], 4, name)
+            self.assertAlmostEqual(tails[name]["p99_ms"], 1.0, msg=name)
+        self.assertNotIn("run_queue_per_pass", tails)
+
+    def test_the_jobs_tails_are_read_when_reported(self):
+        snap = snapshot()
+        syncs = {"buckets": [[41, 9], [49, 1]], "max": duration(0.012)}
+        snap["cost"]["Observed"]["waits"] = {"Observed": {
+            "appender": {"count": 0, "time": duration(0)},
+            "materializer": {"count": 0, "time": duration(0)},
+            "appender_jobs": {"count": 10, "queued": duration(0), "served": duration(0.03),
+                              "completed": duration(0), "served_each": syncs},
+            "materializer_jobs": {"count": 0, "queued": duration(0), "served": duration(0),
+                                  "completed": duration(0)},
+        }}
+        tails = cost.per_command("n1", snap)["tails"]
+        self.assertEqual(tails["journal_served"]["count"], 10)
+        self.assertAlmostEqual(tails["journal_served"]["p50_ms"], 3.072)
+        self.assertAlmostEqual(tails["journal_served"]["max_ms"], 12.0)
+        for absent in ("journal_queued", "projection_served", "projection_queued"):
+            self.assertNotIn(absent, tails)
+
+    def test_the_bucket_edges_match_the_daemons(self):
+        # Four a power of two: 4..7 us one each, then 8, 10, 12, 14.
+        self.assertEqual([cost.bucket_lower(i) for i in range(12)],
+                         [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14])
+        self.assertEqual(cost.bucket_lower(cost.DISTRIBUTION_BUCKETS - 1), 7 << 24)
 
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):

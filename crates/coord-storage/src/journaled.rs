@@ -87,7 +87,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch};
+use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch, StoreUpdate};
 use coord_core::event::{StorageError, StorageEvent};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalError, JournalFailure};
@@ -106,6 +106,7 @@ use coord_journal_api::stream::{
 };
 use coord_store_api::engine::{CommitFailure, EngineError, LocalEngine, SnapshotSource, WriteTxn};
 use coord_store_api::envelope::AppliedStamp;
+use coord_store_api::registry::Collection;
 use coord_store_api::seq::StoreSeq;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
@@ -114,7 +115,8 @@ use coord_types::ids::{
 };
 
 use crate::cut::{CutOverlay, RecoveryCut};
-use crate::lowering::{DurableMeta, ExecutionFrontier, batch_bytes, lower_update};
+use crate::intake::{Assigner, IndexDelta, IntakeIndex};
+use crate::lowering::{DurableMeta, ExecutionFrontier, Lowered, batch_bytes};
 use crate::view::{Frontier, GatedReader};
 
 /// Durability profile implemented here (design Section 17.3.4): journal
@@ -205,6 +207,32 @@ pub struct DurableCadence {
     pub commits: NonZeroU32,
     /// Records at most applied by working commits between durable ones.
     pub records: NonZeroU32,
+}
+
+/// How long a pipelined replay-backed projection holds the records it is
+/// owed before it commits them (task-d86): until `records` are pending,
+/// `wait` has passed since the first of them was, or something asks for
+/// the commit ([`JournaledStore::request_projection_commit`]), whichever
+/// comes first.
+///
+/// A commit costs the pages each random-keyed table copies once a
+/// transaction, besides what its rows cost, so a commit of more records
+/// costs less a record. What a held commit changes is only when the
+/// projection shows a record: the journal has it durable already, and a
+/// crash replays it as it replays any working commit. Whatever reads the
+/// projection and waits for a record asks for the next commit, so the
+/// hold bounds only what nobody waits on.
+///
+/// Only under the replay profile, and only with a materializer: under
+/// `strict` every commit is the record's durability as well
+/// (design Section 17.3.4), and a store that materializes on the
+/// caller's thread commits when the caller lowers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitHold {
+    /// Pending records at which the commit goes out whatever the time.
+    pub records: NonZeroU32,
+    /// The longest a pending record waits for its commit to go out.
+    pub wait: Duration,
 }
 
 /// What a replay-backed projection has committed since it was last
@@ -361,6 +389,9 @@ pub enum JournaledError {
     /// A checkpoint pointer is already queued for the journal worker and
     /// its outcome has not been taken (task-d66).
     CheckpointQueued,
+    /// A commit hold was asked of a projection under the strict profile,
+    /// where a commit is a record's durability (task-d86).
+    HoldUnderStrict,
 }
 
 impl fmt::Display for JournaledError {
@@ -387,6 +418,9 @@ impl fmt::Display for JournaledError {
             }
             JournaledError::CheckpointQueued => {
                 f.write_str("a checkpoint pointer is already queued for the journal")
+            }
+            JournaledError::HoldUnderStrict => {
+                f.write_str("a projection commit hold under the strict profile")
             }
         }
     }
@@ -656,8 +690,10 @@ struct Domain<E: LocalEngine> {
     /// Durable records waiting for the projection, in journal order.
     pending: Vec<Durable>,
     /// Projection metadata an uncertain materialization would have
-    /// produced, and how many of the front `pending` records it took.
-    pending_meta: Option<(DurableMeta, usize)>,
+    /// produced, how many of the front `pending` records it took, and its
+    /// changes to the index by command, published only if it landed
+    /// (task-d113, rule (d)).
+    pending_meta: Option<(DurableMeta, usize, IndexDelta)>,
     /// How many durable records a [`Materializer`] is committing to the
     /// projection with the lent engine (task-d52). They come before
     /// `pending` in journal order, and the job carries them: its outcome
@@ -677,6 +713,75 @@ struct Domain<E: LocalEngine> {
     /// from [`JournaledStore::queue_checkpoint`] to
     /// [`JournaledStore::take_published`].
     checkpoint: Option<Queued>,
+    /// Since when `pending` has held records no commit has been lent
+    /// (task-d86): what the hold's `wait` is counted from.
+    held_since: Option<Instant>,
+    /// Something reading the projection waits for a record (task-d86):
+    /// commits go out whatever the hold says until one is lent that
+    /// carries everything submitted when the ask was made.
+    commit_asked: Option<CommitAsk>,
+    /// Who made the standing ask, for the count of what ended each hold
+    /// ([`HoldEnds`]): the latest, since a later ask replaces an earlier.
+    ask_cause: AskCause,
+    /// What the commit lent now spent (#238 review): the ask it carried
+    /// out, with its cause, and the hold's start. A commit that gives its
+    /// records back puts them back, as the caller's thread leaves them,
+    /// so the records are due when they were and the ask stands.
+    lent_spent: Option<LentSpent>,
+}
+
+/// The ask and the hold's start a lent commit spent (#238 review).
+#[derive(Clone, Copy, Debug)]
+struct LentSpent {
+    ask: Option<(CommitAsk, AskCause)>,
+    held_since: Option<Instant>,
+}
+
+/// Who asked for a projection commit (task-d86), for the count of what
+/// ended each hold ([`HoldEnds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AskCause {
+    /// A read due and not yet answerable from the projection.
+    Read,
+    /// A look for a half-established entry's execution record.
+    Settle,
+    /// Anything else: a release published again, a group's effects
+    /// beyond its results, a watch's events, a drain.
+    #[default]
+    Other,
+}
+
+/// What ended the hold of each commit lent while a hold applies
+/// (task-d86, the lead on #185): the records reached the hold's count,
+/// its wait ran out, or an ask cut it short, by who asked. Each commit is
+/// counted once, in the first that applies in that order, so an ask is
+/// counted only where the hold would otherwise have gone on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldEnds {
+    /// The records held reached the hold's count.
+    pub full: u64,
+    /// The hold's wait ran out.
+    pub deadline: u64,
+    /// A read's ask.
+    pub read: u64,
+    /// A half-established entry's look for its record.
+    pub settle: u64,
+    /// Any other ask.
+    pub other: u64,
+}
+
+/// How far an ask for a projection commit reaches (task-d86): the
+/// records submitted when it was made, which a commit lent must carry
+/// before the ask is spent. A commit lent with only records held from
+/// before leaves it standing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitAsk {
+    /// The last submission queued when the ask was made, not yet in a
+    /// group: its journal sequence is not known until it is sealed.
+    Queued(BarrierId),
+    /// The last journal sequence submitted when the ask was made, in a
+    /// group out or already durable.
+    Through(LocalJournalSeq),
 }
 
 /// A checkpoint pointer on its way through the journal worker (task-d66).
@@ -713,6 +818,18 @@ pub struct Replayed {
     pub through: LocalJournalSeq,
     /// How long the replay took.
     pub took: Duration,
+    /// How long the index by command of the intake-keyed rows took to
+    /// build from the rows, before the replay (task-d113). It grows with
+    /// the live intake-keyed rows.
+    pub intake_index: Duration,
+    /// Entries in the intake index.
+    pub intake_entries: usize,
+    /// How long the key index of the retained event rows took to build,
+    /// before the replay (task-d105). It grows with the event rows
+    /// retained.
+    pub key_index: Duration,
+    /// Versions in the key index.
+    pub key_versions: usize,
 }
 
 impl Replayed {
@@ -837,6 +954,49 @@ impl<E: LocalEngine> Domain<E> {
             self.queued_bytes = self
                 .queued_bytes
                 .saturating_sub(batch_bytes(&submission.batch));
+            // Sealed now: the head has reserved its sequences (each seal
+            // reserves before it dequeues), so the ask that named it
+            // reaches the group's last.
+            if self.commit_asked == Some(CommitAsk::Queued(submission.batch.barrier)) {
+                self.commit_asked = Some(CommitAsk::Through(self.submitted_through()));
+            }
+        }
+    }
+
+    /// The last journal sequence sealed into a group: the outstanding
+    /// group's last, whatever its outcome turns out to be, or the
+    /// durable head with none out.
+    fn submitted_through(&self) -> LocalJournalSeq {
+        match self.head.state() {
+            HeadState::Pending(p) | HeadState::Uncertain(p) => p.last,
+            HeadState::Idle => self.head.durable(),
+        }
+    }
+
+    /// Ask for commits that carry everything submitted so far (task-d86).
+    /// A later ask reaches as far as an earlier one and further, so it
+    /// replaces it.
+    fn ask_for_commit(&mut self, cause: AskCause) {
+        self.ask_cause = cause;
+        self.commit_asked = Some(match self.queue.back() {
+            Some(last) => CommitAsk::Queued(last.batch.barrier),
+            None => CommitAsk::Through(self.submitted_through()),
+        });
+    }
+
+    /// Whether the commit lent now spends the ask (task-d86). It carries
+    /// every durable record not materialized, so it spends an ask whose
+    /// records are durable. One whose submission was dropped unjournaled
+    /// is spent too: nothing it waits for is coming. A sequence a
+    /// definite failure released is taken again by the next record, so
+    /// an ask for it stands at most until that record is lent.
+    fn ask_spent(&self) -> bool {
+        match self.commit_asked {
+            None => true,
+            Some(CommitAsk::Queued(barrier)) => {
+                !self.queue.iter().any(|s| s.batch.barrier == barrier)
+            }
+            Some(CommitAsk::Through(seq)) => seq <= self.frontiers.durable(),
         }
     }
 
@@ -901,6 +1061,12 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     syncs: Option<u64>,
     /// How projections commit (task-j06).
     profile: ProjectionProfile,
+    /// How long a pipelined replay-backed projection holds its records
+    /// for a larger commit (task-d86).
+    hold: Option<CommitHold>,
+    /// Hand-offs that held a domain's records rather than lend them
+    /// (task-d86; diagnostic).
+    holds: u64,
     /// What times a publication's steps on the calling thread (task-d66).
     thread_clock: Option<ThreadClock>,
 }
@@ -998,6 +1164,70 @@ pub struct LoweringCost {
     pub appends: u64,
     /// Projection transactions committed.
     pub commits: u64,
+    /// What the groups appended held (task-d84).
+    pub groups: GroupMix,
+    /// What ended the hold of each commit lent while a hold applies
+    /// (task-d86).
+    pub hold_ends: HoldEnds,
+}
+
+/// What the journal groups a store appended held, by the records in
+/// them (task-d84): which of a turn's writes each synced group carried.
+///
+/// Every group is counted once, in the first of `protocol`, `application`
+/// and `both` that it fits, or as `other` when it holds neither kind:
+/// a checkpoint pointer alone, or a lifecycle record. The record counts
+/// are over every group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupMix {
+    /// Groups of protocol transitions and no application outcome.
+    pub protocol: u64,
+    /// Groups of application outcomes and no protocol transition.
+    pub application: u64,
+    /// Groups holding both.
+    pub both: u64,
+    /// Groups holding neither.
+    pub other: u64,
+    /// Protocol transitions journaled: promises, votes, adoptions and
+    /// Sync bindings.
+    pub protocol_records: u64,
+    /// Of those, the ones carrying a command's payload row.
+    pub payload_records: u64,
+    /// Application records journaled: one an executed command, or one a
+    /// group's record of several (the batching-rule doc's 10.7, step 1).
+    pub application_records: u64,
+}
+
+impl GroupMix {
+    /// Count one group of `sealed` entries.
+    fn count(&mut self, sealed: &[Sealed]) {
+        let payload = Collection::PayloadV1.id();
+        let (mut protocol, mut application) = (0u64, 0u64);
+        for (_, _, records) in sealed {
+            for item in records {
+                match item.record.body() {
+                    RecordBody::ProtocolTransition { updates, .. } => {
+                        protocol += 1;
+                        if updates.iter().any(|u| u.collection == payload) {
+                            self.payload_records += 1;
+                        }
+                    }
+                    RecordBody::ApplicationOutcome { .. } | RecordBody::ApplicationGroup { .. } => {
+                        application += 1
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.protocol_records += protocol;
+        self.application_records += application;
+        match (protocol > 0, application > 0) {
+            (true, false) => self.protocol += 1,
+            (false, true) => self.application += 1,
+            (true, true) => self.both += 1,
+            (false, false) => self.other += 1,
+        }
+    }
 }
 
 impl LoweringCost {
@@ -1032,6 +1262,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             cost: LoweringCost::default(),
             syncs: journal.syncs(),
             profile: ProjectionProfile::Strict,
+            hold: None,
+            holds: 0,
             thread_clock: None,
             journal: Some(journal),
             appender: None,
@@ -1244,6 +1476,23 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         let frontiers = Frontiers::recovered(durable, applied.materialized, baseline)?;
         let gate = Arc::new(Frontier::default());
+        // The index by command of the intake-keyed rows (task-d113), from
+        // the rows themselves; a store of another layout is refused here,
+        // before anything is replayed into it.
+        let snapshot = reader.snapshot()?;
+        let building = Instant::now();
+        let intake = IntakeIndex::build(&snapshot, applied.materialized.get())?;
+        let intake_entries = intake.len();
+        gate.install_index(intake);
+        let intake_index = building.elapsed();
+        // The key index of the retained event rows (task-d105), from the
+        // same snapshot, before the replay lowers into it.
+        let building = Instant::now();
+        let keys = crate::kv_index::KvIndex::build(&snapshot)?;
+        let key_versions = keys.versions();
+        gate.install_kv_index(keys);
+        let key_index = building.elapsed();
+        drop(snapshot);
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
             origin,
@@ -1271,8 +1520,16 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 from: applied.materialized,
                 through: applied.materialized,
                 took: Duration::ZERO,
+                intake_index,
+                intake_entries,
+                key_index,
+                key_versions,
             },
             checkpoint: None,
+            held_since: None,
+            commit_asked: None,
+            lent_spent: None,
+            ask_cause: AskCause::Other,
         };
         let started = Instant::now();
         Self::replay(
@@ -1670,6 +1927,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.head.complete_durable(barrier)?;
                 state.frontiers.advance_durable(record.seq())?;
                 state.head_digest = record.digest();
+                state.held_since.get_or_insert_with(Instant::now);
                 state.pending.push(Durable {
                     barrier: None,
                     record,
@@ -1782,6 +2040,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             && state.projection_durable < pointer.represented
         {
             state.working.requested = true;
+            // The pointer waits for the projection, so its commit is not
+            // held (task-d86).
+            state.ask_for_commit(AskCause::Other);
         }
         state.checkpoint = Some(Queued {
             pointer: *pointer,
@@ -1825,6 +2086,55 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         self.domains
             .get(&domain)
             .is_some_and(|d| d.checkpoint.is_some())
+    }
+
+    /// Show `visit` every update of `domain`'s journaled records the
+    /// projection `engine` has not applied, `(M, J]`, in order, without
+    /// applying any: the first answer `visit` gives is returned with the
+    /// record's sequence, and nothing after it is read. A start uses it to
+    /// refuse a record before the attach's replay writes anything (an
+    /// activation of a feature this build can't do; Codex on #98, as
+    /// #212 does). It reads what [`attach`](Self::attach) would replay and
+    /// verifies nothing; the replay verifies the chain.
+    pub fn scan_unapplied<T>(
+        &self,
+        domain: DomainId,
+        engine: &E,
+        mut visit: impl FnMut(&StoreUpdate) -> Option<T>,
+    ) -> Result<Option<(LocalJournalSeq, T)>, JournaledError> {
+        let key = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: self.incarnation,
+        };
+        let Some(stream) = self.allocator.lookup(&key) else {
+            return Ok(None);
+        };
+        let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
+        let durable = journal.durable_head(stream)?;
+        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let mut after = AppliedFrontier::from_stamp(&meta.stamp).materialized;
+        while after < durable {
+            let page = journal.read_suffix(stream, after, self.limits.read)?;
+            let Some(last) = page.records.last() else {
+                break;
+            };
+            after = last.seq();
+            for record in &page.records {
+                if record.seq() > durable {
+                    return Ok(None);
+                }
+                for update in record.body().updates() {
+                    if let Some(answer) = visit(update) {
+                        return Ok(Some((record.seq(), answer)));
+                    }
+                }
+            }
+            if page.exhausted {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `engine`, the projection a boot found, continues `domain`'s
@@ -2099,12 +2409,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             _ => return Err(SubmitRefused::BaseMismatchedKind),
         };
         check_update_bounds(&submission.batch, &submission.kind).map_err(SubmitRefused::Record)?;
-        let bytes = batch_bytes(&submission.batch);
-        if bytes.saturating_add(RECORD_HEADER_ALLOWANCE) > MAX_RECORD_BYTES {
-            // Refused here rather than at sealing time, so a batch that
-            // could never become a valid record never occupies the queue.
-            return Err(SubmitRefused::Record(RecordError::TooLarge));
+        // Refused here rather than at sealing time, so a batch that could
+        // never become a valid record never occupies the queue. An
+        // application's batch is measured first by the applier, at every
+        // voter, with the same function, so it reaches here only when it
+        // fits.
+        if let Some(refusal) = record_refusal(&submission.batch) {
+            return Err(SubmitRefused::Record(refusal));
         }
+        let bytes = batch_bytes(&submission.batch);
         if state.queue.len() >= limits.max_queued_per_domain
             || state.queued_bytes + bytes > limits.max_queued_bytes_per_domain
         {
@@ -2475,6 +2788,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         sealed: Vec<Sealed>,
         written: GroupWritten,
     ) -> Result<FlushReport, JournaledError> {
+        self.cost.groups.count(&sealed);
         let mut report = FlushReport {
             appends: 1,
             ..FlushReport::default()
@@ -2502,6 +2816,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                 journal_seq: record.seq(),
                             });
                         }
+                        state.held_since.get_or_insert_with(Instant::now);
                         state.pending.push(item);
                     }
                     // The pointer this entry carried is durable, and its
@@ -2929,6 +3244,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                                     journal_seq: item.record.seq(),
                                 });
                             }
+                            state.held_since.get_or_insert_with(Instant::now);
                             state.pending.push(item);
                         }
                         state.status = DomainStatus::Ready;
@@ -2956,12 +3272,20 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
             }
             DomainStatus::MaterializationUncertain => {
-                let (expected, taken) = state.pending_meta.ok_or(JournaledError::Quarantined(
-                    "uncertain materialization without the metadata it wrote",
-                ))?;
+                let (expected, taken) = state
+                    .pending_meta
+                    .as_ref()
+                    .map(|(meta, taken, _)| (*meta, *taken))
+                    .ok_or(JournaledError::Quarantined(
+                        "uncertain materialization without the metadata it wrote",
+                    ))?;
                 let observed = DurableMeta::read(&state.reader.snapshot()?)?;
                 if observed == expected {
                     state.meta = observed;
+                    // The commit landed: its changes to the index are
+                    // published before the gate moves to it.
+                    let (_, _, delta) = state.pending_meta.take().expect("read above");
+                    state.gate.publish_index(delta, observed.stamp.store_seq());
                     state.gate.set_completed(observed.stamp.store_seq());
                     state
                         .frontiers
@@ -2971,6 +3295,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // ran, and those are still owed.
                     let taken = taken.min(state.pending.len());
                     let applied: Vec<Durable> = state.pending.drain(..taken).collect();
+                    if state.pending.is_empty() {
+                        state.held_since = None;
+                    }
                     report.materialized = applied.len();
                     report.commits = 1;
                     for item in applied {
@@ -3052,10 +3379,58 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             return Err(CutError::NotReady(state.status));
         }
         let reader = GatedReader::new(state.reader.clone(), state.gate.clone());
-        let snapshot = reader.snapshot().map_err(CutError::View)?;
         let durable = state.frontiers.durable();
+        // The overlay lays the suffix's rows at the keys materialization
+        // will write, over the index as of the snapshot's stamp (task-d113,
+        // rule (e)). When the index moves: a commit's changes are published
+        // as the commit returns, on whichever thread ran it, before the gate
+        // moves to it and before the store takes it back. So a snapshot the
+        // gate hands out, one commit ahead of the take-back or not, has an
+        // index at its stamp, and the cut never reads the store's own state
+        // of the take-back. Only a commit that publishes between the
+        // snapshot and the index's lock leaves the index ahead of it; the
+        // cut is then taken again over the newer snapshot.
+        for _ in 0..CUT_ATTEMPTS {
+            let snapshot = reader.snapshot().map_err(CutError::View)?;
+            let records = self.cut_suffix(state, &snapshot, durable)?;
+            let index = state.gate.index();
+            if index.stamp() != snapshot.meta().stamp.journal_seq().get() {
+                continue;
+            }
+            let mut assigner = Assigner::new(&index);
+            let mut overlay = CutOverlay::new();
+            for record in &records {
+                overlay
+                    .extend_assigned(
+                        &mut assigner,
+                        record.seq().get(),
+                        record.body().updates(),
+                        snapshot.view(),
+                    )
+                    .map_err(|e| CutError::View(crate::view::ViewError::Engine(e)))?;
+            }
+            drop(assigner);
+            drop(index);
+            return Ok(RecoveryCut::new(snapshot, overlay, durable));
+        }
+        Err(CutError::View(crate::view::ViewError::Engine(
+            EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                "the projection moved on under every attempt at a cut",
+            ),
+        )))
+    }
+
+    /// The records durable through `durable` and past `snapshot`'s stamp,
+    /// verified, in journal order.
+    fn cut_suffix(
+        &self,
+        state: &Domain<E>,
+        snapshot: &crate::view::GatedView<<E::Reader as SnapshotSource>::View>,
+        durable: LocalJournalSeq,
+    ) -> Result<Vec<JournalRecordV1>, CutError> {
         let mut seq = snapshot.meta().stamp.journal_seq();
-        let mut overlay = CutOverlay::new();
+        let mut records = Vec::new();
         if seq < durable {
             let mut expect = RecordExpectation {
                 origin: state.origin,
@@ -3089,12 +3464,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     expect = expect
                         .after(&record)
                         .map_err(|e| CutError::Journal(e.into()))?;
-                    overlay.extend(record.body().updates());
                     seq = record.seq();
+                    records.push(record);
                 }
             }
         }
-        Ok(RecoveryCut::new(snapshot, overlay, durable))
+        Ok(records)
     }
 
     /// Apply one domain's durable records atomically, on this thread.
@@ -3123,6 +3498,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // redo would be dropped while the domain stayed ready, and a
         // later record could stamp the projection past it for good.
         let next = state.frontiers.materialized().checked_next().ok();
+        let mut held = None;
         let commit = match project(
             engine,
             &pending,
@@ -3131,6 +3507,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             &state.gate,
             durable,
             &mut failure,
+            &mut held,
         ) {
             Ok(commit) => commit,
             Err(e) => {
@@ -3152,6 +3529,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.pending_meta = None;
                 state.status = DomainStatus::Ready;
                 state.committed(durable, pending.len());
+                // This commit carried everything held (task-d86): the hold
+                // runs again from the next record to arrive, and an ask
+                // whose records were among these is spent, as a lent
+                // commit spends it. Left set, the next record would count
+                // its wait from records already committed and go out at
+                // once. Only a commit that took the records does this: one
+                // that gave them back leaves their wait, and the ask, as
+                // they were, so they are still due when they were.
+                state.held_since = None;
+                if state.ask_spent() {
+                    state.commit_asked = None;
+                }
                 report.commits = 1;
                 report.materialized = pending.len();
                 for item in pending {
@@ -3173,7 +3562,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             Err(CommitFailure::Indeterminate(_)) => {
                 let taken = pending.len();
                 state.pending = pending;
-                state.pending_meta = Some((meta, taken));
+                state.pending_meta = Some((meta, taken, held.unwrap_or_default()));
                 state.status = DomainStatus::MaterializationUncertain;
                 report.indeterminate = true;
             }
@@ -3217,6 +3606,98 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// How projections commit (task-j06).
     pub fn projection_profile(&self) -> ProjectionProfile {
         self.profile
+    }
+
+    /// Hold a pipelined projection's records for larger commits from now
+    /// on (task-d86), as `hold` bounds it. It applies under the replay
+    /// profile with a materializer, and nowhere else; refused over the
+    /// strict profile, where a held commit would hold a record's
+    /// durability.
+    pub fn hold_projection_commits(&mut self, hold: CommitHold) -> Result<(), JournaledError> {
+        if matches!(self.profile, ProjectionProfile::Strict) {
+            return Err(JournaledError::HoldUnderStrict);
+        }
+        self.hold = Some(hold);
+        Ok(())
+    }
+
+    /// The commit hold, if one is set (task-d86).
+    pub fn commit_hold(&self) -> Option<CommitHold> {
+        self.hold
+    }
+
+    /// Hand-offs that held a domain's records rather than lend them
+    /// (task-d86; diagnostic).
+    pub fn commit_holds(&self) -> u64 {
+        self.holds
+    }
+
+    /// Ask for every domain's next projection commit to go out at the
+    /// next hand-off, whatever the hold says (task-d86): for a caller
+    /// that waits for the projection to show a record -- a read held at
+    /// the barrier, a release or watch event held for its group's
+    /// commit, a lookup of an execution record. It waits for nothing:
+    /// the caller hands off as it does already, and
+    /// [`JournaledStore::projection_commit_due`] says it is due now.
+    ///
+    /// The ask reaches every record submitted when it is made, and
+    /// stands until a commit carrying them all is lent. So a record still
+    /// on its way to the journal goes out with the commit that carries
+    /// it, not after the hold, even if a commit of records held from
+    /// before is lent first.
+    pub fn request_projection_commit(&mut self) {
+        self.request_projection_commit_for(AskCause::Other);
+    }
+
+    /// [`JournaledStore::request_projection_commit`], saying who asks, for
+    /// the count of what ended each hold (task-d86).
+    pub fn request_projection_commit_for(&mut self, cause: AskCause) {
+        if self.hold.is_none() {
+            return;
+        }
+        for state in self.domains.values_mut() {
+            state.ask_for_commit(cause);
+        }
+    }
+
+    /// When the next held projection commit is due to go out
+    /// (task-d86): the earliest of the domains whose records are held,
+    /// at their `wait` or now if one was asked for. `None` when nothing
+    /// is held. A caller that hands off on events alone calls
+    /// [`JournaledStore::hand_off`] at this time too, since nothing
+    /// arrives to say a hold has run out.
+    pub fn projection_commit_due(&self) -> Option<Instant> {
+        let hold = self.held_hold()?;
+        self.domains
+            .values()
+            // What a hand-off would lend: it skips a domain quarantined
+            // or with a commit in doubt, so those are not due either.
+            .filter(|d| {
+                d.lent.is_none()
+                    && !d.pending.is_empty()
+                    && !matches!(
+                        d.status,
+                        DomainStatus::Quarantined | DomainStatus::MaterializationUncertain
+                    )
+            })
+            .filter_map(|d| {
+                let since = d.held_since?;
+                Some(if d.commit_asked.is_some() {
+                    since
+                } else {
+                    since + hold.wait
+                })
+            })
+            .min()
+    }
+
+    /// The hold, where it applies: a replay-backed projection with a
+    /// materializer.
+    fn held_hold(&self) -> Option<CommitHold> {
+        match self.profile {
+            ProjectionProfile::Replay(_) if self.materializer.is_some() => self.hold,
+            _ => None,
+        }
     }
 
     /// Time a publication's steps on the calling thread with `clock` from
@@ -3371,6 +3852,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // left the thread.
         let mut refused = Vec::new();
         let profile = self.profile;
+        let hold = match profile {
+            ProjectionProfile::Replay(_) => self.hold,
+            ProjectionProfile::Strict => None,
+        };
+        let now = Instant::now();
         while let Some(done) = materializer.try_take() {
             let domain = done.domain();
             let result = take_back(&mut self.domains, done);
@@ -3392,6 +3878,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
         }
         for (id, state) in &mut self.domains {
+            // The hold runs from when the records arrived, even if a
+            // commit was out then (stamped as they joined `pending`);
+            // records given back by a commit that did not take them wait
+            // from now at the latest.
+            if !state.pending.is_empty() {
+                state.held_since.get_or_insert(now);
+            }
             if state.lent.is_some()
                 || state.pending.is_empty()
                 || refused.contains(id)
@@ -3402,9 +3895,42 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             {
                 continue;
             }
+            let since = state.held_since.unwrap_or(now);
+            if let Some(hold) = hold
+                && state.commit_asked.is_none()
+                && state.pending.len() < hold.records.get() as usize
+                && now.saturating_duration_since(since) < hold.wait
+            {
+                self.holds += 1;
+                continue;
+            }
             let Some(engine) = state.engine.take() else {
                 continue;
             };
+            if let Some(hold) = hold {
+                let ends = &mut self.cost.hold_ends;
+                let end = if state.pending.len() >= hold.records.get() as usize {
+                    &mut ends.full
+                } else if now.saturating_duration_since(since) >= hold.wait {
+                    &mut ends.deadline
+                } else {
+                    match state.ask_cause {
+                        AskCause::Read => &mut ends.read,
+                        AskCause::Settle => &mut ends.settle,
+                        AskCause::Other => &mut ends.other,
+                    }
+                };
+                *end += 1;
+            }
+            let spent_ask = if state.ask_spent() {
+                state.commit_asked.take().map(|ask| (ask, state.ask_cause))
+            } else {
+                None
+            };
+            state.lent_spent = Some(LentSpent {
+                ask: spent_ask,
+                held_since: state.held_since.take(),
+            });
             let records = std::mem::take(&mut state.pending);
             state.lent = Some(records.len());
             materializer.submit(MaterializeJob {
@@ -3476,10 +4002,25 @@ fn take_back<E: LocalEngine>(
     state.lent = None;
     // The records go back in front of what was journaled meanwhile,
     // unless the projection conclusively took them.
+    let spent = state.lent_spent.take();
     let give_back = |state: &mut Domain<E>, records: &mut Vec<Durable>| {
         let taken = records.len();
         records.append(&mut state.pending);
         state.pending = std::mem::take(records);
+        // Not committed, so what the lend spent is put back (#238
+        // review): the records' wait from when they were first held, and
+        // the ask, unless a later one, which reaches further, stands.
+        if let Some(spent) = spent {
+            if let Some(since) = spent.held_since {
+                state.held_since = Some(state.held_since.map_or(since, |s| s.min(since)));
+            }
+            if state.commit_asked.is_none()
+                && let Some((ask, cause)) = spent.ask
+            {
+                state.commit_asked = Some(ask);
+                state.ask_cause = cause;
+            }
+        }
         taken
     };
     match outcome {
@@ -3512,7 +4053,7 @@ fn take_back<E: LocalEngine>(
                 state.status = DomainStatus::MaterializationDeferred;
             }
         }
-        Outcome::Indeterminate(meta) => {
+        Outcome::Indeterminate(meta, delta) => {
             let taken = give_back(state, &mut records);
             if !matches!(
                 state.status,
@@ -3521,7 +4062,7 @@ fn take_back<E: LocalEngine>(
                 return Err(state
                     .quarantine("a projection commit in doubt beside another outcome in doubt"));
             }
-            state.pending_meta = Some((meta, taken));
+            state.pending_meta = Some((meta, taken, delta));
             state.status = DomainStatus::MaterializationUncertain;
             report.indeterminate = true;
         }
@@ -3548,6 +4089,15 @@ fn take_back<E: LocalEngine>(
 /// an `Err` means the projection itself failed and the caller still owns
 /// the redo. A commit that returns moves `gate` to its stamp before this
 /// does, whichever thread runs it (task-d52).
+///
+/// The records' dependency and proposal rows are keyed by intake order
+/// through the index by command (task-d113). A commit that returns
+/// publishes its changes to the index before it moves the gate, here and
+/// not at the store's take-back, so the index is always at the stamp of
+/// the newest snapshot the gate hands out (rule (e)); one whose
+/// outcome is not known leaves them in `held`, for the settling to publish
+/// or drop (rule (d)); any other outcome drops them.
+#[allow(clippy::too_many_arguments)]
 fn project<E: LocalEngine>(
     engine: &mut E,
     pending: &[Durable],
@@ -3556,8 +4106,12 @@ fn project<E: LocalEngine>(
     gate: &Frontier,
     durable: bool,
     failure: &mut Option<&'static str>,
+    held: &mut Option<IndexDelta>,
 ) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
     let mut tx = engine.begin_write()?;
+    let index = gate.index();
+    let mut assigner = Assigner::new(&index);
+    let mut lowered = Lowered::new();
     // Guards read the durable accepted state inside this very
     // transaction, never a cached copy.
     match DurableMeta::read(&tx) {
@@ -3577,25 +4131,42 @@ fn project<E: LocalEngine>(
                 *failure = Some("materialization would skip a journaled record");
                 break;
             }
-            if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
-                if *base != meta.frontier.as_base() {
+            // A group of outcomes is checked as one: its record holds
+            // them contiguous from its base (`check_body`), so the
+            // projection moves from that base to the last one's position.
+            if let Some((base, position)) = record.body().execution() {
+                if base != meta.frontier.as_base() {
                     *failure = Some("durable record's base does not extend the projection");
                     break;
                 }
                 meta.frontier = ExecutionFrontier {
                     configuration: base.configuration,
-                    execution_position: *position,
+                    execution_position: position,
                 };
             }
-            for update in record.body().updates() {
-                lower_update(&mut tx, update)?;
-            }
+            // Intake order is the record's journal sequence, the one the
+            // stamp takes below.
+            lowered.lower_record(
+                &tx,
+                &mut assigner,
+                record.seq().get(),
+                record.body().updates(),
+            )?;
             // The journal sequence is derived from the store sequence
             // by the constructor, never chosen alongside it.
             meta.stamp = AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
             expect = record.seq().checked_next().ok();
         }
+        // Every record's rows in journal order, as assigned, as one
+        // batch: the engine opens each collection once for the commit
+        // rather than once a row (task-d86). Nothing is written before
+        // the checks above pass, so a commit they refuse writes nothing.
+        if failure.is_none() {
+            tx.apply_updates(lowered.updates())?;
+        }
     }
+    let delta = assigner.into_delta();
+    drop(index);
     if failure.is_some() {
         drop(tx);
         return Ok(None);
@@ -3614,8 +4185,13 @@ fn project<E: LocalEngine>(
     } else {
         tx.commit_working()
     };
-    if committed.is_ok() {
-        gate.set_completed(meta.stamp.store_seq());
+    match &committed {
+        Ok(()) => {
+            gate.publish_index(delta, meta.stamp.store_seq());
+            gate.set_completed(meta.stamp.store_seq());
+        }
+        Err(CommitFailure::Indeterminate(_)) => *held = Some(delta),
+        Err(CommitFailure::DefinitelyNotCommitted(_)) => {}
     }
     gate.end_commit();
     Ok(Some(committed))
@@ -3763,6 +4339,7 @@ impl<E: LocalEngine> MaterializeJob<E> {
             durable,
         } = self;
         let mut failure = None;
+        let mut held = None;
         let outcome = match project(
             &mut engine,
             &records,
@@ -3771,12 +4348,15 @@ impl<E: LocalEngine> MaterializeJob<E> {
             &gate,
             durable,
             &mut failure,
+            &mut held,
         ) {
             Err(e) => Outcome::Failed(e),
             Ok(None) => Outcome::Refused(failure.expect("failure set")),
             Ok(Some(Ok(()))) => Outcome::Committed(meta),
             Ok(Some(Err(CommitFailure::DefinitelyNotCommitted(_)))) => Outcome::NotCommitted,
-            Ok(Some(Err(CommitFailure::Indeterminate(_)))) => Outcome::Indeterminate(meta),
+            Ok(Some(Err(CommitFailure::Indeterminate(_)))) => {
+                Outcome::Indeterminate(meta, held.unwrap_or_default())
+            }
         };
         MaterializeDone {
             domain,
@@ -3823,10 +4403,16 @@ impl<E: LocalEngine> MaterializeDone<E> {
 enum Outcome {
     Committed(DurableMeta),
     NotCommitted,
-    Indeterminate(DurableMeta),
+    /// The metadata the commit wrote, and its changes to the index.
+    Indeterminate(DurableMeta, IndexDelta),
     Refused(&'static str),
     Failed(JournaledError),
 }
+
+/// How many times [`JournaledStore::recovery_cut`] pins a snapshot before
+/// it gives up on the materializer publishing between the snapshot and the
+/// index (task-d113). A commit is milliseconds; a cut reads a suffix.
+const CUT_ATTEMPTS: usize = 64;
 
 /// Whether `ballot` is obsolete relative to `promised`.
 fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {
@@ -3838,17 +4424,16 @@ fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {
 }
 
 /// The execution frontier after a record: only an established application
-/// outcome moves it, and it moves to the position the record recorded, not
-/// to a position derived at materialization time.
+/// outcome moves it, or a group of them, and it moves to the position the
+/// record recorded (a group's last), not to a position derived at
+/// materialization time.
 fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> ExecutionFrontier {
-    match record.body() {
-        RecordBody::ApplicationOutcome { base, position, .. } => ExecutionFrontier {
+    match record.body().execution() {
+        Some((base, position)) => ExecutionFrontier {
             configuration: base.configuration,
-            execution_position: *position,
+            execution_position: position,
         },
-        RecordBody::ProtocolTransition { .. }
-        | RecordBody::PublishLocalCheckpoint(_)
-        | RecordBody::Lifecycle(_) => frontier,
+        None => frontier,
     }
 }
 
@@ -3860,27 +4445,79 @@ fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> Exec
 /// the command took, and a command that legitimately changed no rows --
 /// a rejection, a comparison that did not match -- still took one, and
 /// losing that record would free the position for a successor.
+// A follower writes the COMMIT rows of what it holds committed ahead of a
+// Sync that would not fit its row, in batches it bounds itself
+// (task-d106): each must be a journal record this check admits. A batch
+// of several commands stays within both bounds, since it is closed before
+// a command that would pass them; one past them holds a single command's
+// payload and dependency rows, which a vote already writes as one batch.
+const _: () = assert!(coord_consensus::COMMIT_ROWS_BATCH_UPDATES <= MAX_RECORD_UPDATES);
+const _: () = assert!(
+    coord_consensus::COMMIT_ROWS_BATCH_BYTES
+        + coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD
+        + RECORD_HEADER_ALLOWANCE
+        <= MAX_RECORD_BYTES
+);
+// A follower writes a proposal frame's adoptions in batches it bounds the
+// same way (step 2b of the batching rule's 10.7): closed before an
+// adoption that would pass either bound, so a batch of several adoptions
+// stays within both, and one past them holds a single adoption, its
+// payload row and dependency row, which it already wrote as one batch.
+const _: () = assert!(coord_consensus::FRAME_BATCH_UPDATES <= MAX_RECORD_UPDATES);
+const _: () = assert!(
+    coord_consensus::FRAME_BATCH_BYTES
+        + coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD
+        + RECORD_HEADER_ALLOWANCE
+        <= MAX_RECORD_BYTES
+);
+
+// A lease at its quota is revoked, or expires, in one batch, and so in one
+// record: its attachments' worst case (`coord_state::attachment_cost`, the
+// measure `batch_bytes` takes) and 64 KiB for the batch's fixed rows, which
+// are the lease row, the revision counter, the retry binding and a
+// retirement of at most `MAX_RETIRE_PER_COMMAND` sequences.
+const _: () = assert!(coord_state::MAX_LEASE_BYTES as usize + 64 * 1024 <= RECORD_UPDATE_BYTES);
+
 fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
     if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
         return Err(RecordError::EmptyUpdates);
     }
+    Ok(())
+}
+
+/// Why `batch` can't be one journal record, or `None` when it can: more
+/// updates than a record holds, a key or a value longer than a record's,
+/// or more bytes than a record's once its header is allowed for.
+///
+/// A function of the batch alone, so every voter reaches the same answer
+/// for the same batch, whatever its store. The applier measures each
+/// command's batch with it before submitting, so a command too large for
+/// one record is a replicated refusal and not a voter's halt (design
+/// Section 4.5, the release rule's third requirement), and
+/// [`JournaledStore::submit`] refuses with it.
+pub fn record_refusal(batch: &PersistBatch) -> Option<RecordError> {
     if batch.updates.len() > MAX_RECORD_UPDATES {
-        return Err(RecordError::TooManyUpdates);
+        return Some(RecordError::TooManyUpdates);
     }
     for update in &batch.updates {
         if update.key.len() > MAX_RECORD_KEY_BYTES {
-            return Err(RecordError::KeyTooLong);
+            return Some(RecordError::KeyTooLong);
         }
         if update
             .value
             .as_ref()
             .is_some_and(|v| v.len() > MAX_RECORD_VALUE_BYTES)
         {
-            return Err(RecordError::ValueTooLong);
+            return Some(RecordError::ValueTooLong);
         }
     }
-    Ok(())
+    (batch_bytes(batch).saturating_add(RECORD_HEADER_ALLOWANCE) > MAX_RECORD_BYTES)
+        .then_some(RecordError::TooLarge)
 }
+
+/// The bytes one journal record holds for its updates, as `batch_bytes`
+/// measures them: the record's bound less its header's allowance.
+pub const RECORD_UPDATE_BYTES: usize = MAX_RECORD_BYTES - RECORD_HEADER_ALLOWANCE;
 
 /// Seal one queued transition at `seq`, chained onto `predecessor`: the
 /// stream's accepted durable head for the first record of an entry, the

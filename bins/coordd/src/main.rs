@@ -326,6 +326,18 @@ fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
 }
 
 /// The first eight bytes of a digest, for a line an operator reads.
+/// A format's versions for the build line: the one it reads and writes,
+/// when its window is one version wide, or else `oldest..newest`, the
+/// versions it reads.
+fn versions(f: coord_types::formats::Format) -> String {
+    let w = f.window();
+    if w.oldest == w.newest {
+        w.current.to_string()
+    } else {
+        format!("{}..{}", w.oldest, w.newest)
+    }
+}
+
 fn hex16(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -567,6 +579,11 @@ fn report_metrics(
         } else {
             Measure::Unavailable(Unavailable::NotThisRole)
         },
+        // No connection is open before the first turn, and the frontend
+        // has offered nothing.
+        paths: Vec::new(),
+        paths_unreported: 0,
+        offers: coord_daemon::metrics::Offers::default(),
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),
@@ -574,7 +591,18 @@ fn report_metrics(
     }
 }
 
+/// Key the consensus machines' digest maps (task-d60, step 3) from the
+/// operating system's randomness, through the standard library's own
+/// randomly keyed hasher, before any machine is built: a caller who
+/// cannot learn the key cannot pick identities that share a bucket.
+fn seed_digest_maps() {
+    use std::hash::{BuildHasher, RandomState};
+    let state = RandomState::new();
+    coord_consensus::digest::seed(state.hash_one(0u64), state.hash_one(1u64));
+}
+
 fn main() -> ExitCode {
+    seed_digest_maps();
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
         Ok(t) => t,
@@ -622,7 +650,13 @@ fn main() -> ExitCode {
                     short(&report.replica.0),
                     report.incarnation.get(),
                     report.role,
-                    credential_state(&report.credential),
+                    // A non-voter naming a voter is refused for its role,
+                    // whatever its generation and key say.
+                    if report.names_a_voter {
+                        "names-a-committed-voter".to_owned()
+                    } else {
+                        credential_state(&report.credential)
+                    },
                 );
                 println!(
                     "leaf issued_at={} expires_at={} renewal={} driver={}",
@@ -669,14 +703,21 @@ fn main() -> ExitCode {
     // What this build is, before it opens anything (task-60). Formats
     // are what it reads and writes; features are what the cluster may
     // have turned on. An operator reconciling a mixed fleet reads this
-    // line on every node and compares it.
+    // line on every node and compares it. A format whose window is wider
+    // than one version prints the versions it reads, `oldest..newest`:
+    // the journal's `1..2` says this build reads what its successor
+    // writes, so a voter can go back to it (the batching-rule doc's
+    // 10.7, step 1a). The journal's written version is given beside it,
+    // since a build and its successor read the same window and differ in
+    // what they write.
     println!(
-        "build schema={} journal={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
-        coord_types::formats::Format::StoreSchema.current(),
+        "build schema={} journal={} journal_writes={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
+        versions(coord_types::formats::Format::StoreSchema),
+        versions(coord_types::formats::Format::JournalRecord),
         coord_types::formats::Format::JournalRecord.current(),
-        coord_types::formats::Format::SharedCheckpoint.current(),
-        coord_types::formats::Format::LocalCheckpoint.current(),
-        coord_types::formats::Format::Backup.current(),
+        versions(coord_types::formats::Format::SharedCheckpoint),
+        versions(coord_types::formats::Format::LocalCheckpoint),
+        versions(coord_types::formats::Format::Backup),
         coord_types::formats::Supported::features()
             .iter()
             .map(|f| f.name())
@@ -926,6 +967,7 @@ fn main() -> ExitCode {
             && let Err(why) = enroll::collector_for(
                 &credential,
                 placed.membership.cluster(),
+                placed.membership.domain(),
                 placed.replica,
                 placed.incarnation,
             )
@@ -977,6 +1019,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
+    let booting = std::time::Instant::now();
     let mut opened = match store::open_storage(
         &config,
         store::Intent::Serve,
@@ -1068,7 +1111,9 @@ fn main() -> ExitCode {
     // problem and is the most expensive kind of misconfiguration to
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
+    let phases = storage.phases;
     let checkpoints = storage.checkpoints;
+    let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
         storage.domain,
         coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
@@ -1090,10 +1135,17 @@ fn main() -> ExitCode {
     let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
     // Where the loop's waits on those two threads are counted.
     let mut waits = None;
+    let building = std::time::Instant::now();
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot, config.limits.command_table_capacity)
-            .and_then(|v| keep_floor(&placed, &config, v))
-            .and_then(|v| pipeline(v, &materialized, &mut waits))
+        match voter(
+            &placed,
+            applier,
+            boot,
+            config.limits.command_table_capacity,
+            early_proposal,
+        )
+        .and_then(|v| keep_floor(&placed, &config, v))
+        .and_then(|v| pipeline(v, &materialized, &mut waits))
         {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
@@ -1104,6 +1156,15 @@ fn main() -> ExitCode {
     } else {
         serve::Backing::Serving(Box::new(applier))
     };
+    println!(
+        "{}",
+        boot_line(
+            &phases,
+            replayed.as_ref(),
+            building.elapsed(),
+            booting.elapsed()
+        )
+    );
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
     // `None` and reaches every voter over the wire.
@@ -1225,10 +1286,13 @@ fn main() -> ExitCode {
     // on the address it reported.
     let api_socket = listeners.take_api();
     let peer_socket = listeners.take_peer();
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    // The runtime's worker count is the configuration's if it sets one,
+    // and tokio's (a worker a core) otherwise (task-d91).
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = config.runtime.worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    let runtime = match builder.enable_all().build() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot start the runtime: {e}");
@@ -1278,6 +1342,20 @@ fn main() -> ExitCode {
             domain = domain.with_peers(plane);
         }
         domain = domain.with_links(serve::CollectorLinks::new(links));
+        // An operator reaches a voter's feature activation through a
+        // socket beside its state, local and the owner's alone (task-d99):
+        // `coordctl feature --socket <state>/admin.sock activate <name>`.
+        if voting {
+            let path = std::path::Path::new(&config.state_directory).join(ADMIN_SOCKET);
+            match serve::listen_admin(&path) {
+                Ok(admin) => domain = domain.with_admin(admin),
+                Err(e) => eprintln!(
+                    "the admin socket at {} could not be opened, and this node takes no \
+                     operator requests: {e}",
+                    path.display()
+                ),
+            }
+        }
         // Expiry is scheduled where this process votes. A frontend-only
         // node schedules nothing: it proposes no commands, and an
         // expiry is a command like any other.
@@ -1358,11 +1436,14 @@ fn main() -> ExitCode {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
         }
+        if let Some(line) = domain.catch_up_line() {
+            eprintln!("{line}");
+        }
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
 saturated={} unavailable={} refused={} released={} returned={} unreturnable={} \
-watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
+returned_sends={} watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
 crowded_out={}",
             counts.queued_local,
             counts.queued_remote,
@@ -1373,6 +1454,7 @@ crowded_out={}",
             counts.released,
             counts.returned,
             counts.unreturnable,
+            counts.returned_sends,
             counts.watches,
             counts.watch_frames,
             counts.watches_lost,
@@ -1425,6 +1507,31 @@ crowded_out={}",
     })
 }
 
+/// The admin socket's name in the state directory (task-d99).
+const ADMIN_SOCKET: &str = "admin.sock";
+
+/// Whether this node's leaders send the proposal before its batch is
+/// durable (task-d98): only where the domain activated `EarlyProposal`,
+/// which every configured voter's build supports, or in a build made for
+/// task-d98's local reading alone (`early-proposal-without-activation`),
+/// never built for anything else. Section 23 rules out an operator flag
+/// around a correctness gate, so there is no setting for it.
+///
+/// In a running domain the feature driver activates it (task-d99), and
+/// narrows the early send to the followers known to hold the activation;
+/// this is the value at start, from the activation the store holds.
+fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feature>) -> bool {
+    if cfg!(feature = "early-proposal-without-activation") {
+        eprintln!(
+            "coordd: built with early-proposal-without-activation, task-d98's local reading: \
+             a leader sends its proposal before its batch is durable without the domain having \
+             activated it, so a voter built before task-d74 may count it toward a fast decision"
+        );
+        return true;
+    }
+    active.contains(&coord_types::formats::Feature::EarlyProposal)
+}
+
 /// This node's voter, booted, over the store it will write.
 ///
 /// The role it takes is not a setting. The committed configuration says
@@ -1438,6 +1545,7 @@ fn voter(
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
     capacity: usize,
+    early_proposal: bool,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1603,6 +1711,44 @@ fn voter(
         (m.cluster(), m.domain()),
         promised,
     );
+    // Given to the node before its boot, so the leader it holds now and
+    // every one it becomes later sends as the domain allows (task-d98):
+    // from the activation this store holds, and from here on from the
+    // feature driver, which turns it on once its own activation row is
+    // durable and keeps the followers known to hold it (task-d99).
+    voter.node_mut().set_early_proposal(early_proposal);
+    let features = {
+        use coord_storage::Persistence;
+        let voters = coord_consensus::quorum::EpochVoters::new(
+            m.epoch(),
+            m.voters().map(|v| v.node).collect(),
+        )
+        .ok_or("a configuration without voters")?;
+        let gated = voter
+            .node()
+            .applier()
+            .store()
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the feature rows cannot be read: {e:?}"))?;
+        coord_daemon::feature::Features::open(
+            m.cluster(),
+            m.domain(),
+            placed.replica,
+            voters,
+            gated.view(),
+            placed.incarnation,
+            boot,
+        )
+        .map_err(|e| format!("the feature rows cannot be read: {e}"))?
+    };
+    // The release rule (task-d90) has no start value of its own: the
+    // driver reports its active set as changed when opened, so this sets
+    // it from the same activation the store holds.
+    voter.node_mut().keep_features(features);
+    if cfg!(feature = "early-proposal-without-activation") {
+        voter.node_mut().send_early_without_activation();
+    }
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
@@ -1768,4 +1914,39 @@ fn now_seconds() -> u64 {
 /// an identity, not a secret, and the full value is in the certificate.
 fn short(bytes: &[u8; 16]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The startup report's `boot` line: how long each step before the
+/// runtime starts took, in milliseconds, with the sizes of what the
+/// attach indexed (#245; the lead on #185 asked what grows with history
+/// there). `voter_ms` is building the voter over the attached store;
+/// `total_ms` runs from the journal's open to the voter built.
+fn boot_line(
+    phases: &store::BootPhases,
+    replayed: Option<&coord_storage::Replayed>,
+    voter: std::time::Duration,
+    total: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (intake, entries, keys, versions, replay) = replayed.map_or((0.0, 0, 0.0, 0, 0.0), |r| {
+        (
+            ms(r.intake_index),
+            r.intake_entries,
+            ms(r.key_index),
+            r.key_versions,
+            ms(r.took),
+        )
+    });
+    format!(
+        "boot journal_open_ms={:.1} projection_open_ms={:.1} baseline_ms={:.1} guard_scan_ms={:.1} \
+attach_ms={:.1} intake_index_ms={intake:.1} intake_entries={entries} key_index_ms={keys:.1} \
+key_versions={versions} replay_ms={replay:.1} voter_ms={:.1} total_ms={:.1}",
+        ms(phases.journal_open),
+        ms(phases.projection_open),
+        ms(phases.baseline),
+        ms(phases.guard_scan),
+        ms(phases.attach),
+        ms(voter),
+        ms(total),
+    )
 }

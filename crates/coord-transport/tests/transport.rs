@@ -19,9 +19,9 @@ use coord_transport::{
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedVec, COLLECTOR_SUBMIT_VERSION, CloseV1, HEADER_LEN, HelloV1, KIND_COLLECTOR_SUBMIT,
-    KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1, PeerRole, SESSION_BIND_VERSION,
-    encode_frame,
+    BoundedVec, COLLECTOR_SUBMIT_RELAYED_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1, HEADER_LEN,
+    HelloV1, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1, PeerRole,
+    SESSION_BIND_VERSION, encode_frame,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::time::timeout;
@@ -194,6 +194,7 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
         } => {
             assert_eq!(provenance.from(), r(0));
             assert_eq!(provenance.incarnation(), inc(1));
+            assert_eq!(provenance.role(), PeerRole::Voter);
             assert_eq!(lane, Lane::Control);
             assert_eq!(kind, coord_transport::KIND_PEER_EVIDENCE);
             assert_eq!(payload, b"vote-from-a");
@@ -282,6 +283,104 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
     assert_eq!((heard.received_frames, heard.received_bytes), (1, to_b));
     assert_eq!((heard.sent_frames, heard.sent_bytes), (1, to_a));
     assert_eq!(c.peer_traffic(), coord_transport::PeerTraffic::default());
+}
+
+/// Each open connection's path as QUIC estimates it (the lead's item 2 on
+/// #185): read for a link to a voter and for a collector's link, never
+/// for a client's, which are as many as the callers.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_readings_cover_voters_and_collectors_but_not_clients() {
+    let f = fixture(&[
+        PeerRole::Voter,
+        PeerRole::Voter,
+        PeerRole::Client,
+        PeerRole::Frontend,
+    ]);
+    let mut a = bind(&f, 0);
+    let mut b = bind(&f, 1);
+    let client = bind(&f, 2);
+    let frontend = bind(&f, 3);
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    drained(&mut a).await;
+    drained(&mut b).await;
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"vote").unwrap(),
+    )
+    .unwrap();
+    match event(&mut b).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload, b"vote"),
+        other => panic!("{other:?}"),
+    }
+    for (caller, role) in [(&client, PeerRole::Client), (&frontend, PeerRole::Frontend)] {
+        caller
+            .connect(
+                a.local_addr().unwrap(),
+                &f.ids[0].name,
+                role,
+                None,
+                Lane::Unary,
+                f.ids[0].expected(),
+            )
+            .await
+            .expect("the caller connected");
+        drained(&mut a).await;
+    }
+
+    // The voter reads its link to the other voter, then the collector's
+    // connection it accepted; the client's is not read.
+    let readings = a.path_readings();
+    assert_eq!(readings.len(), 2, "{readings:?}");
+    let peer = &readings[0];
+    assert_eq!(
+        (
+            peer.class,
+            peer.lane,
+            peer.role,
+            peer.replica,
+            peer.accepted
+        ),
+        (
+            Class::Peer,
+            Lane::Control,
+            PeerRole::Voter,
+            Some(r(1)),
+            false
+        )
+    );
+    assert!(
+        peer.sent_packets > 0 && peer.rtt > Duration::ZERO && peer.cwnd > 0,
+        "{peer:?}"
+    );
+    let collector = &readings[1];
+    assert_eq!(
+        (
+            collector.class,
+            collector.lane,
+            collector.role,
+            collector.replica,
+            collector.accepted
+        ),
+        (Class::Api, Lane::Unary, PeerRole::Frontend, None, true)
+    );
+    assert!(collector.sent_packets > 0, "{collector:?}");
+    // The collector reads its link to the voter, named by the voter's
+    // replica: the connection a relay to the leader goes on.
+    let dialed = frontend.path_readings();
+    assert_eq!(dialed.len(), 1, "{dialed:?}");
+    assert_eq!(
+        (
+            dialed[0].class,
+            dialed[0].role,
+            dialed[0].replica,
+            dialed[0].accepted
+        ),
+        (Class::Api, PeerRole::Voter, Some(r(0)), false)
+    );
+    // What is left out is by the other end's role: a client reads its own
+    // link to the voter.
+    assert_eq!(client.path_readings().len(), 1);
 }
 
 /// A raw client endpoint presenting `id`'s certificate, for driving the
@@ -1090,7 +1189,10 @@ async fn a_submission_stream_is_open_to_a_collector_and_to_nobody_else() {
     send.write_all(
         &encode_frame(
             KIND_COLLECTOR_SUBMIT,
-            COLLECTOR_SUBMIT_VERSION + 1,
+            // Past every version this build reads: 1, 2 for a command
+            // answered on the release alone (task-d100), and 3 for one
+            // relayed to the leader alone (task-d102).
+            COLLECTOR_SUBMIT_RELAYED_VERSION + 1,
             &[0x02, 0xaa, 0xbb],
         )
         .unwrap(),
@@ -1153,6 +1255,19 @@ async fn a_caller_asks_a_question_and_reads_the_answer_on_the_same_stream() {
     let answer = answered.expect("the caller read its answer");
     assert_eq!(answer.kind, KIND_SESSION_BIND_ACK);
     assert_eq!(answer.payload, b"you are");
+    // A caller's datagrams are the api plane's, counted apart from the
+    // peer plane's (task-d70), and read the same way apart from the
+    // transport.
+    let traffic = node.traffic_reader().read();
+    assert!(
+        traffic.api.datagrams_sent > 0 && traffic.api.datagrams_received > 0,
+        "{traffic:?}"
+    );
+    assert_eq!(
+        (traffic.datagrams_sent, traffic.datagrams_received),
+        (0, 0),
+        "no peer connection"
+    );
 }
 
 /// An answer above its kind's class limit is refused as a bound, not
@@ -1718,6 +1833,235 @@ async fn a_second_connection_on_one_lane_replaces_and_closes_the_first() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(a.connections(), 1, "the displaced connection is closed");
+}
+
+/// Binds each registered leaf to the identity it was issued for, and
+/// checks nothing else: in particular not the rule that refuses a
+/// non-voter certificate naming a voter's replica. With it the transport's
+/// own keying of links is tested by itself, as it must hold for a
+/// connection bound before its node's role changed.
+struct BindsAnyRole(std::collections::HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole)>);
+
+impl coord_transport::IdentityBinder for BindsAnyRole {
+    fn bind(
+        &self,
+        certs: &[rustls_pki_types::CertificateDer<'_>],
+        hello: &HelloV1,
+    ) -> Result<coord_transport::BoundIdentity, coord_transport::BindError> {
+        let leaf = certs
+            .first()
+            .ok_or(coord_transport::BindError::NoCertificate)?;
+        let (replica, incarnation, role) = self
+            .0
+            .get(leaf.as_ref())
+            .ok_or(coord_transport::BindError::UnknownCertificate)?;
+        if hello.role != *role {
+            return Err(coord_transport::BindError::RoleNotAuthorized);
+        }
+        Ok(coord_transport::BoundIdentity {
+            role: *role,
+            replica: Some(*replica),
+            incarnation: Some(*incarnation),
+            capabilities: hello.capabilities.as_slice().to_vec(),
+        })
+    }
+}
+
+/// A connection bound as an observer naming voter 1's replica keeps a
+/// link of its own (design Section 10.1). The replica's link is the one
+/// frames to voter 1 go out on, and a newcomer from the same identity
+/// takes its lane slot; keyed by replica alone, the observer's dial would
+/// close voter 1's connection as replaced and receive what is sent to
+/// voter 1. Keyed by role too, voter 1 keeps its connection and its
+/// frames, and the observer gets none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_naming_a_voters_replica_does_not_take_its_link() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(1), PeerRole::Observer);
+    let binder: Arc<dyn coord_transport::IdentityBinder> = Arc::new(BindsAnyRole(
+        f.ids
+            .iter()
+            .chain([&posing])
+            .map(|id| {
+                (
+                    id.chain[0].as_ref().to_vec(),
+                    (id.replica, id.incarnation, id.role),
+                )
+            })
+            .collect(),
+    ));
+    let at = |id: &TestIdentity| {
+        Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            id.local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            binder.clone(),
+            limits(),
+        )
+        .unwrap()
+    };
+    let mut a = at(&f.ids[0]);
+    let mut b = at(&f.ids[1]);
+    let mut observer = at(&posing);
+
+    connect_lane(&b, &a, &f.ids[0], Lane::Control).await;
+    assert!(matches!(
+        event(&mut a).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert!(matches!(
+        event(&mut b).await,
+        TransportEvent::Connected { .. }
+    ));
+
+    observer
+        .connect(
+            a.local_addr().unwrap(),
+            &f.ids[0].name,
+            PeerRole::Observer,
+            Some(inc(1)),
+            Lane::Control,
+            f.ids[0].expected(),
+        )
+        .await
+        .unwrap();
+    match event(&mut a).await {
+        TransportEvent::Connected { identity, .. } => {
+            assert_eq!(identity.role, PeerRole::Observer);
+            assert_eq!(identity.replica, Some(r(1)));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        event(&mut observer).await,
+        TransportEvent::Connected { .. }
+    ));
+    // Voter 1's connection is not closed as replaced: no event at all
+    // follows at `a`, and both connections stay.
+    assert!(
+        timeout(Duration::from_millis(500), a.next_event())
+            .await
+            .is_err(),
+        "voter 1's link moved"
+    );
+    assert_eq!(a.connections(), 2);
+
+    // The transport reports the role it bound, not the replica's: what
+    // the observer sends reaches `a` as an observer's, under voter 1's
+    // replica, and nothing downstream takes it for voter 1's.
+    observer
+        .send(
+            dest(0, Lane::Control),
+            DOMAIN,
+            evidence_frame(b"from-the-observer").unwrap(),
+        )
+        .unwrap();
+    match event(&mut a).await {
+        TransportEvent::PeerFrame {
+            provenance,
+            payload,
+            ..
+        } => {
+            assert_eq!(payload, b"from-the-observer");
+            assert_eq!(provenance.from(), r(1));
+            assert_eq!(provenance.role(), PeerRole::Observer);
+            assert!(!provenance.is_voter());
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // What is sent to voter 1 reaches voter 1, and never the observer.
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"to-voter-1").unwrap(),
+    )
+    .unwrap();
+    match event(&mut b).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload, b"to-voter-1"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        timeout(Duration::from_millis(300), observer.next_event())
+            .await
+            .is_err(),
+        "the observer received voter 1's frame"
+    );
+}
+
+/// A binder that refuses every certificate with one reason.
+struct Refuses(coord_transport::BindError);
+
+impl coord_transport::IdentityBinder for Refuses {
+    fn bind(
+        &self,
+        _: &[rustls_pki_types::CertificateDer<'_>],
+        _: &HelloV1,
+    ) -> Result<coord_transport::BoundIdentity, coord_transport::BindError> {
+        Err(self.0.clone())
+    }
+}
+
+/// A handshake refused because an observer's or learner's certificate
+/// names a committed voter is counted on the node that refused it, and
+/// no other refusal is (design Section 20.4). The peer learns only that
+/// it was refused; what the count says -- an issuer signed what it never
+/// should -- is for this node's operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_naming_a_voter_is_counted_where_it_is_refused() {
+    use coord_transport::BindError;
+    let f = fixture(&[PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(1), PeerRole::Observer);
+    // The dialer accepts the voter it dials; only the acceptor refuses.
+    let dialer: Arc<dyn coord_transport::IdentityBinder> = Arc::new(BindsAnyRole(
+        f.ids
+            .iter()
+            .map(|id| {
+                (
+                    id.chain[0].as_ref().to_vec(),
+                    (id.replica, id.incarnation, id.role),
+                )
+            })
+            .collect(),
+    ));
+    for (reason, counted) in [
+        (BindError::NonVoterNamesVoter, 1),
+        (BindError::RoleNotAuthorized, 0),
+        (BindError::IncarnationMismatch, 0),
+    ] {
+        let accepting = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            f.ids[0].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            Arc::new(Refuses(reason.clone())),
+            limits(),
+        )
+        .unwrap();
+        let observer = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            posing.local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]),
+            dialer.clone(),
+            limits(),
+        )
+        .unwrap();
+        let refused = observer
+            .connect(
+                accepting.local_addr().unwrap(),
+                &f.ids[0].name,
+                PeerRole::Observer,
+                Some(inc(1)),
+                Lane::Control,
+                f.ids[0].expected(),
+            )
+            .await;
+        assert!(refused.is_err(), "{reason:?}: the handshake completed");
+        assert_eq!(
+            accepting.peer_traffic().refused_voter_names,
+            counted,
+            "{reason:?}"
+        );
+        assert_eq!(observer.peer_traffic().refused_voter_names, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2812,6 +3156,47 @@ async fn linked(a: Limits, b: Limits) -> (Fixture, Transport, Transport) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_cadence_asked_of_a_peer_still_delivers() {
+    // task-d70: both ends ask the other to acknowledge after eight
+    // packets or two milliseconds, then at the default and with nothing
+    // asked. What is sent and received is unchanged; only when QUIC
+    // acknowledges it moves.
+    let short = Limits {
+        ack_frequency: Some(coord_transport::AckFrequency {
+            threshold: 8,
+            max_delay: Some(Duration::from_millis(2)),
+        }),
+        ..limits()
+    };
+    let asked_nothing = Limits {
+        ack_frequency: None,
+        ..limits()
+    };
+    assert_eq!(
+        Limits::default().ack_frequency,
+        Some(coord_transport::AckFrequency::DEFAULT)
+    );
+    for cadence in [short, limits(), asked_nothing] {
+        delivers_at(cadence).await;
+    }
+}
+
+async fn delivers_at(cadence: Limits) {
+    let (_f, a, mut b) = linked(cadence, cadence).await;
+    for round in 0..5 {
+        let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(10));
+        assert!(sent.iter().all(Result::is_ok), "round {round}: {sent:?}");
+        assert_eq!(payloads(&mut b, 10).await, said(10));
+    }
+    let (out, heard) = (a.peer_traffic(), b.peer_traffic());
+    assert_eq!((out.sent_frames, out.sent_lost), (50, 0));
+    assert_eq!(heard.received_frames, 50);
+    assert!(out.datagrams_sent > 0 && heard.datagrams_received > 0);
+    // Peer links are not the api plane's.
+    assert_eq!(out.api, coord_transport::Datagrams::default());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
     // task-d61: what one call queues for a peer goes on one stream, each
     // frame unchanged and in order, every one admitted and delivered on
@@ -2856,6 +3241,77 @@ async fn a_turns_frames_to_one_peer_share_a_stream_in_order() {
         out.send_calls > 0 && out.send_calls <= out.datagrams_sent,
         "{out:?}"
     );
+}
+
+// One thread: the lane's sender runs only when this test yields, so it has
+// parked by the time `b` reads a batch, and a frame queued under the hold
+// can only leave at the release. On several threads, a sender still
+// finishing the last batch drains the held frames, which the hold allows.
+#[tokio::test]
+async fn a_held_wake_up_leaves_the_frames_queued_until_it_is_released() {
+    // task-d115, lever 8: under a hold, a send admits and queues as
+    // before and its sender is woken only at the release -- once for
+    // all the frames queued -- or when the hold is dropped.
+    let (_f, a, mut b) = linked(limits(), limits()).await;
+    // One frame first, unheld: the sender has taken every wake-up it
+    // was owed and waits for the next.
+    assert!(
+        a.send(dest(1, Lane::Control), DOMAIN, numbered(1).remove(0))
+            .is_ok()
+    );
+    assert_eq!(payloads(&mut b, 1).await, said(1));
+
+    let hold = coord_transport::WakeHold::new();
+    assert_eq!(hold.held_since(), None);
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(3));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(hold.held_since().is_some());
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    // One lane, owed one wake-up for both calls.
+    assert_eq!(hold.release(), 1);
+    assert_eq!(hold.held_since(), None);
+    let mut five = said(3);
+    five.extend(said(2));
+    assert_eq!(sorted(payloads(&mut b, 5).await), sorted(five));
+
+    // Code with no hold at hand releases the thread's (#256 review).
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    assert_eq!(coord_transport::WakeHold::release_this_thread(), 1);
+    assert_eq!(hold.held_since(), None);
+    assert_eq!(sorted(payloads(&mut b, 2).await), sorted(said(2)));
+
+    // Still holding after a release; dropping the hold releases.
+    let sent = a.send_many(dest(1, Lane::Control), DOMAIN, numbered(2));
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    assert!(
+        timeout(Duration::from_millis(300), payloads(&mut b, 1))
+            .await
+            .is_err(),
+        "a held frame went out"
+    );
+    drop(hold);
+    assert_eq!(sorted(payloads(&mut b, 2).await), sorted(said(2)));
+
+    // No hold: a send wakes its sender at once.
+    assert!(
+        a.send(dest(1, Lane::Control), DOMAIN, numbered(1).remove(0))
+            .is_ok()
+    );
+    assert_eq!(payloads(&mut b, 1).await, said(1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3081,4 +3537,134 @@ async fn a_batch_that_cannot_be_sent_is_lost_whole_and_counted_so() {
         "nothing past the first batch"
     );
     assert_eq!(b.peer_traffic().received_frames, 4);
+}
+
+/// A UDP relay a test can black-hole: what a killed process looks like
+/// to its peers, which hear nothing from it again, not even a close.
+struct Relay {
+    addr: std::net::SocketAddr,
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Relay {
+    /// Packets to `addr` go to `to`, and its answers back to whoever sent
+    /// the last packet, until [`Relay::cut`].
+    async fn to(to: std::net::SocketAddr) -> Relay {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(to).await.unwrap();
+        let addr = front.local_addr().unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let client = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (front, back, open, client) =
+                (front.clone(), back.clone(), open.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65536];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client.lock().unwrap() = Some(from);
+                    if open.load(Ordering::SeqCst) {
+                        let _ = back.send(&buf[..n]).await;
+                    }
+                }
+            });
+        }
+        {
+            let open = open.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let to = *client.lock().unwrap();
+                    if let Some(to) = to
+                        && open.load(Ordering::SeqCst)
+                    {
+                        let _ = front.send_to(&buf[..n], to).await;
+                    }
+                }
+            });
+        }
+        Relay { addr, open }
+    }
+
+    /// Nothing passes from here on, either way.
+    fn cut(&self) {
+        self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A voter killed and started again under the same incarnation has its
+/// link back within the peer plane's idle timeout, not the transport's
+/// default (task-d82).
+///
+/// Its peer keeps the connection it dialled to the dead process until
+/// that connection's idle timeout, and the lane rule keeps the one whose
+/// dialler has the lower identity, so the restarted voter's dials lose to
+/// it until then. On the Jepsen runner a leader back within the default
+/// 30 s was locked out that long while its peers promised its ballots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_restarted_under_its_incarnation_is_linked_again_within_the_peer_idle_timeout() {
+    let limits = || Limits {
+        handshake_timeout: Duration::from_secs(3),
+        frame_timeout: Duration::from_secs(3),
+        ..Limits::node()
+    };
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut a = bind_with(&f, 0, limits());
+    let b = bind_with(&f, 1, limits());
+    // r0 dials r1, as the lower identity's connection is the one a pair
+    // keeps.
+    let relay = Relay::to(b.local_addr().unwrap()).await;
+    a.connect(
+        relay.addr,
+        &f.ids[1].name,
+        PeerRole::Voter,
+        Some(inc(1)),
+        Lane::Control,
+        f.ids[1].expected(),
+    )
+    .await
+    .unwrap();
+    assert!(a.linked(r(1), inc(1), Lane::Control));
+
+    // Killed: nothing more reaches r0 from it.
+    relay.cut();
+    drop(b);
+    let killed = std::time::Instant::now();
+
+    // Started again on another socket, under the same identity, it dials
+    // r0 as coordd's re-dial does (task-d03) until a frame from r0 reaches
+    // it.
+    let mut b = bind_with(&f, 1, limits());
+    let bound = Duration::from_secs(8);
+    let mut reached = false;
+    while killed.elapsed() < bound && !reached {
+        let _ = b
+            .connect(
+                a.local_addr().unwrap(),
+                &f.ids[0].name,
+                PeerRole::Voter,
+                Some(inc(1)),
+                Lane::Control,
+                f.ids[0].expected(),
+            )
+            .await;
+        let _ = a.send(
+            dest(1, Lane::Control),
+            DOMAIN,
+            evidence_frame(b"r0").unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, b.next_event()).await {
+            if matches!(event, TransportEvent::PeerFrame { ref payload, .. } if payload == b"r0") {
+                reached = true;
+                break;
+            }
+        }
+        while let Ok(Some(_)) = timeout(Duration::from_millis(1), a.next_event()).await {}
+    }
+    assert!(
+        reached,
+        "r1 restarted was not linked to r0 within {bound:?} of its kill"
+    );
 }
