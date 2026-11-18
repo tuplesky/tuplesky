@@ -1584,12 +1584,35 @@ struct Caller {
 impl Caller {
     /// Dial `daemon`, negotiate as a client of this domain, and bind
     /// `session` with a token the daemon's own keys verify.
+    ///
+    /// A voter answers from its policy only after a pass with a leader
+    /// and a majority of its peer links (#320). Until then it refuses a
+    /// bind as unavailable and closes the connection, and a caller
+    /// presents its credential again on a new one, as a client does.
+    /// "voters submittable" says a node holds its submission links, not
+    /// its peer links, so a caller that binds right after it can meet
+    /// that refusal.
     async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
-        let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
-        let token = service_token(ring, session);
-        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
-        let answer = ask(&connection, &bind)
-            .await
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (answer, endpoint, connection, control, control_recv) = loop {
+            let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
+            let token = service_token(ring, session);
+            let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+            match try_ask(&connection, &bind).await {
+                Ok(answer) => break (answer, endpoint, connection, control, control_recv),
+                Err(quinn::ConnectionError::ApplicationClosed(close))
+                    if close.reason.as_ref() == b"bind refused"
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!(
+                    "the binding's connection was lost: {e:?}\n{}",
+                    daemon.said()
+                ),
+            }
+        };
+        let answer = answer
             .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
         assert_eq!(
@@ -1809,8 +1832,20 @@ impl Caller {
 /// Write `frame` on a fresh stream and read the answer the daemon
 /// writes back on it, or `None` if it never comes.
 async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types::wire_v1::Frame> {
-    let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
-    send.write_all(frame).await.expect("written");
+    try_ask(connection, frame).await.expect("readable")
+}
+
+/// [`ask`], with the connection's loss returned rather than a panic.
+async fn try_ask(
+    connection: &quinn::Connection,
+    frame: &[u8],
+) -> Result<Option<coord_types::wire_v1::Frame>, quinn::ConnectionError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    match send.write_all(frame).await {
+        Ok(()) => {}
+        Err(quinn::WriteError::ConnectionLost(lost)) => return Err(lost),
+        Err(e) => panic!("written: {e:?}"),
+    }
     send.finish().expect("finished");
     // Generous on purpose. Every caller of this helper asserts that an
     // answer arrived, never that one arrived quickly: the timeout is
@@ -1819,22 +1854,29 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     // can legitimately take tens of seconds for one request without
     // anything being wrong. A test that needs the whole load to finish
     // inside a bound sets that bound itself.
-    let bytes = tokio::time::timeout(Duration::from_secs(45), async {
+    let read = tokio::time::timeout(Duration::from_secs(45), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
-        while let Some(n) = recv.read(&mut buf).await.expect("readable") {
-            bytes.extend_from_slice(&buf[..n]);
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => bytes.extend_from_slice(&buf[..n]),
+                Ok(None) => return Ok(bytes),
+                Err(quinn::ReadError::ConnectionLost(lost)) => return Err(lost),
+                Err(e) => panic!("readable: {e:?}"),
+            }
         }
-        bytes
     })
-    .await
-    .ok()?;
+    .await;
+    let Ok(bytes) = read else {
+        return Ok(None);
+    };
+    let bytes = bytes?;
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut reader = coord_types::wire_v1::FrameReader::new();
     reader.push(&bytes).expect("within the reader bound");
-    reader.next_frame().expect("a frame")
+    Ok(reader.next_frame().expect("a frame"))
 }
 
 /// A caller binds a session against the running daemon, and the

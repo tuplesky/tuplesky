@@ -91,10 +91,12 @@ pub struct Limits {
     pub max_admitted_per_second: u32,
     /// How long, in milliseconds, a voter's frontend still answers from
     /// its own policy after the last pass on which the voter had a leader
-    /// and reached a majority (#312). Past it, the policy barrier is
-    /// unavailable: binds are refused, output is withheld and watches
-    /// close, until the voter has both again. A voter that has had
-    /// neither since it started is past it.
+    /// and reached a majority (#312). Past it, the voter decides nothing
+    /// from its policy: binds are refused as unavailable, output is held
+    /// as pending and watches close as source-lost, each of which the
+    /// caller retries, until the voter has both again. A voter that has
+    /// had neither since it started is past it. Between
+    /// [`MIN_POLICY_STALENESS_MILLIS`] and [`MAX_POLICY_STALENESS_MILLIS`].
     ///
     /// A voter cut off from the domain stops learning revocations. This
     /// bounds how long it goes on authorizing from what it last learned:
@@ -151,6 +153,15 @@ pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
 const fn default_max_policy_staleness_millis() -> u64 {
     DEFAULT_MAX_POLICY_STALENESS_MILLIS
 }
+
+/// The smallest policy staleness a configuration may name. Below it a
+/// voter's policy would close between two looks inside one loop pass,
+/// and the voter would decide nothing while it leads.
+pub const MIN_POLICY_STALENESS_MILLIS: u64 = 100;
+
+/// The largest policy staleness a configuration may name: past it the
+/// setting no longer bounds what #312 asks it to bound.
+pub const MAX_POLICY_STALENESS_MILLIS: u64 = 60_000;
 
 /// The command table capacity a configuration that names none gets: the
 /// largest (task-d20).
@@ -1114,6 +1125,15 @@ impl Config {
                 field: "limits.max_admitted_per_second",
                 min: 1,
                 max: u64::from(u32::MAX),
+            });
+        }
+        if !(MIN_POLICY_STALENESS_MILLIS..=MAX_POLICY_STALENESS_MILLIS)
+            .contains(&self.limits.max_policy_staleness_millis)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_policy_staleness_millis",
+                min: MIN_POLICY_STALENESS_MILLIS,
+                max: MAX_POLICY_STALENESS_MILLIS,
             });
         }
         // Durable state is opened under the name this build implements or

@@ -2034,12 +2034,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self
     }
 
-    /// Whether this node's policy may still be read for an answer (#312):
-    /// a voter's while it is within its allowance of having had a leader
-    /// and a majority. A process with no voter has no such signal, and
-    /// is not bounded here.
+    /// [`Self::policy_fresh_at`] now; the serving paths read the clock
+    /// once through [`Self::policy_open`] instead.
+    #[cfg(test)]
     fn policy_fresh(&self) -> bool {
-        self.election.is_none() || self.recency.fresh(std::time::Instant::now())
+        self.policy_fresh_at(std::time::Instant::now())
+    }
+
+    /// Whether this node's policy may still be read for an answer at
+    /// `now` (#312): a voter's while it is within its allowance of having
+    /// had a leader and a majority. A process with no voter has no such
+    /// signal, and is not bounded here.
+    fn policy_fresh_at(&self, now: std::time::Instant) -> bool {
+        self.election.is_none() || self.recency.fresh(now)
     }
 
     /// Whether this node's policy may be read for an answer now,
@@ -2054,16 +2061,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// frame's admission, a retained answer and a watch's batch. A voter
     /// that has lost its leader or its majority looks, sees neither,
     /// and stays closed.
+    ///
+    /// One clock read serves both the look and the check (#320 review):
+    /// read twice, a short allowance could lapse between them and close
+    /// a voter that had just looked.
     fn policy_open(&mut self) -> bool {
-        self.refresh_recency();
-        self.policy_fresh()
+        let now = std::time::Instant::now();
+        self.refresh_recency(now);
+        self.policy_fresh_at(now)
     }
 
-    /// Repeat the turn's observation (`led_and_majority`) if the last
-    /// look is past the allowance; otherwise this costs one
-    /// `Instant::now()`.
-    fn refresh_recency(&mut self) {
-        let now = std::time::Instant::now();
+    /// Repeat the turn's observation (`led_and_majority`) at `now` if the
+    /// last look is past the allowance there.
+    fn refresh_recency(&mut self, now: std::time::Instant) {
         if self.recency.fresh(now) {
             return;
         }
@@ -4989,6 +4999,34 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         )
     }
 
+    /// The frontend's decision about a caller's frame, under this
+    /// node's policy as it stands right now: looked at again if the
+    /// last look is past the allowance (#320).
+    fn admit(
+        &mut self,
+        health: &ClockHealth,
+        now: MonotonicMillis,
+        connection: u64,
+        frame: &Frame,
+    ) -> coord_session::Ingress {
+        let fresh = self.policy_open();
+        let policy = Fresh {
+            source: StorePolicySource {
+                store: self.backing.applier().store(),
+                budget: ViewBudget::default(),
+            },
+            fresh,
+        };
+        self.frontend.frontend.on_frame(
+            health,
+            now,
+            connection,
+            frame,
+            self.backing.applier().hub(),
+            &policy,
+        )
+    }
+
     /// Answer the caller a delivery belongs to, gated against a fresh
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
@@ -5110,28 +5148,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.respond_inline(responder, answer).await;
                     return;
                 }
-                let fresh = self.policy_open();
-                let policy = Fresh {
-                    source: StorePolicySource {
-                        store: self.backing.applier().store(),
-                        budget: ViewBudget::default(),
-                    },
-                    fresh,
-                };
                 // Admission is the frontend's decision about this frame:
                 // verified and admitted, answered, or refused at the door.
                 self.recorder.entered(Stage::Admission);
                 let started = std::time::Instant::now();
                 let now = self.now_millis();
                 let refused_before = self.admission_refusals().total();
-                let ingress = self.frontend.frontend.on_frame(
-                    &health,
-                    now,
-                    connection.0,
-                    &frame,
-                    self.backing.applier().hub(),
-                    &policy,
-                );
+                let ingress = self.admit(&health, now, connection.0, &frame);
                 // A refused binding is the one refusal an operator
                 // cannot diagnose from the outside: the caller is told
                 // only that it was refused, deliberately, because
@@ -5544,6 +5567,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// the path where the daemon has its own close to write, and a
     /// client that received two closes for one watch would have to
     /// decide which one to resume from.
+    /// One bounded pump of a watch, under this node's policy as it
+    /// stands right now. Each pump looks again: the last pump's pushes
+    /// can have waited past the allowance (#320, Codex review).
+    fn pump_watch(
+        &mut self,
+        health: &ClockHealth,
+        connection: u64,
+        watch_id: u64,
+        hub: &coord_storage::WatchHub,
+    ) -> Vec<Vec<u8>> {
+        let fresh = self.policy_open();
+        let policy = Fresh {
+            source: StorePolicySource {
+                store: self.backing.applier().store(),
+                budget: ViewBudget::default(),
+            },
+            fresh,
+        };
+        self.frontend
+            .frontend
+            .pump_watch(health, connection, watch_id, hub, &policy)
+    }
+
     fn forget_watch(&mut self, connection: u64, watch_id: u64, hub: &coord_storage::WatchHub) {
         self.frontend
             .frontend
@@ -5577,20 +5623,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // and the close it was acknowledged with is written there.
             let mut lost = false;
             loop {
-                // Each batch looks again: the last batch's pushes can have
-                // waited past the allowance (#320, Codex review).
-                let fresh = self.policy_open();
-                let policy = Fresh {
-                    source: StorePolicySource {
-                        store: self.backing.applier().store(),
-                        budget: ViewBudget::default(),
-                    },
-                    fresh,
-                };
-                let frames = self
-                    .frontend
-                    .frontend
-                    .pump_watch(health, connection, watch_id, &hub, &policy);
+                let frames = self.pump_watch(health, connection, watch_id, &hub);
                 if frames.is_empty() {
                     break;
                 }
@@ -6605,9 +6638,12 @@ impl Recency {
 }
 
 /// A policy source that reads nothing once its node's policy may be
-/// stale (#312): every barrier is unavailable, which every caller of
-/// one takes as a denial -- a bind refused, an establishment not
-/// confirmed, output withheld, a watch closed.
+/// stale (#312): every barrier is [`PolicyError::Stale`]. Nothing is
+/// disclosed on one, and no caller takes it as a denial (#320 review):
+/// a bind or an establishment is refused as unavailable, output is held
+/// as pending, and a watch closes as source-lost at its last complete
+/// revision. The caller retries each, here once the voter is fresh
+/// again or at another node.
 struct Fresh<S> {
     source: S,
     fresh: bool,
@@ -6620,7 +6656,7 @@ impl<S: PolicySource> PolicySource for Fresh<S> {
         session: &SessionId,
     ) -> Result<AuthorizationBarrier, PolicyError> {
         if !self.fresh {
-            return Err(PolicyError::Unavailable);
+            return Err(PolicyError::Stale);
         }
         self.source.barrier(namespace, session)
     }
@@ -7735,8 +7771,10 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
     /// domain revokes the caller's read through a majority the follower
     /// is not part of, so the follower's own store goes on granting it.
     /// Within the allowance it still answers from that store: that is the
-    /// bound, not zero. Past it, the same question is withheld and a new
-    /// bind is refused, until a pass sees a leader and a majority again.
+    /// bound, not zero. Past it, the same question is answered with
+    /// nothing -- pending, not withheld, since the caller's credential
+    /// was not refused (#320 review) -- and a new bind is refused as
+    /// unavailable, until a pass sees a leader and a majority again.
     #[test]
     fn a_cut_off_voter_stops_answering_from_its_policy_after_the_allowance() {
         use coord_authn::ClockHealth;
@@ -7961,10 +7999,6 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 other => panic!("{other:?}"),
             }
         };
-        let withheld = |outcome: &OutcomeV1| {
-            matches!(outcome, OutcomeV1::Err { code, .. }
-                if *code == coord_collector::codes::OUTPUT_WITHHELD)
-        };
 
         // Led, with a majority: the caller binds on the follower, a live
         // connection, and its read is answered.
@@ -8021,12 +8055,19 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             ask(&mut frontend, recency.fresh(edge)),
             OutcomeV1::Ok { .. }
         ));
-        // Past it, nothing more: the read is withheld, and a new bind is
-        // refused.
+        // Past it, nothing more: the read is held as pending, which the
+        // caller asks again about rather than taking as a refusal of its
+        // credential, and a new bind is refused as unavailable.
         let past = edge + Duration::from_millis(1);
         assert!(!recency.fresh(past));
+        let (denied, deferred) = (frontend.denied, frontend.deferred);
         let answered = ask(&mut frontend, recency.fresh(past));
-        assert!(withheld(&answered), "{answered:?}");
+        assert!(matches!(answered, OutcomeV1::Pending), "{answered:?}");
+        assert_eq!(
+            (frontend.denied, frontend.deferred),
+            (denied, deferred + 1),
+            "deferred, not denied"
+        );
         assert!(matches!(
             frontend.on_frame(
                 &health,
@@ -9201,6 +9242,15 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             voter: Voter<Journaled>,
             collector: Collector,
         ) -> super::super::Domain<Journaled> {
+            domain_trusting(voter, collector, serde_json::json!({ "keys": [] }))
+        }
+
+        /// [`domain`], its frontend trusting the token keys `jwks`.
+        fn domain_trusting(
+            voter: Voter<Journaled>,
+            collector: Collector,
+            jwks: serde_json::Value,
+        ) -> super::super::Domain<Journaled> {
             let membership = super::membership();
             let dispatcher = Dispatcher::new(
                 Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default()),
@@ -9213,7 +9263,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     coord_session::BindingConfig {
                         issuer: "https://sts.cluster-1".into(),
                         resource: "tuplesky://cluster-1".into(),
-                        jwks: serde_json::json!({ "keys": [] }),
+                        jwks,
                         cluster: CLUSTER,
                         domain: DOMAIN,
                     },
@@ -10067,6 +10117,15 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             );
         }
 
+        /// A policy allowance for the tests that let it run out: long
+        /// enough that a look and the check right after it fall inside
+        /// it on a loaded runner (#320 review), and the smallest a
+        /// configuration may name (`MIN_POLICY_STALENESS_MILLIS`).
+        const ALLOWANCE: Duration = Duration::from_millis(100);
+
+        /// A wait that runs past [`ALLOWANCE`].
+        const PAST_IT: Duration = Duration::from_millis(150);
+
         /// Only a pass that sees a leader and a majority opens a voter's
         /// policy (#312). A lone leader's turn does; a follower holding no
         /// link to the voter it follows never does; and the allowance
@@ -10089,10 +10148,9 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert!(!following.policy_fresh(), "no link to the voter it follows");
 
             let (leader, _lapsing_commits) = held_leader(hour);
-            let mut lapsing =
-                domain(leader, collector()).policy_staleness(Duration::from_millis(1));
+            let mut lapsing = domain(leader, collector()).policy_staleness(ALLOWANCE);
             lapsing.turn(&api).await.expect("a turn");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(PAST_IT).await;
             assert!(!lapsing.policy_fresh(), "the allowance ran out");
         }
 
@@ -10107,13 +10165,13 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             let hour = Duration::from_secs(3600);
 
             let (leader, _commits) = held_leader(hour);
-            let mut quiet = domain(leader, collector()).policy_staleness(Duration::from_millis(1));
+            let mut quiet = domain(leader, collector()).policy_staleness(ALLOWANCE);
             quiet.turn(&api).await.expect("a turn");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(PAST_IT).await;
             assert!(!quiet.policy_fresh(), "past the allowance with no turn");
             assert!(quiet.policy_open(), "it still leads, a majority of one");
             assert!(quiet.policy_fresh(), "the look is kept");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(PAST_IT).await;
             assert!(quiet.policy_open(), "a second wait, a second look");
 
             let voters: std::collections::BTreeSet<ReplicaId> =
@@ -10122,6 +10180,236 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             let mut cut_off = domain(follower, collector());
             assert!(!cut_off.policy_open(), "no link to the voter it follows");
             assert!(!cut_off.policy_fresh(), "and nothing kept");
+        }
+
+        /// Every read of a voter's policy that the serving loop makes
+        /// goes through the staleness cap (#320 review): a frame's
+        /// admission, an answer's gate and a watch's pump, each through
+        /// the `Domain` method the loop calls. Two voters over the same
+        /// store, with the same caller and grants: a lone leader, whose
+        /// look finds a leader and a majority, and a follower of three
+        /// with no peer plane, whose look finds neither. The follower
+        /// binds nothing; output for a caller bound while it was fresh is
+        /// held as pending, not withheld; and that caller's watch closes
+        /// as source-lost at the last revision it was given, not as
+        /// unauthorized. The leader does each.
+        #[tokio::test]
+        async fn every_read_of_a_voters_policy_goes_through_the_staleness_cap() {
+            use coord_authn::ClockHealth;
+            use coord_collector::Action;
+            use coord_session::{BindError, Ingress, StorePolicySource};
+            use coord_state::Response;
+            use coord_state::plan::{KvEvent, KvEventKind, Outcome};
+            use coord_state::view::KvEntry;
+            use coord_storage::WatchHub;
+            use coord_storage::views::ViewBudget;
+            use coord_sts::{KeyRing, ServiceClaims, SigningKey};
+            use coord_types::ids::KvRevision;
+            use coord_types::logical_v1::{KeyRange, RangeOp};
+            use coord_types::wire_v1::{
+                BoundedBytes, OutcomeV1, ResponseV1, WatchOpenV1, decode_stream,
+            };
+
+            const NOW: u64 = 1_700_000_000;
+            const CONNECTION: u64 = 7;
+            const WATCH: u64 = 9;
+            let health = ClockHealth::healthy(NOW, 5);
+            let at = MonotonicMillis::new(0);
+
+            // The caller's credential, its read of `k`, the answer to it,
+            // and a watch over `k`.
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let ring =
+                KeyRing::new(SigningKey::from_pkcs8_der("sts-1", &key.serialize_der()).unwrap());
+            let credential = ring
+                .sign(&ServiceClaims {
+                    iss: "https://sts.cluster-1".into(),
+                    sub: super::hex(&ALICE.0),
+                    aud: "tuplesky://cluster-1".into(),
+                    sid: super::hex(&SESSION.0),
+                    scope: PolicyAction::FULL_CEILING,
+                    rule: super::hex(&SESSION.0),
+                    generation: 1,
+                    jti: super::hex(&[9u8; 32]),
+                    iat: NOW,
+                    exp: NOW + 1000,
+                })
+                .unwrap()
+                .into_bytes();
+            let bind = frame(&coord_session::bind_frame(&credential).unwrap());
+            let mut logical = LogicalRequest::new(
+                NS,
+                CanonicalOperation::Range(RangeOp {
+                    range: KeyRange::exact(b"k".to_vec()),
+                    revision: None,
+                    limit: 0,
+                    keys_only: false,
+                    count_only: false,
+                }),
+            );
+            logical.canonicalize();
+            let read = frame(
+                &MessageV1::Request(RequestV1::new(retry_key(2), &logical, 0, 0).unwrap())
+                    .encode()
+                    .unwrap(),
+            );
+            let command = coord_types::CommandId::derive(&retry_key(2), &logical).unwrap();
+            let revision = KvRevision::new(1).unwrap();
+            let result = postcard::to_allocvec(&Response {
+                revision,
+                outcome: Outcome::Range {
+                    items: vec![],
+                    count: 0,
+                    more: false,
+                },
+            })
+            .unwrap();
+            let answer = || coord_collector::Delivery {
+                connection: CONNECTION,
+                retry_key: retry_key(2),
+                frame: MessageV1::Response(ResponseV1 {
+                    command_id: command,
+                    outcome: OutcomeV1::Ok {
+                        revision: Some(revision),
+                        result: BoundedBytes::new(result.clone()).unwrap(),
+                    },
+                })
+                .encode()
+                .unwrap(),
+            };
+            let open = frame(
+                &MessageV1::WatchOpen(WatchOpenV1 {
+                    watch_id: WATCH,
+                    namespace: NS,
+                    key: BoundedBytes::new(b"a".to_vec()).unwrap(),
+                    range_end: Some(BoundedBytes::new(b"m".to_vec()).unwrap()),
+                    start_revision: None,
+                    prev_kv: false,
+                    progress_notify: false,
+                })
+                .encode()
+                .unwrap(),
+            );
+            // A put of `k` at the hub's next revision; which one.
+            let publish = |hub: &WatchHub| -> u64 {
+                let next = KvRevision::new(hub.published().get() + 1).unwrap();
+                hub.publish(
+                    NS,
+                    next,
+                    &[KvEvent {
+                        kind: KvEventKind::Put,
+                        key: b"k".to_vec(),
+                        entry: Some(KvEntry {
+                            value: b"v".to_vec(),
+                            create_revision: next,
+                            mod_revision: next,
+                            version: 1,
+                            lease: None,
+                            lease_generation: None,
+                        }),
+                        prev: None,
+                    }],
+                )
+                .unwrap();
+                next.get()
+            };
+            let kinds = |frames: &[Vec<u8>]| -> Vec<String> {
+                frames
+                    .iter()
+                    .map(|f| match decode_stream(f).unwrap().remove(0) {
+                        MessageV1::WatchEvents(e) => format!("events@{}", e.revision.get()),
+                        MessageV1::WatchClose(c) => format!(
+                            "close:{:?}@{}",
+                            c.reason,
+                            c.last_complete_revision.map_or(0, KvRevision::get)
+                        ),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            };
+
+            let hour = Duration::from_secs(3600);
+            let (leader, _commits) = held_leader(hour);
+            let mut fresh = domain_trusting(leader, collector(), ring.jwks());
+            let voters: std::collections::BTreeSet<ReplicaId> =
+                (1..=3u8).map(|n| ReplicaId([n; 16])).collect();
+            let (follower, _its_commits) = held_voter(ReplicaId([2; 16]), hour, voters);
+            let mut stale = domain_trusting(follower, collector(), ring.jwks());
+
+            // Admission: the stale voter binds nothing; the fresh one binds.
+            assert!(matches!(
+                stale.admit(&health, at, CONNECTION, &bind),
+                Ingress::Rejected(BindError::Unavailable)
+            ));
+            assert!(matches!(
+                fresh.admit(&health, at, CONNECTION, &bind),
+                Ingress::Bound(_)
+            ));
+            // The same caller bound on the follower while it was fresh:
+            // its store read with nothing in the way.
+            let stale_hub = stale.backing.applier().hub().clone();
+            {
+                let store = StorePolicySource {
+                    store: stale.backing.applier().store(),
+                    budget: ViewBudget::default(),
+                };
+                assert!(matches!(
+                    stale
+                        .frontend
+                        .frontend
+                        .on_frame(&health, at, CONNECTION, &bind, &stale_hub, &store),
+                    Ingress::Bound(_)
+                ));
+            }
+
+            // An answer: the read is admitted on both, a request admission
+            // reads no barrier, and its output is gated.
+            for domain in [&mut stale, &mut fresh] {
+                assert!(matches!(
+                    domain.admit(&health, at, CONNECTION, &read),
+                    Ingress::Action(_)
+                ));
+                domain.answer(answer());
+            }
+            let gated = |domain: &super::super::Domain<Journaled>| {
+                let f = &domain.frontend.frontend;
+                (f.deferred, f.denied)
+            };
+            assert_eq!(gated(&stale), (1, 0), "held as pending, not withheld");
+            assert_eq!(gated(&fresh), (0, 0), "answered");
+
+            // A watch: opened on both, a revision given to the caller on
+            // the follower while it was fresh, then the next one pumped
+            // through the loop's own call.
+            let mut watching = Vec::new();
+            for domain in [&mut stale, &mut fresh] {
+                let registration = match domain.admit(&health, at, CONNECTION, &open) {
+                    Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
+                    other => panic!("{other:?}"),
+                };
+                let hub = domain.backing.applier().hub().clone();
+                hub.replay_complete(registration.id).unwrap();
+                watching.push(publish(&hub));
+            }
+            let given = watching[0];
+            {
+                let store = StorePolicySource {
+                    store: stale.backing.applier().store(),
+                    budget: ViewBudget::default(),
+                };
+                let frames = stale
+                    .frontend
+                    .frontend
+                    .pump_watch(&health, CONNECTION, WATCH, &stale_hub, &store);
+                assert_eq!(kinds(&frames), [format!("events@{given}")]);
+            }
+            publish(&stale_hub);
+            let frames = stale.pump_watch(&health, CONNECTION, WATCH, &stale_hub);
+            assert_eq!(kinds(&frames), [format!("close:SourceLost@{given}")]);
+            assert_eq!(gated(&stale), (1, 0), "a source lost is not a denial");
+            let fresh_hub = fresh.backing.applier().hub().clone();
+            let frames = fresh.pump_watch(&health, CONNECTION, WATCH, &fresh_hub);
+            assert_eq!(kinds(&frames), [format!("events@{}", watching[1])]);
         }
 
         /// A half-established entry's record is found within one commit

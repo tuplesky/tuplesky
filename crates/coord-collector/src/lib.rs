@@ -53,7 +53,8 @@ pub use collector::{
     SUBMIT_ENVELOPE_ALLOWANCE, Said, SettleError, SubmitRefusal, Submitted, undelivered_budget,
 };
 pub use dispatch::{
-    Action, Delivery, Dispatcher, READ_FALLBACK_MILLIS, ReadPlan, ReadResolution, servable,
+    Action, BatchVerdict, Delivery, Dispatcher, READ_FALLBACK_MILLIS, ReadPlan, ReadResolution,
+    servable,
 };
 pub use ingress::{IngressError, admitted_from_submit, frontend_frame};
 pub use trace::CollectorEvent;
