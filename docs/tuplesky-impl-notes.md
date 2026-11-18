@@ -10759,8 +10759,64 @@ cost task-d73 and task-d74 take. task-d74, measured, is about 4% of the
 nodes' CPU and 6% of a follower's, the largest single lever so far and
 still a small one; task-d73, which removes frames a turn, is worth on
 the order of 1% at that rate. task-d75's reading of the leader's loop is
-the leader's 40%, and what it found is in its own section, "The domain
-loop, read (task-d75)", with #168.
+the leader's 40%, and what it found is in its own section
+([below](#the-domain-loop-read-task-d75)).
+
+## The domain loop, read (task-d75)
+
+The reading first, as the plan asks, on the same host and setup as
+task-d72's (five voters on one 4-CPU host, replay profile, 30 callers),
+at #165's head `2f7f511`: `perf` on the leader (n1) and a follower
+outside the fast set (n4), 15 s of a 40,000-operation run at 499 Hz.
+The domain loop is 41% of the leader's samples and 39% of the
+follower's; the shares below are of the loop.
+
+| On the domain loop | Leader | Follower |
+| --- | --- | --- |
+| the machine's `step` | 23% | 23% |
+| applying (`Applier::apply`), with its reads | 8% | 12% |
+| the read barrier (`pump_reads`) | 14% | -- |
+| settling from records (`settle_from_records`): two snapshots and two lookups a key | 3.4% | 5.0% |
+| `GatedReader::snapshot` (a read transaction and `DurableMeta::read`), all callers | 5% | 6.5% |
+| `load_authorization` (a session get, a trust-rule get, a policy scan, every command) | 3.9% | -- |
+| the outbox's filing (`Outbox::filing`, a lookup in a set of every barrier the boot made durable) | 2.1% | 2.3% |
+| B-tree searches, all callers (32-byte command identities) | 19% | -- |
+
+- **The host is the bound, not the leader's loop.** The leader's domain
+  thread was runnable and waiting for a core for 11.9 s of a 29 s run,
+  and the loop's own CPU is 0.68 ms of the leader's 1.65 ms a write. On
+  this host what any node saves goes to every node, so `ok`/s follows
+  the CPU a write, which the runner's separate nodes do not show.
+- **Amortization is the lever this reading points at, more than any one
+  call.** The leader's counters for the same run: 10,150 commands
+  executed, 8,870 lowerings (1.14 commands each), 4,648 journal appends
+  and 4,222 projection commits (2.2 and 2.4 commands each). The appender
+  served an append in 2.4 ms and the materializer a commit in 1.9 ms, a
+  cost a command pays nearly alone. A turn that took every event ready
+  before it lowered would carry more commands a group without waiting
+  on anything; the loop now turns again (`progressed => continue`) as
+  soon as a turn did something.
+- **The fast path is all but absent on this mix:** 239 commands
+  established fast and 9,911 slow, 9,275 of them `missed_path`.
+- **Each candidate is its own PR with its pair.** The first is the
+  settle read, the cheapest to take whole.
+
+**The settle read (this task's first PR).** `RecordReads` reads the
+half-held commands of a turn from one snapshot, with one lookup a key
+for the records and the conflicts both, and does not look up again a
+command it found with no record until the completed frontier moves: a
+record only appears with a projection commit, and a commit moves the
+frontier (task-d58's rule for the read barrier). Three alternating
+pairs, as task-d72's (20,000 operations):
+
+| Build | ok/s | put p50 | put p99 | Leader a write (its loop) | A follower a write (its loop) | All nodes a write |
+| --- | --- | --- | --- | --- | --- | --- |
+| `2f7f511` | 749 to 790 | 73.6 to 76.9 | 119.8 to 122.5 | 1.63 to 1.70 (0.662 to 0.685) | 1.36 to 1.43 (0.526 to 0.553) | 7.08 to 7.41 |
+| the settle read | 758 to 788 | 73.1 to 76.1 | 118.0 to 122.1 | 1.64 to 1.69 (0.649 to 0.679) | 1.35 to 1.41 (0.504 to 0.525) | 7.05 to 7.33 |
+
+A follower's loop falls by 4% (0.538 to 0.516 ms a write, the means),
+the leader's by 1.5%, what the profile's share said; nothing else
+moves outside the spread.
 
 ## Journal syncs a command, and what each carries (task-d84)
 
@@ -10941,6 +10997,93 @@ window.
   of the process's CPU per window. The trim stays the long-run bound, and
   its first reading, the rows exported by kind at two positions, waits
   for it.
+
+## A local checkpoint publication's cost a record (task-d92)
+
+R2 found the process's cost a command steps up once local checkpoint
+publications start, and that the step is the publications' own export
+and write. This is the profile task-d92 asked for, and its lever.
+
+**The setup.** R2's: `command-cost.sh` with `MEASURED=750000`, 10
+callers, three voters on one host (x86_64, 4 CPUs), `replay`, stores on
+tmpfs. Every 0.5 s a script looked for a new `checkpoint` thread in a
+follower and ran `perf record -F 199 --call-graph dwarf` on it while it
+lived. Every voter's threads were read from `/proc` each 5 s. The base
+is `df72e28`.
+
+**The profile** (a follower's 13 publications and reclaims, 8,715
+samples), each sample put under the publication step it ran in:
+
+| Step | Share | Of it, the kernel zeroing fresh pages |
+| --- | --- | --- |
+| The export's encode of each chunk (for its length and digest) | 32.6% | 23.5 points |
+| redb's scan | 20.6% | 0.9 points |
+| Writing and syncing the files | 15.6% | |
+| Verifying the image (its encode of each chunk) | 10.1% | |
+| The store's write (its encode of each chunk) | 9.9% | |
+| The export's rows (copied out of each page) | 5.9% | 3.0 points |
+| Dropping the image, and the rest | 5.3% | |
+
+- **Each chunk was encoded three times,** at 53% of the thread
+  together: once by the export, once by `verify_local`, once by the
+  store's write.
+- **Each encode went a byte at a time.** serde serializes a `Vec<u8>`
+  as a sequence, and postcard pushes each `u8` on its own
+  (`serialize_u8` and `Vec::push` under `RowV1`'s fields).
+- **Its buffer grew by doubling,** and the pages each growth faulted in
+  were zeroed by the kernel: 27% of the thread, almost all of it under
+  the export's encode.
+
+**The change** (the image's bytes do not change):
+- `RowV1`'s key and value serialize as bytes. postcard writes a
+  sequence of bytes and bytes alike, a varint length and the bytes, so
+  the encoding is the same; a test pins it against the derived form at
+  every varint width.
+- `ChunkV1::encode` sizes its buffer for the chunk before it writes.
+- `LocalCheckpointStore::write` writes each chunk from the bytes its
+  verification encoded (`verify_local_each`), so a publication encodes
+  a chunk twice, not three times. An image that does not verify leaves
+  no pending directory.
+- The export moves each scanned row into the image instead of copying
+  it, and verification compares keys by slice.
+- Each chunk after the first is encoded into the buffer the one before
+  it used (`ChunkV1::encode_into`), in the export and in verification.
+
+**The pair.** The base against the head, alternating; the head was
+read twice: with the first four changes (head 1), and with the reused
+buffer too (head 2). µs a record is every voter's export and write over
+the records each publication represented; CPU is each voter's process a
+command.
+
+| Side | Publications | Export µs/record | Write µs/record | Total µs/record | Export and write ms a command a voter | Process CPU ms/cmd (n1, n2, n3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| base | 33 | 6.07 | 2.50 | 8.58 | 0.145 | 0.970, 0.834, 0.820 |
+| head 1 | 36 | 4.83 | 0.70 | 5.54 | 0.108 | 0.950, 0.817, 0.802 |
+| base | 33 | 5.89 | 2.07 | 7.96 | 0.135 | 0.959, 0.830, 0.813 |
+| head 1 | 36 | 4.68 | 0.78 | 5.46 | 0.106 | 0.955, 0.820, 0.806 |
+| head 2 | 36 | 4.80 | 0.85 | 5.65 | 0.112 | 0.942, 0.810, 0.797 |
+| base | 33 | 5.40 | 1.92 | 7.33 | 0.124 | 0.968, 0.840, 0.823 |
+| head 2 | 36 | 4.64 | 0.80 | 5.44 | 0.107 | 0.940, 0.810, 0.793 |
+
+**What it says:**
+- **A publication costs about 30% less a record:** 7.33 to 8.58 µs
+  against 5.44 to 5.65. The write falls by two thirds; the export by
+  about a fifth.
+- **The process's CPU a command falls 2 to 3.6% at every voter** with
+  both heads. The head fits three more publications into the same run,
+  because each takes less time; publications stay on the same cadence
+  (records and time), so that is more images, not less work counted.
+- **The reused buffer moves the publication's time within the spread.**
+  Both of its runs read the process about 1% lower than either run of
+  the first head, which is near the spread too; it stays, since it is
+  four lines and removes the faults a chunk.
+- **What leads now** (the head's profile, 1,107 samples): redb's scan,
+  44.5% of the thread, then the export's encode at 26%, nearly all of it
+  zeroing fresh pages (before the reused buffer). The scan is the
+  engine's; it is not this task's.
+- **On the runner,** R2 sized a publication at the register row's
+  length at 0.15 to 0.2 ms an operation over five voters. A third less
+  is about −0.05 ms an operation. The batch's pairs read it.
 
 ## A fresh proposal's acceptance in its proposal batch (task-d89)
 
@@ -11207,6 +11350,63 @@ each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
   transport admits a frame, on the first offer or a later one, so a frame
   kept and offered again is counted once. The table above was read before
   that, on one `send` a frame.
+
+## A voter's policy bounded in staleness: what the tests pin (#320)
+
+#320 bounds how long a voter's frontend answers from its own policy: it
+asks the leader it follows every half allowance (`Freshness`,
+`0x0108`), the leader answers once a round started after the ask
+arrived has confirmed and its read index has executed, and the voter
+stamps the ask's send time once its committed projection has reached
+the answer's position. Design 6.4 states the rule. The follow-up to
+#320's review adds the tests and limits below.
+
+- **A stale node refuses a bind before it reads the token.**
+  `PolicySource::fresh` is asked before the token is verified, and the
+  refusal is its own, `BindError::Stale`, closed as
+  `Rejected` with the reason "bind unavailable". A token that would
+  fail verification gets the same answer on a stale node as a good one
+  (`a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying`),
+  so the reason says nothing about the token. The kine client returns
+  `ErrBindUnavailable`, which the backend maps to gRPC `Unavailable`,
+  and keeps its token (`TestBindUnavailableKeepsTheToken`, with a
+  control that a refused token is still dropped once). The SDK's
+  `binding_unavailable` closes the connection and keeps the credential.
+- **An answer after the ballot moved still counts for the ask it
+  answers.** A later ballot's commits need a quorum that left the ask's
+  ballot after confirming, so they follow the ask's arrival, and the
+  answer covers only what was committed before it.
+  `an_answer_after_the_ballot_moved_still_stamps_its_send_time` pins
+  that the old leader's answer stamps its ask, an answer from the new
+  leader to an ask it never got is ignored, and the new leader's answer
+  to its own ask stamps that ask.
+- **A domain whose every voter is stale still turns fresh.** No client
+  write can be the first proposal, since no bind is admitted. A leader
+  with nothing proposed has no read index, so lease renewal proposes
+  `EstablishLeaseAuthority` for it.
+  `an_idle_leader_proposes_so_a_stale_domain_turns_fresh` pins the
+  wiring from `Expiry::renew` through the domain; without the renewal
+  the leader holds the ask and the voter stays stale
+  (`only_a_confirmed_ask_opens_the_policy`).
+- **One origin cannot take the leader's places.** A leader holds 256
+  asks, and 4 from one connection or its own voter
+  (`ASKS_HELD_PER_ORIGIN`). At most about three of a voter's asks can
+  still make it fresh, so 4 is room for those and one more.
+  `a_leader_holds_a_bounded_number_of_freshness_asks_from_each_origin`.
+- **End to end.** `a_cut_off_voter_stops_binding_and_binds_again_once_healed`
+  (`bins/coordd/tests/multi_host.rs`) runs three voters with a 2 s
+  allowance, stops two with `SIGSTOP`, and checks that the third goes
+  stale and refuses a bind ("a binding was refused: Stale" in its log)
+  past the allowance, then that it turns fresh and binds again once the
+  two continue. A revocation in between is not driven end to end:
+  coordd has no command that revokes a session, so the revocation half
+  stays with the `coord-session` tests.
+- **Left as is for alpha.** The allowance runs on the monotonic clock,
+  which stops in suspend: a voter resumed after a freeze answers for at
+  most what was left of one allowance. A leader built before #320
+  closes the link on `0x0108`, so a voter with the bound under it stays
+  stale; voters move to the bound together. The stale transition is a
+  log line, not a metric.
 
 ## A disclosure the projection is behind for is held, not answered pending (task-d93)
 

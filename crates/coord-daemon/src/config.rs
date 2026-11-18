@@ -149,18 +149,23 @@ const fn default_max_admitted_per_second() -> u32 {
     DEFAULT_MAX_ADMITTED_PER_SECOND
 }
 
-/// The policy staleness a configuration that names none gets: with the
-/// peer plane's 5 s idle timeout, a cut-off voter stops authorizing from
-/// its own policy about 10 s after it last heard the domain (#312).
+/// The policy staleness a configuration that names none gets: a voter
+/// answers from its own policy for at most 5 s past the send time of the
+/// last freshness ask its leader confirmed and its store reached, so a
+/// cut-off voter stops authorizing within 5 s of the last instant its
+/// store was confirmed current (#312, #320). It asks every 2.5 s.
 pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
 
 const fn default_max_policy_staleness_millis() -> u64 {
     DEFAULT_MAX_POLICY_STALENESS_MILLIS
 }
 
-/// The smallest policy staleness a configuration may name. Below it a
-/// voter's policy would close between two looks inside one loop pass,
-/// and the voter would decide nothing while it leads.
+/// The smallest policy staleness a configuration may name. A voter asks
+/// every half allowance, and each ask needs a round trip, a confirmation
+/// round, the leader's execution and this voter's projection commit
+/// before it stamps. Below this, half an allowance leaves too little
+/// room for that, and a voter linked and current could go stale between
+/// asks and decide nothing.
 pub const MIN_POLICY_STALENESS_MILLIS: u64 = 100;
 
 /// The largest policy staleness a configuration may name: past it the

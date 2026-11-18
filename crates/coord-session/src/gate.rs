@@ -173,6 +173,18 @@ pub trait PolicySource {
         namespace: NamespaceId,
         session: &SessionId,
     ) -> Result<AuthorizationBarrier, PolicyError>;
+
+    /// Whether this node's policy is fresh enough to decide from at all,
+    /// whatever the session. A source that is never stale says yes; one
+    /// whose every barrier is [`PolicyError::Stale`] says no.
+    ///
+    /// A binding asks before it reads the credential (#320 follow-up), so
+    /// a stale node refuses every binding the same way, a good token and
+    /// a bad one alike: the refusal says the node can't bind now, and
+    /// nothing about the token.
+    fn fresh(&self) -> bool {
+        true
+    }
 }
 
 /// Barriers read from a store's durable snapshot.

@@ -3267,6 +3267,8 @@ This entry is the budget and the record, not a lever:
 
 **Implement:** The leader's single loop is the serialization point. On the runner it queued for a CPU while 0.65 to 1.48 cores sat idle. What it does that another thread could is read first, from the per-thread split task-d53's and task-d60's readings give (the leader's loop by phase, the follower beside it), with the idle cores as the evidence that the loop is the bound. Each candidate the reading names is its own PR with its pair.
 
+- **The reading, recorded** ([notes](../tuplesky-impl-notes.md#the-domain-loop-read-task-d75)): on one host the host is the bound, not the leader's loop, and the commands a group carries (1.14 a lowering, 2.2 a journal append) is the lever it points at. The first candidate taken is the settle read (this task's first PR): one snapshot and one lookup a key a turn, and none for a command already found without a record at the same completed frontier.
+
 **Acceptance:** The reading recorded in the notes before any change. Each change a pair on the runner: the leader's loop CPU per command, the idle cores, `ok`/s and p99.
 
 **Review boundary:** What runs on the leader's domain thread. No change to the order the loop decides in, or to the protocol.
@@ -3744,6 +3746,14 @@ The change, in two steps:
 - **First, a profile of one publication's `checkpoint` thread** at a few hundred thousand records: the export's reads, encoding and hashing, and the write and its syncs, recorded as a split per record.
 - **With it, the growth by thread:** a split per 30 s window from `/proc/<pid>/task/*/stat` (the `checkpoint`, `materializer` and `appender` threads and the tokio workers). `Cpu` holds only the domain loop and the process, so this shows the publication's share directly, and whether the export's pin moves the materializer too: redb cannot reuse pages freed while the pin is open (task-d51).
 - **Then the lever the profile leads with,** recorded in this entry before it is built. The image's format and what it carries do not change.
+- **The profile, recorded** (a follower's `checkpoint` threads at R2's setup, [notes](../tuplesky-impl-notes.md#a-local-checkpoint-publications-cost-a-record-task-d92)). Each chunk was encoded three times: for the export's digest, by `verify_local`, and by the store's write. That was 53% of the thread. Each encode pushed a key's and a value's bytes one at a time, because serde serializes a `Vec<u8>` as a sequence, into a buffer grown by doubling. The kernel's zeroing of the pages that growth faulted in was another 27%. redb's scan was 21%, and the files' write and sync 16%.
+- **The lever, built** (this entry's PR). The image's bytes do not change:
+  - `RowV1`'s key and value serialize as bytes, which postcard writes exactly as it writes a byte sequence. A test pins the encoding against the derived form at every varint width.
+  - `ChunkV1::encode` sizes its buffer first.
+  - The store writes each chunk from the bytes its verification encoded. An image that fails verification leaves no pending directory.
+  - The export moves rows out of the scanned page instead of copying them.
+  - The export and the verification each reuse one buffer across chunks.
+- **The pair** (R2's setup, alternating, three runs of the base and four of the head): a publication's cost a record falls about 30%, from 7.33 to 8.58 µs to 5.44 to 5.65. Its write falls two thirds and its export a fifth. Every voter's process CPU a command falls 2 to 3.6%. On the runner's register row that is about −0.05 ms an operation, against the −0.18 R2 sized as the most a publication could give back. What leads the export now is redb's scan (44.5% of the thread), the engine's cost and not this entry's.
 
 **Acceptance:** The profile and the per-thread split recorded first. A local pair at R2's setup: the publication's CPU a record and the step in the process's cost a command fall, and an image is byte-identical to one written before the change at the same represented position. task-j04's crash points recover as task-d51's acceptance states. Its runner pair is read in the batch job (task-d72).
 

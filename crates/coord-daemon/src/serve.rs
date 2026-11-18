@@ -19,7 +19,7 @@
 //! decided here, where a test can state them without a socket.
 
 use coord_collector::{Action, FanOut, ReadPlan};
-use coord_session::Ingress;
+use coord_session::{BindError, Ingress};
 use coord_storage::watch::Registration;
 use coord_transport::CloseCode;
 use coord_types::RetryKey;
@@ -86,6 +86,14 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // back: nothing the caller could do with the session precedes
         // the session.
         Ingress::Establishing(plan) => Step::Submit(plan),
+        // A node whose policy may be stale refused before it read the
+        // credential (#320 follow-up), so saying so tells the caller
+        // nothing about its token: only that it should keep it and bind
+        // again, here later or at another node.
+        Ingress::Rejected(BindError::Stale) => Step::Close {
+            code: CloseCode::Rejected,
+            reason: "bind unavailable",
+        },
         // A refused, absent or ended binding are three ways of saying the
         // same thing -- this connection has no session -- and the peer
         // learns which only as `Rejected`, because whether a token was
