@@ -83,8 +83,11 @@ pub use local::{
 };
 
 pub use feature::{
-    ActiveFeaturesV1, AdmitError, FeatureSupportV1, TooOld, activate_feature, admit,
-    published_activation as published_feature_activation, read_support, record_support,
+    ActiveFeaturesV1, AdmitError, FeatureRows, FeatureSupportV1, InstallActivationError,
+    PrepareError, TooOld, activate_feature, activation_over, active_features, admit, check_support,
+    install_activation, installed_record, prepare_feature, prepare_rows, prepared,
+    promotion_missing, published_activation as published_feature_activation, read_support,
+    record_support,
 };
 pub use floor::{
     ActivatedFloorV1, CheckpointReadinessV1, RecoveryObligation, RecoveryReport, activate_floor,
@@ -103,7 +106,7 @@ pub use store::{LocalCheckpointStore, SharedImageStore, StoreError};
 
 pub use install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,
-    SelectError, install_shared, installed_baseline, select_installed,
+    SelectError, carry_feature_rows, install_shared, installed_baseline, select_installed,
 };
 pub use manifest::{
     CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, MAX_CHUNKS,

@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 
 use coord_collector::{
     Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, MonotonicMillis,
-    Progress, SOLICIT_AFTER_MILLIS, SettleError, SubmitRefusal, Submitted,
+    OfferOutcome, Offered, Progress, RELAY_FALLBACK_MILLIS, SOLICIT_AFTER_MILLIS, SettleError,
+    SubmitRefusal, Submitted,
 };
 use coord_consensus::{BallotConfiguration, ProtocolMessage, SubmissionRefusal};
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -22,7 +23,7 @@ use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
-use coord_types::wire_v1::{MessageV1, OutcomeV1, RequestV1, codes};
+use coord_types::wire_v1::{MessageV1, OutcomeV1, PeerRole, RequestV1, codes};
 use coord_types::{CommandId, RetryKey};
 
 const NS: NamespaceId = NamespaceId([5; 16]);
@@ -112,7 +113,12 @@ fn submit(c: &mut Collector, seq: u64) -> CommandId {
 }
 
 fn from(i: u8) -> PeerProvenance {
-    PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1)
+    PeerProvenance::from_transport(
+        r(i),
+        ReplicaIncarnation::new(1).unwrap(),
+        PeerRole::Voter,
+        1,
+    )
 }
 
 fn refused(command: CommandId, refusal: SubmissionRefusal) -> ProtocolMessage {
@@ -244,16 +250,22 @@ fn a_minority_voter_bound_to_another_request_does_not_end_the_entry() {
 
 /// A command a voter holds under other admission facts, or executed so
 /// long ago it forgot the payload, is answered from this node's durable
-/// record: with nothing of the collector's own to corroborate it.
+/// record: with nothing of the collector's own to corroborate it. A
+/// command answered on the release alone (task-d100, step A) takes the
+/// same path, though it counted nothing to begin with (#204 review).
 #[test]
 fn other_facts_and_a_forgotten_duplicate_are_answered_from_the_record() {
-    for refusal in [
-        SubmissionRefusal::OtherFacts {
-            accepted: Digest32([8; 32]),
-        },
-        SubmissionRefusal::Forgotten,
-    ] {
+    for (marked, refusal) in [false, true].into_iter().flat_map(|marked| {
+        [
+            SubmissionRefusal::OtherFacts {
+                accepted: Digest32([8; 32]),
+            },
+            SubmissionRefusal::Forgotten,
+        ]
+        .map(|refusal| (marked, refusal))
+    }) {
         let mut c = collector(4);
+        c.set_answer_on_release(marked);
         let command = submit(&mut c, 1);
         // Before the refusal the record alone settles nothing.
         assert_eq!(
@@ -304,6 +316,31 @@ fn a_refusal_from_a_stranger_is_not_counted() {
     assert!(c.half_established().is_empty());
 }
 
+/// A refusal on an observer's or learner's link is not counted, though
+/// the replica it names is a voter (design Section 10.1): only a link
+/// bound as a voter's carries a voter's word. The same refusal on the
+/// voter's own link is counted.
+#[test]
+fn a_refusal_on_a_non_voter_link_is_not_counted_whatever_replica_it_names() {
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut c = collector(4);
+        let command = submit(&mut c, 1);
+        let posing =
+            PeerProvenance::from_transport(r(0), ReplicaIncarnation::new(1).unwrap(), role, 1);
+        assert_eq!(
+            c.on_evidence(posing, refused(command, SubmissionRefusal::Forgotten)),
+            Err(EvidenceError::NotAVoter { sender: r(0) }),
+            "{role:?}"
+        );
+        assert!(c.half_established().is_empty());
+        assert_eq!(
+            c.on_evidence(from(0), refused(command, SubmissionRefusal::Forgotten)),
+            Ok(Progress::Held(HoldReason::AwaitingRecord))
+        );
+        assert_eq!(c.half_established().len(), 1);
+    }
+}
+
 /// An entry that holds neither half of a release is submitted to every
 /// voter again after `SOLICIT_AFTER_MILLIS`, and from the second time on
 /// the record may settle it. One that holds a half is not asked for.
@@ -350,6 +387,204 @@ fn a_ballot_change_asks_for_every_entry_again() {
     let commands: BTreeSet<CommandId> = asked.iter().map(|f| f.command).collect();
     assert_eq!(commands, BTreeSet::from([a, b]));
     assert_eq!(c.half_established().len(), 2);
+}
+
+fn version(bytes: &[u8]) -> u16 {
+    let mut reader = coord_types::wire_v1::FrameReader::new();
+    reader.push(bytes).expect("bounded");
+    reader
+        .next_frame()
+        .expect("well formed")
+        .expect("complete")
+        .version
+}
+
+/// task-d102: a relayed entry goes to its ballot's leader alone, and a
+/// ballot change re-targets it to the new leader, asked at once with the
+/// relayed frame; an entry not relayed is asked of every voter as before.
+#[test]
+fn a_ballot_change_re_targets_a_relayed_entry_to_the_new_leader() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let (a, request) = admitted(1);
+    let Ok(Submitted::FanOut(fan_out)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(fan_out.targets, vec![r(0)]);
+    assert_eq!(version(&fan_out.frame), coord_collector::VERSION_RELAYED);
+    c.set_relay(false);
+    let b = submit(&mut c, 2);
+    c.reconfigure(quorum(ballot(1, 1)));
+    let asked = c.due_solicits(MonotonicMillis::new(1), 16);
+    let relayed = asked.iter().find(|f| f.command == a).expect("asked");
+    assert_eq!(relayed.targets, vec![r(1)]);
+    assert_eq!(version(&relayed.frame), coord_collector::VERSION_RELAYED);
+    let fanned = asked.iter().find(|f| f.command == b).expect("asked");
+    assert_eq!(fanned.targets, (0..3).map(r).collect::<Vec<_>>());
+}
+
+/// task-d102: `NotLeading` says nothing about the command. A relayed
+/// entry falls back to fan-out at once; any other waits as it was, and
+/// neither is settled from the record on it.
+#[test]
+fn not_leading_falls_back_a_relayed_entry_and_settles_nothing() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    let unrelayed = submit(&mut c, 1);
+    c.set_relay(true);
+    let relayed = submit(&mut c, 2);
+    for command in [unrelayed, relayed] {
+        assert_eq!(
+            c.on_evidence(from(1), refused(command, SubmissionRefusal::NotLeading)),
+            Ok(Progress::Held(HoldReason::AwaitingRelease))
+        );
+    }
+    assert_eq!(c.not_leading(), 1, "counted for the relayed entry only");
+    assert!(
+        c.half_established().is_empty(),
+        "nothing is settled from the record"
+    );
+    let due = c.due_solicits(MonotonicMillis::ZERO, 16);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].command, relayed);
+    assert_eq!(due[0].targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(
+        version(&due[0].frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!(c.relay_fallbacks(), 1);
+    assert!(
+        c.trace()
+            .iter()
+            .any(|e| matches!(e, CollectorEvent::RelayFellBack { .. }))
+    );
+}
+
+/// Storm fix 3: a relayed entry its leader took and hasn't answered by
+/// the bound is asked of that leader alone again, once, with the relayed
+/// frame as it was submitted. Only a bound later is it fanned out, to the
+/// voters that didn't take it.
+#[test]
+fn a_relayed_entry_its_leader_took_is_asked_of_the_leader_again_before_it_falls_back() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let (command, request) = admitted(1);
+    let Ok(Submitted::FanOut(relayed)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(relayed.targets, vec![r(0)]);
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command,
+            outcomes: vec![(r(0), OfferOutcome::Queued)],
+        },
+    );
+
+    let bound = MonotonicMillis::new(RELAY_FALLBACK_MILLIS);
+    assert_eq!(c.next_solicit(), Some(bound));
+    let before = MonotonicMillis::new(RELAY_FALLBACK_MILLIS - 1);
+    assert!(c.due_solicits(before, 16).is_empty());
+    let asked = c.due_solicits(bound, 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].command, command);
+    assert_eq!(asked[0].targets, vec![r(0)], "the leader alone");
+    assert_eq!(asked[0].frame, relayed.frame, "the relayed frame");
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (1, 0));
+
+    // Once: a bound later it is fanned out.
+    let next = MonotonicMillis::new(2 * RELAY_FALLBACK_MILLIS);
+    assert_eq!(c.next_solicit(), Some(next));
+    let before = MonotonicMillis::new(2 * RELAY_FALLBACK_MILLIS - 1);
+    assert!(c.due_solicits(before, 16).is_empty());
+    let fanned = c.due_solicits(next, 16);
+    assert_eq!(fanned.len(), 1);
+    assert_eq!(
+        fanned[0].targets,
+        vec![r(1), r(2)],
+        "the voters that didn't take it"
+    );
+    assert_eq!(
+        version(&fanned[0].frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (1, 1));
+    let steps: Vec<&str> = c
+        .trace()
+        .iter()
+        .filter_map(|e| match e {
+            CollectorEvent::RelayAskedLeader { .. } => Some("asked the leader"),
+            CollectorEvent::RelayFellBack { .. } => Some("fell back"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps, ["asked the leader", "fell back"]);
+}
+
+/// Storm fix 3 asks again only a leader that took the relayed frame and
+/// may still be leading. One whose link refused the frame up to the bound
+/// is fanned out at the bound, and one that said it isn't leading at
+/// once, both as before and without asking it again.
+#[test]
+fn a_relayed_entry_its_leader_never_took_or_refused_is_fanned_out_without_asking_it_again() {
+    let mut c = collector(4);
+    c.set_answer_on_release(true);
+    c.set_relay(true);
+    let refused_by_link = submit(&mut c, 1);
+    let not_leading = submit(&mut c, 2);
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command: refused_by_link,
+            outcomes: vec![(r(0), OfferOutcome::Saturated)],
+        },
+    );
+    c.offered(
+        MonotonicMillis::ZERO,
+        &Offered {
+            command: not_leading,
+            outcomes: vec![(r(0), OfferOutcome::Queued)],
+        },
+    );
+    assert_eq!(
+        c.on_evidence(from(0), refused(not_leading, SubmissionRefusal::NotLeading)),
+        Ok(Progress::Held(HoldReason::AwaitingRelease))
+    );
+    let now = c.due_solicits(MonotonicMillis::ZERO, 16);
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].command, not_leading);
+    assert_eq!(now[0].targets, vec![r(1), r(2)]);
+
+    // (The one fanned out at once is also due its step-A early solicit
+    // at this bound, as any step-A entry is.)
+    let at_bound = c.due_solicits(MonotonicMillis::new(RELAY_FALLBACK_MILLIS), 16);
+    let fanned = at_bound
+        .iter()
+        .find(|f| f.command == refused_by_link)
+        .expect("fanned out at the bound");
+    assert_eq!(fanned.targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(
+        version(&fanned.frame),
+        coord_collector::VERSION_ANSWER_ON_RELEASE
+    );
+    assert_eq!((c.relay_leader_asks(), c.relay_fallbacks()), (0, 2));
+}
+
+/// task-d102: the relay only applies to marked submissions: with answer
+/// on release off, a collector set to relay still fans out version 1.
+#[test]
+fn the_relay_needs_answer_on_release() {
+    let mut c = collector(4);
+    c.set_relay(true);
+    assert!(!c.relays());
+    let (_, request) = admitted(1);
+    let Ok(Submitted::FanOut(fan_out)) = c.submit(MonotonicMillis::ZERO, &request) else {
+        panic!("not new work");
+    };
+    assert_eq!(fan_out.targets, (0..3).map(r).collect::<Vec<_>>());
+    assert_eq!(version(&fan_out.frame), coord_collector::wire::VERSION);
 }
 
 /// The golden trace is kept only by a collector made to keep it: the

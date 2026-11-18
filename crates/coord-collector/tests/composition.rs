@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_collector::{
-    Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
-    CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
-    MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal, Submitted,
-    admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
+    Action, Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, Caller, Collector,
+    CollectorConfig, CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason,
+    KIND_EVIDENCE, KIND_RELEASE, MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal,
+    Submitted, admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -169,7 +169,12 @@ fn response_of(delivery: &Delivery) -> ResponseV1 {
 }
 
 fn provenance(from: ReplicaId, connection: u64) -> PeerProvenance {
-    PeerProvenance::from_transport(from, inc(), connection)
+    PeerProvenance::from_transport(
+        from,
+        inc(),
+        coord_types::wire_v1::PeerRole::Voter,
+        connection,
+    )
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1154,6 +1159,18 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
         Action::Respond(d) => assert_eq!(err_code(&response_of(&d)), codes::BACKPRESSURE),
         other => panic!("{other:?}"),
     }
+    // The gate admitted it and the collector refused it: counted apart
+    // from the gate's own refusals, and in their total (#228 review).
+    assert_eq!(
+        w.frontend.admission().refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 0,
+            other: 0,
+            collection_bound: 1,
+        }
+    );
+    assert_eq!(w.frontend.admission().refusals().total(), 1);
     w.settle();
     assert_eq!(w.frontend.collector().pending(), 2, "nothing evicted");
     assert!(w.frontend.collector().is_pending(&c1) && w.frontend.collector().is_pending(&c2));
@@ -1546,6 +1563,9 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
             CollectorEvent::Undisseminated { .. } => "undisseminated",
             CollectorEvent::VoterRefused { .. } => "voter-refused",
             CollectorEvent::Solicited { .. } => "solicited",
+            CollectorEvent::SolicitedLeader { .. } => "solicited-leader",
+            CollectorEvent::RelayAskedLeader { .. } => "relay-asked-leader",
+            CollectorEvent::RelayFellBack { .. } => "relay-fell-back",
         })
         .collect();
     for k in [
@@ -1601,6 +1621,16 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
     gate.settled(&first.retry_key);
     gate.admit(0, &caller(), &other).expect("the slot is free");
     assert_eq!(gate.pending(&SESSION), 1);
+    // The one refusal was the session's bound, counted as such.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 0,
+            session_busy: 1,
+            other: 0,
+            collection_bound: 0,
+        }
+    );
 }
 
 /// New requests are admitted at no more than the configured rate, with a
@@ -1647,6 +1677,17 @@ fn admission_is_bounded_by_its_rate_and_a_retry_takes_nothing() {
     }
     let (_, tenth) = request(10, put(b"a", b"1"), 0);
     assert!(gate.admit_at(0, at(60_000), &caller(), &tenth).is_err());
+    // Each refusal is counted by why, for the metrics line: the rate
+    // refused four, and nothing else was refused.
+    assert_eq!(
+        gate.refusals(),
+        AdmissionRefusals {
+            rate_limited: 4,
+            session_busy: 0,
+            other: 0,
+            collection_bound: 0,
+        }
+    );
 }
 
 #[test]

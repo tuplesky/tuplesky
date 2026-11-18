@@ -48,6 +48,10 @@ pub struct Window {
     pub oldest: u32,
     /// Version written.
     pub current: u32,
+    /// Newest version decoded: the one written, unless this build reads
+    /// ahead. A build that reads ahead decodes what its successor will
+    /// write, so a voter can go back to it from that successor.
+    pub newest: u32,
 }
 
 /// One independently versioned format.
@@ -116,47 +120,70 @@ impl Format {
 
     /// What this build reads and writes.
     ///
-    /// Every window is currently one version wide, because nothing has
-    /// had an incompatible change yet. Widening one is how a release
-    /// keeps reading its predecessor's bytes, and it is a reviewed
-    /// change to this table rather than a decoder that tries and sees.
+    /// Most windows are one version wide, because nothing has had an
+    /// incompatible change yet. Widening one is how a release keeps
+    /// reading its predecessor's bytes, or reads ahead what its successor
+    /// will write, and it is a reviewed change to this table rather than
+    /// a decoder that tries and sees.
     pub const fn window(self) -> Window {
         match self {
             Format::Command => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::Wire => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
+            // Reads ahead to 2, the first format whose records may hold a
+            // group's application outcomes, which its successor writes
+            // (the batching-rule doc's 10.7, step 1a).
             Format::JournalRecord => Window {
                 oldest: 1,
                 current: 1,
+                newest: 2,
             },
             Format::JournalMetadata => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::StoreSchema => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
+            // 2, for two layouts that landed together. Task-d113, step 2:
+            // executed rows and executed payloads by execution position,
+            // pending payloads and decided records node-private. Task-d105:
+            // no `kv_history_v1` rows; below the floor, each key's newest
+            // put at or below it as its event row. An image of the layout
+            // before is refused, not converted (#243 review).
             Format::SharedCheckpoint => Window {
-                oldest: 1,
-                current: 1,
+                oldest: 2,
+                current: 2,
+                newest: 2,
             },
+            // 2 (task-d113, step 2): executed rows and executed payloads
+            // by execution position, pending payloads and decided records
+            // node-private. An image of the layout before is refused, not
+            // converted (#243 review).
             Format::LocalCheckpoint => Window {
-                oldest: 1,
-                current: 1,
+                oldest: 2,
+                current: 2,
+                newest: 2,
             },
             Format::Backup => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
             Format::KineAdapter => Window {
                 oldest: 1,
                 current: 1,
+                newest: 1,
             },
         }
     }
@@ -169,12 +196,12 @@ impl Format {
     /// Whether this build can read `version`.
     ///
     /// Below the window is a format that has been retired; above it is
-    /// one written by a newer binary. Both are refusals: guessing at
-    /// either is how a store gets written by something that did not
-    /// understand it.
+    /// one written by a newer binary than this one reads. Both are
+    /// refusals: guessing at either is how a store gets written by
+    /// something that did not understand it.
     pub const fn supports(self, version: u32) -> bool {
         let window = self.window();
-        version >= window.oldest && version <= window.current
+        version >= window.oldest && version <= window.newest
     }
 
     /// Look up by frozen identifier.
@@ -202,14 +229,14 @@ pub enum FormatError {
         /// Oldest decoded.
         oldest: u32,
     },
-    /// Newer than anything this build writes: something else wrote it.
+    /// Newer than anything this build reads: something else wrote it.
     Newer {
         /// The format.
         format: Format,
         /// Version found.
         found: u32,
-        /// Newest understood.
-        current: u32,
+        /// Newest decoded.
+        newest: u32,
     },
 }
 
@@ -228,10 +255,10 @@ impl core::fmt::Display for FormatError {
             FormatError::Newer {
                 format,
                 found,
-                current,
+                newest,
             } => write!(
                 f,
-                "{} format {found} was written by a newer build than this one ({current})",
+                "{} format {found} was written by a newer build than this one reads ({newest})",
                 format.name()
             ),
         }
@@ -250,11 +277,11 @@ pub const fn admit(format: Format, version: u32) -> Result<(), FormatError> {
             oldest: window.oldest,
         });
     }
-    if version > window.current {
+    if version > window.newest {
         return Err(FormatError::Newer {
             format,
             found: version,
-            current: window.current,
+            newest: window.newest,
         });
     }
     Ok(())
@@ -284,14 +311,81 @@ pub enum Feature {
     /// (task-j04). A voter that cannot load a published baseline cannot
     /// recover from a reclaimed prefix at all.
     LocalCheckpoint = 0x0003,
+    /// The leader's proposal sent before its batch is durable, to a
+    /// follower that cannot make a fast quorum from it (task-d98, design
+    /// Sections 4.3 and 4.8). A follower built before task-d74 hears the
+    /// other followers' fast acknowledgements, and with the proposal they
+    /// make a fast quorum it would count over a vote the leader may lose.
+    EarlyProposal = 0x0004,
+    /// `EarlyProposal`'s prepare marker (task-d99, design Section 13): a
+    /// voter that wrote its durable support for `EarlyProposal` names this
+    /// in its own activation record, in the same batch. It gates no
+    /// behaviour. It is the rollback guard every build since `admit`
+    /// already runs: a build that does not know this id cannot read the
+    /// record and refuses to start, so a voter cannot report the feature,
+    /// roll back, and leave unanimity counting a build it no longer runs.
+    EarlyProposalPrepared = 0x0005,
+    /// Every voter votes on durable payload rows and forgets only what its
+    /// journal holds (task-d90's points 2 and 4, #195; point 3, task-d95).
+    /// A build from before those can acknowledge a command whose payload
+    /// row it never made durable, and come back holding the record alone.
+    /// Two rules rest on this, and each is on only while it is active
+    /// (design Section 4.5):
+    /// - a leader's results are released as its commands execute in
+    ///   memory, before their execution group is journaled; without the
+    ///   premise a domain-wide crash could lose a result already
+    ///   released;
+    /// - a selection leaves out a re-proposal no reporter holds a payload
+    ///   row for (`SelectionRules::leave_out_unheld`); without the premise
+    ///   that could drop a command an older voter acknowledged, where
+    ///   re-proposing it stalls until a supplier is back.
+    ReleaseAtExecution = 0x0006,
+    /// `ReleaseAtExecution`'s prepare marker, as `EarlyProposalPrepared`
+    /// is `EarlyProposal`'s.
+    ReleaseAtExecutionPrepared = 0x0007,
+    /// A collector answers a command on its leader's final release alone,
+    /// and the voters send its frontend no evidence for it (task-d100,
+    /// step A; design Section 4.3). A collector marks its submissions so
+    /// only while this is active, which implies that every configured
+    /// voter runs a build that reads the mark and puts the decided
+    /// payload's admission digest in its releases. Unmarked commands keep
+    /// today's evidence, so the two mix while it activates.
+    AnswerOnRelease = 0x0008,
+    /// `AnswerOnRelease`'s prepare marker, as `EarlyProposalPrepared` is
+    /// `EarlyProposal`'s.
+    AnswerOnReleasePrepared = 0x0009,
+    /// A contended round is a batch (task-d102, design Section 4.3), with
+    /// task-d100's step B, the leader relay, as its first part. A
+    /// collector may send a submission to its ballot's leader alone,
+    /// marked as relayed, and the leader's proposal of it then carries
+    /// the payload to every follower (`ProtocolMessage::RelayedProposal`).
+    /// A voter of an older build could not decode that proposal, so a
+    /// collector relays only while this is active, and it is activated
+    /// only after `AnswerOnRelease`: a relayed command is marked, and
+    /// answered on the leader's release alone. It gates a wire form and
+    /// a routing, not an argument about votes: a relayed command is, to
+    /// every voter, one whose submission to the followers was lost and
+    /// whose payload arrived with the leader's proposal.
+    BatchedRound = 0x000A,
+    /// `BatchedRound`'s prepare marker, as `EarlyProposalPrepared` is
+    /// `EarlyProposal`'s.
+    BatchedRoundPrepared = 0x000B,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 3] = [
+    pub const ALL: [Feature; 11] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
+        Feature::EarlyProposal,
+        Feature::EarlyProposalPrepared,
+        Feature::ReleaseAtExecution,
+        Feature::ReleaseAtExecutionPrepared,
+        Feature::AnswerOnRelease,
+        Feature::AnswerOnReleasePrepared,
+        Feature::BatchedRound,
+        Feature::BatchedRoundPrepared,
     ];
 
     /// The frozen identifier.
@@ -305,7 +399,52 @@ impl Feature {
             Feature::CheckpointFloor => "checkpoint-floor",
             Feature::SealedHandoff => "sealed-handoff",
             Feature::LocalCheckpoint => "local-checkpoint",
+            Feature::EarlyProposal => "early-proposal",
+            Feature::EarlyProposalPrepared => "early-proposal-prepared",
+            Feature::ReleaseAtExecution => "release-at-execution",
+            Feature::ReleaseAtExecutionPrepared => "release-at-execution-prepared",
+            Feature::AnswerOnRelease => "answer-on-release",
+            Feature::AnswerOnReleasePrepared => "answer-on-release-prepared",
+            Feature::BatchedRound => "batched-round",
+            Feature::BatchedRoundPrepared => "batched-round-prepared",
         }
+    }
+
+    /// The prepare marker of a feature a running domain can activate
+    /// (task-d99), or `None` for one it cannot: a feature without a marker
+    /// has no guard binding a voter's report from the moment it is
+    /// durable, so it is not activated through the running path.
+    pub const fn prepare_marker(self) -> Option<Feature> {
+        match self {
+            Feature::EarlyProposal => Some(Feature::EarlyProposalPrepared),
+            Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
+            Feature::AnswerOnRelease => Some(Feature::AnswerOnReleasePrepared),
+            Feature::BatchedRound => Some(Feature::BatchedRoundPrepared),
+            _ => None,
+        }
+    }
+
+    /// The feature this is the prepare marker of, or `None` for a feature
+    /// that is not a marker.
+    pub const fn marks(self) -> Option<Feature> {
+        match self {
+            Feature::EarlyProposalPrepared => Some(Feature::EarlyProposal),
+            Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
+            Feature::AnswerOnReleasePrepared => Some(Feature::AnswerOnRelease),
+            Feature::BatchedRoundPrepared => Some(Feature::BatchedRound),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a prepare marker rather than a feature: it is never
+    /// reported, never activated and gates nothing.
+    pub const fn is_marker(self) -> bool {
+        self.marks().is_some()
+    }
+
+    /// Look up by stable name (operator input).
+    pub fn from_name(name: &str) -> Option<Feature> {
+        Feature::ALL.iter().copied().find(|f| f.name() == name)
     }
 
     /// Look up by frozen identifier.
@@ -325,9 +464,17 @@ impl Feature {
 pub struct Supported;
 
 impl Supported {
-    /// The features this build supports, in identifier order.
-    pub const fn features() -> [Feature; 3] {
+    /// The features this build supports, in identifier order, prepare
+    /// markers included: a marker is supported exactly when the feature
+    /// it marks is, and `admit` reads one as a requirement on this set.
+    pub const fn features() -> [Feature; 11] {
         Feature::ALL
+    }
+
+    /// What this build reports it can take part in: its features without
+    /// the prepare markers, which are never reported.
+    pub fn reported() -> impl Iterator<Item = Feature> {
+        Feature::ALL.into_iter().filter(|f| !f.is_marker())
     }
 
     /// Whether this build supports `feature`.

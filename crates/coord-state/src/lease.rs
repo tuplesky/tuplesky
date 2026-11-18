@@ -12,15 +12,17 @@ use coord_types::ids::{LeaseGeneration, NamespaceId, PrincipalId};
 use serde::{Deserialize, Serialize};
 
 /// Copies of the entry key one revocation materializes for an attached
-/// key. The current-row deletion, the history tombstone and the
+/// key. It writes three rows for it: the current-row deletion and the
 /// reverse-index deletion each carry the ordered-key escaping of the key,
-/// which at worst doubles it (three rows, six lengths); the event row
-/// carries it once more.
+/// which at worst doubles it (four lengths), and the event row carries the
+/// key once more. That is five copies; the seven charged keep two of margin
+/// from when a revocation also wrote a history tombstone, which task-d105
+/// removed. The number is a replicated limit's input, so it stays.
 pub const ATTACHMENT_KEY_COPIES: u64 = 7;
 
 /// Fixed bytes charged per attached key besides its key copies and value:
-/// the namespace and lease prefixes and revision suffixes of the four row
-/// keys, the previous entry's metadata inside the event row, the record
+/// the namespace and lease prefixes of the two row keys, the event row's
+/// key, the previous entry's metadata inside the event row, the record
 /// framing of every value and the per-update overhead the storage worker
 /// charges. Deliberately above the exact sum so the bound stays valid when
 /// a codec grows a field.
@@ -82,9 +84,9 @@ impl LeaseRecord {
 
 /// Bytes charged to a lease for one attached key with `value`: an upper
 /// bound on what one revocation writes for that key (current deletion,
-/// history tombstone, reverse-index deletion and event row, as the worker
-/// sizes a batch), so a lease within [`PlanLimits::max_lease_bytes`] is
-/// always revocable in one batch below the worker's single-batch limit.
+/// reverse-index deletion and event row, as the worker sizes a batch), so a
+/// lease within [`PlanLimits::max_lease_bytes`] is always revocable in one
+/// batch, and that batch is one journal record.
 ///
 /// [`PlanLimits::max_lease_bytes`]: crate::PlanLimits::max_lease_bytes
 pub fn attachment_cost(key: &[u8], value: &[u8]) -> u64 {

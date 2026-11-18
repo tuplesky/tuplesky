@@ -122,8 +122,16 @@ struct Cluster {
     nodes: Vec<Node>,
     seed: u64,
     /// Nodes whose incoming acknowledgements from other followers are
-    /// dropped. The leader's proposals still reach them.
+    /// dropped, and the commit frontier the leader announces in a step
+    /// (task-d74): only the one its re-send timer announces reaches them.
+    /// Since task-d74 no follower sends another an acknowledgement, so
+    /// this is a follower that missed every prompt frontier, which the
+    /// timer's repairs. The leader's proposals still reach them.
     deaf: Vec<u8>,
+    /// Whether the frontier being routed is the re-send timer's.
+    ticking: bool,
+    /// Acknowledgements one follower sent another.
+    between_followers: usize,
     /// Nodes that receive no proposals at all.
     unproposed: Vec<u8>,
     /// Nodes that are down: they send, receive and do nothing.
@@ -132,8 +140,8 @@ struct Cluster {
     announced: Vec<(u8, u64)>,
     /// Every payload ask sent: (from, commands).
     asks: Vec<(u8, Vec<CommandId>)>,
-    /// The voters' table capacity.
-    capacity: usize,
+    /// Each voter's table capacity.
+    capacity: Vec<usize>,
     /// The most records each node's table held after a delivery.
     peak: Vec<usize>,
 }
@@ -142,8 +150,15 @@ const SETTLE_STEPS: u32 = 200_000;
 
 impl Cluster {
     fn new(seed: u64, capacity: usize) -> Self {
+        Self::sized(seed, |_| capacity)
+    }
+
+    /// A cluster whose voter `me` has a table of `capacity(me)`.
+    fn sized(seed: u64, capacity: impl Fn(usize) -> usize) -> Self {
         let mut nodes = Vec::new();
+        let capacities: Vec<usize> = (0..VOTERS as usize).map(capacity).collect();
         for me in 0..VOTERS {
+            let capacity = capacities[me as usize];
             let role = if me == 0 {
                 Role::Leader(Leader::new(
                     LeaderConfig {
@@ -182,11 +197,13 @@ impl Cluster {
             nodes,
             seed,
             deaf: Vec::new(),
+            ticking: false,
+            between_followers: 0,
             unproposed: Vec::new(),
             down: Vec::new(),
             announced: Vec::new(),
             asks: Vec::new(),
-            capacity,
+            capacity: capacities,
             peak: vec![0; VOTERS as usize],
         }
     }
@@ -221,9 +238,22 @@ impl Cluster {
                         continue;
                     }
                     let message = ProtocolMessage::decode(&frame).unwrap();
+                    if matches!(
+                        message,
+                        ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
+                    ) && i != 0
+                        && dest != 0
+                    {
+                        self.between_followers += 1;
+                    }
                     match &message {
                         ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
                             if i != 0 && self.deaf.contains(&dest) =>
+                        {
+                            continue;
+                        }
+                        ProtocolMessage::Committed { .. }
+                            if !self.ticking && self.deaf.contains(&dest) =>
                         {
                             continue;
                         }
@@ -250,7 +280,12 @@ impl Cluster {
 
     fn deliver(&mut self, to: usize, from: ReplicaId, frame: Vec<u8>) {
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             frame,
         ));
         let effects = self.nodes[to].step(event);
@@ -351,14 +386,16 @@ impl Cluster {
             panic!("r0 leads")
         };
         let effects = l.announce_committed();
+        self.ticking = true;
         self.handle(0, effects);
+        self.ticking = false;
     }
 
     /// Kill node `i` and bring it back at once from its durable rows, as
     /// `coordd` restores a voter: its volatile state is gone, and its
     /// adoptions come back without the ballot's sequence numbers.
     fn restart(&mut self, i: usize) {
-        let capacity = self.capacity;
+        let capacity = self.capacity[i];
         let node = &mut self.nodes[i];
         node.inbox.clear();
         node.storage.crash();
@@ -518,6 +555,27 @@ fn a_follower_that_hears_only_the_leader_executes_what_it_commits() {
     }
 }
 
+/// Every follower learns from the leader's commit frontier, announced
+/// in the step that moves it (task-d74): no re-send timer, and no
+/// acknowledgement from one follower to another.
+#[test]
+fn every_follower_executes_from_the_frontier_announced_in_the_step_that_moves_it() {
+    let mut cluster = Cluster::new(19, 64);
+    let commands: Vec<CommandId> = (1..=12).map(|n| cluster.admit(n)).collect();
+    cluster.settle();
+    for i in 0..VOTERS as usize {
+        assert_eq!(cluster.nodes[i].executed, commands, "node {i}");
+    }
+    assert_eq!(
+        cluster.between_followers, 0,
+        "a follower acknowledged to another"
+    );
+    assert!(
+        (1..VOTERS).all(|f| cluster.announced.iter().any(|(to, _)| *to == f)),
+        "the frontier reached every follower"
+    );
+}
+
 /// Two followers cut off from each other's acknowledgements under a live
 /// leader both execute, and so does everyone else.
 ///
@@ -547,9 +605,15 @@ fn two_followers_cut_from_their_peers_both_execute() {
 /// Its first eight commands are adopted and wait for a commit. Every later
 /// payload is refused as backpressure, and so is every later proposal's
 /// placeholder: those proposals are held with nothing in the table.
+///
+/// The other voters' tables hold the whole run, so the leader still has
+/// every proposal and payload r3 asks for: they are not history yet. Past
+/// its window a command's are dropped (task-d111 item 4 (d)), as a history
+/// sweep dropped them before, and a voter that far behind catches up by
+/// pages (task-d08).
 fn stalled(seed: u64) -> (Cluster, Vec<CommandId>) {
     let capacity = 8;
-    let mut cluster = Cluster::new(seed, capacity);
+    let mut cluster = Cluster::sized(seed, |me| if me == 3 { capacity } else { capacity * 4 });
     cluster.deaf = vec![3];
     let commands: Vec<CommandId> = (1..=(capacity as u64 * 4))
         .map(|n| {
@@ -1028,4 +1092,43 @@ fn a_proposal_a_voter_lacks_is_resent_with_a_growing_gap() {
             "a proposal r4 adopted was sent again"
         );
     }
+}
+
+/// A restarted voter queues only the restored executions its table has
+/// not forgotten yet (#221 review). Queued whole, the restored history
+/// waited at the front of the forget queue for the first execution after
+/// the restart, which let all but the queue's bound go in one call,
+/// unforgotten as far as the queue knew, and owed them to a sweep.
+#[test]
+fn a_restarted_voter_queues_only_what_it_has_not_forgotten() {
+    let capacity = 8;
+    let mut cluster = Cluster::new(37, capacity);
+    for n in 1..=(capacity as u64 * 16) {
+        cluster.admit(n);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    assert_eq!(cluster.nodes[1].executed.len(), capacity * 16);
+    cluster.restart(1);
+    let queued = cluster.nodes[1]
+        .follower_mut()
+        .ledger()
+        .forget_queued()
+        .len();
+    assert!(
+        queued <= capacity * 2,
+        "{queued} restored executions queued at a capacity of {capacity}"
+    );
+    for n in 1..=(capacity as u64 * 2) {
+        cluster.admit(1_000 + n);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    let f = cluster.nodes[1].follower_mut();
+    assert_eq!(f.ledger().forgets_skipped(), 0, "the queue let some go");
+    assert_eq!(f.ledger().owed_sweep(), None);
+    assert_eq!(
+        cluster.nodes[1].executed.len(),
+        cluster.nodes[0].executed.len()
+    );
 }

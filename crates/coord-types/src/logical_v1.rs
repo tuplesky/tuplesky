@@ -402,10 +402,13 @@ impl LogicalRequest {
     }
 
     /// Canonical postcard encoding (the identity payload). Fails only when
-    /// the request is invalid or not canonical.
+    /// the request is invalid or not canonical. Counted, then encoded into
+    /// a buffer of that size, rather than one grown a field at a time.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ValidationError> {
         self.validate()?;
-        postcard::to_allocvec(self).map_err(|_| ValidationError::RequestTooLarge)
+        let too_large = |_| ValidationError::RequestTooLarge;
+        let len = postcard::experimental::serialized_size(self).map_err(too_large)?;
+        postcard::to_extend(self, Vec::with_capacity(len)).map_err(too_large)
     }
 }
 

@@ -45,7 +45,7 @@ pub use http::{IssuerState, SignClock, SystemSignClock, router};
 pub use identity::{NodeIdentity, node_uri, parse_node_uri, role_of, role_str};
 pub use issuer::{IssueError, Issued, NodeIssuer, NodeRequest};
 pub use lifecycle::{Leaf, Renewal, RenewalPolicy};
-pub use policy::{NodePolicy, PolicyError, RolePolicy};
+pub use policy::{Choice, NodePolicy, PolicyError, RolePolicy};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

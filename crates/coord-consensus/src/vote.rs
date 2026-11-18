@@ -165,6 +165,17 @@ pub enum VoteError {
     },
 }
 
+/// Which learning predicate holds over a vote set: [`Learned`] without
+/// the dependencies, for a caller that needs only the path (task-d60,
+/// step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LearnedBy {
+    /// The fast predicate.
+    Fast,
+    /// The slow predicate, and not the fast one.
+    Slow,
+}
+
 /// A learned decision for the command.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Learned {
@@ -308,9 +319,16 @@ impl VoteSet {
     /// durable, has arrived.
     pub fn learned_slow(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        (self.slow.len() >= self.config.slow_size()).then(|| Learned::Slow {
+        self.learned_slow_by().map(|_| Learned::Slow {
             deps: leader.deps.clone(),
         })
+    }
+
+    /// [`VoteSet::learned_slow`]'s path, without cloning the
+    /// dependencies.
+    pub fn learned_slow_by(&self) -> Option<LearnedBy> {
+        self.leader.as_ref()?;
+        (self.slow.len() >= self.config.slow_size()).then_some(LearnedBy::Slow)
     }
 
     /// Whether `replica` has acknowledged the leader's proposal of this
@@ -328,6 +346,16 @@ impl VoteSet {
     /// The learning predicate over the counted votes. Fast learning is
     /// preferred when both hold; both need the leader proposal.
     pub fn learned(&self) -> Option<Learned> {
+        let deps = self.leader.as_ref()?.deps.clone();
+        self.learned_by().map(|by| match by {
+            LearnedBy::Fast => Learned::Fast { deps },
+            LearnedBy::Slow => Learned::Slow { deps },
+        })
+    }
+
+    /// [`VoteSet::learned`]'s path, without cloning the dependencies:
+    /// what the learner asks of every command at ACCEPT on each pass.
+    pub fn learned_by(&self) -> Option<LearnedBy> {
         let leader = self.leader.as_ref()?;
         let agreeing_paths = self
             .fast
@@ -335,11 +363,9 @@ impl VoteSet {
             .filter(|a| a.path == leader.path && same_set(&a.deps, &leader.deps))
             .count();
         if agreeing_paths + 1 >= self.config.fast_size() {
-            return Some(Learned::Fast {
-                deps: leader.deps.clone(),
-            });
+            return Some(LearnedBy::Fast);
         }
-        self.learned_slow()
+        self.learned_slow_by()
     }
 
     /// Why the fast predicate fails over the votes counted so far
@@ -480,7 +506,20 @@ impl MissedLog {
 }
 
 /// Dependency sets compare as sets (prototype `Dep.Equals`).
+///
+/// Two lists in the same order are the same set without building either,
+/// which is the common case: every voter derives a command's dependencies
+/// the same way. Short lists are compared by membership both ways, which
+/// allocates nothing; only long ones in another order are built into sets
+/// (task-d60, step 4: the learner compares every fast acknowledgement's
+/// dependencies with the leader's on each pass).
 pub fn same_set(a: &[CommandId], b: &[CommandId]) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.len() <= 16 && b.len() <= 16 {
+        return a.iter().all(|x| b.contains(x)) && b.iter().all(|y| a.contains(y));
+    }
     let a: BTreeSet<&CommandId> = a.iter().collect();
     let b: BTreeSet<&CommandId> = b.iter().collect();
     a == b

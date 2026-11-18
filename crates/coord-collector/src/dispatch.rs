@@ -199,9 +199,35 @@ impl Dispatcher {
         self.leader_reads = on;
     }
 
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A; see
+    /// [`crate::Collector::set_answer_on_release`]).
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.collector.set_answer_on_release(on);
+    }
+
+    /// Relay marked submissions to the ballot's leader alone, or stop
+    /// (task-d102; [`crate::Collector::set_relay`]).
+    pub fn set_relay(&mut self, on: bool) {
+        self.collector.set_relay(on);
+    }
+
     /// Reads waiting on their leader's answer.
     pub fn reads_waiting(&self) -> usize {
         self.reads.len()
+    }
+
+    /// Whether a result for `key` can still come from here: a read
+    /// waiting on its leader, a command being collected, or one whose
+    /// result is retained for resolution. Each is bounded by this
+    /// dispatcher's own limits.
+    pub fn holds(&self, key: &RetryKey) -> bool {
+        self.reads.contains_key(key) || self.collector.is_bound(key)
+    }
+
+    /// How many keys [`Dispatcher::holds`] is true for.
+    pub fn held(&self) -> usize {
+        self.reads.len() + self.collector.bound()
     }
 
     /// The collector.
@@ -776,6 +802,7 @@ impl Dispatcher {
                         "retry key bound to another payload",
                     ),
                     SubmitRefusal::Backpressure { .. } => {
+                        self.admission.refused_at_collection_bound();
                         (codes::BACKPRESSURE, "domain at its collection bound")
                     }
                 };
@@ -853,17 +880,25 @@ impl Dispatcher {
         })
     }
 
-    /// The leader `from`'s answer to a read (task-d50).
+    /// The leader's answer to a read (task-d50), by the provenance the
+    /// transport bound its link to.
     ///
-    /// Only the voter the read was sent to answers it. A served result is
-    /// the caller's, still to pass the frontend's output gate; a refusal
-    /// orders the read instead.
+    /// Only the voter the read was sent to answers it, and only on a
+    /// voter's link: an observer's or learner's, bound under the leader's
+    /// replica, answers nothing, and the read keeps waiting for the
+    /// leader (design Section 10.1). A served result is the caller's,
+    /// still to pass the frontend's output gate; a refusal orders the
+    /// read instead.
     pub fn on_read_answer(
         &mut self,
         now: MonotonicMillis,
-        from: ReplicaId,
+        from: PeerProvenance,
         answer: ReadAnswerV1,
     ) -> Option<ReadResolution> {
+        if !from.is_voter() {
+            return None;
+        }
+        let from = from.from();
         let key = answer.retry_key;
         if self.reads.get(&key)?.leader != from {
             return None;

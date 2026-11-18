@@ -612,13 +612,16 @@ impl Default for InstallLocalLimits {
 fn identity_row_admitted(key: &[u8], staged: &[u8], image: Option<&[u8]>) -> bool {
     use coord_store_api::registry::meta_fields;
     use coord_types::ReplicaIncarnation;
-    const IDENTITY: [&[u8]; 6] = [
+    // The store format too (task-d113): an image of another layout is not
+    // installed into a generation of this one.
+    const IDENTITY: [&[u8]; 7] = [
         meta_fields::CLUSTER_ID,
         meta_fields::DOMAIN_ID,
         meta_fields::REPLICA_ID,
         meta_fields::INCARNATION,
         meta_fields::ENGINE,
         meta_fields::PROFILE,
+        meta_fields::FORMAT_VERSION,
     ];
     let Some(image) = image else { return false };
     if !IDENTITY.contains(&key) {

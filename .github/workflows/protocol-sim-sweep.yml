@@ -6,12 +6,35 @@
 # runs with half, three in four and every acknowledgement to a follower
 # lost (`PROTOCOL_SIM_PEER_ACK_LOSS`, task-d78): half found row 4's seed
 # 720, all found row 10's seed 540, and only three in four found row 9's
-# seed 296 (task-d80); rows 16 and 17 run under their own loss. CI's default
+# seed 296 (task-d80); rows 16 and 17 run under their own loss. Rows 1
+# and 2 run each seed again with task-d98's early proposals, and row 18
+# is the early send's own row. Rows 19 to 24 (task-d90's crash cuts, the
+# gate's window, late execution, a donor lost mid-window) and
+# `relayed_rows` (rows 1, 9 and 14 with answers on release and relayed
+# payloads) run too: `relayed_rows` had only ever run at 12 seeds, and
+# its first run here found row 9's seed 275. Row 24 runs with catch-up
+# only: its donor is lost mid-window, and without catch-up there is no
+# window (#306 review). CI's default
 # of 12 seeds per row and size stays in `cargo xtask test`. A failing
 # seed is printed with its row and size; replay it with
 # `PROTOCOL_SIM_ONE=row,voters,seed` and `PROTOCOL_SIM_TRACE=1`, and keep
 # it in `crates/coord-consensus/fixtures/protocol_sim/seeds.json` with
 # what it found.
+#
+# Each job first checks that its `--exact` name lists a test: with a name
+# that matches nothing, libtest runs no test and passes, so a row renamed
+# or removed fails here rather than passing empty. The testing session
+# reads the Sunday run and reports it on the code branch's pull request.
+#
+# The sweep above builds release, so neither of the simulator's debug
+# checks runs in it: `next_executable`'s ready set against a full walk
+# (task-d107), and each learning pass passed over against every accepted
+# command (#269). The `checked` job runs them, in release with
+# `coord-consensus`'s debug assertions on: every row at
+# `checked_seeds` (400 by default; about 30 minutes on four cores), and
+# the rows with storage steps (`rows_with_storage_steps_learn_once_a_step`,
+# rows 1, 9, 21 and 23 handed one step of storage events at once, which
+# no other row does) at `seeds`.
 name: protocol-sim-sweep
 
 on:
@@ -20,12 +43,33 @@ on:
       seeds:
         description: "Seeds per row and size"
         default: "1000"
+      checked_seeds:
+        description: "Seeds per row and size for every row with debug checks"
+        default: "400"
   schedule:
     # Weekly (Sundays 04:41 UTC), apart from CI's Monday run.
     - cron: "41 4 * * 0"
+  # GitHub takes `schedule` and `workflow_dispatch` only from the default
+  # branch, and `main` doesn't hold this file, so neither has started it.
+  # A branch reaches it through a pull request, as jepsen.yml is reached:
+  # that one's `pull_request` trigger runs it once on a pull request that
+  # changes the harness, at its dispatch defaults. Here the trigger is the
+  # `run-sweep` label. Putting it on a pull request runs the sweep once on
+  # the pull request's merge commit, at the defaults below. Taking it off
+  # and putting it back runs it again and cancels the older run.
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
+
+# A second `run-sweep` label on a pull request cancels the run the first
+# started. Any other label starts a run whose jobs are all skipped (each
+# job's `if`), in a group of its own, so it cancels nothing. Scheduled and
+# dispatched runs wait for each other rather than cancel.
+concurrency:
+  group: protocol-sim-sweep-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'run' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +78,7 @@ env:
 jobs:
   sweep:
     name: row ${{ matrix.row }} (${{ matrix.catch-up }}, peer-ack loss ${{ matrix.peer-ack-loss || 'of the row' }})
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-sweep'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -51,6 +96,14 @@ jobs:
           - row_14_lost_responses_and_retries_under_one_identity
           - row_16_repeated_elections_with_every_acknowledgement_to_a_follower_lost
           - row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
+          - row_18_the_leaders_proposal_before_its_batch_is_durable
+          - row_19_results_released_before_their_execution_group_is_durable
+          - row_20_each_vote_on_a_durable_payload_row
+          - row_21_a_payload_batch_failed_under_a_later_vote
+          - row_22_the_leader_crashed_in_the_gates_window
+          - row_23_early_proposals_with_late_execution
+          - row_24_a_voter_behind_loses_the_donor_serving_its_pages
+          - relayed_rows
         catch-up: [catch-up, no-catch-up]
         # Parts per million; empty is the row's own.
         peer-ack-loss: ["", "500000", "750000", "1000000"]
@@ -67,6 +120,8 @@ jobs:
             peer-ack-loss: "750000"
           - row: row_17_repeated_elections_with_half_the_acknowledgements_to_a_follower_lost
             peer-ack-loss: "1000000"
+          - row: row_24_a_voter_behind_loses_the_donor_serving_its_pages
+            catch-up: no-catch-up
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -75,7 +130,7 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           cargo --version && rustc --version
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: protocol-sim-sweep
       - name: Build the simulator (release)
@@ -89,5 +144,61 @@ jobs:
         run: |
           if [ -n "$NO_CATCH_UP" ]; then export PROTOCOL_SIM_NO_CATCH_UP=1; fi
           if [ -n "$PEER_ACK_LOSS" ]; then export PROTOCOL_SIM_PEER_ACK_LOSS="$PEER_ACK_LOSS"; fi
+          # `--exact` with a name that matches nothing runs 0 tests and passes.
+          if ! cargo test --locked --release -p coord-consensus --test protocol_sim -- \
+              --exact "$ROW" --list | grep -qxF "$ROW: test"; then
+            echo "::error::no test named $ROW in protocol_sim"
+            exit 1
+          fi
           cargo test --locked --release -p coord-consensus --test protocol_sim -- \
             --exact "$ROW" --nocapture
+
+  checked:
+    name: ${{ matrix.name }} (debug checks)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-sweep'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: every row
+            test: ""
+          - name: storage steps
+            test: rows_with_storage_steps_learn_once_a_step
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: protocol-sim-sweep-checked
+      - name: Build the simulator (release, debug checks on)
+        run: |
+          cargo test --locked --release \
+            --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+            -p coord-consensus --test protocol_sim --no-run
+      - name: Sweep with debug checks
+        env:
+          PROTOCOL_SIM_SEEDS: ${{ matrix.test == '' && (inputs.checked_seeds || '400') || (inputs.seeds || '1000') }}
+          TEST: ${{ matrix.test }}
+        run: |
+          set -- --nocapture
+          if [ -n "$TEST" ]; then
+            # `--exact` with a name that matches nothing runs 0 tests and passes.
+            if ! cargo test --locked --release \
+                --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+                -p coord-consensus --test protocol_sim -- --exact "$TEST" --list \
+                | grep -qxF "$TEST: test"; then
+              echo "::error::no test named $TEST in protocol_sim"
+              exit 1
+            fi
+            set -- --exact "$TEST" --nocapture
+          fi
+          cargo test --locked --release \
+            --config 'profile.release.package.coord-consensus.debug-assertions=true' \
+            -p coord-consensus --test protocol_sim -- "$@"

@@ -47,11 +47,12 @@ pub mod sched;
 
 pub use budget::{Budget, BudgetError, BudgetLimits};
 pub use config::{
-    ALPN_API, ALPN_PEER, AckFrequency, Class, ClientIdentity, Limits, LocalIdentity, TlsProfile,
+    ALPN_API, ALPN_PEER, AckFrequency, Class, ClientIdentity, Congestion, Limits, LocalIdentity,
+    Reordering, TlsProfile,
 };
 pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
-    TrafficReader, Transport, TransportError, TransportEvent,
+    CloseCode, CloseReason, ConnectionId, Destination, Dialer, PathReading, Refused, RequestError,
+    Responder, SendError, TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
 };
 pub use frames::{
     CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,

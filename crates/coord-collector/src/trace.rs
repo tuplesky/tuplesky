@@ -164,4 +164,36 @@ pub enum CollectorEvent {
         /// How many times it has been, this one included.
         times: u32,
     },
+    /// A pending command answered on the release alone, holding neither
+    /// half of a release one offer ceiling after its submission, was
+    /// submitted again to its ballot's leader only (task-d100, step A;
+    /// #204 review). Once a command, and it doesn't count toward
+    /// [`CollectorEvent::Solicited`]'s `times`.
+    SolicitedLeader {
+        /// Command.
+        command: String,
+        /// The leader it went to.
+        to: String,
+    },
+    /// A command relayed to its ballot's leader alone (task-d102,
+    /// task-d100's step B), which that leader took and hadn't answered
+    /// within [`crate::RELAY_FALLBACK_MILLIS`], was submitted to the
+    /// leader alone again, once (storm fix 3).
+    RelayAskedLeader {
+        /// Command.
+        command: String,
+        /// The leader it went to.
+        to: String,
+    },
+    /// A command relayed to its ballot's leader alone (task-d102,
+    /// task-d100's step B) was submitted to every voter as one answered
+    /// on the release alone: its leader did not answer within
+    /// [`crate::RELAY_FALLBACK_MILLIS`] of being asked again, never took
+    /// it, or said it isn't leading.
+    RelayFellBack {
+        /// Command.
+        command: String,
+        /// The voters it was offered to.
+        targets: Vec<String>,
+    },
 }

@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::ca::Ca;
 use crate::identity::node_uri;
-use crate::policy::{RolePolicy, authorize};
+use crate::policy::{Choice, RolePolicy, authorize};
 use coord_types::wire_v1::PeerRole;
 
 /// A signed node certificate.
@@ -50,6 +50,13 @@ pub struct NodeRequest {
     /// matching the workload would answer both renewals. `None` keeps
     /// that first-match rule.
     pub role: Option<PeerRole>,
+    /// The domain asked for, where the request names one.
+    ///
+    /// Like [`NodeRequest::role`], a choice among the workload's own
+    /// rules: a workload that runs a node in each of two domains holds a
+    /// rule for each, and its renewal names the domain it is in. The
+    /// certificate's domain is still the matched rule's.
+    pub domain: Option<[u8; 16]>,
 }
 
 /// Why enrollment failed. Bounded; never key material.
@@ -152,7 +159,10 @@ impl NodeIssuer {
             &identity,
             node,
             incarnation,
-            request.role,
+            Choice {
+                role: request.role,
+                domain: request.domain.map(coord_types::ids::DomainId),
+            },
             request.lifetime_secs,
         )
         .map_err(IssueError::Policy)?;
