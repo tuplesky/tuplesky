@@ -5021,13 +5021,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let fresh = self.policy_open();
-        let policy = Fresh {
-            source: ReadViewPolicy {
-                applier: self.backing.applier(),
-                budget: ViewBudget::default(),
-            },
-            fresh,
-        };
+        let policy = answer_policy(self.backing.applier(), fresh);
         let now = self.now_millis();
         let delivery = match self.frontend.frontend.deliver_at(now, delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
@@ -5067,9 +5061,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// `Pending`.
     ///
     /// A held disclosure is gated again against the barrier `answer`
-    /// builds: over the applier's read view, so a revoke in a group not
-    /// yet committed to the store is seen (#281), and only while this
-    /// voter's policy is fresh (#320), so a stale one withholds it.
+    /// gates with ([`answer_policy`]), looked at again now.
     fn release_held(&mut self) {
         if !self.frontend.frontend.holds_any() {
             return;
@@ -5082,13 +5074,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let fresh = self.policy_open();
-        let policy = Fresh {
-            source: ReadViewPolicy {
-                applier: self.backing.applier(),
-                budget: ViewBudget::default(),
-            },
-            fresh,
-        };
+        let policy = answer_policy(self.backing.applier(), fresh);
         let now = self.now_millis();
         for delivery in self.frontend.frontend.release_held(now, &policy) {
             self.write_answer(delivery);
@@ -6715,6 +6701,25 @@ impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
             budget: self.budget,
         }
         .barrier(namespace, session)
+    }
+}
+
+/// The barrier an answer is gated against, and a disclosure the gate held
+/// is gated against again at its release (task-d93): over the applier's
+/// read view, so a revoke in a group the projection hasn't committed yet
+/// is seen (#281), and only while this voter's policy is fresh, so a stale
+/// one withholds the output (#320). Both build it here, so a release
+/// can't authorize from an older view, or a staler policy, than an answer.
+fn answer_policy<P: Persistence>(
+    applier: &Applier<P>,
+    fresh: bool,
+) -> Fresh<ReadViewPolicy<'_, P>> {
+    Fresh {
+        source: ReadViewPolicy {
+            applier,
+            budget: ViewBudget::default(),
+        },
+        fresh,
     }
 }
 

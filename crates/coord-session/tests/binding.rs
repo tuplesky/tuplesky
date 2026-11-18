@@ -1514,6 +1514,42 @@ fn a_held_disclosure_goes_with_its_connection() {
     );
 }
 
+/// A held disclosure is gated again at its release, and a policy that
+/// can't be read then withholds it, as it does an answer. coordd releases
+/// with the barrier it answers with, which is unavailable once the voter's
+/// policy is stale (#320). The disclosure is neither left held nor
+/// answered `Pending`.
+#[test]
+fn a_held_disclosure_is_withheld_when_its_release_cannot_read_the_policy() {
+    struct Down;
+    impl coord_session::PolicySource for Down {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Unavailable)
+        }
+    }
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    let out = f.release_held(at(NOW).plus(10), &Down);
+    assert_eq!(out.len(), 1);
+    assert!(is_denied(&out[0]), "{:?}", outcome_of(&out[0]));
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 1));
+}
+
 /// A second binding of a session whose establishment already executed
 /// is settled from that outcome, also before this node's projection
 /// shows the row.

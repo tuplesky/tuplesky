@@ -11105,6 +11105,23 @@ held, since its caller is answered within the call on the stream it
 retried on; it is answered `Pending` as before (`deliver` keeps that
 behaviour, and `deliver_retained` uses it).
 
+**On the carry, a release is gated as an answer is** (#313 review).
+coordd builds both barriers in `answer_policy`: over the applier's read
+view, so a grant revoked in a group the projection hasn't committed yet
+is seen (#281), and only while the voter's policy is fresh (#320). A
+release over the committed store alone could miss such a revoke, and
+wasn't bounded by the staleness cap. With the policy stale, a held
+disclosure is withheld when it is released, as an answer would be.
+
+**A held disclosure keeps its request's record** (Codex on #98). The
+release gates a disclosure from its request's record: its namespace and
+keys. The frontend forgets a settled record once the dispatcher no
+longer holds its key, and the dispatcher lets a leader read's answer go
+when it is answered. So requests arriving while the projection lagged
+could forget a held read's record, and its release was refused with a
+final `OUTPUT_WITHHELD`. The gate's held keys now count as held when
+the frontend forgets records, and in that bound.
+
 **The stopgap goes.** `c01a397` had the two leader-restart tests present
 a read again while their node answered `Pending` (`read_projected`). It is
 reverted, and the tests read once.
