@@ -7082,6 +7082,10 @@ impl<S: PolicySource> PolicySource for Fresh<S> {
         }
         self.source.barrier(namespace, session)
     }
+
+    fn fresh(&self) -> bool {
+        self.fresh && self.source.fresh()
+    }
 }
 
 /// Barriers over the view a read is served from (#281): the projection's
@@ -8610,7 +8614,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 &hub,
                 &policy(&follower, recency.fresh(past))
             ),
-            Ingress::Rejected(BindError::Unavailable)
+            Ingress::Rejected(BindError::Stale)
         ));
         // Control: the follower's store alone would have answered.
         assert!(matches!(
@@ -8733,6 +8737,92 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         recency.on_answer(leader, &through(fourth), applied, t3 + ms);
         assert!(recency.fresh(t3 + allowance));
         assert!(!recency.fresh(t3 + allowance + ms));
+    }
+
+    /// An answer to an ask sent under one ballot stamps the voter even
+    /// when it arrives after the ballot it follows has moved (#320
+    /// follow-up). `Recency` keeps no ballot with an ask, and needs none.
+    ///
+    /// The answer says that a round the leader started after the ask
+    /// arrived was confirmed by a quorum still in the ask's ballot, and
+    /// that everything the leader proposed below the ask's index had
+    /// executed. A later ballot's commits need a quorum that has left the
+    /// ask's ballot, and that quorum shares a voter with the confirming
+    /// one, which left after it confirmed: after the ask arrived. So what
+    /// a later ballot commits is after the ask too, and is what the
+    /// allowance after the ask's send time bounds, as for any answer. An
+    /// answer covers everything committed before its ask arrived, and
+    /// nothing after, whichever ballot the voter follows by then.
+    #[test]
+    fn an_answer_after_the_ballot_moved_still_stamps_its_send_time() {
+        use coord_collector::{FreshnessAnswerV1, FreshnessOutcomeV1};
+        use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition};
+        use std::time::{Duration, Instant};
+
+        let allowance = Duration::from_secs(8);
+        let mut recency = super::Recency::new(allowance);
+        let leader = ReplicaId([0; 16]);
+        let next = ReplicaId([1; 16]);
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let ballot = Ballot {
+            epoch,
+            number: 1,
+            leader,
+        };
+        let moved = Ballot {
+            epoch,
+            number: 2,
+            leader: next,
+        };
+        let applied = ExecutionPosition::new(3).unwrap();
+        let ms = Duration::from_millis(1);
+
+        let t0 = Instant::now();
+        let first = recency.ask(t0, leader, ballot);
+        // The ballot moves before the answer comes back, and the voter
+        // asks the new leader at once.
+        assert!(recency.due(t0 + ms, moved));
+        let second = recency.ask(t0 + ms, next, moved);
+        // The old leader's answer, under the old ballot, stamps the
+        // first ask's send time.
+        recency.on_answer(
+            leader,
+            &FreshnessAnswerV1 {
+                ballot,
+                ask: first,
+                outcome: FreshnessOutcomeV1::Through { position: applied },
+            },
+            applied,
+            t0 + 2 * ms,
+        );
+        assert_eq!(recency.last, Some(t0));
+        assert!(recency.fresh(t0 + allowance));
+        assert!(!recency.fresh(t0 + allowance + ms));
+        // An answer is taken only from the voter its ask went to: the
+        // new leader can't answer the old leader's ask.
+        recency.on_answer(
+            next,
+            &FreshnessAnswerV1 {
+                ballot: moved,
+                ask: first,
+                outcome: FreshnessOutcomeV1::Through { position: applied },
+            },
+            applied,
+            t0 + 3 * ms,
+        );
+        assert_eq!(recency.last, Some(t0));
+        // The new leader's answer to the ask sent to it stamps later.
+        recency.on_answer(
+            next,
+            &FreshnessAnswerV1 {
+                ballot: moved,
+                ask: second,
+                outcome: FreshnessOutcomeV1::Through { position: applied },
+            },
+            applied,
+            t0 + 3 * ms,
+        );
+        assert_eq!(recency.last, Some(t0 + ms));
     }
 
     /// Held evidence registers when it is due to be let go.
@@ -10933,6 +11023,77 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert!(!lapsing.policy_open(), "and a look asks nobody");
         }
 
+        /// A leader that has proposed nothing in its ballot refuses every
+        /// freshness ask, its own among them (#320). So in a domain where
+        /// every voter is stale -- a leader just elected, nobody writing --
+        /// nobody would turn fresh until a client wrote. What gets such a
+        /// domain fresh is the leader's expiry schedule: it takes lease
+        /// authority at its first scan, that epoch is the ballot's first
+        /// proposal, and once it has executed and the projection has it,
+        /// the leader's own ask is answered and the domain is fresh with
+        /// no client write. The control is the same idle leader with no
+        /// expiry schedule, driven the same way: it proposes nothing, and
+        /// stays closed. This is a leader's first ballot; a leader
+        /// elected again after its epoch is installed takes authority
+        /// again through `Expiry::renew`, which
+        /// `leases::tests::a_renewal_takes_authority_again_although_its_epoch_is_installed`
+        /// covers. Both run on [`ALLOWANCE`], so the ask after the first
+        /// one's refusal (an eighth of the allowance later) falls inside
+        /// the turns they get.
+        #[tokio::test]
+        async fn an_idle_leader_proposes_so_a_stale_domain_turns_fresh() {
+            let api = transport();
+            let hour = Duration::from_secs(3600);
+
+            let (idle, handle) = held_leader(hour);
+            assert!(idle.leads_with_nothing_proposed());
+            let mut control = domain(idle, collector()).policy_staleness(ALLOWANCE);
+            assert!(
+                !serve_until_fresh(&mut control, &handle, &api, 32).await,
+                "with no expiry schedule nothing proposes, and nothing answers its ask"
+            );
+            assert!(voter(&mut control).leads_with_nothing_proposed());
+
+            let (idle, handle) = held_leader(hour);
+            let mut scheduled = domain(idle, collector())
+                .policy_staleness(ALLOWANCE)
+                .with_expiry(crate::leases::Expiry::new(CLUSTER, DOMAIN));
+            assert!(!scheduled.policy_fresh());
+            assert!(
+                serve_until_fresh(&mut scheduled, &handle, &api, 32).await,
+                "a leader with nothing proposed took lease authority, and its ask was answered"
+            );
+            assert!(!voter(&mut scheduled).leads_with_nothing_proposed());
+        }
+
+        /// Serve `domain` as the loop does, at most `turns` times a read
+        /// round's spacing apart, until its policy is fresh: a turn, the
+        /// flush that makes what it proposed durable, and whatever the
+        /// materializer behind `handle` committed. Whether it turned
+        /// fresh.
+        async fn serve_until_fresh(
+            domain: &mut super::super::Domain<Journaled>,
+            handle: &ManualHandle<ModelEngine>,
+            api: &coord_transport::Transport,
+            turns: usize,
+        ) -> bool {
+            for _ in 0..turns {
+                domain.turn(api).await.expect("a turn");
+                assert!(
+                    !domain.stops_on_flush(api, super::super::Flush::Idle),
+                    "journaled"
+                );
+                if handle.run() {
+                    assert!(!domain.stops_on_settle(api), "settled");
+                }
+                if domain.policy_fresh() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+
         /// A quiet voter asks again before its allowance runs out (#320):
         /// the loop wakes for the next ask (`next_deadline`), half an
         /// allowance after the last, so a quiet spell closes nothing
@@ -11252,7 +11413,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             // Admission: the stale voter binds nothing; the fresh one binds.
             assert!(matches!(
                 stale.admit(&health, at, CONNECTION, &bind),
-                Ingress::Rejected(BindError::Unavailable)
+                Ingress::Rejected(BindError::Stale)
             ));
             assert!(matches!(
                 fresh.admit(&health, at, CONNECTION, &bind),

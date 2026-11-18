@@ -78,6 +78,19 @@ the allowance. Past it, a bind is refused as unavailable, output is
 held as pending and a watch closes as source-lost. A process with no
 voter is never fresh, and refuses every bind.
 
+A leader holds a freshness ask at most 1 s and then refuses it
+`Expired`. It holds at most 256 asks, and at most 4 from one connection
+or from its own voter: only about three of a voter's asks can still
+make it fresh (sent now, half an allowance ago, an allowance ago), so
+one origin cannot take the places the others need. Past either cap it
+refuses `Busy`. After a refusal, or an ask it could not send, the voter
+asks again at an eighth of the allowance. The allowance runs on the
+voter's monotonic clock, which stops while its host is suspended: a
+voter resumed after a freeze answers for at most what was left of one
+allowance (#320). A leader built before #320 closes the connection on
+`0x0108`, so a voter with the bound under it stays stale: a domain
+moves its voters to a build with the bound together.
+
 ## Admission
 
 A request enters through the admission interface with the connection's

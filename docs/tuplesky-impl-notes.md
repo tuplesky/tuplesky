@@ -11207,3 +11207,60 @@ each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
   transport admits a frame, on the first offer or a later one, so a frame
   kept and offered again is counted once. The table above was read before
   that, on one `send` a frame.
+
+## A voter's policy bounded in staleness: what the tests pin (#320)
+
+#320 bounds how long a voter's frontend answers from its own policy: it
+asks the leader it follows every half allowance (`Freshness`,
+`0x0108`), the leader answers once a round started after the ask
+arrived has confirmed and its read index has executed, and the voter
+stamps the ask's send time once its committed projection has reached
+the answer's position. Design 6.4 states the rule. The follow-up to
+#320's review adds the tests and limits below.
+
+- **A stale node refuses a bind before it reads the token.**
+  `PolicySource::fresh` is asked before the token is verified, and the
+  refusal is its own, `BindError::Stale`, closed as
+  `Rejected` with the reason "bind unavailable". A token that would
+  fail verification gets the same answer on a stale node as a good one
+  (`a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying`),
+  so the reason says nothing about the token. The kine client returns
+  `ErrBindUnavailable`, which the backend maps to gRPC `Unavailable`,
+  and keeps its token (`TestBindUnavailableKeepsTheToken`, with a
+  control that a refused token is still dropped once). The SDK's
+  `binding_unavailable` closes the connection and keeps the credential.
+- **An answer after the ballot moved still counts for the ask it
+  answers.** A later ballot's commits need a quorum that left the ask's
+  ballot after confirming, so they follow the ask's arrival, and the
+  answer covers only what was committed before it.
+  `an_answer_after_the_ballot_moved_still_stamps_its_send_time` pins
+  that the old leader's answer stamps its ask, an answer from the new
+  leader to an ask it never got is ignored, and the new leader's answer
+  to its own ask stamps that ask.
+- **A domain whose every voter is stale still turns fresh.** No client
+  write can be the first proposal, since no bind is admitted. A leader
+  with nothing proposed has no read index, so lease renewal proposes
+  `EstablishLeaseAuthority` for it.
+  `an_idle_leader_proposes_so_a_stale_domain_turns_fresh` pins the
+  wiring from `Expiry::renew` through the domain; without the renewal
+  the leader holds the ask and the voter stays stale
+  (`only_a_confirmed_ask_opens_the_policy`).
+- **One origin cannot take the leader's places.** A leader holds 256
+  asks, and 4 from one connection or its own voter
+  (`ASKS_HELD_PER_ORIGIN`). At most about three of a voter's asks can
+  still make it fresh, so 4 is room for those and one more.
+  `a_leader_holds_a_bounded_number_of_freshness_asks_from_each_origin`.
+- **End to end.** `a_cut_off_voter_stops_binding_and_binds_again_once_healed`
+  (`bins/coordd/tests/multi_host.rs`) runs three voters with a 2 s
+  allowance, stops two with `SIGSTOP`, and checks that the third goes
+  stale and refuses a bind ("a binding was refused: Stale" in its log)
+  past the allowance, then that it turns fresh and binds again once the
+  two continue. A revocation in between is not driven end to end:
+  coordd has no command that revokes a session, so the revocation half
+  stays with the `coord-session` tests.
+- **Left as is for alpha.** The allowance runs on the monotonic clock,
+  which stops in suspend: a voter resumed after a freeze answers for at
+  most what was left of one allowance. A leader built before #320
+  closes the link on `0x0108`, so a voter with the bound under it stays
+  stale; voters move to the bound together. The stale transition is a
+  log line, not a metric.
