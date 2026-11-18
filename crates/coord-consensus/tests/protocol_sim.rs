@@ -310,7 +310,12 @@ struct Knobs {
     /// refused, definitely not committed, and every other is kept, the
     /// promise row and what was submitted after it among them. `coordd`'s
     /// voter journals what it queued before it fences (`Voter::fence`);
-    /// this doesn't, so it refuses more than `coordd` would. Execution
+    /// this doesn't, so it refuses more than `coordd` would, and a batch
+    /// of a ballot left behind never lands after the promise here. Nor is
+    /// the order `coordd`'s: there the fence comes before the change of
+    /// role, so a deposed leader hears its refused batches; here
+    /// [`Sim::fence`] runs after the conversion, and the follower the
+    /// leader became hears them (#314 review). Execution
     /// groups are kept: `coordd` replans a refused application from the
     /// frontier the domain reports, which the simulator's group stands
     /// for already.
@@ -1865,11 +1870,18 @@ impl Sim {
     }
 
     /// Fence node `i`'s store at its promise once the promise has moved
-    /// past the last fence (`Knobs::fence`), as `coordd`'s voter does after
-    /// the step that promised and any change of role it led to: what is
-    /// still queued under a ballot left behind is refused, definitely not
-    /// committed, in journal order, and fed to the machine; the rest is
-    /// kept, in order.
+    /// past the last fence (`Knobs::fence`), after the step that promised:
+    /// what is still queued under a ballot left behind is refused,
+    /// definitely not committed, in journal order, and fed to the machine;
+    /// the rest is kept, in order.
+    ///
+    /// Not where `coordd` fences (#314 review). Its voter fences in
+    /// `Voter::follow_machine` before `Node::change_role`, having journaled
+    /// what was queued first, so a deposed leader is still the leader when
+    /// the refusals reach it, and retries them (`Leader::retry_proposal`).
+    /// Here the fence runs after [`Sim::convert`], so the follower the
+    /// leader became takes the refusals, and no row runs a leader's retry
+    /// across a deposition.
     fn fence(&mut self, i: u8) {
         if !self.knobs.fence {
             return;
@@ -4566,6 +4578,15 @@ fn run_row(row: u8) {
         totals.executed > 0 && totals.campaigns > 0,
         "row {row} ran idle: {totals:?}"
     );
+    // With the fence on (`Knobs::fence`), some promise refused a batch
+    // queued under a ballot left behind: the fence was reached, not only
+    // configured (#314 review).
+    if row_knobs(row).fence {
+        assert!(
+            totals.fenced > 0,
+            "row {row} fenced no batch at a promise: {totals:?}"
+        );
+    }
     // At each size, most runs learned something: the frontend's oracles
     // (one dependency set, every learned decision executed) are not
     // vacuous there.

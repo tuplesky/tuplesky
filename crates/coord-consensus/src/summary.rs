@@ -219,10 +219,15 @@ impl DurableLedger {
 
     /// The batch under `barrier` failed: nothing became durable.
     pub fn failed(&mut self, barrier: BarrierId) -> Option<CommandId> {
+        self.failed_rows(barrier).first().map(|(c, _)| *c)
+    }
+
+    /// [`DurableLedger::failed`], giving back the records the batch
+    /// staged, in order: a batch presented again unchanged under a new
+    /// barrier stages them again there (`Leader::retry_proposal`).
+    pub fn failed_rows(&mut self, barrier: BarrierId) -> Vec<(CommandId, CommandRecord)> {
         self.removals.remove(&barrier);
-        self.staged
-            .remove(&barrier)
-            .and_then(|s| s.first().map(|(c, _)| *c))
+        self.staged.remove(&barrier).unwrap_or_default()
     }
 
     /// The commands the batch under `barrier` writes, while it is in
