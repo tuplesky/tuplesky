@@ -2042,16 +2042,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.election.is_none() || self.recency.fresh(std::time::Instant::now())
     }
 
-    /// Look again, before what a wait woke the loop for reads the
-    /// policy, if the last look is past the allowance (#320, Codex
-    /// review). A turn looks before the loop waits, but a quiet voter's
-    /// loop can wait longer than the allowance with its links held
-    /// throughout: a healthy follower has no election deadline, and
-    /// nothing else need wake it. Without this the caller whose frame
-    /// ends the wait would be denied for a quiet spell rather than for a
-    /// lost leader or majority. Each handler that can answer a caller
-    /// after a wait calls it first: a caller's frame, a peer's frame and
-    /// a settle. A watch is pumped after a turn, which looks.
+    /// Whether this node's policy may be read for an answer now,
+    /// looking again first if the last look is past the allowance (#320,
+    /// Codex review). A turn looks before the loop waits, but a voter
+    /// can wait longer than the allowance with its links held
+    /// throughout: for its next event, since a healthy follower has no
+    /// election deadline, or inside a pass, on a caller's flow control.
+    /// A read after such a wait would deny for the wait rather than for
+    /// a lost leader or majority. So each of the four places that build
+    /// a barrier asks here, right before it builds one: an answer, a
+    /// frame's admission, a retained answer and a watch's batch. A voter
+    /// that has lost its leader or its majority looks, sees neither,
+    /// and stays closed.
+    fn policy_open(&mut self) -> bool {
+        self.refresh_recency();
+        self.policy_fresh()
+    }
+
+    /// Repeat the turn's observation (`led_and_majority`) if the last
+    /// look is past the allowance; otherwise this costs one
+    /// `Instant::now()`.
     fn refresh_recency(&mut self) {
         let now = std::time::Instant::now();
         if self.recency.fresh(now) {
@@ -3614,8 +3624,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Take back what the voter's materializer committed and send what
     /// that released (task-d52). Returns whether the voter must stop.
     fn stops_on_settle(&mut self, api: &Transport) -> bool {
-        // A settle answers callers, after a wait (#320, Codex review).
-        self.refresh_recency();
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };
@@ -4970,7 +4978,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         connection: u64,
         frame: &Frame,
     ) -> Option<Vec<u8>> {
-        let fresh = self.policy_fresh();
+        let fresh = self.policy_open();
         retained_answer(
             &mut self.frontend.frontend,
             self.backing.applier().store(),
@@ -4996,12 +5004,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         {
             return;
         }
+        let fresh = self.policy_open();
         let policy = Fresh {
             source: ReadViewPolicy {
                 applier: self.backing.applier(),
                 budget: ViewBudget::default(),
             },
-            fresh: self.policy_fresh(),
+            fresh,
         };
         let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
@@ -5055,7 +5064,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         event: TransportEvent,
         clock: &impl Fn() -> u64,
     ) {
-        self.refresh_recency();
         match event {
             TransportEvent::ApiRequest {
                 connection,
@@ -5102,12 +5110,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.respond_inline(responder, answer).await;
                     return;
                 }
+                let fresh = self.policy_open();
                 let policy = Fresh {
                     source: StorePolicySource {
                         store: self.backing.applier().store(),
                         budget: ViewBudget::default(),
                     },
-                    fresh: self.policy_fresh(),
+                    fresh,
                 };
                 // Admission is the frontend's decision about this frame:
                 // verified and admitted, answered, or refused at the door.
@@ -5195,9 +5204,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// answer and no session to forget, which is why it is a different
     /// handler and not a branch of the api one.
     fn on_peer_plane(&mut self, api: &Transport, event: TransportEvent) {
-        // A peer's frame can answer a caller, after a wait (#320, Codex
-        // review).
-        self.refresh_recency();
         match event {
             TransportEvent::PeerFrame {
                 provenance,
@@ -5571,12 +5577,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // and the close it was acknowledged with is written there.
             let mut lost = false;
             loop {
+                // Each batch looks again: the last batch's pushes can have
+                // waited past the allowance (#320, Codex review).
+                let fresh = self.policy_open();
                 let policy = Fresh {
                     source: StorePolicySource {
                         store: self.backing.applier().store(),
                         budget: ViewBudget::default(),
                     },
-                    fresh: self.policy_fresh(),
+                    fresh,
                 };
                 let frames = self
                     .frontend
@@ -10087,37 +10096,32 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert!(!lapsing.policy_fresh(), "the allowance ran out");
         }
 
-        /// A voter whose loop waited past the allowance for its next
-        /// event, still led and holding its majority, looks again before
-        /// it reads its policy for a caller's frame, so a quiet spell
-        /// denies nothing (#320, Codex review). A voter that looks again
-        /// and is not led stays closed.
-        #[tokio::test(flavor = "multi_thread")]
+        /// A voter that waited past the allowance, still led and holding
+        /// its majority, looks again when it next reads its policy, so a
+        /// wait denies nothing (#320, Codex review): a wait for its next
+        /// event, or one inside a pass, on a caller's flow control. A
+        /// voter that looks again and is not led stays closed.
+        #[tokio::test]
         async fn a_quiet_spell_past_the_allowance_does_not_close_a_led_voters_policy() {
-            use coord_transport::{ConnectionId, TransportEvent};
-
-            let mut api = transport();
+            let api = transport();
             let hour = Duration::from_secs(3600);
-            let closed = |connection| TransportEvent::Closed {
-                connection: ConnectionId(connection),
-                lane: None,
-                reason: coord_transport::CloseReason::Shutdown,
-            };
 
             let (leader, _commits) = held_leader(hour);
             let mut quiet = domain(leader, collector()).policy_staleness(Duration::from_millis(1));
             quiet.turn(&api).await.expect("a turn");
             tokio::time::sleep(Duration::from_millis(5)).await;
             assert!(!quiet.policy_fresh(), "past the allowance with no turn");
-            quiet.on_transport(&mut api, closed(7), &|| 0).await;
-            assert!(quiet.policy_fresh(), "it still leads, a majority of one");
+            assert!(quiet.policy_open(), "it still leads, a majority of one");
+            assert!(quiet.policy_fresh(), "the look is kept");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(quiet.policy_open(), "a second wait, a second look");
 
             let voters: std::collections::BTreeSet<ReplicaId> =
                 (1..=3u8).map(|n| ReplicaId([n; 16])).collect();
             let (follower, _its_commits) = held_voter(ReplicaId([2; 16]), hour, voters);
             let mut cut_off = domain(follower, collector());
-            cut_off.on_transport(&mut api, closed(8), &|| 0).await;
-            assert!(!cut_off.policy_fresh(), "no link to the voter it follows");
+            assert!(!cut_off.policy_open(), "no link to the voter it follows");
+            assert!(!cut_off.policy_fresh(), "and nothing kept");
         }
 
         /// A half-established entry's record is found within one commit
