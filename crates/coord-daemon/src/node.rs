@@ -747,7 +747,8 @@ pub struct Outbound {
     pub entropy: Vec<u64>,
     /// Answers to reads the leader read barrier held, each an encoded
     /// `ReadAnswerV1` frame for the collector that sent the read
-    /// (task-d50).
+    /// (task-d50), and to freshness asks, each a `FreshnessAnswerV1`
+    /// frame for the frontend that asked (#320).
     pub reads: Vec<(crate::voter::Origin, Vec<u8>)>,
 }
 
