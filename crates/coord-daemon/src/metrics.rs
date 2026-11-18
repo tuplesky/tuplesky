@@ -711,16 +711,15 @@ pub struct Cost {
     /// What the journal groups this voter appended held (task-d84).
     #[serde(default)]
     pub journal_groups: JournalGroups,
-    /// The domain loop's flushes: why it lowered when it did (task-d73),
-    /// and how many events it took between them, by plane (task-d102): a
-    /// batched round's frame is cut at a flush, so this is what a turn
-    /// can hold.
-    #[serde(default)]
-    pub flushes: Flushes,
     /// The durable command records this voter holds, against what its
     /// history sweep forgets (task-d110).
     #[serde(default)]
     pub history: History,
+    /// How many events the domain loop took between its flushes, by
+    /// plane (task-d102): a batched round's frame is cut at a flush, so
+    /// this is what a turn can hold.
+    #[serde(default)]
+    pub flushes: Flushes,
     /// The domain loop's hand-offs to the runtime, by what made each
     /// (task-d115, lever 8; #256 review).
     #[serde(default)]
@@ -754,6 +753,10 @@ pub struct Cost {
     /// machine saw it is [`Offers::refused`].
     #[serde(default)]
     pub table_full: u64,
+    /// Why the domain loop lowered when it did (task-d73): beside
+    /// `flushes`, which counts how many events each flush followed.
+    #[serde(default)]
+    pub flush_causes: FlushCauses,
 }
 
 /// What a node's collector sent again, and what its voter refused or could
@@ -907,27 +910,11 @@ impl OldestWait {
     }
 }
 
-/// The domain loop's flushes, cumulative, one count a flush: why it
-/// lowered what its events left queued (task-d73), and how many events it
-/// took between flushes (task-d102). A flush with nothing more ready ends
-/// a group as early as it must; one cut by a bound ends it while events
-/// were still waiting, and is the only kind a longer turn could merge.
+/// How many events the domain loop took between flushes (task-d102),
+/// cumulative.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Flushes {
-    /// No event was ready (the select's flush arm) (task-d73).
-    pub idle: u64,
-    /// The loop had taken its bound of events since the last flush
-    /// (`FLUSH_EVENTS`), with more possibly ready (task-d73).
-    pub events: u64,
-    /// A full journal group's worth was queued (`FLUSH_QUEUED`)
-    /// (task-d73).
-    pub queued: u64,
-    /// Of all of them, the flushes taken while an append was out: what
-    /// they queued waits behind it, and joins the next group (task-d54,
-    /// task-d73).
-    pub appending: u64,
-    /// Flushes the loop took (task-d102).
+    /// Flushes the loop took.
     pub flushes: u64,
     /// API-plane events taken before them, summed over the flushes.
     pub api_events: u64,
@@ -1116,6 +1103,24 @@ pub struct History {
     pub largest_map: u64,
 }
 
+/// Why the domain loop lowered what its events left queued (task-d73),
+/// cumulative, one count a flush. A flush with nothing more ready ends a
+/// group as early as it must; one cut by a bound ends it while events
+/// were still waiting, and is the only kind a longer turn could merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushCauses {
+    /// No event was ready (the select's flush arm).
+    pub idle: u64,
+    /// The loop had taken its bound of events since the last flush
+    /// (`FLUSH_EVENTS`), with more possibly ready.
+    pub events: u64,
+    /// A full journal group's worth was queued (`FLUSH_QUEUED`).
+    pub queued: u64,
+    /// Of all of them, the flushes taken while an append was out: what
+    /// they queued waits behind it, and joins the next group (task-d54).
+    pub appending: u64,
+}
+
 /// What a voter's journal groups held, by their records (task-d84),
 /// cumulative: which of a turn's writes each synced group carried.
 ///
@@ -1185,10 +1190,6 @@ pub struct Traffic {
     /// collectors' (task-d70), so its datagrams split into its two planes.
     #[serde(default)]
     pub api: Datagrams,
-    /// The frames this node sent and took on its api connections, by
-    /// kind (task-d88's R3).
-    #[serde(default)]
-    pub api_frames: ApiFrames,
     /// Handshakes refused because an observer's or learner's certificate
     /// named a committed voter's node (design Section 20.4). No legitimate
     /// peer today: until a prepared transition names a staged learner's
@@ -1196,6 +1197,10 @@ pub struct Traffic {
     /// never should, and an operator has a certificate to revoke.
     #[serde(default)]
     pub refused_voter_names: u64,
+    /// The frames this node sent and took on its api connections, by
+    /// kind (task-d88's R3).
+    #[serde(default)]
+    pub api_frames: ApiFrames,
 }
 
 /// The api plane's frames at one node, by kind (task-d88's R3).

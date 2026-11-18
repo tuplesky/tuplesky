@@ -1085,12 +1085,13 @@ pub struct Domain<P: Persistence> {
     since_flush: u32,
     /// Of those, the API plane's (task-d102).
     since_flush_api: u32,
-    /// Why the loop flushed (task-d73), and how many events it took
-    /// between its flushes (task-d102).
+    /// How many events the loop took between its flushes (task-d102).
     flushes: coord_daemon::metrics::Flushes,
     /// The loop's hand-offs to the runtime, by what made each (#256
     /// review).
     hand_offs: coord_daemon::metrics::HandOffs,
+    /// Why the loop flushed (task-d73).
+    flush_causes: coord_daemon::metrics::FlushCauses,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1732,17 +1733,6 @@ const FLUSH_QUEUED: usize = 64;
 /// many more are ready (task-d47).
 const FLUSH_EVENTS: u32 = 64;
 
-/// Why the loop lowered (task-d73's reading).
-#[derive(Clone, Copy, Debug)]
-enum Flush {
-    /// Nothing more was ready.
-    Idle,
-    /// `FLUSH_EVENTS` events since the last flush.
-    Events,
-    /// `FLUSH_QUEUED` batches queued.
-    Queued,
-}
-
 /// Whether the domain loop looks at its links this pass (task-d115):
 /// something said they moved -- a connection opened or closed, a dial
 /// ended -- or a re-dial is `due` by `now`, or the loop last looked
@@ -1786,6 +1776,17 @@ async fn unless_ready<F: std::future::Future>(work: F, before_waiting: impl FnOn
             work.await
         }
     }
+}
+
+/// Why the loop lowered (task-d73's reading).
+#[derive(Clone, Copy, Debug)]
+enum Flush {
+    /// Nothing more was ready.
+    Idle,
+    /// `FLUSH_EVENTS` events since the last flush.
+    Events,
+    /// `FLUSH_QUEUED` batches queued.
+    Queued,
 }
 
 /// Whether the loop lowers before it takes another event: a full journal
@@ -2023,6 +2024,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             since_flush_api: 0,
             flushes: coord_daemon::metrics::Flushes::default(),
             hand_offs: coord_daemon::metrics::HandOffs::default(),
+            flush_causes: coord_daemon::metrics::FlushCauses::default(),
             budgets,
             recorder,
             pacing: Pacing::default(),
@@ -2133,7 +2135,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             projection_commits: storage.lowering.commits,
             hold_ends: coord_daemon::metrics::HoldEnds::of(storage.lowering.hold_ends),
             journal_groups: journal_groups(&storage.lowering.groups),
-            flushes: self.flushes,
             history: {
                 let ledger = voter.node().machine().ledger();
                 let maps = voter.node().machine().history_maps();
@@ -2171,6 +2172,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
             },
             table_full: voter.node().table_full(),
+            flush_causes: self.flush_causes,
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -2199,6 +2201,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .dispatcher()
                 .collector()
                 .early_solicits(),
+            flushes: self.flushes,
             hand_offs: self.hand_offs,
             proposals: {
                 let sent = voter.node().sent_bytes();
@@ -3585,12 +3588,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return false;
         };
         match cause {
-            Flush::Idle => self.flushes.idle += 1,
-            Flush::Events => self.flushes.events += 1,
-            Flush::Queued => self.flushes.queued += 1,
+            Flush::Idle => self.flush_causes.idle += 1,
+            Flush::Events => self.flush_causes.events += 1,
+            Flush::Queued => self.flush_causes.queued += 1,
         }
         if voter.appending() {
-            self.flushes.appending += 1;
+            self.flush_causes.appending += 1;
         }
         // What the journal append released goes out before the execution
         // group's projection commit, and the group's results after it.
@@ -4588,15 +4591,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let domain = self.frontend.membership.domain();
         let now = std::time::Instant::now();
         for (id, frames) in returning.0 {
-            for bytes in &frames {
-                count_returned(&mut self.frontend.counts.api_frames, bytes);
-            }
+            let counts = &mut self.frontend.counts.api_frames;
             let offered = self.unreturned.send(id, frames, now, |frames| {
-                api.offer_many(
-                    coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-                    domain,
-                    frames,
-                )
+                offer_returned(api, domain, id, frames, counts)
             });
             self.count_returns(offered);
         }
@@ -4612,14 +4609,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let domain = self.frontend.membership.domain();
+        let counts = &mut self.frontend.counts.api_frames;
         let offered = self
             .unreturned
             .offer_due(std::time::Instant::now(), |id, frames| {
-                api.offer_many(
-                    coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-                    domain,
-                    frames,
-                )
+                offer_returned(api, domain, id, frames, counts)
             });
         self.count_returns(offered);
     }
@@ -6285,24 +6279,76 @@ impl Returning {
     }
 }
 
-/// Count one frame returned to a collector elsewhere by its kind
-/// (task-d88's R3).
-fn count_returned(counts: &mut coord_daemon::metrics::ApiFrames, bytes: &[u8]) {
+/// Offer frames to the collector on the other end of `id`, and count
+/// each one the transport admits by its kind (task-d88's R3).
+///
+/// Every offer goes through here, a round's first and every repeat of
+/// what was kept, so a frame is counted once, when the transport takes
+/// it; one it refuses is counted when a later offer is admitted.
+fn offer_returned(
+    api: &Transport,
+    domain: coord_types::DomainId,
+    id: u64,
+    frames: Vec<Vec<u8>>,
+    counts: &mut coord_daemon::metrics::ApiFrames,
+) -> Vec<Result<(), coord_transport::Refused>> {
+    let kinds: Vec<Returned> = frames.iter().map(|bytes| returned_kind(bytes)).collect();
+    let results = api.offer_many(
+        coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+        domain,
+        frames,
+    );
+    for (kind, result) in kinds.iter().zip(&results) {
+        if result.is_ok() {
+            kind.count(counts);
+        }
+    }
+    results
+}
+
+/// The kind of a frame returned to a collector elsewhere, read before
+/// the transport takes the bytes (task-d88's R3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Returned {
+    FastAck,
+    SlowAck,
+    LeaderReply,
+    OtherEvidence,
+    Release,
+    ReadAnswer,
+    Other,
+}
+
+impl Returned {
+    fn count(self, counts: &mut coord_daemon::metrics::ApiFrames) {
+        let count = match self {
+            Returned::FastAck => &mut counts.fast_acks,
+            Returned::SlowAck => &mut counts.slow_acks,
+            Returned::LeaderReply => &mut counts.leader_replies,
+            Returned::OtherEvidence => &mut counts.other_evidence,
+            Returned::Release => &mut counts.releases,
+            Returned::ReadAnswer => &mut counts.read_answers,
+            Returned::Other => &mut counts.other_returned,
+        };
+        *count += 1;
+    }
+}
+
+fn returned_kind(bytes: &[u8]) -> Returned {
     use coord_consensus::ProtocolMessage as M;
     let Ok(frame) = one_frame(bytes) else {
-        counts.other_returned += 1;
-        return;
+        return Returned::Other;
     };
     match frame.kind {
         KIND_EVIDENCE => match M::decode(&frame.payload) {
-            Ok(M::FastAck(_)) => counts.fast_acks += 1,
-            Ok(M::SlowAck(_)) => counts.slow_acks += 1,
-            Ok(M::LeaderReply { .. }) => counts.leader_replies += 1,
-            _ => counts.other_evidence += 1,
+            Ok(M::FastAck(_)) => Returned::FastAck,
+            Ok(M::SlowAck(_)) => Returned::SlowAck,
+            Ok(M::LeaderReply { .. }) => Returned::LeaderReply,
+            _ => Returned::OtherEvidence,
         },
-        KIND_RELEASE => counts.releases += 1,
-        KIND_READ_ANSWER => counts.read_answers += 1,
-        _ => counts.other_returned += 1,
+        KIND_RELEASE => Returned::Release,
+        KIND_READ_ANSWER => Returned::ReadAnswer,
+        _ => Returned::Other,
     }
 }
 
@@ -9112,6 +9158,13 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 (owed_open.len() as u64, owed_gone.len() as u64, 2),
                 "every frame handed off, one hand-off a collector"
             );
+            // Counted by kind only where the transport took the frame:
+            // the gone connection's are not (task-d88's R3).
+            assert_eq!(
+                returned_by_kind(&counts.api_frames),
+                owed_open.len() as u64,
+                "{counts:?}"
+            );
 
             // The collector's end hears every frame owed to it. One frame
             // a stream on the api plane, so the streams may be read in
@@ -9150,6 +9203,18 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         /// and reaches the collector as the lane drains: nothing is let go
         /// (the +loss1 reading's fix 2, #185).
         ///
+        /// The frames counted as returned to a collector, every kind
+        /// summed (task-d88's R3).
+        fn returned_by_kind(frames: &coord_daemon::metrics::ApiFrames) -> u64 {
+            frames.fast_acks
+                + frames.slow_acks
+                + frames.leader_replies
+                + frames.other_evidence
+                + frames.releases
+                + frames.read_answers
+                + frames.other_returned
+        }
+
         /// One round owes the collector twice what its lane's queue holds.
         /// The hand-off admits what the queue takes and the transport
         /// refuses the rest for a full queue. That rest is kept, the loop
@@ -9199,6 +9264,13 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             );
             assert_eq!(counts.returned + counts.kept_returns, total as u64);
             assert_eq!(domain.unreturned.frames() as u64, counts.kept_returns);
+            // Counted by kind where the transport admits a frame, and only
+            // there (task-d88's R3): what is kept is not counted yet.
+            assert_eq!(
+                returned_by_kind(&counts.api_frames),
+                counts.returned,
+                "{counts:?}"
+            );
             // What is kept registers a wake, so a quiet domain takes the
             // turn that offers it again.
             let due = domain.unreturned.next_due().expect("kept frames are due");
@@ -9219,6 +9291,20 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             assert_eq!(
                 (counts.returned, counts.returned_again, counts.unreturnable),
                 (total as u64, counts.kept_returns, 0),
+                "{counts:?}"
+            );
+            // A kept frame is counted once, when an offer of it is
+            // admitted, and by its own kind.
+            assert_eq!(
+                returned_by_kind(&counts.api_frames),
+                total as u64,
+                "{counts:?}"
+            );
+            assert_eq!(
+                counts.api_frames.releases,
+                sent.iter()
+                    .filter(|f| f.kind == coord_collector::KIND_RELEASE)
+                    .count() as u64,
                 "{counts:?}"
             );
 

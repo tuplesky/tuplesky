@@ -7,12 +7,12 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
-    HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path,
-    PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions,
-    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Table, Traffic,
-    Unavailable, UnorderedPreAcceptances, Wait,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, FlushCauses, Flushes,
+    Frontiers, Gate, HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading,
+    Latency, MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait,
+    Path, PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release,
+    ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
+    Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -518,10 +518,6 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 largest_map: 1700,
             },
             flushes: Flushes {
-                idle: 5000,
-                events: 40,
-                queued: 2,
-                appending: 900,
                 flushes: 900,
                 api_events: 4000,
                 peer_events: 6000,
@@ -572,6 +568,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed_bytes: 2_520_000,
             },
             table_full: 31,
+            flush_causes: FlushCauses {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
+            },
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.
@@ -827,9 +829,6 @@ fn every_stage_is_accounted_for_under_every_role() {
     }
 }
 
-/// A `cpu` reading written before the thread's scheduling was reported
-/// (task-d55) still reads, and says it has no scheduling rather than
-/// zero run-queue time.
 /// A traffic reading from before task-d88's R3 has no frames by kind,
 /// and parses with them zero.
 #[test]
@@ -843,6 +842,9 @@ fn a_traffic_reading_without_api_frames_reads_them_as_zero() {
     );
 }
 
+/// A `cpu` reading written before the thread's scheduling was reported
+/// (task-d55) still reads, and says it has no scheduling rather than
+/// zero run-queue time.
 #[test]
 fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
     let older = r#"{"domain":{"secs":25,"nanos":0},"process":{"secs":70,"nanos":0}}"#;
