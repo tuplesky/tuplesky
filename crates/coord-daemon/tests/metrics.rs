@@ -7,12 +7,12 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
-    HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
-    MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path,
-    PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions,
-    Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading, Table, Traffic,
-    Unavailable, UnorderedPreAcceptances, Wait,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, FlushCauses, Flushes,
+    Frontiers, Gate, HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading,
+    Latency, MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait,
+    Path, PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release,
+    ReleaseDistributions, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
+    Table, Traffic, Unavailable, UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -492,6 +492,14 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     acks_sent: 1900,
                     acks_received: 2000,
                 },
+                api_frames: coord_daemon::metrics::ApiFrames {
+                    submissions: 2300,
+                    fast_acks: 2250,
+                    slow_acks: 40,
+                    releases: 1150,
+                    requests: 1200,
+                    ..Default::default()
+                },
             }),
             journal_groups: JournalGroups {
                 protocol: 3100,
@@ -560,6 +568,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed_bytes: 2_520_000,
             },
             table_full: 31,
+            flush_causes: FlushCauses {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
+            },
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.
@@ -813,6 +827,19 @@ fn every_stage_is_accounted_for_under_every_role() {
             );
         }
     }
+}
+
+/// A traffic reading from before task-d88's R3 has no frames by kind,
+/// and parses with them zero.
+#[test]
+fn a_traffic_reading_without_api_frames_reads_them_as_zero() {
+    let older = r#"{"sent_frames":1,"sent_bytes":2,"sent_streams":1,"sent_lost":0,
+        "received_frames":1,"received_bytes":2,"received_streams":1}"#;
+    let traffic: Traffic = serde_json::from_str(older).expect("an older reading parses");
+    assert_eq!(
+        traffic.api_frames,
+        coord_daemon::metrics::ApiFrames::default()
+    );
 }
 
 /// A `cpu` reading written before the thread's scheduling was reported
