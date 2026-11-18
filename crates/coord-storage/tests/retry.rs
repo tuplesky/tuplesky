@@ -3,6 +3,8 @@
 //! duplicates, retired/unknown sessions and retired sequences never execute
 //! as new work, and floors bound retention.
 
+mod support;
+
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
@@ -105,7 +107,7 @@ impl<E: LocalEngine> Domain<E> {
     ) -> (Admission, Option<coord_state::Response>) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
@@ -119,6 +121,7 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),
@@ -135,7 +138,7 @@ impl<E: LocalEngine> Domain<E> {
 
     fn resolve(&self, seq: u64, request: &LogicalRequest, authorized: bool) -> Resolution {
         let gated = self.worker.reader().snapshot().unwrap();
-        retry::resolve(gated.view(), &binding(seq, request), |_| authorized).unwrap()
+        retry::resolve(gated.view(), &binding(seq, request), |_| Ok(authorized)).unwrap()
     }
 
     fn retire_through(&mut self, seq: u64) {
@@ -165,7 +168,7 @@ impl<E: LocalEngine> Domain<E> {
         let mut b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
         b.retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
-        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| Ok(true)).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
@@ -179,6 +182,7 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),
@@ -233,20 +237,28 @@ fn lost_response_with_the_same_identity_returns_the_same_result() {
     let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
     assert_eq!(stored, response);
     // Session activation is an ordered step, so the command is position 2.
+    let position = record.position;
     assert_eq!(record.position.get(), 2);
     // Resolution returns the same record only under current authorization.
     assert_eq!(d.resolve(1, &request, true), Resolution::Result(record));
     assert_eq!(d.resolve(1, &request, false), Resolution::Unauthorized);
-    // The executed identity is recorded.
+    // The executed identity is recorded, at its position (task-d113,
+    // step 2).
     let gated = d.worker.reader().snapshot().unwrap();
     let executed = gated
         .view()
         .get(
-            Collection::ExecutedV1.id(),
-            &coord_storage::codecs::executed_key(&binding(1, &request).command_id),
+            Collection::ExecutionV1.id(),
+            &coord_storage::codecs::position_key(position),
         )
-        .unwrap();
-    assert!(executed.is_some());
+        .unwrap()
+        .expect("an executed row");
+    assert_eq!(
+        coord_storage::codecs::decode_execution(&executed)
+            .unwrap()
+            .command,
+        binding(1, &request).command_id
+    );
 }
 
 #[test]
@@ -392,6 +404,7 @@ fn crash_between_materialization_and_notification_never_duplicates() {
             .unwrap();
             let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
             drop(gated);
+            support::stage_bound(&mut d.worker, Some(&b), &request);
             let _ = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b));
             assert!(shared.is_frozen());
             let image = shared.crash_image(tail);
@@ -475,7 +488,7 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     // Admit and plan from one snapshot.
     let gated = d.worker.reader().snapshot().unwrap();
     assert_eq!(
-        retry::admit(gated.view(), &b, |_| true).unwrap(),
+        retry::admit(gated.view(), &b, |_| Ok(true)).unwrap(),
         Admission::New
     );
     let view = build_read_view(
@@ -495,6 +508,7 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     d.admin(update);
     // The bound command's batch carries the base its admission was checked
     // at, so it is rejected instead of executing under a retired session.
+    support::stage_bound(&mut d.worker, Some(&b), &request);
     let outcome = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b)).unwrap();
     assert_eq!(outcome, ApplyOutcome::Replan);
     assert_eq!(d.kv_revision(), 0);
@@ -727,4 +741,236 @@ fn a_filled_window_is_reopened_by_the_frame_that_first_crosses_it() {
         }
     );
     assert_eq!(d.floor(), u64::from(WINDOW), "a refusal moves nothing");
+}
+
+/// What a command's authorization context answers for its admission
+/// ([`retry::retire_and_admit`], as `Applier::apply_bound` takes it) and
+/// what its rows answer read one by one ([`retry::retirement`], then
+/// [`retry::admit`] with that retirement), which must be the same.
+fn admitted<E: LocalEngine>(
+    d: &Domain<E>,
+    seq: u64,
+    request: &LogicalRequest,
+    ack_through: u64,
+    authorized: bool,
+) -> (Option<retry::Retirement>, Admission) {
+    let b = binding(seq, request);
+    let gated = d.worker.reader().snapshot().unwrap();
+    let context =
+        coord_storage::load_authorization(gated.view(), NS, &SESSION, ViewBudget::SCHEMA).unwrap();
+    let standing = context
+        .session
+        .as_ref()
+        .map(|record| (record, context.valid_session().is_some()));
+    let from_context =
+        retry::retire_and_admit(gated.view(), &b, ack_through, standing, |_| Ok(authorized))
+            .unwrap();
+    let retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
+    let read = retry::admit(gated.view(), &RetryBinding { retires, ..b }, |_| {
+        Ok(authorized)
+    })
+    .unwrap();
+    assert_eq!(
+        from_context,
+        (retires, read),
+        "sequence {seq}, acknowledging {ack_through}"
+    );
+    from_context
+}
+
+#[test]
+fn admission_from_the_sessions_context_answers_as_its_rows_do() {
+    let trust_rule = |enabled: bool, generation: u64| {
+        let rule = TrustRuleId(*SESSION.as_bytes());
+        vec![coord_core::effect::StoreUpdate {
+            collection: Collection::PolicyV1.id(),
+            key: coord_storage::codecs::trust_rule_key(&rule),
+            value: Some(
+                coord_storage::codecs::encode_trust_rule(&coord_state::policy::TrustRule {
+                    enabled,
+                    generation,
+                })
+                .unwrap(),
+            ),
+        }]
+    };
+    let mut d = Domain::new(ModelEngine::new());
+    let mut kinds = Vec::new();
+    let mut note = |admission: &Admission| {
+        let kind = std::mem::discriminant(admission);
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    };
+    let request = put(b"k", b"v");
+
+    // No session: nothing retired, whatever the frame acknowledges.
+    for ack in [0, 3] {
+        let (retires, admission) = admitted(&d, 1, &request, ack, true);
+        assert_eq!((retires, &admission), (None, &Admission::UnknownSession));
+        note(&admission);
+    }
+    d.activate_session(4);
+    let (_, admission) = admitted(&d, 1, &request, 0, true);
+    assert_eq!(admission, Admission::New);
+    note(&admission);
+    assert_eq!(d.submit_acking(1, &request, 0).0, Admission::New);
+
+    // Executed: its record answers a retry, or refuses it.
+    for (authorized, expected) in [(true, "Retry"), (false, "Unauthorized")] {
+        let (_, admission) = admitted(&d, 1, &request, 0, authorized);
+        assert!(
+            format!("{admission:?}").starts_with(expected),
+            "{admission:?}"
+        );
+        note(&admission);
+    }
+    let (_, admission) = admitted(&d, 1, &put(b"k", b"other"), 0, true);
+    assert!(matches!(admission, Admission::Conflict { .. }));
+    note(&admission);
+
+    // The window, measured from the floor this frame's acknowledgement
+    // establishes.
+    let (retires, admission) = admitted(&d, 5, &request, 0, true);
+    assert_eq!(retires, None);
+    assert!(matches!(admission, Admission::OutOfWindow { .. }));
+    note(&admission);
+    let (retires, admission) = admitted(&d, 5, &request, 1, true);
+    assert_eq!(retires.map(|r| r.through.get()), Some(1));
+    assert_eq!(admission, Admission::New);
+
+    // Below the floor; and an acknowledgement at it, or past this frame.
+    d.retire_through(2);
+    for seq in [1, 2] {
+        let (_, admission) = admitted(&d, seq, &request, 0, true);
+        assert!(matches!(admission, Admission::TooOld { .. }));
+        note(&admission);
+    }
+    assert_eq!(admitted(&d, 3, &request, 2, true), (None, Admission::New));
+    let (retires, admission) = admitted(&d, 6, &request, 100, true);
+    assert_eq!(
+        retires.map(|r| (r.from.get(), r.through.get())),
+        Some((2, 5))
+    );
+    assert_eq!(admission, Admission::New);
+
+    // A session that may not execute: its trust rule disabled, regenerated
+    // or gone, or the session itself retired. Its acknowledgement still
+    // resolves, as the rows resolve it.
+    let missing_rule = vec![coord_core::effect::StoreUpdate {
+        collection: Collection::PolicyV1.id(),
+        key: coord_storage::codecs::trust_rule_key(&TrustRuleId(*SESSION.as_bytes())),
+        value: None,
+    }];
+    let retired =
+        coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 4, false)
+            .unwrap();
+    for updates in [
+        trust_rule(false, 1),
+        trust_rule(true, 2),
+        missing_rule,
+        trust_rule(true, 1).into_iter().chain(retired).collect(),
+    ] {
+        d.admin(updates);
+        for ack in [0, 3] {
+            let (retires, admission) = admitted(&d, 4, &request, ack, true);
+            assert_eq!(admission, Admission::SessionRetired);
+            assert_eq!(retires.is_some(), ack == 3);
+            note(&admission);
+        }
+    }
+    assert_eq!(kinds.len(), 8, "every kind of admission is compared");
+}
+
+/// A contended transaction touches its key three times: the compare, the
+/// success put and the failure branch. The key is read once, with a point
+/// read, but each touch is charged as the one-row scan it replaces was
+/// charged, since the budget's refusal is a replicated outcome. The
+/// failure branch then touches a key that isn't there.
+#[test]
+fn an_exact_key_is_read_once_and_charged_on_every_touch_as_its_scans_were() {
+    use coord_storage::ViewBuildError;
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(8);
+    assert_eq!(d.submit(1, &put(b"k", &[7; 100])).0, Admission::New);
+    let gated = d.worker.reader().snapshot().unwrap();
+    let row_key = coord_storage::codecs::current_key(&NS, b"k");
+    let row = gated
+        .view()
+        .get(Collection::KvCurrentV1.id(), &row_key)
+        .unwrap()
+        .unwrap();
+    let cost = u32::try_from(row_key.len() + row.len()).unwrap();
+    let txn = {
+        let mut r = LogicalRequest::new(
+            NS,
+            CanonicalOperation::Txn(TxnOp {
+                compares: vec![Compare {
+                    key: b"k".to_vec(),
+                    target: CompareTarget::Version,
+                    result: CompareResult::Equal,
+                    operand: CompareOperand::Counter(1),
+                }],
+                success: vec![BranchOp::Put(PutOp {
+                    key: b"k".to_vec(),
+                    value: b"next".to_vec(),
+                    lease: None,
+                    prev_kv: false,
+                })],
+                failure: vec![
+                    BranchOp::Range(RangeOp {
+                        range: KeyRange::exact(b"k".to_vec()),
+                        revision: None,
+                        limit: 0,
+                        keys_only: false,
+                        count_only: false,
+                    }),
+                    BranchOp::Range(RangeOp {
+                        range: KeyRange::exact(b"absent".to_vec()),
+                        revision: None,
+                        limit: 0,
+                        keys_only: false,
+                        count_only: false,
+                    }),
+                ],
+            }),
+        );
+        r.canonicalize();
+        r
+    };
+    let build = |max_rows, max_bytes| {
+        build_read_view(
+            &gated,
+            NS,
+            PrincipalId([0xaa; 16]),
+            &txn,
+            ViewBudget {
+                max_rows,
+                max_bytes,
+            },
+        )
+    };
+    let view = build(3, 3 * cost + 1).unwrap();
+    assert_eq!(
+        view.current.keys().cloned().collect::<Vec<_>>(),
+        vec![b"k".to_vec()]
+    );
+    assert_eq!(view.current[&b"k".to_vec()].value, vec![7; 100]);
+    // A row a touch: three, not one.
+    assert!(matches!(
+        build(2, 3 * cost + 1),
+        Err(ViewBuildError::BudgetExceeded)
+    ));
+    // No bytes left for the absent key's touch: refused before it reads.
+    assert!(matches!(
+        build(3, 3 * cost),
+        Err(ViewBuildError::BudgetExceeded)
+    ));
+    // Bytes for two touches: the third's row is past the bytes left, and
+    // the budget refuses it, as `scan_all`'s page (at least its floor)
+    // returns the row for the budget to refuse.
+    assert!(matches!(
+        build(3, 3 * cost - 1),
+        Err(ViewBuildError::BudgetExceeded)
+    ));
 }

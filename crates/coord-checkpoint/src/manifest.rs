@@ -36,6 +36,12 @@ pub const MAX_CHUNK_BYTES: usize =
     CHUNK_TARGET_BYTES + MAX_ROW_KEY_BYTES + MAX_ROW_VALUE_BYTES + 64;
 /// Longest row key (an escaped ordered key of a maximal logical key).
 pub const MAX_ROW_KEY_BYTES: usize = 32 * 1024;
+
+// A row key a journal record accepts is one a checkpoint exports. The
+// record's bound holds the longest row key a command writes, asserted in
+// `coord_storage::codecs`.
+const _: () = assert!(coord_journal_api::record::MAX_RECORD_KEY_BYTES <= MAX_ROW_KEY_BYTES);
+
 /// Longest row value (an envelope at its payload limit).
 pub const MAX_ROW_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
 /// Largest encoded manifest: exactly what one snapshot frame carries

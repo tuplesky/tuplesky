@@ -12,6 +12,7 @@ publish.workspace = true
 role = "test-only"
 
 [dependencies]
+coord-core.workspace = true
 coord-types.workspace = true
 coord-transport.workspace = true
 rcgen.workspace = true

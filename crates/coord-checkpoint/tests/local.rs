@@ -17,7 +17,9 @@ use coord_checkpoint::local::{
 };
 use coord_checkpoint::manifest::RowV1;
 use coord_checkpoint::store::{LocalCheckpointStore, StoreError};
-use coord_journal_api::frontier::{LOCAL_CHECKPOINT_FORMAT_V1, select_recovery_pointer};
+use coord_journal_api::frontier::{
+    CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT, select_recovery_pointer,
+};
 use coord_journal_api::record::RecordOrigin;
 use coord_journal_api::stream::StorageStreamId;
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
@@ -256,6 +258,32 @@ fn a_written_image_loads_exactly_and_a_directory_selects_nothing() {
     let selected = select_recovery_pointer(&origin(3), [&pointer, &later_pointer]);
     assert_eq!(selected, Some(&later_pointer));
     // And the older one still loads, because nothing has reclaimed it.
+    assert_eq!(store.load(&pointer).expect("loads"), checkpoint);
+}
+
+/// A pointer that names an image format from before the raise is refused
+/// where its image is loaded, as a quarantine naming the format: the
+/// journal that holds it opens, and the baseline it selects stops the
+/// node rather than reading a layout this build doesn't know (#247,
+/// Codex).
+#[test]
+fn a_pointer_naming_an_older_image_format_is_refused_at_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LocalCheckpointStore::open(dir.path()).expect("store");
+    let engine = engine();
+    let checkpoint = exported(&engine);
+    let pointer = store.write(&checkpoint).expect("written");
+    let before_the_raise = CheckpointPointerV1 {
+        format: OLDEST_POINTER_FORMAT,
+        ..pointer
+    };
+    assert_ne!(before_the_raise.format, LOCAL_CHECKPOINT_FORMAT_V1);
+    match store.load(&before_the_raise) {
+        Err(StoreError::Quarantine { reason }) => {
+            assert!(reason.contains("format"), "{reason}");
+        }
+        other => panic!("expected a quarantine naming the format, got {other:?}"),
+    }
     assert_eq!(store.load(&pointer).expect("loads"), checkpoint);
 }
 

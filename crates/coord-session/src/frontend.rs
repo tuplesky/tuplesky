@@ -33,6 +33,12 @@ use crate::binding::{BindError, Binding, BindingConfig, verify_bind};
 use crate::gate::{PolicySource, carries_previous, is_read_output, protected_keys};
 use crate::wire::{BindAckV1, KIND_BIND, bind_ack_frame, decode_bind};
 
+/// How many records the dispatcher still holds that a record added past
+/// the gate's bound moves to the back before it stops looking (#185):
+/// two, so a pass over all the records takes at most half as many
+/// additions as there are records.
+const HELD_LOOKS: usize = 2;
+
 /// What a frame produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ingress {
@@ -202,7 +208,9 @@ pub struct BoundFrontend {
 
 impl BoundFrontend {
     /// Wrap `dispatcher`; `pump_bound` items per watch pump share one
-    /// barrier; `max_requests` request identities are remembered.
+    /// barrier; `max_requests` request identities are remembered, and
+    /// past that only those whose result the dispatcher can still
+    /// deliver, within four times what it holds.
     pub fn new(
         dispatcher: Dispatcher,
         config: BindingConfig,
@@ -237,6 +245,11 @@ impl BoundFrontend {
     /// The dispatcher, mutably (evidence, releases).
     pub const fn dispatcher_mut(&mut self) -> &mut Dispatcher {
         &mut self.dispatcher
+    }
+
+    /// Request identities the gate remembers.
+    pub fn remembered(&self) -> usize {
+        self.requests.len()
     }
 
     /// The binding of `connection`.
@@ -579,6 +592,10 @@ impl BoundFrontend {
             }
             return;
         }
+        // Room first: the record being added is never the one forgotten,
+        // since its result may be gated as soon as it is recorded (a
+        // retained answer to a retry).
+        self.forget_settled();
         let info = RequestInfo {
             command,
             namespace: logical.namespace,
@@ -588,10 +605,64 @@ impl BoundFrontend {
         };
         self.requests.insert(key, info);
         self.order.push_back(key);
-        while self.order.len() > self.max_requests {
-            if let Some(old) = self.order.pop_front() {
+    }
+
+    /// Forget the oldest records past `max_requests`, but never one whose
+    /// result the dispatcher can still deliver.
+    ///
+    /// The gate authorizes a read's output from this record, so a record
+    /// dropped while its read is outstanding turns an executed read that
+    /// policy permits into `OUTPUT_WITHHELD`. The records are shared by
+    /// every connection on the node and turn over by arrival, so under
+    /// load a read slower than the node's last `max_requests` arrivals
+    /// lost its record.
+    ///
+    /// At the bound, a record about to be added looks at the oldest
+    /// records in turn: it forgets each one the dispatcher no longer
+    /// holds, and moves at most [`HELD_LOOKS`] that it still holds to the
+    /// back. It looks before it is added, so it is never among them. So
+    /// the work is constant for each record added, however much the
+    /// dispatcher holds (its retained results alone can outnumber the
+    /// bound on a busy node).
+    ///
+    /// Those looks alone do not bound the records, because a record the
+    /// dispatcher let go can be held again: a key that has a record is
+    /// not recorded again, and an answered read presented again waits on
+    /// its leader again (#268 review). A caller that presents its oldest
+    /// answered reads again before each new one keeps the looks on held
+    /// records, and nothing is forgotten. So once the records pass the
+    /// larger of `max_requests` and four times what the dispatcher holds
+    /// (its commands pending or retained for resolution, and its reads
+    /// waiting on a leader), every record is looked at once and each one
+    /// it no longer holds is forgotten. That bounds the records by the
+    /// same figure, plus the record being added. A sweep forgets at least
+    /// three records in four, so the work stays constant for each record
+    /// added on average. Under honest load the looks keep the records
+    /// within that figure (1.3 to 1.4 times what is held, at 120 and 480
+    /// callers), and it does not run.
+    fn forget_settled(&mut self) {
+        let mut held = 0;
+        while self.order.len() >= self.max_requests && held < HELD_LOOKS {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if self.dispatcher.holds(&old) {
+                self.order.push_back(old);
+                held += 1;
+            } else {
                 self.requests.remove(&old);
             }
+        }
+        if self.order.len() > self.max_requests.max(4 * self.dispatcher.held()) {
+            let dispatcher = &self.dispatcher;
+            let requests = &mut self.requests;
+            self.order.retain(|key| {
+                let keep = dispatcher.holds(key);
+                if !keep {
+                    requests.remove(key);
+                }
+                keep
+            });
         }
     }
 

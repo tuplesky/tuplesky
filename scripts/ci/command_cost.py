@@ -21,9 +21,33 @@ spreads it over commands that ran while the history was short.
 commands a voter established on the slow path missed the fast one, the
 pre-acceptances it held that the leader had not ordered, the leader's
 waits from learned to released, the read waits taken apart, the peer
-frames and streams per command, and the journal's and the projection's
-jobs per command, queued, served and completed. A run
+frames and streams per command, what a voter sent while it led (its
+fresh proposals, its proposal frames and its `Committed` frontier
+announcements, task-d102, each a follower, per command), and the
+journal's and the projection's jobs per command, queued, served and
+completed. A run
 in which no voter decided anything fast is printed as a finding.
+
+`table` prints a fourth table (task-d97): the tails of the waits the
+metrics line carries as distributions, p50, p99 and the longest, since
+the voter started:
+- end to end at the node that took the request, from its arrival to the
+  answer handed back, writes and reads apart (#191 review);
+- the leader's round from a submission to learned, then from learned to
+  released, in all and by part;
+- the read barrier's wait;
+- the domain loop's run-queue time a pass, sampled one pass every 10 ms,
+  over every sampled pass and over those that executed a command;
+- the journal appender's and the projection's jobs, each job's time
+  served (for the appender, an append and its sync: the disk's own
+  tail) and queued before its thread took it, at every voter.
+
+A quantile is the upper edge of the bucket it falls in, within a fifth
+of the value. The read barrier's wait is kept in whole milliseconds, the
+barrier's clock, so its quantiles are millisecond steps printed at bucket
+edges: 2.05 is 2 ms, 5.12 is 5 ms, and a read that waited under a
+millisecond counts as 0. The arrival-to-answer reads are timed on the
+monotonic clock, to the microsecond.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
@@ -48,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -118,8 +143,94 @@ def per_command(node: str, snapshot: dict) -> dict:
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
+        **proposals_of(cost, executed),
         **groups_of(cost, executed, syncs["Observed"]),
+        **tails_of(cost),
     }
+
+
+SUB_BUCKETS = 4
+DISTRIBUTION_BUCKETS = SUB_BUCKETS + (26 - 2 + 1) * SUB_BUCKETS
+
+
+def bucket_lower(index: int) -> int:
+    """The least value, in microseconds, a distribution's bucket holds:
+    `Distribution::lower` (task-d97), four buckets an octave."""
+    if index < SUB_BUCKETS:
+        return index
+    octave = (index - SUB_BUCKETS) // SUB_BUCKETS + 2
+    within = (index - SUB_BUCKETS) % SUB_BUCKETS
+    return (SUB_BUCKETS + within) << (octave - 2)
+
+
+def quantiles_of(distribution: dict | None) -> dict | None:
+    """p50, p99 and the longest of a printed distribution (task-d97), in
+    milliseconds, with the count: a quantile is the upper edge of the
+    bucket its rank falls in, never past the longest, as
+    `Distribution::quantile` reads it. None for a binary older than the
+    reading, or a distribution that counted nothing."""
+    if not isinstance(distribution, dict):
+        return None
+    buckets = sorted((int(i), int(n)) for i, n in distribution.get("buckets", []))
+    count = sum(n for _, n in buckets)
+    if count == 0:
+        return None
+    longest = seconds(distribution["max"]) * 1000
+
+    def at(q: float) -> float:
+        rank = max(1, math.ceil(q * count))
+        seen = 0
+        for index, n in buckets:
+            seen += n
+            if seen >= rank:
+                if index + 1 < DISTRIBUTION_BUCKETS:
+                    return min(bucket_lower(index + 1) / 1000, longest)
+                return longest
+        return longest
+
+    return {"count": count, "p50_ms": at(0.50), "p99_ms": at(0.99), "max_ms": longest}
+
+
+def tails_of(cost: dict) -> dict:
+    """The waits the metrics line carries as distributions (task-d97),
+    as p50, p99 and the longest: the leader's from learned to released,
+    in all and by part; the read barrier's; and the domain loop's
+    run-queue time a sampled pass. Empty for a binary older than them."""
+    tails = {}
+    answered = cost.get("answered")
+    if isinstance(answered, dict):
+        for kind in ("writes", "reads"):
+            q = quantiles_of(answered.get(kind))
+            if q is not None:
+                tails[f"answered_{kind}"] = q
+    release = cost.get("release")
+    if isinstance(release, dict):
+        for part, d in (release.get("distributions") or {}).items():
+            q = quantiles_of(d)
+            if q is not None:
+                tails[f"release_{part}"] = q
+    reads = cost.get("reads")
+    if isinstance(reads, dict):
+        q = quantiles_of(reads.get("waited"))
+        if q is not None:
+            tails["read_waited"] = q
+    cpu = cost.get("cpu")
+    if isinstance(cpu, dict) and "Observed" in cpu:
+        scheduling = cpu["Observed"].get("domain_scheduling")
+        if isinstance(scheduling, dict) and "Observed" in scheduling:
+            for name in ("run_queue_per_pass", "run_queue_per_working_pass"):
+                q = quantiles_of(scheduling["Observed"].get(name))
+                if q is not None:
+                    tails[name] = q
+    waits = cost.get("waits")
+    if isinstance(waits, dict) and "Observed" in waits:
+        for side, short in (("appender", "journal"), ("materializer", "projection")):
+            jobs = waits["Observed"].get(f"{side}_jobs") or {}
+            for time in ("served", "queued"):
+                q = quantiles_of(jobs.get(f"{time}_each"))
+                if q is not None:
+                    tails[f"{short}_{time}"] = q
+    return {"tails": tails} if tails else {}
 
 
 def cpu_of(cost: dict, executed: int) -> dict:
@@ -190,6 +301,18 @@ def traffic_of(cost: dict, executed: int) -> dict:
     if traffic.get("sent_lost_streams"):
         out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
     return out
+
+
+def proposals_of(cost: dict, executed: int) -> dict:
+    """What a voter sent while it led, per command (task-d102): its fresh
+    proposals, the proposal frames that carried more than one, and its
+    commit frontier announcements (`Committed`), each counted once a
+    follower, with their bytes. Empty for a binary older than the counts
+    and for a voter that never led."""
+    proposals = cost.get("proposals")
+    if not isinstance(proposals, dict) or not any(proposals.values()):
+        return {}
+    return {"proposals_per_command": {k: v / executed for k, v in proposals.items()}}
 
 
 def groups_of(cost: dict, executed: int, syncs: int) -> dict:
@@ -312,11 +435,16 @@ def gate_of(cost: dict) -> dict:
     callers (task-d93): how many it held for the projection to catch up
     with their session, how many it still answered `Pending`, and how
     many a barrier denied. Empty for a binary older than the counts, or a
-    node whose gate did none of these."""
+    node whose gate did none of these. A binary from before the hold
+    reports no `holds`, read as none; `remembered`, a gauge of the
+    records kept, is not a count of what the gate did."""
     gate = cost.get("gate")
-    if not isinstance(gate, dict) or not any(gate.values()):
+    if not isinstance(gate, dict):
         return {}
-    return {"gate": {k: gate[k] for k in ("holds", "deferred", "denied")}}
+    counts = {k: gate.get(k, 0) for k in ("holds", "deferred", "denied")}
+    if not any(counts.values()):
+        return {}
+    return {"gate": counts}
 
 
 def resends_of(cost: dict, executed: int) -> dict:
@@ -545,14 +673,16 @@ def paths_table(result: dict) -> str:
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
         "| peer frames/cmd sent/received (streams sent/received) "
         "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
+        "| led, sent/cmd: proposals/frames/Committed "
         "| journal ms/cmd queued/served/completed | projection ms/cmd queued/served/completed |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- |",
     ]
     dash = "--"
     for run in result["runs"]:
         for finding in run.get("findings", []):
             lines.append(f"| {run['callers']} | **finding** | {finding} "
-                         "| | | | | | | | | | | |")
+                         "| | | | | | | | | | | | |")
         for v in run["voters"]:
             share = v.get("fast_path_share")
             share = dash if share is None else f"{share:.1%}"
@@ -582,13 +712,45 @@ def paths_table(result: dict) -> str:
             packets = dash if not traffic_cmd or "datagrams_sent" not in traffic_cmd else (
                 f"{traffic_cmd['datagrams_sent']:.2f}/{traffic_cmd['datagrams_received']:.2f} "
                 f"({traffic_cmd['send_calls']:.2f}, {traffic_cmd['acks_sent']:.2f})")
+            sent = v.get("proposals_per_command")
+            sent = dash if sent is None else "/".join(
+                f"{sent[f]:.2f}" for f in ("proposals", "frames", "frontiers"))
             jobs = lambda side: dash if f"{side}_jobs" not in v else "/".join(
                 f"{v[f'{side}_jobs'][f'{t}_ms_per_command']:.3f}"
                 for t in ("queued", "served", "completed"))
             lines.append(
                 f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
                 f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
-                f"| {jobs('appender')} | {jobs('materializer')} |")
+                f"| {sent} | {jobs('appender')} | {jobs('materializer')} |")
+    return "\n".join(lines)
+
+
+TAILS = ("answered_writes", "answered_reads", "release_round", "release_whole",
+         "release_predecessors", "release_group", "release_journal", "read_waited",
+         "run_queue_per_pass", "run_queue_per_working_pass", "journal_served",
+         "journal_queued", "projection_served", "projection_queued")
+
+
+def tails_table(result: dict) -> str:
+    """The waits' tails (task-d97), one row per voter per run: p50, p99
+    and the longest, in milliseconds, each with its count."""
+    lines = [
+        "| callers | node | arrival to answer ms p50/p99/max (n): writes | reads "
+        "| submitted to learned | learned to released | predecessors | group | journal "
+        "| read wait (whole ms) | run queue a pass (sampled) | a pass that executed "
+        "| journal job served | queued | projection job served | queued |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- | --- | --- |",
+    ]
+    for run in result["runs"]:
+        for v in run["voters"]:
+            tails = v.get("tails", {})
+            cells = []
+            for name in TAILS:
+                q = tails.get(name)
+                cells.append("--" if q is None else (
+                    f"{q['p50_ms']:.2f}/{q['p99_ms']:.2f}/{q['max_ms']:.2f} ({q['count']})"))
+            lines.append(f"| {run['callers']} | {v['node']} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -666,6 +828,8 @@ def main(argv: list[str]) -> int:
             print(paths_table(result))
             print()
             print(groups_table(result))
+            print()
+            print(tails_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

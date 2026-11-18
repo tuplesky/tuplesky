@@ -78,14 +78,31 @@ pub struct Limits {
     /// as a burst (task-d26). A retry of a request still outstanding is
     /// not a new one.
     ///
-    /// Bounded below the rate at which a voter catching up executes: a
-    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// Meant to be below the rate at which a voter catching up executes,
+    /// a page of up to 125 commands installed in one batch, the next asked
+    /// ahead while it executes (task-d25). A
     /// voter returning behind gains on the domain by the difference, so
     /// the time it takes to close a gap is bounded by the gap; admitted
     /// faster than it can execute, it never closes it. The bound is per
-    /// frontend: a domain served by several admits their sum.
+    /// frontend: a domain served by several admits their sum, which the
+    /// default no longer keeps below that rate
+    /// ([`DEFAULT_MAX_ADMITTED_PER_SECOND`]).
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
+    /// How long, in milliseconds, a voter's frontend still answers from
+    /// its own policy after the last pass on which the voter had a leader
+    /// and reached a majority (#312). Past it, the policy barrier is
+    /// unavailable: binds are refused, output is withheld and watches
+    /// close, until the voter has both again. A voter that has had
+    /// neither since it started is past it.
+    ///
+    /// A voter cut off from the domain stops learning revocations. This
+    /// bounds how long it goes on authorizing from what it last learned:
+    /// the transport's idle timeout on the peer plane (5 s) for its links
+    /// to drop, then this. A local setting: no replicated result depends
+    /// on it.
+    #[serde(default = "default_max_policy_staleness_millis")]
+    pub max_policy_staleness_millis: u64,
 }
 
 /// The checkpoint interval in records a strict configuration that names
@@ -101,17 +118,38 @@ pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_RECORDS: u64 = 65_536;
 pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_SECONDS: u64 = 30;
 
 /// The admission rate a configuration that names none gets (task-d26): a
-/// design target and a ceiling, not a proved bound. It is under a sixth
-/// of what catch-up would execute at one 64-command window per durable
-/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
-/// is its check. At the 35 to 100 commands a second a domain sustains
-/// today it never binds. It gates client requests only: resolves,
+/// design target and a ceiling, not a proved bound; task-d33's budget
+/// oracle is its check. It gates client requests only: resolves,
 /// watches and held retries bypass it, and every session of a frontend
 /// shares one bucket.
+///
+/// It is close to binding. Five voters on one four-core host with three
+/// frontends sustain about 1,500 to 1,700 commands a second at 120
+/// callers (#224, #225). The busiest frontend admits 630 to 770 of them
+/// a second at the median, and up to 977 in its busiest second, within
+/// 3% of this bound. A faster domain, or one served by fewer frontends,
+/// is refused here first. So a reading states the rate it ran under,
+/// and the `admission` line says what the rate refused.
+///
+/// Catch-up is measured now, not the 64-command window every 10 ms
+/// assumed here before. A page costs about 22 ms plus 0.28 ms a command,
+/// so a voter rejoining at full load with the relay executes about 1,600
+/// commands a second at 64 a page and 2,200 at 125 (#98). That is not
+/// the sixfold margin over this bound it was set with, and a domain
+/// admitting the sum of several frontends' bounds outruns it.
 pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
 
 const fn default_max_admitted_per_second() -> u32 {
     DEFAULT_MAX_ADMITTED_PER_SECOND
+}
+
+/// The policy staleness a configuration that names none gets: with the
+/// peer plane's 5 s idle timeout, a cut-off voter stops authorizing from
+/// its own policy about 10 s after it last heard the domain (#312).
+pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
+
+const fn default_max_policy_staleness_millis() -> u64 {
+    DEFAULT_MAX_POLICY_STALENESS_MILLIS
 }
 
 /// The command table capacity a configuration that names none gets: the
@@ -150,6 +188,7 @@ impl Default for Limits {
             checkpoint_after_seconds: None,
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
+            max_policy_staleness_millis: default_max_policy_staleness_millis(),
         }
     }
 }
@@ -167,6 +206,26 @@ pub struct MetricsConfig {
     /// only the ones at start and at the end.
     #[serde(default = "default_metrics_interval")]
     pub interval_seconds: u64,
+}
+
+/// The process's async runtime (task-d91).
+///
+/// coordd's network, timers and serve loop run on tokio's multi-thread
+/// runtime; the domain loop and the store workers are threads of their
+/// own and are not counted here. Set, it is the count, whatever
+/// `TOKIO_WORKER_THREADS` says. Unset, tokio chooses: that variable's
+/// count where it is set, as the Jepsen job sets it, and otherwise a
+/// worker a core. On one host with every voter sharing its cores that runs
+/// several workers a core: in task-d91's local pair one worker a voter
+/// cut the voters' CPU a command by 12 to 27%, with latency lower too,
+/// almost all of it the workers' parking, wake-ups and stealing. The
+/// default stays tokio's until a node with cores of its own is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Worker threads of the runtime. Zero is refused.
+    #[serde(default)]
+    pub worker_threads: Option<std::num::NonZeroUsize>,
 }
 
 /// How this node's frontend serves a current read (task-d50; design
@@ -384,6 +443,20 @@ pub struct JournalConfig {
     /// the end is synced by its own loop.
     #[serde(default = "projection_durable_ms")]
     pub projection_durable_ms: u64,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], journal records a projection
+    /// commit waits for before it goes out (task-d86): records the
+    /// materializer is owed are held for one larger commit until this
+    /// many are, [`JournalConfig::projection_commit_ms`] has passed, or
+    /// something that reads the projection waits for one of them. Zero
+    /// holds nothing: a commit goes out as soon as the last is back.
+    /// Ignored under the strict profile.
+    #[serde(default = "projection_commit_records")]
+    pub projection_commit_records: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a record
+    /// is held for a larger projection commit (task-d86). Zero holds
+    /// nothing. Ignored under the strict profile.
+    #[serde(default = "projection_commit_ms")]
+    pub projection_commit_ms: u64,
 }
 
 impl JournalConfig {
@@ -391,6 +464,29 @@ impl JournalConfig {
     pub fn replays_projection(&self) -> bool {
         self.profile == JOURNAL_REPLAY_PROFILE
     }
+
+    /// The projection commit hold (task-d86): records and the longest
+    /// wait, or `None` where nothing is held (the strict profile, or
+    /// either bound zero).
+    pub fn projection_commit_hold(&self) -> Option<(u32, std::time::Duration)> {
+        (self.replays_projection()
+            && self.projection_commit_records > 0
+            && self.projection_commit_ms > 0)
+            .then(|| {
+                (
+                    self.projection_commit_records,
+                    std::time::Duration::from_millis(self.projection_commit_ms),
+                )
+            })
+    }
+}
+
+fn projection_commit_records() -> u32 {
+    32
+}
+
+fn projection_commit_ms() -> u64 {
+    5
 }
 
 fn projection_durable_commits() -> u32 {
@@ -731,6 +827,10 @@ pub struct Config {
     /// How current reads are served (task-d50).
     #[serde(default)]
     pub reads: ReadsConfig,
+    /// The async runtime's worker count (task-d91). Absent, tokio's
+    /// default.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
@@ -1252,6 +1352,19 @@ allow_insecure_loopback = {allow}
         assert!(on.enabled);
         assert_ne!(on.images, state_checkpoints());
         assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
+    }
+
+    /// The runtime's worker count is tokio's unless a configuration sets
+    /// one, and a configuration can't set none (task-d91).
+    #[test]
+    fn the_runtime_keeps_tokios_worker_count_unless_configured() {
+        use super::RuntimeConfig;
+        assert_eq!(with_renewal(true).runtime, RuntimeConfig::default());
+        assert_eq!(RuntimeConfig::default().worker_threads, None);
+        let one: RuntimeConfig = toml::from_str("worker_threads = 1").expect("parses");
+        assert_eq!(one.worker_threads.map(|n| n.get()), Some(1));
+        assert!(toml::from_str::<RuntimeConfig>("worker_threads = 0").is_err());
+        assert!(toml::from_str::<RuntimeConfig>("workers = 1").is_err());
     }
 
     /// Turned on, the floor refuses a directory the local checkpoints
