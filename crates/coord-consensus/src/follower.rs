@@ -1479,10 +1479,11 @@ impl Follower {
         // executed with its row tracked nowhere (protocol_sim row 21,
         // three voters, seed 1853: node 2's own payload batch failed, it
         // led, wrote the row again as a leader does for a payload it does
-        // not serve, and was deposed by its next campaign with that batch
-        // in flight). So the row is written again in a batch this follower
-        // tracks before the command executes, as after a failed payload
-        // batch ([`Follower::stale`], [`Follower::carry_stale`]).
+        // not serve, and was deposed with that batch in flight: by another
+        // voter's campaign, since only a follower campaigns). So the row is
+        // written again in a batch this follower tracks before the command
+        // executes, as after a failed payload batch ([`Follower::stale`],
+        // [`Follower::carry_stale`]).
         let payload_unwritten = state
             .payloads
             .keys()
