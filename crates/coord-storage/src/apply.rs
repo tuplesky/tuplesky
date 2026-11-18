@@ -210,6 +210,10 @@ pub struct Applier<P: Persistence> {
     /// The position the projection was last seen committed through, by
     /// [`Applier::settle`] or a drain (task-d63).
     committed: Option<coord_types::ids::ExecutionPosition>,
+    /// The position the projection had committed through when this
+    /// applier opened it: what [`Applier::projected_through`] reports
+    /// before any settle or drain has seen a commit (#320).
+    opened: coord_types::ids::ExecutionPosition,
     /// Whether a group of this applier's was lost: met by the applier
     /// ([`ApplyError::GroupLost`]), or by a node's lowering and noted
     /// ([`Applier::note_journaled`]). Every use after it is refused
@@ -391,13 +395,14 @@ impl<P: Persistence> Applier<P> {
     /// of this applier's is also one of the protocol machine's that
     /// shares its store and its boot.
     pub fn new(store: P, alloc: BarrierAllocator) -> Result<Self, EngineError> {
-        let (published, floor) = {
+        let (published, floor, opened) = {
             let gated = store.reader().snapshot().map_err(|_| {
                 EngineError::new(coord_store_api::engine::ErrorClass::Busy, "no durable view")
             })?;
             (
                 crate::codecs::read_kv_revision(gated.view())?,
                 crate::codecs::read_retention_floor(gated.view())?,
+                gated.meta().frontier.execution_position,
             )
         };
         Ok(Applier {
@@ -409,6 +414,7 @@ impl<P: Persistence> Applier<P> {
             group: None,
             inflight: VecDeque::new(),
             committed: None,
+            opened,
             authorizations: std::cell::RefCell::default(),
             lost: false,
         })
@@ -823,6 +829,17 @@ impl<P: Persistence> Applier<P> {
         for event in events {
             self.note_journaled(event);
         }
+    }
+
+    /// The execution position the committed projection is known to reach:
+    /// the furthest a settle or a drain has seen it commit, or where it
+    /// stood when this applier opened it (#320). A read of the store
+    /// (not of [`Applier::read_view`]) sees at least this much, since the
+    /// projection only moves forward under one applier. It lags
+    /// [`Applier::journaled_through`].
+    pub fn projected_through(&self) -> coord_types::ids::ExecutionPosition {
+        self.committed
+            .map_or(self.opened, |seen| seen.max(self.opened))
     }
 
     /// The execution position through which every group handed off is in

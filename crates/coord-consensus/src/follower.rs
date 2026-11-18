@@ -1470,6 +1470,29 @@ impl Follower {
         let selection = state
             .synced_selection
             .filter(|d| d.ballot == state.ballots.synced());
+        // A payload held here, of a command not yet executed, with no
+        // payload row known durable: a deposed leader's batch that writes
+        // it may still be in flight, and this follower does not track the
+        // leader's batches. Durable, it never marks the row served; failed,
+        // it never marks it unwritten. Of a command already committed, no
+        // later vote or installation writes it again, so the command
+        // executed with its row tracked nowhere (protocol_sim row 21,
+        // three voters, seed 1853: node 2's own payload batch failed, it
+        // led, wrote the row again as a leader does for a payload it does
+        // not serve, and was deposed with that batch in flight: by another
+        // voter's campaign, since only a follower campaigns). So the row is
+        // written again in a batch this follower tracks before the command
+        // executes, as after a failed payload batch ([`Follower::stale`],
+        // [`Follower::carry_stale`]).
+        let payload_unwritten = state
+            .payloads
+            .keys()
+            .filter(|c| {
+                !state.served_payloads.contains(c)
+                    && state.table.phase_of(c).is_some_and(|p| p < Phase::Executed)
+            })
+            .copied()
+            .collect();
         Follower {
             config: FollowerConfig {
                 identity: state.identity,
@@ -1504,7 +1527,7 @@ impl Follower {
             payloads: state.payloads,
             durable_payloads: PayloadsInFlight::new(),
             unwritten: BTreeSet::new(),
-            payload_unwritten: BTreeSet::new(),
+            payload_unwritten,
             installs: BTreeMap::new(),
             sync_reinstall: false,
             sync_examine: false,

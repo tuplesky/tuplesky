@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_collector::{
-    Action, Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, Caller, Collector,
-    CollectorConfig, CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason,
+    Action, Admission, AdmissionLimits, AdmissionRefusal, AdmissionRefusals, BatchVerdict, Caller,
+    Collector, CollectorConfig, CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason,
     KIND_EVIDENCE, KIND_RELEASE, MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal,
     Submitted, admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
 };
@@ -1255,7 +1255,7 @@ fn unary_and_finalized_watch_dispatch() {
     hub.replay_complete(registration.id).unwrap();
     assert!(
         w.frontend
-            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| BatchVerdict::Permit)
             .is_empty()
     );
 
@@ -1278,14 +1278,16 @@ fn unary_and_finalized_watch_dispatch() {
     );
     assert!(
         w.frontend
-            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| BatchVerdict::Permit)
             .is_empty(),
         "a tentative value never reaches a watch"
     );
     let (c2, _) = w.submit(1, 2, put(b"w", b"2"));
     w.settle();
     assert!(w.delivered(&c1).is_some() && w.delivered(&c2).is_some());
-    let frames = w.frontend.pump_watch(&hub, 5, 9, usize::MAX, |_| true);
+    let frames = w
+        .frontend
+        .pump_watch(&hub, 5, 9, usize::MAX, |_| BatchVerdict::Permit);
     let mut revisions = Vec::new();
     for f in &frames {
         match decode_stream(f).unwrap().as_slice() {
@@ -1328,7 +1330,7 @@ fn unary_and_finalized_watch_dispatch() {
     }
     assert!(
         w.frontend
-            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| BatchVerdict::Permit)
             .is_empty()
     );
     assert_eq!(hub.open_watches(), 0);

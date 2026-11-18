@@ -1230,7 +1230,10 @@ fn main() -> ExitCode {
         Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
-        .wake_on_materialized(materialized);
+        .wake_on_materialized(materialized)
+        .policy_staleness(std::time::Duration::from_millis(
+            config.limits.max_policy_staleness_millis,
+        ));
     if let Some(replayed) = replayed {
         domain = domain.recovered_in(replayed.took);
     }

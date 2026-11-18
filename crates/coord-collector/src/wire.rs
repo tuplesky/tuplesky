@@ -10,6 +10,8 @@
 //! | `Evidence` `0x0700` | voter to collector | `ProtocolMessage` (postcard) |
 //! | `Read` `0x0107` | collector to the leader it follows | [`ReadV1`] |
 //! | `ReadAnswer` `0x0702` | leader to collector | [`ReadAnswerV1`] |
+//! | `Freshness` `0x0108` | a voter's collector to the leader it follows | [`FreshnessAskV1`] |
+//! | `FreshnessAnswer` `0x0703` | leader to collector | [`FreshnessAnswerV1`] |
 //!
 //! None of these is decodable by the typed `wire_v1` decoder: they are
 //! dispatched by raw kind at the collector boundary, the way peer
@@ -18,7 +20,7 @@
 use coord_consensus::ProtocolMessage;
 use coord_core::capability::{AdmissionFacts, ReleasedResult};
 use coord_types::identity::RetryKey;
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ExecutionPosition};
 use coord_types::wire_v1::{Frame, RequestV1, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +144,60 @@ pub enum ReadRefusal {
     NotServable,
     /// The leader holds as many reads as it bounds.
     Busy,
+}
+
+/// A voter's freshness ask (#320): sent by the frontend beside the voter
+/// to the leader of the ballot the voter follows, every half allowance
+/// while it votes (an eighth after an ask that was refused or could not
+/// be sent, and at once when its ballot moves).
+pub use coord_types::wire_v1::KIND_COLLECTOR_FRESHNESS as KIND_FRESHNESS;
+/// The leader's answer to a [`FreshnessAskV1`], in the collector-evidence
+/// range beside [`KIND_READ_ANSWER`].
+pub const KIND_FRESHNESS_ANSWER: u16 = 0x0703;
+
+/// A freshness ask (#320). The leader answers it as it answers a current
+/// read (task-d50): it takes its read index when the ask arrives,
+/// confirms its ballot with a round started after that, waits until
+/// everything it proposed below the index has executed, and answers with
+/// how far it had executed then. Everything the domain committed before
+/// the ask arrived is at or below that position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessAskV1 {
+    /// The ballot the asking voter follows. A voter that does not lead it
+    /// refuses.
+    pub ballot: Ballot,
+    /// The asker's number for this ask, echoed in the answer.
+    pub ask: u64,
+}
+
+/// The leader's answer to a [`FreshnessAskV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessAnswerV1 {
+    /// The ballot the answering voter was at.
+    pub ballot: Ballot,
+    /// The ask answered.
+    pub ask: u64,
+    /// What came of it.
+    pub outcome: FreshnessOutcomeV1,
+}
+
+/// What came of a [`FreshnessAskV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshnessOutcomeV1 {
+    /// Everything committed before the ask reached the leader is at or
+    /// below `position` in the execution order, which is one order at
+    /// every voter.
+    Through {
+        /// How far the leader had executed once a round confirmed it and
+        /// everything below the ask's index had executed.
+        position: ExecutionPosition,
+    },
+    /// Not answered, for the reason a read would not have been. The
+    /// asker stays as fresh as it was and asks again.
+    Refused {
+        /// Why.
+        reason: ReadRefusal,
+    },
 }
 
 /// The submission: what the admitting verifier attested and the exact
@@ -336,5 +392,29 @@ pub fn read_answer_frame(answer: &ReadAnswerV1) -> Result<Vec<u8>, CollectorWire
 /// Decode a read's answer.
 pub fn decode_read_answer(frame: &Frame) -> Result<ReadAnswerV1, CollectorWireError> {
     check(frame, KIND_READ_ANSWER)?;
+    exact(&frame.payload)
+}
+
+/// Encode a freshness ask (#320).
+pub fn freshness_frame(ask: &FreshnessAskV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(ask).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_FRESHNESS, &payload)
+}
+
+/// Decode a freshness ask.
+pub fn decode_freshness(frame: &Frame) -> Result<FreshnessAskV1, CollectorWireError> {
+    check(frame, KIND_FRESHNESS)?;
+    exact(&frame.payload)
+}
+
+/// Encode a freshness ask's answer.
+pub fn freshness_answer_frame(answer: &FreshnessAnswerV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(answer).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_FRESHNESS_ANSWER, &payload)
+}
+
+/// Decode a freshness ask's answer.
+pub fn decode_freshness_answer(frame: &Frame) -> Result<FreshnessAnswerV1, CollectorWireError> {
+    check(frame, KIND_FRESHNESS_ANSWER)?;
     exact(&frame.payload)
 }

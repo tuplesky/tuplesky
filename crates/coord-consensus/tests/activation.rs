@@ -6537,6 +6537,227 @@ fn a_batch_staged_as_leader_reaches_the_followers_ledger() {
     );
 }
 
+/// #314 review: a proposal batch definitely rejected and presented again
+/// (`Leader::retry_proposal`) is staged in the leader's ledger under its
+/// new barrier, as its first batch was, so a follower made from the
+/// leader while it is in flight follows it: durable, its record reaches
+/// the follower's ledger and its report.
+#[test]
+fn a_retried_proposal_batch_reaches_the_followers_ledger() {
+    let mut leader = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(ballot(0, 0)),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        None,
+        ExecutionPosition::ZERO,
+    );
+    leader.step(boot_event(1));
+    let (x, admit) = admission(1, 1);
+    let proposed = leader.step(admit);
+    let [Effect::Persist(first)] = proposed.as_slice() else {
+        panic!("one proposal batch: {proposed:?}")
+    };
+    let retried = leader.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: first.barrier,
+        error: coord_core::event::StorageError::DefinitelyNotCommitted,
+    }));
+    let [Effect::Persist(again)] = retried.as_slice() else {
+        panic!("the rejected batch is presented again: {retried:?}")
+    };
+    assert_eq!(again.updates, first.updates, "the same rows, unchanged");
+    // Deposed before the retried batch lands.
+    let q = leader.config_quorum();
+    let mut f = Follower::from_recovered(leader.into_recovered(), q);
+    for e in durable_events(&retried) {
+        f.step(e);
+    }
+    let report = f.report(ballot(1, 1));
+    assert!(
+        report.entries.iter().any(|e| e.command == x),
+        "the retried proposal, durable, is missing from the report: {:?}",
+        report.entries
+    );
+}
+
+/// #314 review (seed 1853's shape in a test): a voter whose payload batch
+/// failed commits the command, leads, writes the payload row again in its
+/// re-proposal as a leader does for a payload it does not serve, and is
+/// deposed with that batch in flight. The follower it becomes does not
+/// follow the leader's batches, and no later vote or installation writes
+/// the row of a command already committed, so `Follower::from_recovered`
+/// marks the row unwritten: the gate (`Follower::next_executable`,
+/// task-d113's rule (b)) holds the command back until the next event that
+/// is not a failure writes the row again in a batch this follower tracks
+/// (`Follower::carry_stale`). Without the mark the command was executable
+/// at once over a payload held only in memory.
+#[test]
+fn a_command_committed_at_a_deposed_leader_waits_for_its_payload_row() {
+    let b0 = ballot(1, 2);
+    let b1 = ballot(2, 1);
+    let b2 = ballot(3, 2);
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(b0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: b0,
+            synced: ballot(0, 0),
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    f.step(boot_event(1));
+    // r1 holds x's payload, and the batch that wrote its row failed.
+    let (x, admit) = admission(3, 1);
+    let admitted = f.step(admit);
+    let held = f.table().record(&x).expect("admitted").payload;
+    assert!(held.is_some());
+    for e in &admitted {
+        if let Effect::Persist(b) = e {
+            f.step(Event::Storage(StorageEvent::Failed {
+                barrier_id: b.barrier,
+                error: coord_core::event::StorageError::DefinitelyNotCommitted,
+            }));
+        }
+    }
+    let is_payload_row = |u: &coord_core::effect::StoreUpdate| {
+        u.collection == Collection::PayloadV1.id() && u.value.is_some()
+    };
+    let payload_batches = |effects: &[Effect]| -> Vec<BarrierId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(b) if b.updates.iter().any(is_payload_row) => Some(b.barrier),
+                _ => None,
+            })
+            .collect()
+    };
+    // Until it leads, every batch r1 writes lands but those writing x's
+    // payload row again, which fail.
+    let settle = |f: &mut Follower, effects: Vec<Effect>| {
+        let mut queue = effects;
+        for _ in 0..32 {
+            if queue.is_empty() {
+                return;
+            }
+            let mut next = Vec::new();
+            for e in &queue {
+                if let Effect::Persist(b) = e {
+                    let event = if b.updates.iter().any(is_payload_row) {
+                        StorageEvent::Failed {
+                            barrier_id: b.barrier,
+                            error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                        }
+                    } else {
+                        StorageEvent::JournalDurable {
+                            barrier_id: b.barrier,
+                            journal_seq: LocalJournalSeq::new(1).unwrap(),
+                        }
+                    };
+                    next.extend(f.step(Event::Storage(event)));
+                }
+            }
+            queue = next;
+        }
+        panic!("r1's batches did not settle");
+    };
+    // r2's Sync of b0 selects x committed.
+    let mut entry = selected(x, &[]);
+    entry.phase = Phase::Commit;
+    entry.admission = held;
+    let synced = f.step(peer_event(
+        r(2),
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b0,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::from([(x, entry)]),
+            reproposed: BTreeSet::new(),
+        }),
+    ));
+    settle(&mut f, synced);
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Commit));
+    // r1 campaigns for b1 and wins with r0's empty report.
+    let campaign = f.campaign(b1);
+    settle(&mut f, campaign);
+    let promise = f.step(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: b1,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    settle(&mut f, promise);
+    let report = RecoveryReport {
+        replica: r(0),
+        ballot: b1,
+        committed_ballot: ballot(0, 0),
+        entries: Vec::new(),
+    };
+    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+        let effects = f.step(peer_event(r(0), ProtocolMessage::ReportPage(page)));
+        settle(&mut f, effects);
+    }
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .cloned()
+        .expect("r1 wins b1");
+    // As leader it writes x's payload row again in the re-proposal's
+    // batch: it holds the payload and serves none.
+    let (mut leader, led) = Leader::from_recovered(f.into_recovered(), quorum(b1), &decision);
+    assert_eq!(leader.table().phase_of(&x), Some(Phase::Commit));
+    assert!(
+        !payload_batches(&led).is_empty(),
+        "the leader writes x's payload row again: {led:?}"
+    );
+    // Deposed by r2's campaign with that batch in flight.
+    let promised = leader.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&promised) {
+        leader.step(e);
+    }
+    assert!(leader.deposed());
+    let q = leader.config_quorum();
+    let mut f = Follower::from_recovered(leader.into_recovered(), q);
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Commit));
+    assert_eq!(
+        f.next_executable(),
+        None,
+        "x is held back until its payload row is in a batch this follower tracks"
+    );
+    // The next event that is not a failure writes the row again, and x
+    // executes over it in flight.
+    let effects = f.step(peer_event(
+        r(2),
+        ProtocolMessage::Committed {
+            ballot: b2,
+            through: 0,
+        },
+    ));
+    assert!(
+        !payload_batches(&effects).is_empty(),
+        "x's payload row is written again: {effects:?}"
+    );
+    assert_eq!(f.next_executable(), Some(x));
+}
+
 /// A selection with a dependency cycle, as another build could bind it.
 fn cyclic_selection(a: CommandId, b: CommandId) -> SyncDecision {
     let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
