@@ -5065,6 +5065,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// projection that can go out now (task-d93): once the projection
     /// shows the caller's session, or at the hold's deadline as
     /// `Pending`.
+    ///
+    /// A held disclosure is gated again against the barrier `answer`
+    /// builds: over the applier's read view, so a revoke in a group not
+    /// yet committed to the store is seen (#281), and only while this
+    /// voter's policy is fresh (#320), so a stale one withholds it.
     fn release_held(&mut self) {
         if !self.frontend.frontend.holds_any() {
             return;
@@ -5076,9 +5081,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         {
             return;
         }
-        let policy = StorePolicySource {
-            store: self.backing.applier().store(),
-            budget: ViewBudget::default(),
+        let fresh = self.policy_open();
+        let policy = Fresh {
+            source: ReadViewPolicy {
+                applier: self.backing.applier(),
+                budget: ViewBudget::default(),
+            },
+            fresh,
         };
         let now = self.now_millis();
         for delivery in self.frontend.frontend.release_held(now, &policy) {
