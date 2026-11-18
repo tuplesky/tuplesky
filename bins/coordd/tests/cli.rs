@@ -1584,12 +1584,35 @@ struct Caller {
 impl Caller {
     /// Dial `daemon`, negotiate as a client of this domain, and bind
     /// `session` with a token the daemon's own keys verify.
+    ///
+    /// A voter answers from its policy only after a pass with a leader
+    /// and a majority of its peer links (#320). Until then it refuses a
+    /// bind as unavailable and closes the connection, and a caller
+    /// presents its credential again on a new one, as a client does.
+    /// "voters submittable" says a node holds its submission links, not
+    /// its peer links, so a caller that binds right after it can meet
+    /// that refusal.
     async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
-        let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
-        let token = service_token(ring, session);
-        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
-        let answer = ask(&connection, &bind)
-            .await
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (answer, endpoint, connection, control, control_recv) = loop {
+            let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
+            let token = service_token(ring, session);
+            let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+            match try_ask(&connection, &bind).await {
+                Ok(answer) => break (answer, endpoint, connection, control, control_recv),
+                Err(quinn::ConnectionError::ApplicationClosed(close))
+                    if close.reason.as_ref() == b"bind refused"
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!(
+                    "the binding's connection was lost: {e:?}\n{}",
+                    daemon.said()
+                ),
+            }
+        };
+        let answer = answer
             .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
         assert_eq!(
@@ -1809,8 +1832,20 @@ impl Caller {
 /// Write `frame` on a fresh stream and read the answer the daemon
 /// writes back on it, or `None` if it never comes.
 async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types::wire_v1::Frame> {
-    let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
-    send.write_all(frame).await.expect("written");
+    try_ask(connection, frame).await.expect("readable")
+}
+
+/// [`ask`], with the connection's loss returned rather than a panic.
+async fn try_ask(
+    connection: &quinn::Connection,
+    frame: &[u8],
+) -> Result<Option<coord_types::wire_v1::Frame>, quinn::ConnectionError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    match send.write_all(frame).await {
+        Ok(()) => {}
+        Err(quinn::WriteError::ConnectionLost(lost)) => return Err(lost),
+        Err(e) => panic!("written: {e:?}"),
+    }
     send.finish().expect("finished");
     // Generous on purpose. Every caller of this helper asserts that an
     // answer arrived, never that one arrived quickly: the timeout is
@@ -1819,22 +1854,29 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     // can legitimately take tens of seconds for one request without
     // anything being wrong. A test that needs the whole load to finish
     // inside a bound sets that bound itself.
-    let bytes = tokio::time::timeout(Duration::from_secs(45), async {
+    let read = tokio::time::timeout(Duration::from_secs(45), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
-        while let Some(n) = recv.read(&mut buf).await.expect("readable") {
-            bytes.extend_from_slice(&buf[..n]);
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => bytes.extend_from_slice(&buf[..n]),
+                Ok(None) => return Ok(bytes),
+                Err(quinn::ReadError::ConnectionLost(lost)) => return Err(lost),
+                Err(e) => panic!("readable: {e:?}"),
+            }
         }
-        bytes
     })
-    .await
-    .ok()?;
+    .await;
+    let Ok(bytes) = read else {
+        return Ok(None);
+    };
+    let bytes = bytes?;
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut reader = coord_types::wire_v1::FrameReader::new();
     reader.push(&bytes).expect("within the reader bound");
-    reader.next_frame().expect("a frame")
+    Ok(reader.next_frame().expect("a frame"))
 }
 
 /// A caller binds a session against the running daemon, and the
@@ -4764,7 +4806,7 @@ async fn one_backup_restores_every_voter_of_a_successor() {
             .await
             .unwrap_or_else(|| panic!("the cluster answered the request\n{}", running[0].said()));
         // The backup is voter 1's store, so voter 1 has executed it.
-        let read = read_projected(&caller, 2, b"k")
+        let read = ask(&caller.connection, &caller.range(2, b"k"))
             .await
             .expect("voter 1 answered the read");
         assert_eq!(read_value(&read).as_deref(), Some(&b"v"[..]));
@@ -4839,7 +4881,7 @@ async fn one_backup_restores_every_voter_of_a_successor() {
     // ...and serve what the backup held, from each of them.
     for (n, node) in running.iter().enumerate() {
         let reader = Caller::bind(node, &successor.ca, &successor.ring, [0x60 + n as u8; 16]).await;
-        let read = read_projected(&reader, 1, b"k")
+        let read = ask(&reader.connection, &reader.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("restored voter {} did not answer the read", n + 1));
         assert_eq!(
@@ -7165,7 +7207,7 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
         Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x68; 16]).await,
     ];
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 1, b"k")
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(

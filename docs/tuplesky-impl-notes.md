@@ -11111,7 +11111,9 @@ view, so a grant revoked in a group the projection hasn't committed yet
 is seen (#281), and only while the voter's policy is fresh (#320). A
 release over the committed store alone could miss such a revoke, and
 wasn't bounded by the staleness cap. With the policy stale, a held
-disclosure is withheld when it is released, as an answer would be.
+disclosure is answered `Pending` when it is released, as an answer
+would be: stale is "not yet", not a denial. One the policy can't be
+read for is withheld.
 
 **A held disclosure keeps its request's record** (Codex on #98). The
 release gates a disclosure from its request's record: its namespace and

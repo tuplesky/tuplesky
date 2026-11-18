@@ -10,15 +10,19 @@
 //! * Every response that discloses entries (unary result, retained
 //!   result) is gated against one fresh barrier at delivery; each bounded
 //!   watch pump loads one fresh barrier for the batches it selects. A
-//!   denied disclosure becomes a `NOT_ADMITTED` error response; a denied
-//!   batch closes the watch as unauthorized before any progress crosses
-//!   it. An unreadable barrier denies (fail closed).
+//!   denied disclosure becomes an `OUTPUT_WITHHELD` error response; a
+//!   denied batch closes the watch as unauthorized before any progress
+//!   crosses it. An unreadable barrier denies (fail closed). A stale one
+//!   (#312, [`PolicyError::Stale`]) discloses nothing either, but is not
+//!   a denial: the disclosure is answered `Pending` (not held for the
+//!   projection, as a session not yet shown is) and the watch closes as
+//!   source-lost.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_authn::ClockHealth;
 use coord_collector::MonotonicMillis;
-use coord_collector::{Action, Delivery, Dispatcher, codes};
+use coord_collector::{Action, BatchVerdict, Delivery, Dispatcher, codes};
 use coord_core::event::AdmittedRequest;
 use coord_state::Response;
 use coord_state::plan::Outcome;
@@ -30,7 +34,7 @@ use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest};
 use coord_types::wire_v1::{Frame, MessageV1, OutcomeV1, RequestV1, decode, decode_stream};
 
 use crate::binding::{BindError, Binding, BindingConfig, verify_bind};
-use crate::gate::{PolicySource, carries_previous, is_read_output, protected_keys};
+use crate::gate::{PolicyError, PolicySource, carries_previous, is_read_output, protected_keys};
 use crate::wire::{BindAckV1, KIND_BIND, bind_ack_frame, decode_bind};
 
 /// How many records the dispatcher still holds that a record added past
@@ -890,8 +894,22 @@ impl BoundFrontend {
             return Decision::Out(self.deny(delivery, response.command_id));
         }
         self.barriers_read += 1;
-        let Ok(barrier) = policy.barrier(namespace, &session) else {
-            return Decision::Out(self.deny(delivery, response.command_id));
+        let barrier = match policy.barrier(namespace, &session) {
+            Ok(barrier) => barrier,
+            // This node's policy may be behind the domain's (#312). That
+            // is "not yet", as below, not "no": a refusal is read as a
+            // credential that is no longer good, and this node may be
+            // fresh again in a moment, or the caller may reach one that
+            // is. It is answered pending now rather than held: a stale
+            // voter is cut off, and a hold would only delay the caller's
+            // resolve, which may reach a voter that is not. The request's
+            // record stays, so its retry is gated afresh.
+            Err(PolicyError::Stale) => {
+                return Decision::Out(self.defer(delivery, response.command_id));
+            }
+            Err(PolicyError::Unavailable) => {
+                return Decision::Out(self.deny(delivery, response.command_id));
+            }
         };
         // "Not yet" is not "no". This node's binding was established
         // from a committed session-creation command, but the barrier
@@ -960,7 +978,10 @@ impl BoundFrontend {
     }
 
     /// Pump a watch: one fresh barrier for at most `pump_bound` selected
-    /// items; a batch the barrier does not permit closes the watch.
+    /// items; a batch the barrier does not permit closes the watch. A
+    /// stale barrier (#312) closes it as source-lost at its last complete
+    /// revision instead, which the client resumes from: here once this
+    /// node is fresh again, or at another node.
     pub fn pump_watch(
         &mut self,
         clock: &ClockHealth,
@@ -983,19 +1004,20 @@ impl BoundFrontend {
                 if b.active(clock) && b.scope_ceiling & PolicyAction::Read.bit() != 0 =>
             {
                 self.barriers_read += 1;
-                policy.barrier(ns, &b.session).ok()
+                Some(policy.barrier(ns, &b.session))
             }
             _ => None,
         };
         let mut denied = 0;
         let frames = self
             .dispatcher
-            .pump_watch(hub, connection, watch_id, bound, |batch| {
-                let ok = barrier.as_ref().is_some_and(|b| b.permits_batch(batch));
-                if !ok {
+            .pump_watch(hub, connection, watch_id, bound, |batch| match &barrier {
+                Some(Ok(b)) if b.permits_batch(batch) => BatchVerdict::Permit,
+                Some(Err(PolicyError::Stale)) => BatchVerdict::Undecided,
+                _ => {
                     denied += 1;
+                    BatchVerdict::Deny
                 }
-                ok
             });
         self.denied += denied;
         if frames
