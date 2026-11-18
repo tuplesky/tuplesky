@@ -59,12 +59,14 @@ pub use dispatch::{
 pub use ingress::{IngressError, admitted_from_submit, frontend_frame};
 pub use trace::CollectorEvent;
 pub use wire::{
-    CollectorWireError, KIND_EVIDENCE, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT,
+    CollectorWireError, FreshnessAnswerV1, FreshnessAskV1, FreshnessOutcomeV1, KIND_EVIDENCE,
+    KIND_FRESHNESS, KIND_FRESHNESS_ANSWER, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT,
     ReadAnswerV1, ReadOutcomeV1, ReadRefusal, ReadV1, ReleaseV2, SubmitV1,
-    VERSION_ANSWER_ON_RELEASE, VERSION_RELAYED, decode_evidence, decode_read, decode_read_answer,
-    decode_release, decode_submit, decode_submit_marked, evidence_frame, evidence_frame_from_bytes,
-    read_answer_frame, read_frame, release_frame, submit_frame, submit_frame_answer_on_release,
-    submit_frame_relayed,
+    VERSION_ANSWER_ON_RELEASE, VERSION_RELAYED, decode_evidence, decode_freshness,
+    decode_freshness_answer, decode_read, decode_read_answer, decode_release, decode_submit,
+    decode_submit_marked, evidence_frame, evidence_frame_from_bytes, freshness_answer_frame,
+    freshness_frame, read_answer_frame, read_frame, release_frame, submit_frame,
+    submit_frame_answer_on_release, submit_frame_relayed,
 };
 
 /// Crate role marker used by the dependency-policy check.

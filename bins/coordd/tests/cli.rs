@@ -1471,11 +1471,20 @@ fn start(config: &Path) -> Running {
     start_with(config, &[])
 }
 
+/// Whether the last thing `said` says about this voter's policy is that
+/// it is fresh (#320): the voter says so on each turn to fresh or stale.
+fn policy_fresh(said: &str) -> bool {
+    said.lines()
+        .rev()
+        .find(|line| line.contains("this voter's policy is "))
+        .is_some_and(|line| line.contains("this voter's policy is fresh"))
+}
+
 /// Wait for a restarted single voter to lead again before a caller
-/// binds to it. A voter answers from its own policy only once it has had
-/// a leader and a majority since it started (#312), and a restarted
-/// voter has neither until its campaign wins: a bind before that is
-/// refused.
+/// binds to it. A restarted voter answers from its own policy only once
+/// its leader has confirmed its store (#320), and a single voter is its
+/// own leader once its campaign wins: a bind before that is refused.
+/// `Caller::bind` then waits for the policy's fresh line.
 fn leads_again(daemon: &Running) {
     assert!(
         daemon.waits_until(60, |said| said.contains("this voter leads")),
@@ -1585,33 +1594,28 @@ impl Caller {
     /// Dial `daemon`, negotiate as a client of this domain, and bind
     /// `session` with a token the daemon's own keys verify.
     ///
-    /// A voter answers from its policy only after a pass with a leader
-    /// and a majority of its peer links (#320). Until then it refuses a
-    /// bind as unavailable and closes the connection, and a caller
-    /// presents its credential again on a new one, as a client does.
-    /// "voters submittable" says a node holds its submission links, not
-    /// its peer links, so a caller that binds right after it can meet
-    /// that refusal.
+    /// A voter answers from its policy only while its leader has
+    /// confirmed, within the allowance, a position its store has reached
+    /// (#320). Until then it refuses a bind as unavailable. It says on
+    /// its log when its policy turns fresh, and a caller binds once the
+    /// last thing it said about its policy is that: "voters submittable"
+    /// says a node holds its submission links, not that its policy is
+    /// current.
     async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let (answer, endpoint, connection, control, control_recv) = loop {
-            let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
-            let token = service_token(ring, session);
-            let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
-            match try_ask(&connection, &bind).await {
-                Ok(answer) => break (answer, endpoint, connection, control, control_recv),
-                Err(quinn::ConnectionError::ApplicationClosed(close))
-                    if close.reason.as_ref() == b"bind refused"
-                        && std::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => panic!(
-                    "the binding's connection was lost: {e:?}\n{}",
-                    daemon.said()
-                ),
-            }
-        };
+        assert!(
+            daemon.waits_until(60, policy_fresh),
+            "the voter's policy never turned fresh\n{}",
+            daemon.said()
+        );
+        let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
+        let token = service_token(ring, session);
+        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+        let answer = try_ask(&connection, &bind).await.unwrap_or_else(|e| {
+            panic!(
+                "the binding's connection was lost: {e:?}\n{}",
+                daemon.said()
+            )
+        });
         let answer = answer
             .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
@@ -1915,7 +1919,8 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 }
 
 /// A process that only serves clients starts, binds no peer listener,
-/// and takes a caller's binding to the voters.
+/// negotiates with a caller, and refuses the caller's binding as
+/// unavailable.
 ///
 /// A frontend reaches every committed voter over the api plane, as a
 /// collector: they are its destinations, not peers it votes with. A
@@ -1923,9 +1928,12 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 /// has a peer plane" would demand a peer listener a frontend is not
 /// required to bind, and so a supported role could never start.
 ///
-/// A binding is a replicated command, so with none of the committed
-/// voters running the frontend holds it rather than answering it: that
-/// it negotiates and holds the binding is what says it is serving.
+/// It has no voter, so no leader confirms that the policy it would
+/// answer from is current, and under the staleness cap (#320) it
+/// answers nothing from that policy: a binding is refused at the door,
+/// before it is submitted to any voter, and the caller may present its
+/// credential again elsewhere. So it submits nothing, and has nothing to
+/// offer again (task-c01's quiet re-offer is no longer reachable here).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let dir = workspace("frontend");
@@ -1946,93 +1954,28 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let daemon = start(&path);
     let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
     let token = service_token(&ring, [0x45; 16]);
-    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
-    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+    let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+    let answered = tokio::time::timeout(Duration::from_secs(10), try_ask(&connection, &bind))
         .await
-        .expect("written");
-    send.finish().expect("finished");
-    let mut buf = [0u8; 4096];
-    let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+        .unwrap_or_else(|_| panic!("a frontend held a binding:\n{}", daemon.said()));
     assert!(
-        early.is_err(),
-        "a frontend answered a binding no voter agreed to: {early:?}"
+        matches!(
+            &answered,
+            Err(quinn::ConnectionError::ApplicationClosed(close))
+                if close.reason[..] == b"bind refused"[..]
+        ),
+        "a frontend with no voter took a binding: {answered:?}\n{}",
+        daemon.said()
     );
     let said = daemon.said();
     assert!(
         !said.contains("peer listener"),
         "a frontend was asked for a peer plane: {said}"
     );
-}
-
-/// A submission no voter could take is offered again on a quiet
-/// frontend-only domain, without the caller sending anything more
-/// (task-c01).
-///
-/// The collector schedules the re-offer, but nothing in it runs on its
-/// own: the domain loop carries it out. A rejected fan-out is recorded
-/// before the retry floor has passed, so the pass that recorded it finds
-/// nothing due, and a frontend-only domain has no voter turn and no
-/// payload timer -- it waited on its sockets, and the submission was
-/// offered again only when unrelated traffic arrived or the caller gave
-/// up and retried. The loop now wakes when the collector's next re-offer
-/// falls due. Here no voter is running, so every offer is refused as
-/// unavailable, and the caller sends its binding once and then nothing.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_quiet_frontend_offers_a_refused_submission_again_without_a_caller_retry() {
-    let dir = workspace("frontend-reoffer");
-    let ca = credentials(&dir, 7, coord_types::wire_v1::PeerRole::Frontend);
-    genesis(&dir, Some(&ca.node_spki));
-    endpoints(&dir, &ca, 3, &[]);
-    let ring = sts_keys(&dir);
-    let path = config_only(&dir);
-    let text = std::fs::read_to_string(&path).expect("read");
-    std::fs::write(
-        &path,
-        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
-            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
-    )
-    .expect("write");
-
-    assert_eq!(run(&path, &["init"]).code, Some(0));
-    let daemon = start(&path);
-    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
-    let token = service_token(&ring, [0x46; 16]);
-    let (mut send, _recv) = connection.open_bi().await.expect("bind stream");
-    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
-        .await
-        .expect("written");
-    send.finish().expect("finished");
-
-    // The binding is a replicated command: the frontend submits it to
-    // the three committed voters, none of which is there. After that the
-    // caller is silent and nothing else reaches this process.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let said = loop {
-        let said = daemon.said();
-        if said.contains("offered a submission again") {
-            break said;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a quiet frontend never offered the refused submission again:\n{said}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    // And it goes on doing so on the collector's schedule, still with
-    // nothing arriving: the wake is not a one-off.
-    let before = said.matches("offered a submission again").count();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let said = daemon.said();
-        if said.matches("offered a submission again").count() > before {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the re-offers stopped on a quiet frontend:\n{said}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        !said.contains("offered a submission again"),
+        "a frontend submitted a binding it refused: {said}"
+    );
 }
 
 /// A request is carried all the way through by the voter in this
@@ -2735,17 +2678,27 @@ async fn one_co_located_voter_is_not_a_quorum() {
 
     // Not acknowledged. Held, the caller waits on evidence from two
     // voters that are not running, which is the correct thing for it to
-    // be waiting on. Or refused at the door: a voter that has not had a
-    // leader and a majority since it started does not read its policy
-    // (#312), and this one, alone of three, never has.
+    // be waiting on. Or refused at the door: a voter whose leader has
+    // not confirmed its freshness answers nothing from its policy (#312,
+    // #320), and this one, alone of three, has no leader to ask. A
+    // refusal ends the bind stream unanswered and closes the connection
+    // after it, so the read can see either first.
     let mut buf = [0u8; 4096];
     let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
-    let refused = matches!(
-        &early,
-        Ok(Err(quinn::ReadError::ConnectionLost(
+    let bind_refused = |closed: &quinn::ConnectionError| {
+        matches!(
+            closed,
             quinn::ConnectionError::ApplicationClosed(close)
-        ))) if close.reason[..] == b"bind refused"[..]
-    );
+                if close.reason[..] == b"bind refused"[..]
+        )
+    };
+    let refused = match &early {
+        Ok(Err(quinn::ReadError::ConnectionLost(closed))) => bind_refused(closed),
+        Ok(Ok(None)) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .is_ok_and(|closed| bind_refused(&closed)),
+        _ => false,
+    };
     assert!(
         early.is_err() || refused,
         "one voter established a session for a quorum of three: {early:?}"
@@ -3613,6 +3566,12 @@ impl SdkCaller {
     ) -> Self {
         use coord_types::wire_v1::PeerRole;
 
+        // As `Caller::bind`: once the voter says its policy is fresh.
+        assert!(
+            daemon.waits_until(60, policy_fresh),
+            "the voter's policy never turned fresh\n{}",
+            daemon.said()
+        );
         let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
         let mut roots = rustls::RootCertStore::empty();
         roots

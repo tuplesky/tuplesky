@@ -102,6 +102,10 @@ pub struct Expiry {
     /// scan has something new to see.
     applied: u64,
     unobserved: bool,
+    /// Whether to take authority again although committed state names
+    /// this node's epoch (#320): set by [`Expiry::renew`], cleared once
+    /// the new epoch is installed.
+    renew: bool,
     /// Authority epochs proposed, and expiry candidates proposed.
     pub done: (u64, u64),
 }
@@ -122,7 +126,27 @@ impl Expiry {
             scanned: None,
             applied: 0,
             unobserved: false,
+            renew: false,
             done: (0, 0),
+        }
+    }
+
+    /// Take authority again at the next scan, even if committed state
+    /// names this node's epoch, and scan now (#320).
+    ///
+    /// For a leader that has proposed nothing in its ballot: it was
+    /// re-elected in an idle domain, where the epoch it took under an
+    /// earlier ballot is still the installed one, so nothing would make
+    /// it propose. Without a proposal it has no read index, and refuses
+    /// every voter's freshness ask, so every voter's policy goes stale
+    /// and stays so until a write. The new epoch is that proposal. It
+    /// costs what taking authority at boot costs: every surviving lease
+    /// is armed again from the observation the epoch commits at, late
+    /// and never early.
+    pub fn renew(&mut self) {
+        if !self.renew {
+            self.renew = true;
+            self.scanned = None;
         }
     }
 
@@ -188,7 +212,7 @@ impl Expiry {
     /// scan read if one was due.
     fn decide(&mut self, now: u64, state: Option<&Committed>) -> Vec<Vec<u8>> {
         if let Some(state) = state {
-            if self.scheduler.epoch() != Some(state.authority) {
+            if self.renew || self.scheduler.epoch() != Some(state.authority) {
                 return self.take_authority(now, state);
             }
             self.observe(now, state);
@@ -264,7 +288,8 @@ impl Expiry {
     /// Take authority for scheduling, asking the cluster to install a
     /// new epoch and arming every surviving lease from this observation.
     ///
-    /// A new epoch per boot, not per domain. Design Section 7.2 has a
+    /// A new epoch per boot, not per domain, and again on
+    /// [`Expiry::renew`] (#320). Design Section 7.2 has a
     /// recovered leader establish one before it schedules anything,
     /// precisely so that a predecessor's timers cannot delete a key
     /// after this node has taken over: an expiry carries the epoch it
@@ -286,6 +311,7 @@ impl Expiry {
                 self.scheduler
                     .establish(mine, now, state.snapshots.iter().copied());
                 self.proposing = None;
+                self.renew = false;
                 return Vec::new();
             }
             if state.authority < mine {
@@ -546,6 +572,42 @@ mod tests {
         assert!(expiry.decide(10, Some(&committed(1, Some(0)))).is_empty());
         assert_eq!(expiry.scheduler.epoch(), Some(epoch(1)));
         expiry
+    }
+
+    /// A renewal takes authority again although committed state names
+    /// this node's installed epoch (#320): one new epoch is proposed,
+    /// which is the proposal a leader with nothing proposed in its
+    /// ballot needs before it can answer a freshness ask. Once that epoch
+    /// is installed, it does not ask again.
+    #[test]
+    fn a_renewal_takes_authority_again_although_its_epoch_is_installed() {
+        let mut expiry = established();
+        assert!(
+            expiry.decide(20, Some(&committed(1, Some(0)))).is_empty(),
+            "an installed epoch is not taken again unasked"
+        );
+
+        expiry.renew();
+        let asked = expiry.decide(30, Some(&committed(1, Some(0))));
+        assert_eq!(asked.len(), 1, "a renewal asked for no authority");
+        let logical = request(&asked[0]).logical().unwrap();
+        assert!(
+            matches!(
+                logical.operation,
+                CanonicalOperation::EstablishLeaseAuthority { epoch: e } if e == epoch(2)
+            ),
+            "{:?}",
+            logical.operation
+        );
+        // Asked twice before it lands, it is still the one epoch.
+        expiry.renew();
+        assert!(expiry.decide(31, Some(&committed(1, Some(0)))).is_empty());
+
+        // Installed: armed under it, and nothing more is asked.
+        assert!(expiry.decide(40, Some(&committed(2, Some(0)))).is_empty());
+        assert_eq!(expiry.scheduler.epoch(), Some(epoch(2)));
+        assert!(expiry.decide(50, Some(&committed(2, Some(0)))).is_empty());
+        assert_eq!(expiry.done.0, 2, "one epoch at boot and one renewal");
     }
 
     /// An expiry candidate that committed state never shows resolving --
