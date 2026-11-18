@@ -2042,6 +2042,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.election.is_none() || self.recency.fresh(std::time::Instant::now())
     }
 
+    /// Look again, before what a wait woke the loop for reads the
+    /// policy, if the last look is past the allowance (#320, Codex
+    /// review). A turn looks before the loop waits, but a quiet voter's
+    /// loop can wait longer than the allowance with its links held
+    /// throughout: a healthy follower has no election deadline, and
+    /// nothing else need wake it. Without this the caller whose frame
+    /// ends the wait would be denied for a quiet spell rather than for a
+    /// lost leader or majority. Each handler that can answer a caller
+    /// after a wait calls it first: a caller's frame, a peer's frame and
+    /// a settle. A watch is pumped after a turn, which looks.
+    fn refresh_recency(&mut self) {
+        let now = std::time::Instant::now();
+        if self.recency.fresh(now) {
+            return;
+        }
+        let (Some(election), Backing::Voting(voter)) = (self.election.as_mut(), &self.backing)
+        else {
+            return;
+        };
+        let (led, majority) = led_and_majority(election, voter, self.plane.as_ref(), now);
+        self.recency.observe(led, majority, now);
+    }
+
     /// Wake when `materialized` is notified, and take back what the
     /// voter's materializer committed (task-d52).
     #[must_use]
@@ -3591,6 +3614,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Take back what the voter's materializer committed and send what
     /// that released (task-d52). Returns whether the voter must stop.
     fn stops_on_settle(&mut self, api: &Transport) -> bool {
+        // A settle answers callers, after a wait (#320, Codex review).
+        self.refresh_recency();
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };
@@ -3665,29 +3690,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // leader for its patience, or an operator asked, and follow
         // whatever ballot the machine has moved to by any path.
         if let Some(election) = self.election.as_mut() {
-            let me = voter.provenance().from();
-            let (held, voters) = self
-                .plane
-                .as_ref()
-                .map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
-            let machine = voter.node().machine();
-            let promised = machine.promised();
-            let linked = self.plane.as_ref().is_some_and(|p| {
-                p.peers
-                    .iter()
-                    .any(|peer| peer.replica == promised.leader && p.holds(peer))
-            });
-            let led = election.led(
-                voter.leads(),
-                me,
-                promised,
-                machine.active(),
-                linked,
-                std::time::Instant::now(),
-            );
-            let majority = (held + 1) * 2 > voters;
-            self.recency
-                .observe(led, majority, std::time::Instant::now());
+            let now = std::time::Instant::now();
+            let (led, majority) = led_and_majority(election, voter, self.plane.as_ref(), now);
+            self.recency.observe(led, majority, now);
             let campaigning = voter.node().machine().campaigning();
             if let Some(why) =
                 election.observe(led, majority, campaigning, std::time::Instant::now())
@@ -5050,6 +5055,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         event: TransportEvent,
         clock: &impl Fn() -> u64,
     ) {
+        self.refresh_recency();
         match event {
             TransportEvent::ApiRequest {
                 connection,
@@ -5189,6 +5195,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// answer and no session to forget, which is why it is a different
     /// handler and not a branch of the api one.
     fn on_peer_plane(&mut self, api: &Transport, event: TransportEvent) {
+        // A peer's frame can answer a caller, after a wait (#320, Codex
+        // review).
+        self.refresh_recency();
         match event {
             TransportEvent::PeerFrame {
                 provenance,
@@ -6512,6 +6521,29 @@ impl core::fmt::Display for TransportError {
             TransportError::Endpoint(e) => write!(f, "cannot serve on the bound socket: {e}"),
         }
     }
+}
+
+/// Whether a voter has a leader and reaches a majority of the voters,
+/// itself included, as its election reads them (task-d01): it leads,
+/// or holds a link to the voter its promised ballot names; and the peer
+/// links its plane holds make a majority.
+fn led_and_majority<P: Persistence>(
+    election: &mut crate::election::Election,
+    voter: &Voter<P>,
+    plane: Option<&PeerPlane>,
+    now: std::time::Instant,
+) -> (bool, bool) {
+    let me = voter.provenance().from();
+    let (held, voters) = plane.map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
+    let machine = voter.node().machine();
+    let promised = machine.promised();
+    let linked = plane.is_some_and(|p| {
+        p.peers
+            .iter()
+            .any(|peer| peer.replica == promised.leader && p.holds(peer))
+    });
+    let led = election.led(voter.leads(), me, promised, machine.active(), linked, now);
+    (led, (held + 1) * 2 > voters)
 }
 
 /// When a voter last had a leader and reached a majority, and how long
@@ -10053,6 +10085,39 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             lapsing.turn(&api).await.expect("a turn");
             tokio::time::sleep(Duration::from_millis(5)).await;
             assert!(!lapsing.policy_fresh(), "the allowance ran out");
+        }
+
+        /// A voter whose loop waited past the allowance for its next
+        /// event, still led and holding its majority, looks again before
+        /// it reads its policy for a caller's frame, so a quiet spell
+        /// denies nothing (#320, Codex review). A voter that looks again
+        /// and is not led stays closed.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_quiet_spell_past_the_allowance_does_not_close_a_led_voters_policy() {
+            use coord_transport::{ConnectionId, TransportEvent};
+
+            let mut api = transport();
+            let hour = Duration::from_secs(3600);
+            let closed = |connection| TransportEvent::Closed {
+                connection: ConnectionId(connection),
+                lane: None,
+                reason: coord_transport::CloseReason::Shutdown,
+            };
+
+            let (leader, _commits) = held_leader(hour);
+            let mut quiet = domain(leader, collector()).policy_staleness(Duration::from_millis(1));
+            quiet.turn(&api).await.expect("a turn");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(!quiet.policy_fresh(), "past the allowance with no turn");
+            quiet.on_transport(&mut api, closed(7), &|| 0).await;
+            assert!(quiet.policy_fresh(), "it still leads, a majority of one");
+
+            let voters: std::collections::BTreeSet<ReplicaId> =
+                (1..=3u8).map(|n| ReplicaId([n; 16])).collect();
+            let (follower, _its_commits) = held_voter(ReplicaId([2; 16]), hour, voters);
+            let mut cut_off = domain(follower, collector());
+            cut_off.on_transport(&mut api, closed(8), &|| 0).await;
+            assert!(!cut_off.policy_fresh(), "no link to the voter it follows");
         }
 
         /// A half-established entry's record is found within one commit
