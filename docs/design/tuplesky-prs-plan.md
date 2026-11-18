@@ -4761,7 +4761,8 @@ The order check can't tell whether `A` ran before `D`, so it drops `C`, and the 
      - an execution under a digest (`With`) keeps the rule off, and stops the selection where it carries a nothing (a tripwire below);
      - rows not read yet (`Unread`) wait for the read, as `ExecutedRowsUnread` does today;
      - a retired `D` with no row kept (`WithoutRow`) keeps the rule off for `D`;
-  4. task-d120's wait has passed with no report that changes 1 to 3.
+  4. task-d120's wait has passed with no report that changes 1 to 3;
+  5. and, for the selection as a whole, its order check dropped no possible-fast candidate it can't rule out: that selection's own `SelectionCounts::unreported_undecided` is zero (task-d119's count; "Why no fast decision stands behind `D`", below). Not `Campaign::unreported_undecided`, which adds the counts of every selection the campaign tried, set-aside retries included. Otherwise the selection is the one it is without the rule.
 
 A nothing below the source ballot is an acceptance like any other there: no ballot decided it, so the selection re-proposes `D` as it re-proposes every acceptance below the source, and the conditions apply to that re-proposal. Read the other way, a nothing below the source would block the rule. The second cold check's schedule, at five voters:
 1. At `b2`, `A` selects from `{A, B, C}` and `D` (the `Behind` shape) becomes a nothing. Only `A`'s acceptance is durable, and `A` goes down.
@@ -4790,10 +4791,12 @@ Three of these read more than today's code does:
     - Before it proposes `D` as nothing, it makes an initialized nothing record where it has none: a `Behind`-shape `D`, or an entry or re-proposal whose payload it never held.
     - Where it holds `D` below COMMIT under a digest (a demoted record whose payload row a Sync release dropped, for instance), it replaces that record with the nothing, dropping the payload row as a release does. Proposed under the old digest, `D` would wait for a payload no voter can supply.
     - Before it proposes `D` with its payload, it replaces its own nothing record below COMMIT the same way.
-  - **A voter installing a Sync entry or a nothing re-proposal, or accepting a proposal, that names nothing** initializes `D`'s record from the marker, with no payload to wait for.
+  - **A voter installing a Sync entry, or accepting a proposal, that names nothing** initializes `D`'s record from the marker, with no payload to wait for.
     - A record of `D` it holds below COMMIT, with or without its payload, is replaced at once, with the entry's dependencies for an entry.
     - Otherwise `sync_blocker` and `awaits_selected_facts` would wait for a payload the marker never brings. And `advance_sync`'s `IncompatibleAdmission` check, which takes a record below COMMIT as rebound already, would halt.
-  - Only a record at COMMIT or above, or executed, under a digest stops (a tripwire below).
+  - **A voter installing a Sync that lists `D` among its nothing re-proposals** keeps its record of `D` as it keeps any re-proposal's: demoted, with its payload row. Only accepting the nothing proposal replaces it. So a holder that came back and installed `b'`'s Sync, but missed the proposal, can still supply `D`'s payload to a later ballot if no quorum of `b'` accepted the nothing (When `D`'s submitter learns, below).
+  - **A voter holding `D` as nothing below COMMIT that accepts a proposal, or installs a Sync entry, naming `D` under a digest** replaces its nothing the same way, at once, and then waits for the payload as for any proposal whose payload it lacks: its vote counts once the payload row is durable (point 4). The leader proposing it is one whose selection didn't take the nothing as `D`'s copy: a nothing below the source, or demoted.
+  - Only a record at COMMIT or above, or executed, stops: under a digest meeting a nothing, or as a nothing meeting a digest (a tripwire below).
   - A nothing record is initialized on the conservative key, as every command is (`CONSERVATIVE_KEY`), so the chain stays total without its payload.
 - **The vote.**
   - A voter accepting a nothing writes `D`'s dependency row with the marker in place of an admission digest, and no payload row. The leader also writes its proposal row, as it does for every proposal (`proposal_update` runs at the leader only). A vote counts once those rows are durable.
@@ -4876,24 +4879,35 @@ Three of these read more than today's code does:
 Condition 2 is not redundant. A voter that executed `D` can report it executed without its payload row, and a voter that learned `D` from a Sync at COMMIT holds no payload either. Either one means `D` was decided, so the rule keeps the stall rather than decide nothing.
 
 **Why no fast decision stands behind `D`.**
-- **The payload shape.** The selection keeps `D` an entry, and orders exactly as it does when the candidate supplies `D`'s payload. So it keeps or re-proposes each possible-fast candidate `C` as it would then, which is today's argument for the possible-fast rule.
+- **The payload shape.** The selection keeps `D` an entry, and orders exactly as it does when the candidate supplies `D`'s payload. So it keeps or re-proposes each possible-fast candidate `C` as it would then.
   - `C`'s decided value is its dependencies, which `D`'s nothing doesn't change.
-  - A fast-set follower can acknowledge `C` behind a record of `D` whose payload it lacks, one restored from its dependency row for instance, since `guard_accept` reads the record's phase. That is why this shape keeps `D` an entry instead of reading `D` as absent. (A Sync entry waiting for its payload is not installed, and `guard_accept` reads it as unknown.)
-- **The `Behind` shape.** Here no report holds a record of `D`, and `D` is re-proposed. The order check drops a possible-fast candidate `C` whose closure reaches `D`, because it can't tell what ran before `D`, and `C` is re-proposed. That is safe only if `C` wasn't decided. Suppose a quorum `S_C` decided `C` fast at ballot `b`, with `X` (naming `D`) in its closure:
-  - **The leader held `D`.** The leader of `b` proposed `C` with dependencies from its own table, holding `X`. A leader holds the entries of its own Sync and what it proposed, and its campaign bound only after `selection_gap` found every dependency of every entry selected, re-proposed or committed at it.
-  - **So did each follower.** Each follower of `S_C` acknowledged `C` with a path equal to the leader's.
-    - After a leader change, a follower's head matches the leader's only from the first fresh proposal it adopts on the key (Section 4.1: a Sync's entries carry no position).
-    - Adoption goes through `guard_accept`, which needs each dependency at ACCEPT or above. So the follower held the key's chain at ACCEPT up to `X`, and `X` at ACCEPT needs `D` at ACCEPT (the same guard, at `X`'s acceptance or installation).
-    - A Sync entry waiting for `D` (way (2)) is not installed, so a follower in way (2) acknowledges slow on every key whose chain passes `X`.
-  - **That contradicts the shape.** Every member of `S_C` held a record of `D`, and by step 1 some member of `Q` did.
-    - By step 2's two cases its report holds that record: forgetting it would put the member more than a table ahead of the candidate.
-    - A bound selection between `b` and `b'` read a report holding `D` (by induction, from the member of `S_C` its quorum shares). So it kept `D`, selected or re-proposed.
+  - A fast-set follower can acknowledge `C` without holding everything `C`'s closure names: `guard_accept` reads `C`'s own dependencies, and the schedule below has one acknowledge fast with `D` held nowhere but at the leader. That is why this shape keeps `D` an entry instead of reading `D` as absent.
+- **The re-proposal shape.** A report holds `D`'s record, so the order check reads it as it does when a report supplies the payload, and the selection re-proposes `D` as it does then. Only the value changes.
+- **The `Behind` shape.** No report holds a record of `D`, so the order check can't tell what ran before `D`. It drops a possible-fast candidate `C` whose closure reaches `D`, and that drop is safe only if `C` wasn't decided. The reports can't show that: the fast quorum that decided `C` need not include a voter that holds `D`. #315's re-review found the schedule, at three voters (seed 147 with seed 905's reports, traced by reading, not run):
+  1. `r0` leads `b7`. Its Sync keeps `A` and `X` at ACCEPT, `X` naming `D`, and re-proposes `D`. Only `r0` holds `D`.
+  2. `m` refuses `D`'s re-proposal (`FencedByPromise`) and takes the Sync, and `X` waits uninstalled. The third voter, `o`, holds no `D`.
+  3. `r0` proposes `C` with `{X}`, `m` acknowledges fast, and `{r0, m}` decide `C`. The frontend learns it.
+  4. `r0` is lost, or cut off for longer than task-d120's bound.
+  5. `o` reads `{o, m}`. `X` names `D`, no report holds `D`, and the order check drops `C`.
 
-  So in the `Behind` shape, no command decided at any ballot below `b'` has `D` in its closure through a pre-acceptance, and the drop re-proposes a command that was never decided.
+  Deciding `D` as nothing there would bind the selection and re-propose `C` under other dependencies: two dependency sets for `C`. The carry records that this happens. The known-gap test in `recovery.rs` (`known_gap_a_fast_candidate_behind_a_dependency_no_report_holds_is_reproposed`) pins the drop with no report holding `D`, and `selection_gap`'s doc comment says the `Behind` give-up is what keeps such a decision from being re-proposed. (The note on `undecided_reached` is seed 147 with `o` holding `D`; there the selection keeps `C`.) The previous revision of this entry argued that every member of the fast quorum held `D`. `m` didn't, and that argument is withdrawn.
+- **So the rule doesn't fire in a selection whose order check dropped such a candidate** (condition 5).
+  - task-d119's count, `SelectionCounts::unreported_undecided`, is each dropped possible-fast candidate whose dependencies reach, through the selection and the fast-set member's report, a command that no report holds and that the candidate doesn't hold decided.
+    - The walk follows the selection's entries and candidates, and the member's records except one a Sync demoted.
+    - It stops without counting at three places: a command another report holds and the member doesn't, the member's demoted record, and a command the candidate holds decided. "Why that is enough" says why a drop past each stop doesn't need the count.
+  - Where it is above zero, the selection is the one it is without the rule, and the campaign does what it does today. In the `Behind` shape it gives up as `Behind` after task-d120's wait. In the payload shape it sets reports aside and then waits as `HalfInitialized`. In the re-proposal shape the candidate waits in `selection_missing` for a payload nobody can send, with no give-up.
+  - The condition applies in every shape, so the rule never binds a selection past such a drop. The simulator's oracle fails a run that binds one (`bound_unreported_undecided`) and keeps failing it with the rule on, in every setting where it is checked today. It isn't checked where batches fail and the journal goes on past them (`payload_fail` above zero with `fail_queue` off; row 21, seed 10), so the fast-case tests below run with `fail_queue` on.
+- **Why that is enough.** Where the count is zero, the rule leaves every fast decision where the possible-fast rule leaves it:
+  - The rule runs after `possible_fast_decisions` (What changes, below), so which candidates are kept and which are dropped is today's. So does the `HalfInitialized` check, which today returns before `possible_fast_decisions` runs, so a selection that fails it counts nothing.
+  - A kept candidate is selected with its reported dependencies, and deciding `D` as nothing changes no command's dependencies. `C` executes after `X`, and `X` after `D`'s nothing.
+  - A dropped candidate's walk reached no command missing from every report, except past one of its three stops. A drop is safe on today's arguments at each:
+    - **A command another report holds, or the member's demoted record.** `undecided_reached` counts both: an unheld command through `held_undecided`, and a member record below COMMIT, demoted or not. So the check takes its `lasts` branch for `C`, where an adopted command that waits on no re-proposal passes. What's left to drop `C` is the same-last conflict, the prefix check (task-d78) and the cycle check. Each reads reported records and `held_undecided`, not what lies past the stop: task-d71's and task-d33's argument, as today.
+    - **A command the candidate holds decided.** Condition 3 keeps that command itself off the rule. A drop behind it rests on task-d71's order of the candidate's executions (`CandidateDecisions::executed_before`, read from its in-memory execution order, false where either position is unknown), the premise the known-gap tests in `recovery.rs` pin.
+  - A command decided fast at a ballot below the source reaches this selection as a commit, or as an entry with its decided dependencies, carried by the selections since (Section 4.9: every recovering majority meets the fast quorum). By induction over the bound selections, none of them fired the rule past a counted drop, and each drop past a stop rested on the arguments above.
 
-  **The seed-147 shape** is this case (task-d119's note: `m` reports `A`, `X` naming `D`, and `C` pre-accepted naming `X`; no report holds `D`).
-  - `C` was not decided fast. The 87,000-run probe saw that (no drop could have been a fast decision), and this argument says it of every run.
-  - Where another report holds `D`, the rule doesn't apply, and #305's rule keeps `C` as today.
+  So this shape adds no new kind of premise. It does extend two of today's bound-time premises (a drop on the `lasts` branch, and a drop behind a command the candidate decided) to selections that today never bind, because `selection_gap` stalls them on another command no report holds. The rule declines to fire where the count shows the check couldn't read a closure, and the acceptance tests the two extended premises directly.
+
+  **The seed-147 shape** is the schedule above. With `r0` back, its report holds `D`, the rule doesn't apply, and #305's rule keeps `C` with `{X}`. With `r0` lost for good, the campaign gives up as `Behind` every time (What it leaves). task-d119's 87,000-run probe saw no fast decision at any of its 182 drops, so the shape is rare, but the count can't tell those drops from this one.
 
 **What `X` is.** `X` itself can be decided with `D` named: an entry of a durable Sync whose leader re-proposed `D`, a re-proposal no majority took (way (2)). Deciding `D` as nothing keeps `X`'s decided value whole. Its dependencies are unchanged, and it executes after `D`'s nothing. The rule never edits a decided entry.
 
@@ -4907,20 +4921,22 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - An execution under a digest (`With`) stops the selection: a second decision of one command.
   - Rows not read yet (`Unread`) wait for the read, as `ExecutedRowsUnread` does today. The selection never carries or decides a nothing past an execution it hasn't read.
   - An execution of the nothing itself passes, and so does `WithoutRow`, which can't tell. The tripwire is a check on the premises, not part of the argument.
-- **A voter holding `D` at COMMIT, or executed, under a digest meets a proposal or Sync entry deciding `D` as nothing.** That is a second decision of one command. It stops as task-d14's check stops on a presentation under other facts (`FollowerRejection::IncompatibleAdmission`), and stays stopped until it is replaced (task-d13).
+- **A voter holding `D` at COMMIT, or executed, under a digest meets a proposal or Sync entry deciding `D` as nothing, or one holding `D`'s nothing at COMMIT, or executed as a refusal, meets one under a digest.** That is a second decision of one command. It stops as task-d14's check stops on a presentation under other facts (`FollowerRejection::IncompatibleAdmission`), and stays stopped until it is replaced (task-d13).
   - For a command it executed and retired, today's check compares the payload row, which may be gone. The code step reads the dependency row task-d77 reads there too. That read is asynchronous: until it returns, the voter holds the Sync entry or the proposal and doesn't vote on it.
 - **A collector that answered `D` from a record** and later sees `D` refused stops, as a late release that differs from its answer does (task-d12).
 
 **What changes.**
 - **The selection** (`select_ruled`, and `select_counted`, which counts payloads in `with_payload`; a new `SelectionRules` field beside `leave_out_unheld`).
   - It applies the rule after `possible_fast_decisions`, to the selection that returns. So adding a `Behind`-shape `D` to the re-proposals doesn't change how the possible-fast rule, or task-d33's exception, treats a command `C`.
+  - The `HalfInitialized` check moves after `possible_fast_decisions` and the rule. Today it returns before either, so condition 5 would read a count of zero on any selection that fails it.
   - It decides as nothing each `D` that meets conditions 1 to 3, as a nothing entry or a nothing re-proposal.
   - It counts a payload row under the named facts at any phase as supplying `D`, and fails as `HalfInitialized` only on what it carries.
   - It checks every nothing it carries against `CandidateDecisions::executed`.
+  - It doesn't apply the rule where that selection's order check counted a drop in `unreported_undecided` (condition 5), and returns the selection it returns without the rule.
 - **The campaign.**
   - Where the selection fails as `HalfInitialized`, it first tries today's set-aside, without the rule, and binds if that gives a selection.
   - Otherwise, and where the selection would wait for a payload or give up as `Behind`, it starts task-d120's wait, and selects with the rule and every report when the bound passes.
-  - `selection_gap`'s `Behind` give-up and task-d79's give-up stay for a domain without the rule, and as the fallback.
+  - `selection_gap`'s `Behind` give-up and task-d79's give-up stay for a domain without the rule, for a selection condition 5 keeps the rule off, and as the fallback.
   - The premise in `selection_gap`'s doc comment ("every reporter executed and forgot it") is replaced by this argument.
 - **The record.** The admission gains its nothing value, and every check that reads a record's admission as "initialized" or as facts takes it. The second cold check's list, which the code step goes through:
   - `CommandTable::records`, `phase_of` and `is_initialized`, and through them the demotion at a Sync install;
@@ -4932,9 +4948,10 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - `commit_row_writable` and `write_commit_rows` (task-d106), which write a commit row only for a record with an admission and then expect its payload: a committed nothing writes its dependency row alone.
 - **The leader's proposal path.** A nothing proposal at `b'`, from an entry, a re-proposal, or a record it made for a `D` it held none of.
 - **Accepting a nothing.**
-  - A voter that holds `D` below COMMIT, with or without its payload (a holder that was down and comes back), replaces its record with the nothing: at a proposal, at a Sync install that carries the nothing, and at the leader before it proposes (above). Paxos lets a ballot's proposal replace an acceptance at a lower ballot, and the leader of `b'`, or of any later ballot that carries the nothing, proposes `D` as nothing only.
+  - A voter that holds `D` below COMMIT, with or without its payload (a holder that was down and comes back), replaces its record with the nothing: at a proposal, at a Sync install that carries the nothing as an entry, and at the leader before it proposes (above). A Sync that lists `D` among its nothing re-proposals keeps the record demoted, with its payload row, until the proposal (above). Paxos lets a ballot's proposal replace an acceptance at a lower ballot, and the leader of `b'`, or of any later ballot that carries the nothing, proposes `D` as nothing only.
   - It drops `D`'s payload row as a release does, in the same batch as the nothing's rows.
   - A voter holding `D` committed or executed under a digest stops instead (the tripwire above).
+  - The other way round, a voter holding a nothing below COMMIT replaces it with a proposal or Sync entry under a digest, and waits for the payload; holding it at COMMIT, or executed, it stops.
 - **The ledger** reports a nothing record with its marker.
 - **Storage.** Three checks assume every recorded command has a payload, and each takes the marker:
   - the store's rule (b) refuses to execute a command with no pending payload (`intake.rs`, task-d113);
@@ -4990,20 +5007,29 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - every reporter cuts its report under task-d119's rule. A build without `PendingReport::behind` can execute `D`, forget it and report without it, and the rule would then decide nothing over a decided `D`.
   - every vote is refused once queued behind a promise. That is `JournaledStore::fence`, which `coordd` wires (task-d01) and #314 models in the simulator.
   - every vote waits for its payload row (task-d90's point 4), which is also `release-at-execution`'s premise (`Feature::ReleaseAtExecution`).
-- **So it is a feature.** It is active from genesis on alpha's build, which has all three, and otherwise activated as task-d99 activates one, with no rollback. `leave_out_unheld` is the precedent: a selection rule whose premise holds only in a domain whose voters all run the build it rests on.
-- **A fourth premise, proposed:** the store identity below, for a voter back wiped. If the lead files it before the code step, the gate requires it too.
+  - every voter refuses a peer back under another store identity (below, built in this task). Without it, a voter wiped and started again under its identity turns today's stall into a lost write.
+  - and one an operator keeps: no voter is restored alone from an older copy of its own store. Section 5.4 and task-42 forbid it, and task-d32's restore is of every voter. No check here detects it (the store identity's limits, below).
+- **So it is a feature.** It is active from genesis on alpha's build, which has the first four, and otherwise activated as task-d99 activates one, with no rollback. `leave_out_unheld` is the precedent: a selection rule whose premise holds only in a domain whose voters all run the build it rests on.
+- **The store identity on the wire and on disk:** the peer handshake, the promise and the report carry it, and each voter keeps a durable row per peer.
+
+**The store identity: a voter back wiped, or from an old copy, under its own identity.** A required premise (above), built in this task before the rule's step.
+- Section 5.4 forbids it ("cannot restart as an empty voter under the same identity"), and Section 5.5 calls it quarantine. task-d29 has the harness refuse to initialize over a voter whose state is gone, and task-42 requires quarantine, not reinitialization, of missing files.
+- Nothing in `coordd` detects a voter initialized again, from the same genesis and key, on an empty store.
+- With the rule on, such a voter turns today's stall into a lost write. The schedule from #315's review:
+  1. `L` and `f1` decide `D` and `X`.
+  2. `L` executes and answers, then goes down.
+  3. `f1` returns empty.
+  4. `f2` reports `X` from `L`'s Sync.
+  5. `D` is decided as nothing.
+- **The check.** `init` writes a random store identity into the store. The peer handshake, every promise and every report carry it. Each voter records durably, per peer, the store identity it first saw, and refuses a link, promise or report from that peer under another one until membership names a new generation (task-d41). Each refusal is logged and counted.
+- **Its limits.**
+  - **A copy carries the identity.** `init` writes the identity into the store, so a voter started from a copy of its own store (a backup, a snapshot rolled back, a disk that lost its last writes) is never refused. In the review's schedule, `f1` rolled back to a copy from before it accepted `D` reports without `D`, and the write is lost the same way. That is the operator's premise above. The release note and the runbook say a voter is restored with every other voter or not at all.
+  - **A wiped voter whose identity the candidate never recorded.** What decides it is whether the voter that counts the wiped voter's promise and report, the candidate, durably recorded its identity between its `init` and the wipe (or the link's other end did, and refused it). Other survivors' records don't help. The code step narrows that by carrying in each Sync the identities whose promises its leader counted, so a voter that installed any Sync since learns them, and states what is left. Until then the Jepsen cell's "wiped" stays "never rejoins under its identity".
 
 **What it leaves.**
-- **A voter back wiped, or from an old copy, under its own identity.**
-  - Section 5.4 forbids it ("cannot restart as an empty voter under the same identity"), and Section 5.5 calls it quarantine. task-d29 has the harness refuse to initialize over a voter whose state is gone, and task-42 requires quarantine, not reinitialization, of missing files.
-  - I found nothing in `coordd` that detects a voter initialized again, from the same genesis and key, on an empty store.
-  - With the rule on, such a voter turns today's stall into a lost write. The schedule from #315's review:
-    1. `L` and `f1` decide `D` and `X`.
-    2. `L` executes and answers, then goes down.
-    3. `f1` returns empty.
-    4. `f2` reports `X` from `L`'s Sync.
-    5. `D` is decided as nothing.
-  - **Proposed follow-up, for the lead to file:** `init` writes a random store identity, and every promise and report carries it. A peer that has seen a voter's reports under one store identity refuses that voter under another, until membership names a new generation.
+- **A fast decision behind a command only lost voters held** (the seed-147 shape, above). Where the order check drops a candidate whose closure reaches a command no report holds, the rule doesn't fire, and the campaign does what it does today: it gives up as `Behind`, or waits as `HalfInitialized` after the set-aside, or waits in `selection_missing`, which has no give-up.
+  - If that command's only holders are gone for good, the domain stays without a leader. Its ways out are the holders' storage back, or restoring every voter (task-d32's restore on every voter, #308's runbook step 5).
+  - The count can't tell a drop of a decided candidate from one of an undecided candidate, so the rule keeps the stall for both. `UnreportedDrops::undecided` already counts these drops in every selection made. The code step adds a count of the selections condition 5 keeps the rule off, and the stats line reports it.
 - **A domain without the rule** keeps `selection_gap`'s and task-d79's give-ups, and task-d05's real "behind". The restore rule is unchanged.
 
 **Acceptance.**
@@ -5011,6 +5037,8 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - the survivors lead within the heal check's ceiling plus task-d120's bound, counted from the faults stopping;
   - a command submitted after that commits at every survivor;
   - with the rule off, each keeps today's stall, as a control.
+
+  The build step first checks that neither seed's selections count a drop in `unreported_undecided`. A seed that does is the stall What it leaves names: its test asserts the give-up instead, and the build step finds another seed for the flip.
 - **The payload shape, directed.** The only holder of a Sync entry's payload is destroyed. With the rule the domain leads and the entry executes as nothing; without it the campaign waits for ever.
 - **A nothing decision survives a holder's return** (five voters, the first cold check's schedule above).
   - `H`'s selection carries the nothing, `D` executes as a refusal at every voter, and the oracle sees one decision.
@@ -5030,11 +5058,24 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
 - **Storage.** A voter restarts holding a nothing record, which boot accepts. It executes the record under rule (b), and serves it in a catch-up window to a voter behind, which commits it as nothing. A follower writes a committed nothing's commit row and executes it as a refusal.
 - **The refusal.** A retry of `D` after the table forgets it is answered as refused, at the voter that decided the nothing and at one that learned it from a marker.
 - **The vote.** A nothing acceptance counts only once its rows are durable: a failed batch holds the vote back.
-- **The fast case, at three and five voters.**
-  - A fast-set follower holding `X` without `D` doesn't acknowledge `C` fast: it doesn't install `X`, or it acknowledges slow.
-  - A fast-set follower holding `D`'s record without its payload does acknowledge `C` fast. After `D`'s payload holder is destroyed, the selection keeps `C` as it would with `D`'s payload, and `C`'s decided value is unchanged.
+- **A held nothing meets a digest.** A follower holding `D`'s nothing at ACCEPT, demoted below the source, receives a proposal of `D` under its digest. It replaces the nothing, fetches and writes the payload row, and votes once that row is durable. Holding the nothing at COMMIT, it stops.
+- **A holder that installed `b'`'s Sync keeps its payload.** `D`'s only holder comes back, installs `b'`'s Sync, which lists `D` among its nothing re-proposals, and misses the proposal, which no quorum accepts. At `b''` the selection re-proposes `D` with the holder's payload, and `D` commits with it.
+- **The store identity.**
+  - A voter initialized again on an empty store under its identity is refused by every peer that saw its identity before, and the review's wiped schedule stalls instead of deciding `D` as nothing.
+  - **Control:** with the check off, the oracle reports the lost write.
+  - A voter that restarts on its own store, and one that comes back through membership as a new generation, are not refused.
+- **The fast case: the re-review's schedule, directed** (above). `r0` leads `b7`, `m` refuses `D` and `X` waits uninstalled, `{r0, m}` decide `C` fast, `r0` is lost, and `o` reads `{o, m}`. It runs at three voters, and at five with a third fast-set member beside `m` and a second voter beside `o`.
+  - With the rule on, the selection counts the drop, the rule doesn't fire, and the campaign gives up as `Behind`. No selection binds `C` under dependencies other than `{X}`.
+  - With `r0` back, the selection carries `C` with `{X}`, and the domain leads.
+  - **Control:** with condition 5 off, the selection decides `D` as nothing and re-proposes `C`. The oracle fails on `C`'s two dependency sets and on `bound_unreported_undecided` (`fail_queue` on, where that check runs).
+- **The rule changes no drop.** Unit tests of the selection where the rule decides a `D2` as nothing while the order check drops a candidate `C` whose walk stopped without counting: (i) at a command another report holds undecided, which puts `C` on the `lasts` branch; (ii) behind a command the candidate holds decided, read by `executed_before`. Each selection drops the same candidates as the same reports with `D2`'s payload supplied, and keeps the same ones with the same dependencies. With the `HalfInitialized` check where it is today, a selection failing it counts zero: a control that the move is what condition 5 reads.
+- **The fast case in the payload shape.** A fast-set follower holding `D`'s record without its payload acknowledges `C` fast. After `D`'s payload holder is destroyed, the selection keeps `C` as it would with `D`'s payload, and `C`'s decided value is unchanged.
 - **The premise tests (negative controls, which must fail as meant).**
-  - With task-d119's cut switched off, the oracle reports a decided command decided again as nothing.
+  - **The cut, directed.** `a_voter_that_pulls_past_the_window_before_its_cut_refuses_the_candidate`'s schedule (`tests/activation.rs`), with the rule on.
+    - `r1` pulls the 73rd command and executes it before its promise is durable, so `41`, which `r0` and `r1` executed, leaves its window.
+    - With the cut, `r1` refuses the candidate, and `r2` decides nothing as nothing.
+    - With task-d119's cut switched off, `r1`'s report holds `42` naming `41`, no report holds `41`, and `r2`'s selection decides `41` as nothing. The test's check that no executed command is decided as nothing fails.
+    - The sweeps never reached the cut's way (1), so a sweep alone would pass this control vacuously.
   - With a knob that drops a voter's payload row while keeping its record, the oracle reports the same.
   - These are blocking: a broken premise loses a write quietly where today it stalls.
 - **A unit test of the selection.**
@@ -5056,13 +5097,17 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - Row 10 at 1,000 seeds in the sweep's eight settings at three and five voters.
   - The targeted schedule at 10,000 seeds.
   - Row 21 under its own knobs.
-  - Each run with the knob both destroying and marking, with the assertion task-d119 left waiting: no campaign given up as `Behind`, or waiting for ever on `HalfInitialized`, where the rule is active.
-  - The stats line counts nothing decisions, and those where a holder was up.
-- **A sweep setting** (testing's edit): the generalized knob on rows 10 and 21, at three and five voters, with the fence on and off.
+  - Each run with the knob both destroying and marking, with the assertion task-d119 left waiting: no campaign given up as `Behind`, or waiting for ever on `HalfInitialized`, where the rule is active. A give-up whose selection counted a drop in `unreported_undecided` (condition 5) is the exception, and is counted apart.
+  - The stats line counts nothing decisions, those where a holder was up, and condition 5's give-ups.
+  - **Not vacuous:** each row's runs with the knob destroying must count at least one nothing decision, summed over its seeds, or the row fails.
+- **A sweep setting** (testing's edit): the generalized knob on rows 10 and 21, at three and five voters, with the fence on and off. The setting fails if its runs count no nothing decision, summed over its seeds.
 - **A Jepsen cell** (testing's).
   - "Wiped" there means the voter never rejoins under its identity. It stays down, or comes back through membership as a new generation (task-d41).
   - The rule is on from genesis.
-  - The checker finds no acknowledged write lost, the domain serves again within a stated bound, and every write refused as nothing is reported to its client as a definite refusal.
+  - **The nemesis** cuts the leader and one follower off from the other three of five while writes are in flight, then wipes both, a minority. The writes that only they held are what the rule decides.
+  - The checker finds no acknowledged write lost, and every write refused as nothing is reported to its client as a definite refusal.
+  - **The bound:** the domain serves again within 30 s of the wipe. That is the peer plane's 5 s link drop, an election backoff at its 16 s ceiling (`CEILING` in `bins/coordd/src/election.rs`), task-d120's bound of one base timeout (`PATIENCE`, 1 s), and 8 s for the campaign and catch-up.
+  - **Not vacuous:** the cell's runs must count at least one nothing decision, summed (the stats line), or the cell fails.
 
 **Review boundary:** what a selection keeps. The rule decides as nothing a command whose payload no member of its quorum holds. It must never decide one a quorum decided, and a command it decided as nothing must stay nothing.
 
