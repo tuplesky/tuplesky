@@ -89,6 +89,26 @@ pub struct Limits {
     /// ([`DEFAULT_MAX_ADMITTED_PER_SECOND`]).
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
+    /// How long, in milliseconds, a voter's frontend still answers from
+    /// its own policy after the send time of its last freshness ask that
+    /// its leader confirmed and its store then reached (#312, #320). Past
+    /// it, the voter decides nothing from its policy: binds are refused as
+    /// unavailable, output is held as pending and watches close as
+    /// source-lost, each of which the caller retries, until an answer
+    /// stamps it fresh again. A voter is past it from its start until its
+    /// first stamp, and a process with no voter always is. Between
+    /// [`MIN_POLICY_STALENESS_MILLIS`] and [`MAX_POLICY_STALENESS_MILLIS`].
+    ///
+    /// A voter cut off, healed, restarted or lagging stops authorizing
+    /// from what it last learned within this of the last instant its store
+    /// was confirmed to hold everything the domain had committed. A voter
+    /// asks about every half allowance, so staying fresh needs an ask's
+    /// round trip, a confirmation round, the leader's execution and this
+    /// voter's projection commit within half of it: a value near the
+    /// minimum suits a domain on one site only. A local setting: no
+    /// replicated result depends on it.
+    #[serde(default = "default_max_policy_staleness_millis")]
+    pub max_policy_staleness_millis: u64,
 }
 
 /// The checkpoint interval in records a strict configuration that names
@@ -129,6 +149,24 @@ const fn default_max_admitted_per_second() -> u32 {
     DEFAULT_MAX_ADMITTED_PER_SECOND
 }
 
+/// The policy staleness a configuration that names none gets: with the
+/// peer plane's 5 s idle timeout, a cut-off voter stops authorizing from
+/// its own policy about 10 s after it last heard the domain (#312).
+pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
+
+const fn default_max_policy_staleness_millis() -> u64 {
+    DEFAULT_MAX_POLICY_STALENESS_MILLIS
+}
+
+/// The smallest policy staleness a configuration may name. Below it a
+/// voter's policy would close between two looks inside one loop pass,
+/// and the voter would decide nothing while it leads.
+pub const MIN_POLICY_STALENESS_MILLIS: u64 = 100;
+
+/// The largest policy staleness a configuration may name: past it the
+/// setting no longer bounds what #312 asks it to bound.
+pub const MAX_POLICY_STALENESS_MILLIS: u64 = 60_000;
+
 /// The command table capacity a configuration that names none gets: the
 /// largest (task-d20).
 pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
@@ -165,6 +203,7 @@ impl Default for Limits {
             checkpoint_after_seconds: None,
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
+            max_policy_staleness_millis: default_max_policy_staleness_millis(),
         }
     }
 }
@@ -1090,6 +1129,15 @@ impl Config {
                 field: "limits.max_admitted_per_second",
                 min: 1,
                 max: u64::from(u32::MAX),
+            });
+        }
+        if !(MIN_POLICY_STALENESS_MILLIS..=MAX_POLICY_STALENESS_MILLIS)
+            .contains(&self.limits.max_policy_staleness_millis)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_policy_staleness_millis",
+                min: MIN_POLICY_STALENESS_MILLIS,
+                max: MAX_POLICY_STALENESS_MILLIS,
             });
         }
         // Durable state is opened under the name this build implements or

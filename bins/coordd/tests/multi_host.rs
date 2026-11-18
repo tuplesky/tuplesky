@@ -89,6 +89,16 @@ fn meshed(said: &str) -> bool {
         && reported(said, "voters submittable=").last() == Some(&2)
 }
 
+/// Whether a voter last said its policy is fresh (#320): a voter binds
+/// nobody until its leader has confirmed its store, after its first
+/// start and after a restart alike, so a caller binds once it has.
+fn policy_fresh(said: &str) -> bool {
+    said.lines()
+        .rev()
+        .find(|line| line.contains("this voter's policy is "))
+        .is_some_and(|line| line.contains("this voter's policy is fresh"))
+}
+
 /// One voter, run from its bundle the way `coord-harness start` runs it.
 struct Voter {
     bundle: PathBuf,
@@ -218,6 +228,11 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
         );
     }
     let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    assert!(
+        voters[0].waits_until(60, 0, policy_fresh),
+        "voter 1's policy never turned fresh:\n{}",
+        voters[0].said()
+    );
     let mut first = Caller::connect(&run, &provisioned, &minter, 0, 0)
         .await
         .expect("a caller bound at voter 1");
@@ -239,6 +254,11 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
             voter.said()
         );
     }
+    assert!(
+        voters[2].waits_until(60, 0, policy_fresh),
+        "the late voter's policy never turned fresh:\n{}",
+        voters[2].said()
+    );
     let mut late = Caller::connect(&run, &provisioned, &minter, 2, 1)
         .await
         .expect("a caller bound at the late voter");
@@ -395,6 +415,11 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     }
 
     let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    assert!(
+        voters[0].waits_until(60, 0, policy_fresh),
+        "voter 1's policy never turned fresh:\n{}",
+        voters[0].said()
+    );
     let mut caller = Caller::connect(&run, &provisioned, &minter, 0, 0)
         .await
         .expect("a caller bound at voter 1");
@@ -412,6 +437,11 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     // the read pending (the output gate's "not yet"), so the read is
     // asked again until it is answered, as `read_value` does.
     if replay {
+        assert!(
+            voters[2].waits_until(60, 0, policy_fresh),
+            "voter 3's policy never turned fresh:\n{}",
+            voters[2].said()
+        );
         let mut at_three = Caller::connect(&run, &provisioned, &minter, 2, 2)
             .await
             .expect("a caller bound at voter 3");
@@ -466,6 +496,13 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
         );
     }
 
+    // A restarted voter is stale until its leader confirms its store
+    // again (#320).
+    assert!(
+        voters[2].waits_until(60, since[2], policy_fresh),
+        "the returned voter's policy never turned fresh:\n{}",
+        voters[2].said()
+    );
     let mut returned = Caller::connect(&run, &provisioned, &minter, 2, 1)
         .await
         .expect("a caller bound at the returned voter");

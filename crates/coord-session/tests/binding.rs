@@ -791,6 +791,163 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
     ));
 }
 
+/// A policy this node may hold too stale to read (#312, #320 review)
+/// discloses nothing, and is not a denial either: a bind is refused as
+/// unavailable, output is held as pending, and a watch closes as
+/// source-lost at the last revision it gave, each of which the caller
+/// asks again about. The caller's credential is not refused, so a
+/// client does not throw it away. A barrier that cannot be read at all
+/// still denies.
+#[test]
+fn a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying() {
+    struct Stale;
+    impl coord_session::PolicySource for Stale {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Stale)
+        }
+    }
+    struct Down;
+    impl coord_session::PolicySource for Down {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Unavailable)
+        }
+    }
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    assert_eq!(
+        f.on_frame(&clock(NOW), at(NOW), 2, &bind, &hub, &Stale),
+        Ingress::Rejected(BindError::Unavailable)
+    );
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy()),
+        Ingress::Bound(_)
+    ));
+
+    // Output: pending while stale, answered once fresh, denied by a
+    // barrier that cannot be read.
+    let (c4, read) = request(4, range(b"a"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 1, &read, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    let held = f
+        .deliver(delivery(1, 4, c4, range_outcome(b"a")), &Stale)
+        .answered();
+    assert!(matches!(outcome_of(&held), OutcomeV1::Pending), "{held:?}");
+    assert_eq!((f.deferred, f.denied), (1, 0), "deferred, not denied");
+    let answered = f
+        .deliver(delivery(1, 4, c4, range_outcome(b"a")), &domain.policy())
+        .answered();
+    assert!(matches!(outcome_of(&answered), OutcomeV1::Ok { .. }));
+    assert!(is_denied(
+        &f.deliver(delivery(1, 4, c4, range_outcome(b"a")), &Down)
+            .answered()
+    ));
+    assert_eq!((f.deferred, f.denied), (1, 1));
+
+    // A watch: a revision given while fresh, then the next one stale.
+    let open = frame_of(
+        &MessageV1::WatchOpen(WatchOpenV1 {
+            watch_id: 7,
+            namespace: NS,
+            key: BoundedBytes::new(b"a".to_vec()).unwrap(),
+            range_end: None,
+            start_revision: None,
+            prev_kv: false,
+            progress_notify: true,
+        })
+        .encode()
+        .unwrap(),
+    );
+    let registration = match f.on_frame(&clock(NOW), at(NOW), 1, &open, &hub, &domain.policy()) {
+        Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
+        other => panic!("{other:?}"),
+    };
+    hub.replay_complete(registration.id).unwrap();
+    let event = KvEvent {
+        kind: KvEventKind::Put,
+        key: b"a".to_vec(),
+        entry: Some(entry(b"v")),
+        prev: None,
+    };
+    let kinds = |frames: &[Vec<u8>]| -> Vec<String> {
+        frames
+            .iter()
+            .map(|fr| match decode_stream(fr).unwrap().remove(0) {
+                MessageV1::WatchEvents(e) => format!("events@{}", e.revision.get()),
+                MessageV1::WatchProgress(p) => format!("progress@{}", p.revision.get()),
+                MessageV1::WatchClose(c) => format!(
+                    "close:{:?}@{}",
+                    c.reason,
+                    c.last_complete_revision.map_or(0, KvRevision::get)
+                ),
+                _ => "other".into(),
+            })
+            .collect()
+    };
+    hub.publish(
+        NS,
+        KvRevision::new(1).unwrap(),
+        std::slice::from_ref(&event),
+    )
+    .unwrap();
+    let frames = f.pump_watch(&clock(NOW), 1, 7, &hub, &domain.policy());
+    assert_eq!(kinds(&frames), ["events@1"]);
+    hub.publish(
+        NS,
+        KvRevision::new(2).unwrap(),
+        std::slice::from_ref(&event),
+    )
+    .unwrap();
+    let frames = f.pump_watch(&clock(NOW), 1, 7, &hub, &Stale);
+    assert_eq!(kinds(&frames), ["close:SourceLost@1"]);
+    assert_eq!(
+        (f.deferred, f.denied),
+        (1, 1),
+        "a lost source is not a denial"
+    );
+    // The same batch under a barrier that cannot be read: unauthorized.
+    let open8 = frame_of(
+        &MessageV1::WatchOpen(WatchOpenV1 {
+            watch_id: 8,
+            namespace: NS,
+            key: BoundedBytes::new(b"a".to_vec()).unwrap(),
+            range_end: None,
+            start_revision: None,
+            prev_kv: false,
+            progress_notify: false,
+        })
+        .encode()
+        .unwrap(),
+    );
+    let registration = match f.on_frame(&clock(NOW), at(NOW), 1, &open8, &hub, &domain.policy()) {
+        Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
+        other => panic!("{other:?}"),
+    };
+    hub.replay_complete(registration.id).unwrap();
+    hub.publish(
+        NS,
+        KvRevision::new(3).unwrap(),
+        std::slice::from_ref(&event),
+    )
+    .unwrap();
+    let frames = f.pump_watch(&clock(NOW), 1, 8, &hub, &Down);
+    let closed = kinds(&frames);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert!(closed[0].starts_with("close:Unauthorized@"), "{closed:?}");
+}
+
 #[test]
 fn previously_authorized_in_flight_work_follows_documented_semantics() {
     let ring = ring();
