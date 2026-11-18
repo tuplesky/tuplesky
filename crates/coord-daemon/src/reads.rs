@@ -17,7 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use coord_collector::{MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, ReadV1};
+use coord_collector::{
+    FreshnessAnswerV1, FreshnessAskV1, FreshnessOutcomeV1, MonotonicMillis, ReadAnswerV1,
+    ReadOutcomeV1, ReadRefusal, ReadV1,
+};
 use coord_state::{PlanLimits, plan};
 use coord_storage::retry::{self, Admission, RetryBinding};
 use coord_storage::{GatedView, ViewBudget, build_authorized_view};
@@ -60,6 +63,11 @@ pub const READ_WAIT_MILLIS: u64 = 1_000;
 /// nothing back for longer than this.
 pub const ROUND_SPACING_MILLIS: u64 = 5;
 
+/// How many freshness asks a leader holds at once (#320). Each voter asks
+/// about once a half allowance, so a domain's leader holds a handful at
+/// most; past this an ask is refused, and its voter asks again.
+pub const ASKS_HELD: usize = 256;
+
 pub use coord_collector::servable;
 
 /// What the leader knows when a read arrives or is pumped.
@@ -95,6 +103,34 @@ pub struct Held {
     /// The position the snapshot it is planned over must reach, once
     /// everything below its index has executed.
     pub required: Option<ExecutionPosition>,
+}
+
+/// A freshness ask held at the leader (#320). Held as a read is, without
+/// the request: it is due on the read's two conditions, and its answer is
+/// the position the leader had executed through then.
+#[derive(Clone, Debug)]
+struct HeldAsk {
+    /// Where its answer goes.
+    origin: Origin,
+    /// The ask as the voter sent it.
+    ask: FreshnessAskV1,
+    /// Its read index.
+    index: u64,
+    /// The first round that started after it arrived.
+    after_round: u64,
+    /// When it arrived.
+    arrived: MonotonicMillis,
+    /// Whether a round started after it arrived has confirmed.
+    confirmed: bool,
+}
+
+/// What [`ReadBarrier`] did with freshness asks since boot (#320).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AskCounts {
+    /// Asks answered with a position.
+    pub answered: u64,
+    /// Asks refused.
+    pub refused: u64,
 }
 
 /// A confirmation round in flight.
@@ -140,6 +176,8 @@ pub struct ReadBarrier {
     /// Boxed (task-d60, step 3): a pump moves the reads it takes out and
     /// the ones it holds again, and a held read carries its request.
     held: VecDeque<Box<Held>>,
+    /// The freshness asks held (#320), which share the reads' rounds.
+    asks: VecDeque<HeldAsk>,
     /// The number the next round takes. Rounds are numbered across
     /// ballots, so an answer to a round of another ballot never matches.
     next_round: u64,
@@ -148,6 +186,8 @@ pub struct ReadBarrier {
     confirmed: Option<(Ballot, u64)>,
     /// What came of it.
     pub counts: ReadCounts,
+    /// What came of the freshness asks.
+    pub ask_counts: AskCounts,
 }
 
 impl ReadBarrier {
@@ -159,6 +199,117 @@ impl ReadBarrier {
     /// Reads held.
     pub fn held(&self) -> usize {
         self.held.len()
+    }
+
+    /// Whether anything is held: a read or a freshness ask.
+    pub fn holds_any(&self) -> bool {
+        !self.held.is_empty() || !self.asks.is_empty()
+    }
+
+    /// Take a freshness ask from `origin`, or refuse it at once (#320).
+    ///
+    /// Refused where a read would be: the voter does not lead the ballot
+    /// the ask names, or has proposed nothing in it yet, or holds as many
+    /// asks as it bounds.
+    pub fn admit_ask(
+        &mut self,
+        origin: Origin,
+        ask: FreshnessAskV1,
+        leading: Option<Leading>,
+        now: MonotonicMillis,
+    ) -> Result<(), (Origin, FreshnessAnswerV1)> {
+        let refuse = |this: &mut Self, ballot: Ballot, reason| {
+            this.ask_counts.refused += 1;
+            Err((origin, ask_refusal(ask.ask, ballot, reason)))
+        };
+        let Some(leading) = leading.filter(|l| l.ballot == ask.ballot) else {
+            let ballot = leading.map_or(ask.ballot, |l| l.ballot);
+            return refuse(self, ballot, ReadRefusal::NotLeading);
+        };
+        let Some(index) = leading.index else {
+            return refuse(self, leading.ballot, ReadRefusal::NothingProposed);
+        };
+        if self.asks.len() >= ASKS_HELD {
+            return refuse(self, leading.ballot, ReadRefusal::Busy);
+        }
+        self.asks.push_back(HeldAsk {
+            origin,
+            ask,
+            index,
+            after_round: self.next_round,
+            arrived: now,
+            confirmed: false,
+        });
+        Ok(())
+    }
+
+    /// The answers due to the freshness asks held (#320).
+    ///
+    /// An ask is answered once a round started after it arrived has
+    /// confirmed and everything the leader proposed below its index has
+    /// executed: the two conditions a read is due on (task-d50). The
+    /// answer is `executed_through` at that moment. Everything the domain
+    /// committed before the ask arrived was either proposed in this
+    /// ballot below the index or learned in an earlier one, which the
+    /// total chain orders ahead of this ballot's first proposal (task-d06),
+    /// so it has executed at or below that position. An ask past
+    /// [`READ_WAIT_MILLIS`], or held when the ballot is no longer led, is
+    /// refused.
+    ///
+    /// Called before [`ReadBarrier::take_due`], which drops the rounds
+    /// that have aged out.
+    pub fn take_due_asks(
+        &mut self,
+        leading: Option<Leading>,
+        now: MonotonicMillis,
+        executed_below: impl Fn(u64) -> bool,
+        executed_through: ExecutionPosition,
+    ) -> Vec<(Origin, FreshnessAnswerV1)> {
+        if self.asks.is_empty() {
+            return Vec::new();
+        }
+        let mut answers = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.asks.len());
+        for mut held in core::mem::take(&mut self.asks) {
+            let ballot = held.ask.ballot;
+            let reason = match leading {
+                Some(l) if l.ballot == ballot => None,
+                _ => Some(ReadRefusal::NotLeading),
+            }
+            .or_else(|| {
+                (now.get().saturating_sub(held.arrived.get()) > READ_WAIT_MILLIS)
+                    .then_some(ReadRefusal::Expired)
+            });
+            if let Some(reason) = reason {
+                self.ask_counts.refused += 1;
+                answers.push((held.origin, ask_refusal(held.ask.ask, ballot, reason)));
+                continue;
+            }
+            if !held.confirmed
+                && self
+                    .confirmed
+                    .is_some_and(|(b, round)| b == ballot && round >= held.after_round)
+            {
+                held.confirmed = true;
+            }
+            if held.confirmed && executed_below(held.index) {
+                self.ask_counts.answered += 1;
+                answers.push((
+                    held.origin,
+                    FreshnessAnswerV1 {
+                        ballot,
+                        ask: held.ask.ask,
+                        outcome: FreshnessOutcomeV1::Through {
+                            position: executed_through,
+                        },
+                    },
+                ));
+            } else {
+                kept.push_back(held);
+            }
+        }
+        self.asks = kept;
+        answers
     }
 
     /// Take `read` from `origin`, or refuse it at once (boxed: the
@@ -253,6 +404,10 @@ impl ReadBarrier {
         self.held
             .iter()
             .any(|h| h.read.ballot == ballot && h.after_round >= self.next_round)
+            || self
+                .asks
+                .iter()
+                .any(|a| a.ask.ballot == ballot && a.after_round >= self.next_round)
     }
 
     /// [`ReadBarrier::round_to_start`] with the spacing given, so the
@@ -444,6 +599,15 @@ pub fn refusal(
         retry_key,
         ballot,
         outcome: ReadOutcomeV1::Refused { reason },
+    }
+}
+
+/// A freshness ask's refusal (#320).
+pub fn ask_refusal(ask: u64, ballot: Ballot, reason: ReadRefusal) -> FreshnessAnswerV1 {
+    FreshnessAnswerV1 {
+        ballot,
+        ask,
+        outcome: FreshnessOutcomeV1::Refused { reason },
     }
 }
 
@@ -887,6 +1051,93 @@ mod tests {
         let (due, refused) = barrier.take_due(leading(b, 3), later, |_| true, at(5));
         assert!(due.is_empty());
         assert_eq!(refusal_of(&refused[0].1), Some(ReadRefusal::Expired));
+    }
+
+    fn ask(n: u64, b: Ballot) -> FreshnessAskV1 {
+        FreshnessAskV1 { ballot: b, ask: n }
+    }
+
+    fn through(answer: &FreshnessAnswerV1) -> Result<ExecutionPosition, ReadRefusal> {
+        match answer.outcome {
+            FreshnessOutcomeV1::Through { position } => Ok(position),
+            FreshnessOutcomeV1::Refused { reason } => Err(reason),
+        }
+    }
+
+    /// A freshness ask (#320) is answered on a read's two conditions: a
+    /// round started after it arrived confirmed, and everything below its
+    /// index executed. The answer is the position executed through then.
+    /// A round already out when it arrived does not answer it.
+    #[test]
+    fn a_freshness_ask_is_answered_once_a_later_round_confirms_and_its_index_executed() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 3), T0)
+            .unwrap();
+        let first = barrier.round_to_start(b, 2, T0).unwrap();
+        barrier
+            .admit_ask(Origin::Connection(4), ask(7, b), leading(b, 5), T0)
+            .unwrap();
+        assert!(barrier.holds_any());
+        barrier.on_confirmed(ReplicaId([2; 16]), b, first, 2);
+        assert!(
+            barrier
+                .take_due_asks(leading(b, 5), T0, |_| true, at(9))
+                .is_empty(),
+            "the round out when the ask arrived does not answer it"
+        );
+        let second = barrier
+            .round_to_start(b, 2, T0.plus(ROUND_SPACING_MILLIS))
+            .expect("the ask needs a round of its own");
+        barrier.on_confirmed(ReplicaId([2; 16]), b, second, 2);
+        assert!(
+            barrier
+                .take_due_asks(leading(b, 6), T0, |index| index < 5, at(9))
+                .is_empty(),
+            "a proposal below its index has not executed"
+        );
+        let answers = barrier.take_due_asks(leading(b, 6), T0, |index| index <= 5, at(11));
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].0, Origin::Connection(4));
+        assert_eq!(answers[0].1.ask, 7);
+        assert_eq!(through(&answers[0].1), Ok(at(11)));
+        assert_eq!(barrier.ask_counts.answered, 1);
+        // The read is still held; the asks are not.
+        assert_eq!(barrier.held(), 1);
+    }
+
+    /// An ask is refused where a read is: another ballot, nothing
+    /// proposed, the leader gone from its ballot, or too long a wait.
+    #[test]
+    fn a_freshness_ask_is_refused_where_a_read_is() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        let (_, answer) = barrier
+            .admit_ask(Origin::Local, ask(1, b), leading(ballot(2), 3), T0)
+            .unwrap_err();
+        assert_eq!(through(&answer), Err(ReadRefusal::NotLeading));
+        let mut nothing = leading(b, 0).unwrap();
+        nothing.index = None;
+        let (_, answer) = barrier
+            .admit_ask(Origin::Local, ask(2, b), Some(nothing), T0)
+            .unwrap_err();
+        assert_eq!(through(&answer), Err(ReadRefusal::NothingProposed));
+
+        barrier
+            .admit_ask(Origin::Local, ask(3, b), leading(b, 3), T0)
+            .unwrap();
+        let answers = barrier.take_due_asks(leading(ballot(2), 1), T0, |_| true, at(5));
+        assert_eq!(through(&answers[0].1), Err(ReadRefusal::NotLeading));
+
+        barrier
+            .admit_ask(Origin::Local, ask(4, b), leading(b, 3), T0)
+            .unwrap();
+        let later = T0.plus(READ_WAIT_MILLIS + 1);
+        let answers = barrier.take_due_asks(leading(b, 3), later, |_| true, at(5));
+        assert_eq!(through(&answers[0].1), Err(ReadRefusal::Expired));
+        assert!(!barrier.holds_any());
+        assert_eq!(barrier.ask_counts.refused, 4);
     }
 
     /// Reads that arrive within the spacing of a round start none of

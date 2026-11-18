@@ -307,8 +307,22 @@ impl Session {
             connects: 0,
             stats: Stats::default(),
         };
-        this.connect(by).await.map_err(OpenError)?;
-        Ok(this)
+        // A voter whose policy is not yet confirmed fresh refuses a bind
+        // as unavailable (#320): "not yet", not "no". So the opening
+        // dials and binds again, as a request's reconnect does, until
+        // its deadline.
+        loop {
+            match this.connect(by).await {
+                Ok(()) => return Ok(this),
+                Err(e) => {
+                    let left = by.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(OpenError(e));
+                    }
+                    tokio::time::sleep(Duration::from_millis(250).min(left)).await;
+                }
+            }
+        }
     }
 
     /// The sequences of this session whose identities are retired: a

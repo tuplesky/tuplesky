@@ -163,10 +163,10 @@ offered or granted on the API plane.
 
 ## Collector frames (task-33)
 
-The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two
-are in the API range because they carry a client request and take its
-class limit; the answers and the evidence frame are in the
-collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
+The trusted collector (`spec/collector-v1.md`) uses seven raw kinds.
+Three are in the API range because they carry a client request, or ask
+on a client's behalf, and take its class limit; the answers and the
+evidence frame are in the collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
 kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
@@ -176,6 +176,8 @@ kind at the collector boundary, like peer evidence.
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`, `Refused`); collector-evidence class limit |
 | Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
 | ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
+| Freshness | `0x0108` | a voter's frontend to the leader of the ballot it follows | `FreshnessAskV1 { ballot, ask }` (postcard), version 1: the voter asks whether its policy is current (#320). The leader holds it as it holds a `Read` and answers once a round started after it arrived has confirmed its ballot and everything it proposed below its read index has executed; API class limit |
+| FreshnessAnswer | `0x0703` | leader to the asking voter | `FreshnessAnswerV1 { ballot, ask, outcome: Through { position } \| Refused { reason } }` (postcard), version 1: `position` is the `ExecutionPosition` the leader had executed through then, `reason` as `ReadAnswer`'s; collector-evidence class limit. Taken only by a voter, and only from the voter it asked |
 
 A relayed command's proposal (task-d102) is the peer message
 `RelayedProposal { vote, payload }`, appended after every older
