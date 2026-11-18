@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSIONS, CloseV1, Frame,
-    HelloAckV1, HelloV1, KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1,
-    PeerRole, SESSION_BIND_VERSION, decode,
+    BoundedBytes, BoundedVec, COLLECTOR_FRESHNESS_VERSION, COLLECTOR_READ_VERSION,
+    COLLECTOR_SUBMIT_VERSIONS, CloseV1, Frame, HelloAckV1, HelloV1, KIND_COLLECTOR_FRESHNESS,
+    KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1, PeerRole,
+    SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
@@ -2884,6 +2885,22 @@ async fn read_request(
                 } else if frame.version != COLLECTOR_READ_VERSION {
                     Some(CloseReason::Malformed(format!(
                         "read frame version {}",
+                        frame.version
+                    )))
+                } else {
+                    None
+                }
+            } else if frame.kind == KIND_COLLECTOR_FRESHNESS {
+                // A voter's freshness ask for the leader it follows
+                // (#320): the fourth enumerated raw kind, admitted on the
+                // read's terms. Its answer says how far that leader had
+                // executed, which only a frontend with a voter beside it
+                // has a use for.
+                if !peer.identity.role.may_submit_for_clients() {
+                    Some(CloseReason::Rejected("freshness".into()))
+                } else if frame.version != COLLECTOR_FRESHNESS_VERSION {
+                    Some(CloseReason::Malformed(format!(
+                        "freshness frame version {}",
                         frame.version
                     )))
                 } else {

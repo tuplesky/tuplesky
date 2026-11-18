@@ -90,19 +90,23 @@ pub struct Limits {
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
     /// How long, in milliseconds, a voter's frontend still answers from
-    /// its own policy after the last pass on which the voter had a leader
-    /// and reached a majority (#312). Past it, the voter decides nothing
-    /// from its policy: binds are refused as unavailable, output is held
-    /// as pending and watches close as source-lost, each of which the
-    /// caller retries, until the voter has both again. A voter that has
-    /// had neither since it started is past it. Between
+    /// its own policy after the send time of its last freshness ask that
+    /// its leader confirmed and its store then reached (#312, #320). Past
+    /// it, the voter decides nothing from its policy: binds are refused as
+    /// unavailable, output is held as pending and watches close as
+    /// source-lost, each of which the caller retries, until an answer
+    /// stamps it fresh again. A voter is past it from its start until its
+    /// first stamp, and a process with no voter always is. Between
     /// [`MIN_POLICY_STALENESS_MILLIS`] and [`MAX_POLICY_STALENESS_MILLIS`].
     ///
-    /// A voter cut off from the domain stops learning revocations. This
-    /// bounds how long it goes on authorizing from what it last learned:
-    /// the transport's idle timeout on the peer plane (5 s) for its links
-    /// to drop, then this. A local setting: no replicated result depends
-    /// on it.
+    /// A voter cut off, healed, restarted or lagging stops authorizing
+    /// from what it last learned within this of the last instant its store
+    /// was confirmed to hold everything the domain had committed. A voter
+    /// asks about every half allowance, so staying fresh needs an ask's
+    /// round trip, a confirmation round, the leader's execution and this
+    /// voter's projection commit within half of it: a value near the
+    /// minimum suits a domain on one site only. A local setting: no
+    /// replicated result depends on it.
     #[serde(default = "default_max_policy_staleness_millis")]
     pub max_policy_staleness_millis: u64,
 }

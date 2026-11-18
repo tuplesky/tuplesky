@@ -155,8 +155,9 @@ pub enum PolicyError {
     /// Replicated policy cannot be read now: deny.
     Unavailable,
     /// This node's copy of replicated policy may be behind the domain's
-    /// (#312: it has not had a leader and a majority within its
-    /// allowance), so it decides nothing from it now. That is "not now",
+    /// (#312, #320: no freshness ask its leader confirmed, and its store
+    /// reached, was sent within its allowance), so it decides nothing
+    /// from it now. That is "not now",
     /// not "no": output is held as pending, a bind is refused as
     /// unavailable and a watch closes as source-lost, each of which the
     /// caller retries -- here once the node is fresh again, or at
