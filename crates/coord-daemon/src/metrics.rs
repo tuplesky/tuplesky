@@ -753,6 +753,10 @@ pub struct Cost {
     /// machine saw it is [`Offers::refused`].
     #[serde(default)]
     pub table_full: u64,
+    /// Why the domain loop lowered when it did (task-d73): beside
+    /// `flushes`, which counts how many events each flush followed.
+    #[serde(default)]
+    pub flush_causes: FlushCauses,
 }
 
 /// What a node's collector sent again, and what its voter refused or could
@@ -1099,6 +1103,24 @@ pub struct History {
     pub largest_map: u64,
 }
 
+/// Why the domain loop lowered what its events left queued (task-d73),
+/// cumulative, one count a flush. A flush with nothing more ready ends a
+/// group as early as it must; one cut by a bound ends it while events
+/// were still waiting, and is the only kind a longer turn could merge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushCauses {
+    /// No event was ready (the select's flush arm).
+    pub idle: u64,
+    /// The loop had taken its bound of events since the last flush
+    /// (`FLUSH_EVENTS`), with more possibly ready.
+    pub events: u64,
+    /// A full journal group's worth was queued (`FLUSH_QUEUED`).
+    pub queued: u64,
+    /// Of all of them, the flushes taken while an append was out: what
+    /// they queued waits behind it, and joins the next group (task-d54).
+    pub appending: u64,
+}
+
 /// What a voter's journal groups held, by their records (task-d84),
 /// cumulative: which of a turn's writes each synced group carried.
 ///
@@ -1175,6 +1197,46 @@ pub struct Traffic {
     /// never should, and an operator has a certificate to revoke.
     #[serde(default)]
     pub refused_voter_names: u64,
+    /// The frames this node sent and took on its api connections, by
+    /// kind (task-d88's R3).
+    #[serde(default)]
+    pub api_frames: ApiFrames,
+}
+
+/// The api plane's frames at one node, by kind (task-d88's R3).
+///
+/// QUIC packs frames into datagrams as it sees fit, so datagrams cannot
+/// be split by kind; the frames can, and over the voters they show what
+/// the plane's datagrams carry. Every count is of frames this node
+/// handed to its transport, or took from it, on an api connection: a
+/// frame to or from a voter in this process does not cross the plane and
+/// is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiFrames {
+    /// Submissions this node's collector sent to a voter elsewhere.
+    pub submissions: u64,
+    /// Reads this node's collector sent to a leader elsewhere (task-d50).
+    pub reads: u64,
+    /// Fast acknowledgements this voter returned to a collector
+    /// elsewhere.
+    pub fast_acks: u64,
+    /// Slow acknowledgements returned the same way.
+    pub slow_acks: u64,
+    /// The leader's replies returned the same way.
+    pub leader_replies: u64,
+    /// Other evidence returned the same way.
+    pub other_evidence: u64,
+    /// Releases returned the same way.
+    pub releases: u64,
+    /// Answers to a read returned the same way (task-d50).
+    pub read_answers: u64,
+    /// Frames of any other kind returned the same way.
+    pub other_returned: u64,
+    /// Frames callers sent: requests, resolutions, binds, watch opens.
+    pub requests: u64,
+    /// Submissions and reads collectors elsewhere sent this voter.
+    pub from_collectors: u64,
 }
 
 /// What QUIC sent and received on one class of connections (task-d70).
