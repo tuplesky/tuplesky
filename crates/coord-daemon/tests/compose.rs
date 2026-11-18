@@ -955,6 +955,54 @@ fn the_command_table_capacity_is_configuration_within_bounds() {
     }
 }
 
+/// The policy staleness bound (#312, #320) is configuration within
+/// bounds: unset, a voter gets the default; inside them, it is taken as
+/// written; outside them, it is refused and the setting named. Zero
+/// would close a leading voter's policy between two looks in one pass,
+/// and a huge value would bound nothing.
+#[test]
+fn the_policy_staleness_is_configuration_within_bounds() {
+    use coord_daemon::config::{
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS, MAX_POLICY_STALENESS_MILLIS,
+        MIN_POLICY_STALENESS_MILLIS,
+    };
+    let unset = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        unset.limits.max_policy_staleness_millis,
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS
+    );
+    let limits = |millis: u64| {
+        base_config(&format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             max_policy_staleness_millis = {millis}\n"
+        ))
+    };
+    for millis in [
+        MIN_POLICY_STALENESS_MILLIS,
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS,
+        MAX_POLICY_STALENESS_MILLIS,
+    ] {
+        let config = Config::parse(&limits(millis)).unwrap();
+        assert_eq!(config.limits.max_policy_staleness_millis, millis);
+    }
+    for millis in [
+        0,
+        MIN_POLICY_STALENESS_MILLIS - 1,
+        MAX_POLICY_STALENESS_MILLIS + 1,
+    ] {
+        assert_eq!(
+            Config::parse(&limits(millis)),
+            Err(ConfigError::OutOfRange {
+                field: "limits.max_policy_staleness_millis",
+                min: MIN_POLICY_STALENESS_MILLIS,
+                max: MAX_POLICY_STALENESS_MILLIS,
+            }),
+            "{millis}"
+        );
+    }
+}
+
 /// The largest configured table still gives a Sync that can be written
 /// as one row and sent as one frame (task-d05, measured again in
 /// task-d20).
