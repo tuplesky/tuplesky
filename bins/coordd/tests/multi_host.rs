@@ -655,6 +655,12 @@ async fn a_cut_off_voter_stops_binding_and_binds_again_once_healed() {
         tokio::time::sleep(wait).await;
     }
     let cut_off = Caller::connect(&run, &provisioned, &minter, 2, 1).await;
+    // The daemon says why it refused before it closes the link, but its
+    // output reaches the log through the harness's reader and writer
+    // threads, so the caller can see the close before the line is in the
+    // file. Wait for the refusal to be said, whatever its reason, and
+    // then read the reason.
+    let _ = voters[2].waits_until(10, since, |said| said.contains("a binding was refused: "));
     let said_at_the_cut = voters[2].said().get(since..).unwrap_or_default().to_owned();
     signal(&voters[0], "-CONT");
     signal(&voters[1], "-CONT");
