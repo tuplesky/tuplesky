@@ -34,7 +34,7 @@ use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
-use crate::commands::{CommandTable, InitError};
+use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
@@ -3351,6 +3351,9 @@ impl Leader {
         // adoption, which may never come if it has adopted everything
         // sent to it.
         let mut held_back_durable = false;
+        // The records a failed batch staged, for a proposal presented again
+        // ([`Leader::retry_proposal`]).
+        let mut rejected_rows = Vec::new();
         self.ballots.on_storage(event);
         // Ledger bookkeeping covers every batch this machine staged, not
         // only the proposal batches: an acceptance row carries its own
@@ -3372,7 +3375,7 @@ impl Leader {
                     self.ledger.durable(barrier, *journal_seq);
                 }
                 StorageEvent::Failed { .. } => {
-                    self.ledger.failed(barrier);
+                    rejected_rows = self.ledger.failed_rows(barrier);
                     // An adoption that waited on the failed batch as an
                     // earlier one was dropped with it; its own batch may
                     // still be written, so it is published again over what
@@ -3435,7 +3438,7 @@ impl Leader {
                     error: StorageError::DefinitelyNotCommitted,
                     ..
                 } => {
-                    let mut effects = self.retry_proposal(command);
+                    let mut effects = self.retry_proposal(command, rejected_rows);
                     effects.extend(self.advance_pending());
                     effects.extend(self.release());
                     return effects;
@@ -3574,7 +3577,20 @@ impl Leader {
     /// Present a definitely rejected proposal batch again, unchanged, under
     /// a new barrier, and republish the sends that waited on the old one.
     /// The leader stops leading once the attempts are spent.
-    fn retry_proposal(&mut self, command: CommandId) -> Vec<Effect> {
+    ///
+    /// `rows` are the records the rejected batch staged in the ledger
+    /// ([`DurableLedger::failed_rows`]); the same rows go again, so they
+    /// are staged again under the new barrier (#314 review). Left out, the
+    /// ledger knew no row of a fresh proposal while its batch was in
+    /// flight and none once it was durable: a follower made from this
+    /// leader reported nothing of the command, and its gate
+    /// ([`crate::Follower::next_executable`]) did not hold back a committed
+    /// command whose payload row only that batch wrote.
+    fn retry_proposal(
+        &mut self,
+        command: CommandId,
+        rows: Vec<(CommandId, CommandRecord)>,
+    ) -> Vec<Effect> {
         let Some(proposal) = self.proposals.get(&command) else {
             return Vec::new();
         };
@@ -3586,6 +3602,9 @@ impl Leader {
             return Vec::new();
         };
         let barrier = alloc.allocate();
+        for (c, record) in rows {
+            self.ledger.stage(barrier, c, record);
+        }
         let admission = self
             .table
             .record(&command)
