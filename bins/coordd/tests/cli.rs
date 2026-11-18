@@ -1960,7 +1960,10 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
         .unwrap_or_else(|_| panic!("a frontend held a binding:\n{}", daemon.said()));
     // A refusal ends the bind stream unanswered and closes the
     // connection after it, so the read can see either first: an empty
-    // stream is a refusal only if the close that follows it says so.
+    // stream is a refusal only if the close that follows it says so. A
+    // serving-only process is never fresh, so it says it can't bind now
+    // rather than refusing the token (#320 follow-up): a client keeps
+    // its credential for a node that can.
     let closed = match &answered {
         Err(lost) => Some(lost.clone()),
         Ok(None) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
@@ -1972,7 +1975,7 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
         matches!(
             &closed,
             Some(quinn::ConnectionError::ApplicationClosed(close))
-                if close.reason[..] == b"bind refused"[..]
+                if close.reason[..] == b"bind unavailable"[..]
         ),
         "a frontend with no voter took a binding: {answered:?} then {closed:?}\n{}",
         daemon.said()
@@ -2690,23 +2693,24 @@ async fn one_co_located_voter_is_not_a_quorum() {
     // voters that are not running, which is the correct thing for it to
     // be waiting on. Or refused at the door: a voter whose leader has
     // not confirmed its freshness answers nothing from its policy (#312,
-    // #320), and this one, alone of three, has no leader to ask. A
-    // refusal ends the bind stream unanswered and closes the connection
-    // after it, so the read can see either first.
+    // #320), and this one, alone of three, has no leader to ask, so it
+    // says it can't bind now. A refusal ends the bind stream unanswered
+    // and closes the connection after it, so the read can see either
+    // first.
     let mut buf = [0u8; 4096];
     let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
-    let bind_refused = |closed: &quinn::ConnectionError| {
+    let bind_unavailable = |closed: &quinn::ConnectionError| {
         matches!(
             closed,
             quinn::ConnectionError::ApplicationClosed(close)
-                if close.reason[..] == b"bind refused"[..]
+                if close.reason[..] == b"bind unavailable"[..]
         )
     };
     let refused = match &early {
-        Ok(Err(quinn::ReadError::ConnectionLost(closed))) => bind_refused(closed),
+        Ok(Err(quinn::ReadError::ConnectionLost(closed))) => bind_unavailable(closed),
         Ok(Ok(None)) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
             .await
-            .is_ok_and(|closed| bind_refused(&closed)),
+            .is_ok_and(|closed| bind_unavailable(&closed)),
         _ => false,
     };
     assert!(

@@ -439,8 +439,21 @@ fn one_credential_exchange_serves_many_operations() {
         [SdkAction::Bind { .. }]
     ));
     assert_eq!(c.exchanges(), 1);
+    // A frontend that could not bind now never read the credential, so
+    // the cache is kept: the next connect presents it again.
+    c.binding_unavailable(c2);
+    c.connect(550, ConnectionId(4)).unwrap();
+    assert!(matches!(
+        c.take_actions().as_slice(),
+        [SdkAction::Bind { .. }]
+    ));
+    assert_eq!(
+        c.exchanges(),
+        1,
+        "an unavailable binding keeps the credential"
+    );
     // A rejected binding invalidates the cache: the next connect exchanges.
-    c.binding_rejected(c2);
+    c.binding_rejected(ConnectionId(4));
     c.connect(600, ConnectionId(3)).unwrap();
     assert_eq!(c.exchanges(), 2);
     assert_eq!(c.instance().state().next_sequence, 101);

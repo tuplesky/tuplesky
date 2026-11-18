@@ -68,6 +68,19 @@ pub const ROUND_SPACING_MILLIS: u64 = 5;
 /// most; past this an ask is refused, and its voter asks again.
 pub const ASKS_HELD: usize = 256;
 
+/// How many freshness asks a leader holds from one origin (#320 follow-up),
+/// so one voter, or one connection, can't take the slots the others need.
+///
+/// A voter asks once a half allowance while its asks are held, and an
+/// answer stamps its ask's send time, which is no use once the allowance
+/// has passed (the voter forgets such an ask). So at most three of a
+/// voter's asks can still make it fresh: one sent now, one half an
+/// allowance ago and one a whole allowance ago. Four is room for those
+/// and one more. Past it the ask is refused as busy, the voter asks
+/// again an eighth of an allowance later, and an ask held for nothing
+/// leaves at [`READ_WAIT_MILLIS`] at the latest.
+pub const ASKS_HELD_PER_ORIGIN: usize = 4;
+
 pub use coord_collector::servable;
 
 /// What the leader knows when a read arrives or is pumped.
@@ -210,7 +223,7 @@ impl ReadBarrier {
     ///
     /// Refused where a read would be: the voter does not lead the ballot
     /// the ask names, or has proposed nothing in it yet, or holds as many
-    /// asks as it bounds.
+    /// asks as it bounds, from `origin` or from all.
     pub fn admit_ask(
         &mut self,
         origin: Origin,
@@ -229,7 +242,14 @@ impl ReadBarrier {
         let Some(index) = leading.index else {
             return refuse(self, leading.ballot, ReadRefusal::NothingProposed);
         };
-        if self.asks.len() >= ASKS_HELD {
+        if self.asks.len() >= ASKS_HELD
+            || self
+                .asks
+                .iter()
+                .filter(|held| held.origin == origin)
+                .count()
+                >= ASKS_HELD_PER_ORIGIN
+        {
             return refuse(self, leading.ballot, ReadRefusal::Busy);
         }
         self.asks.push_back(HeldAsk {
@@ -1138,6 +1158,56 @@ mod tests {
         assert_eq!(through(&answers[0].1), Err(ReadRefusal::Expired));
         assert!(!barrier.holds_any());
         assert_eq!(barrier.ask_counts.refused, 4);
+    }
+
+    /// One origin holds at most [`ASKS_HELD_PER_ORIGIN`] asks and all of
+    /// them at most [`ASKS_HELD`] (#320 follow-up): past either an ask
+    /// is refused as busy, and one origin's asks don't take the others'
+    /// slots. Answering an origin's asks frees its slots.
+    #[test]
+    fn a_leader_holds_a_bounded_number_of_freshness_asks_from_each_origin() {
+        let b = ballot(1);
+        let mut barrier = ReadBarrier::new();
+        let busy = Err(ReadRefusal::Busy);
+        for n in 0..ASKS_HELD_PER_ORIGIN as u64 {
+            barrier
+                .admit_ask(Origin::Connection(4), ask(n, b), leading(b, 3), T0)
+                .unwrap();
+        }
+        let (origin, answer) = barrier
+            .admit_ask(Origin::Connection(4), ask(99, b), leading(b, 3), T0)
+            .unwrap_err();
+        assert_eq!((origin, through(&answer)), (Origin::Connection(4), busy));
+        // Another origin is not held back by the first.
+        barrier
+            .admit_ask(Origin::Connection(5), ask(100, b), leading(b, 3), T0)
+            .unwrap();
+        barrier
+            .admit_ask(Origin::Local, ask(101, b), leading(b, 3), T0)
+            .unwrap();
+
+        // Answered, the first origin's asks free its slots.
+        let round = barrier.round_to_start(b, 2, T0).unwrap();
+        barrier.on_confirmed(ReplicaId([2; 16]), b, round, 2);
+        let answers = barrier.take_due_asks(leading(b, 3), T0, |_| true, at(5));
+        assert_eq!(answers.len(), ASKS_HELD_PER_ORIGIN + 2);
+        assert!(answers.iter().all(|(_, a)| through(a) == Ok(at(5))));
+        barrier
+            .admit_ask(Origin::Connection(4), ask(102, b), leading(b, 3), T0)
+            .unwrap();
+
+        // All origins together hold at most ASKS_HELD.
+        let mut barrier = ReadBarrier::new();
+        for n in 0..ASKS_HELD as u64 {
+            barrier
+                .admit_ask(Origin::Connection(n), ask(n, b), leading(b, 3), T0)
+                .unwrap();
+        }
+        let (_, answer) = barrier
+            .admit_ask(Origin::Connection(u64::MAX), ask(0, b), leading(b, 3), T0)
+            .unwrap_err();
+        assert_eq!(through(&answer), busy);
+        assert_eq!(barrier.ask_counts.refused, 1);
     }
 
     /// Reads that arrive within the spacing of a round start none of

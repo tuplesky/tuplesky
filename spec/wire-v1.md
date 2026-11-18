@@ -128,8 +128,10 @@ validity.
 
 Close codes (in `CloseV1.code` and the QUIC application close): `0`
 orderly, `1` protocol violation (framing, unexpected frame), `2`
-negotiation rejected (origin, role class, version, identity), `3`
-deadline, `4` shutdown.
+negotiation rejected (origin, role class, version, identity) or a
+binding refused, `3` deadline, `4` shutdown, `5` expired (the
+credential the connection was authenticated under reached its end, or
+the connection reached its age cap, task-58).
 
 Lanes (task-31): a `Hello` declares exactly one lane through a frozen
 capability identifier; the acceptor admits it only for the dialing role.
@@ -177,7 +179,7 @@ kind at the collector boundary, like peer evidence.
 | Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
 | ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
 | Freshness | `0x0108` | a voter's frontend to the leader of the ballot it follows | `FreshnessAskV1 { ballot, ask }` (postcard), version 1: the voter asks whether its policy is current (#320). The leader holds it as it holds a `Read` and answers once a round started after it arrived has confirmed its ballot and everything it proposed below its read index has executed; API class limit |
-| FreshnessAnswer | `0x0703` | leader to the asking voter | `FreshnessAnswerV1 { ballot, ask, outcome: Through { position } \| Refused { reason } }` (postcard), version 1: `position` is the `ExecutionPosition` the leader had executed through then, `reason` as `ReadAnswer`'s; collector-evidence class limit. Taken only by a voter, and only from the voter it asked |
+| FreshnessAnswer | `0x0703` | leader to the asking voter | `FreshnessAnswerV1 { ballot, ask, outcome: Through { position } \| Refused { reason } }` (postcard), version 1: `position` is the `ExecutionPosition` the leader had executed through then, `reason` as `ReadAnswer`'s; collector-evidence class limit. Taken only by a voter, and only from the voter it asked. A leader holds an ask at most 1 s, then refuses it `Expired`; it holds 256 at once and 4 from one connection or its own voter, and refuses past either `Busy`. An endpoint built before #320 does not know `0x0108` and closes the connection on it, so a voter with the bound under such a leader stays stale (fails closed) |
 
 A relayed command's proposal (task-d102) is the peer message
 `RelayedProposal { vote, payload }`, appended after every older
@@ -311,7 +313,14 @@ An API-class connection carries no session until its first frame after
 
 The frontend verifies the token locally against the STS's published keys
 under its clock health; a rejected binding closes the connection with
-code `2`. A later `Bind` on the same connection (rebind) must carry the
+code `2`. The reason tells a client whether to keep its token. "bind
+unavailable" is a node whose policy may be behind the domain's (#320):
+it refuses before it reads the token, so the reason says nothing about
+the token, and a client keeps it and binds again later or at another
+frontend. Every other refusal is "bind refused", and a client drops the
+token and exchanges for a new one. The close may follow an empty
+answer stream, so a client reads the connection's close as well as the
+stream. A later `Bind` on the same connection (rebind) must carry the
 same session: it refreshes validity, never identity or ceiling. Nothing
 is admitted before a binding, or after its validity ends; watches and
 results of already admitted work are released only through the fresh

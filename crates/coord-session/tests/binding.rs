@@ -796,12 +796,29 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
 /// unavailable, output is held as pending, and a watch closes as
 /// source-lost at the last revision it gave, each of which the caller
 /// asks again about. The caller's credential is not refused, so a
-/// client does not throw it away. A barrier that cannot be read at all
-/// still denies.
+/// client does not throw it away: a stale node refuses a bind before it
+/// reads the credential, the same way for a good token and a bad one, so
+/// its refusal says nothing about the token (#320 follow-up). A barrier
+/// that cannot be read at all still denies.
 #[test]
 fn a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying() {
     struct Stale;
     impl coord_session::PolicySource for Stale {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Stale)
+        }
+        fn fresh(&self) -> bool {
+            false
+        }
+    }
+    // A source that says it is fresh and then reads stale: the binding
+    // has read the credential by then, and is still refused as stale.
+    struct Lagging;
+    impl coord_session::PolicySource for Lagging {
         fn barrier(
             &self,
             _: NamespaceId,
@@ -827,6 +844,27 @@ fn a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying() {
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     assert_eq!(
         f.on_frame(&clock(NOW), at(NOW), 2, &bind, &hub, &Stale),
+        Ingress::Rejected(BindError::Stale)
+    );
+    // The same refusal for a token signed by a key the frontend does not
+    // trust: a stale node never reads the credential, so it can't say
+    // whether it would have taken it. A fresh node refuses that token
+    // for what it is.
+    let foreign = frame_of(&bind_frame(&token(&ring_other(), SESSION, NOW + 1000)).unwrap());
+    assert_eq!(
+        f.on_frame(&clock(NOW), at(NOW), 3, &foreign, &hub, &Stale),
+        Ingress::Rejected(BindError::Stale)
+    );
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 3, &foreign, &hub, &domain.policy()),
+        Ingress::Rejected(BindError::Token(_))
+    ));
+    assert_eq!(
+        f.on_frame(&clock(NOW), at(NOW), 5, &bind, &hub, &Lagging),
+        Ingress::Rejected(BindError::Stale)
+    );
+    assert_eq!(
+        f.on_frame(&clock(NOW), at(NOW), 6, &bind, &hub, &Down),
         Ingress::Rejected(BindError::Unavailable)
     );
     assert!(matches!(
