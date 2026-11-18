@@ -146,6 +146,15 @@ fn epoch() -> ConfigurationEpoch {
     ConfigurationEpoch::new(1).unwrap()
 }
 
+/// Whether `ballot` is behind `promised`, as `coordd`'s store compares a
+/// submission's stamp with its fence.
+fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {
+    match ballot.compare_same_epoch(promised) {
+        Some(order) => order.is_lt(),
+        None => ballot.epoch < promised.epoch,
+    }
+}
+
 fn ballot(number: u64, leader: u8) -> Ballot {
     Ballot {
         epoch: epoch(),
@@ -295,6 +304,17 @@ struct Knobs {
     /// review). Without it, only the drawn batch fails and the journal
     /// goes on past it.
     fail_queue: bool,
+    /// Whether a voter's store is fenced at each promise, as `coordd`'s
+    /// voter fences its journaled store (`JournaledStore::fence`): the
+    /// batches still queued under a ballot the promise left behind are
+    /// refused, definitely not committed, and every other is kept, the
+    /// promise row and what was submitted after it among them. `coordd`'s
+    /// voter journals what it queued before it fences (`Voter::fence`);
+    /// this doesn't, so it refuses more than `coordd` would. Execution
+    /// groups are kept: `coordd` replans a refused application from the
+    /// frontier the domain reports, which the simulator's group stands
+    /// for already.
+    fence: bool,
     /// Chance per step a follower is crashed while a batch writes the
     /// payload row of a command whose dependency row is durable there
     /// without one (task-d90, point 4): restored, the record holds the
@@ -412,6 +432,7 @@ impl Knobs {
         capacity: CAPACITY,
         payload_fail: 0,
         fail_queue: false,
+        fence: true,
         payload_crash: 0,
         drop_payload_rows: false,
         gate_crash: 0,
@@ -685,6 +706,12 @@ struct Node {
     promised_out: Option<Ballot>,
     /// Highest durable promise row seen.
     durable_promise: Option<Ballot>,
+    /// The ballot each queued batch was submitted under: the one the
+    /// node's machine was promised at when it submitted it, as `coordd`'s
+    /// store stamps a submission with its voter's ballot (`Knobs::fence`).
+    stamps: BTreeMap<BarrierId, Ballot>,
+    /// The ballot the store was last fenced at since the node booted.
+    fenced: Option<Ballot>,
 }
 
 /// The rules every candidate here selects under: one build everywhere,
@@ -704,6 +731,14 @@ enum Input {
 impl Node {
     fn alive(&self) -> bool {
         self.role.is_some()
+    }
+
+    /// The ballot the node's machine is promised at; `None` while down.
+    fn promised(&self) -> Option<Ballot> {
+        match self.role.as_ref()? {
+            Role::Leader(l) => Some(l.ballots().promised()),
+            Role::Follower(f) => Some(f.ballots().promised()),
+        }
     }
 
     /// Count executions durable only as the journal holds their groups
@@ -999,6 +1034,8 @@ struct Stats {
     /// failure, as a vote batch and then the adoption batch behind it
     /// (#197 review).
     queue_orders: u32,
+    /// Batches a fence at a promise refused (`Knobs::fence`).
+    fenced: u32,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -1128,6 +1165,8 @@ impl Sim {
                 boot: 1,
                 promised_out: None,
                 durable_promise: None,
+                stamps: BTreeMap::new(),
+                fenced: None,
             });
         }
         let mut sim = Sim {
@@ -1280,6 +1319,20 @@ impl Sim {
                             .retain(|u| u.collection != payloads || u.value.is_none());
                     }
                     let node = &mut self.nodes[usize::from(i)];
+                    if let Some(promised) = node.promised() {
+                        if node.stamps.len() > 4 * node.journal.len() + 64 {
+                            let queued: BTreeSet<BarrierId> = node
+                                .journal
+                                .iter()
+                                .filter_map(|e| match e {
+                                    Entry::Batch(b) => Some(*b),
+                                    Entry::Group(_) => None,
+                                })
+                                .collect();
+                            node.stamps.retain(|b, _| queued.contains(b));
+                        }
+                        node.stamps.insert(batch.barrier, promised);
+                    }
                     node.journal.push_back(Entry::Batch(batch.barrier));
                     node.storage.submit(batch);
                 }
@@ -1808,6 +1861,57 @@ impl Sim {
         }
         self.handle(i, effects);
         self.convert(i);
+        self.fence(i);
+    }
+
+    /// Fence node `i`'s store at its promise once the promise has moved
+    /// past the last fence (`Knobs::fence`), as `coordd`'s voter does after
+    /// the step that promised and any change of role it led to: what is
+    /// still queued under a ballot left behind is refused, definitely not
+    /// committed, in journal order, and fed to the machine; the rest is
+    /// kept, in order.
+    fn fence(&mut self, i: u8) {
+        if !self.knobs.fence {
+            return;
+        }
+        let node = &mut self.nodes[usize::from(i)];
+        let Some(promised) = node.promised() else {
+            return;
+        };
+        if node.fenced.is_some_and(|f| !obsolete(&f, &promised)) {
+            return;
+        }
+        node.fenced = Some(promised);
+        let mut refused = Vec::new();
+        let stamps = &node.stamps;
+        node.journal.retain(|e| match e {
+            Entry::Batch(b) if stamps.get(b).is_some_and(|s| obsolete(s, &promised)) => {
+                refused.push(*b);
+                false
+            }
+            _ => true,
+        });
+        let error = coord_core::event::StorageError::DefinitelyNotCommitted;
+        for barrier in refused {
+            let node = &mut self.nodes[usize::from(i)];
+            node.stamps.remove(&barrier);
+            node.failable.remove(&barrier);
+            if !node.storage.fail(barrier, error) {
+                continue;
+            }
+            self.stats.fenced += 1;
+            self.note(|| format!("fenced node {i} {barrier:?} at {}", bn(&promised)));
+            if self.nodes[usize::from(i)].role.is_none() {
+                continue;
+            }
+            self.step_node(
+                i,
+                Event::Storage(StorageEvent::Failed {
+                    barrier_id: barrier,
+                    error,
+                }),
+            );
+        }
     }
 
     fn admit(&mut self, seq: u64, key: u8, variant: u8, at: &[u8]) {
@@ -2756,6 +2860,8 @@ impl Sim {
         node.journal.clear();
         node.payload_window.clear();
         node.failable.clear();
+        node.stamps.clear();
+        node.fenced = None;
         node.storage.crash();
         // What its materializer executed past its durable groups is gone
         // with the journal (task-d90).
@@ -2854,6 +2960,9 @@ impl Sim {
         };
         self.handle(i, effects);
         self.convert(i);
+        // `coordd`'s voter fences its store at the ballot it campaigns at
+        // (`Voter::campaign`).
+        self.fence(i);
     }
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
@@ -4316,6 +4425,10 @@ fn row_knobs(row: u8) -> Knobs {
         Ok("1") => knobs.fail_queue = true,
         _ => {}
     }
+    // `PROTOCOL_SIM_FENCE=0` leaves a voter's store unfenced at a promise.
+    if std::env::var("PROTOCOL_SIM_FENCE").as_deref() == Ok("0") {
+        knobs.fence = false;
+    }
     knobs
 }
 
@@ -4407,6 +4520,7 @@ fn run_row(row: u8) {
                         totals.payload_failures += s.payload_failures;
                         totals.queue_failures += s.queue_failures;
                         totals.queue_orders += s.queue_orders;
+                        totals.fenced += s.fenced;
                         totals.restored_without_payload += s.restored_without_payload;
                         totals.cut_released += s.cut_released;
                         totals.cut_durable += s.cut_durable;
@@ -4758,11 +4872,14 @@ fn rows_with_donors_that_kept_no_rows() {
 /// it, and no voter of one epoch withholds it in `coordd`.
 #[test]
 fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
+    // Both were found before the simulator fenced a store at a promise.
     let mut row_12 = kept_knobs(12, false, None, None);
     row_12.forget_rows = 300_000;
+    row_12.fence = false;
     let mut row_1 = kept_knobs(1, false, None, None);
     row_1.forget_rows = 300_000;
     row_1.answer_on_release = 500_000;
+    row_1.fence = false;
     let outcomes = [
         ("row 12, seed 22", run_knobs(3, row_12, 22, Some(true))),
         (
@@ -5103,6 +5220,11 @@ struct Kept {
     campaign: Option<u32>,
     #[serde(default)]
     crash: Option<u32>,
+    /// Whether it found it with each voter's store fenced at its promises
+    /// (`Knobs::fence`); absent, not. Every seed kept before the fence was
+    /// found without it, and runs as it was found.
+    #[serde(default)]
+    fence: bool,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
@@ -5144,6 +5266,7 @@ impl Kept {
         if let Some(crash) = self.crash {
             knobs.crash = crash;
         }
+        knobs.fence = self.fence;
         run_knobs(self.voters, knobs, self.seed, self.catch_up)
     }
 }
@@ -5218,6 +5341,7 @@ fn seeds_from_the_environment() {
                 totals.unreported_drops += s.unreported_drops;
                 totals.unreported_drop_runs += s.unreported_drop_runs;
                 totals.bound_unreported += s.bound_unreported;
+                totals.fenced += s.fenced;
             }
             Err(e) => failures.push(e),
         }
@@ -5225,7 +5349,7 @@ fn seeds_from_the_environment() {
     println!(
         "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}), \
          unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
-         failed {}",
+         fenced {}, failed {}",
         v[2],
         v[3],
         totals.behind,
@@ -5233,6 +5357,7 @@ fn seeds_from_the_environment() {
         totals.unreported_drops,
         totals.unreported_drop_runs,
         totals.bound_unreported,
+        totals.fenced,
         failures.len()
     );
     assert_none_failed(&failures);
