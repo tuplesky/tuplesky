@@ -1085,6 +1085,8 @@ pub struct Domain<P: Persistence> {
     /// The loop's hand-offs to the runtime, by what made each (#256
     /// review).
     hand_offs: coord_daemon::metrics::HandOffs,
+    /// Why the loop flushed (task-d73).
+    flush_causes: coord_daemon::metrics::FlushCauses,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1771,6 +1773,17 @@ async fn unless_ready<F: std::future::Future>(work: F, before_waiting: impl FnOn
     }
 }
 
+/// Why the loop lowered (task-d73's reading).
+#[derive(Clone, Copy, Debug)]
+enum Flush {
+    /// Nothing more was ready.
+    Idle,
+    /// `FLUSH_EVENTS` events since the last flush.
+    Events,
+    /// `FLUSH_QUEUED` batches queued.
+    Queued,
+}
+
 /// Whether the loop lowers before it takes another event: a full journal
 /// group's worth is queued, or a run of events left a flush owed.
 ///
@@ -2005,6 +2018,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             since_flush_api: 0,
             flushes: coord_daemon::metrics::Flushes::default(),
             hand_offs: coord_daemon::metrics::HandOffs::default(),
+            flush_causes: coord_daemon::metrics::FlushCauses::default(),
             budgets,
             recorder,
             pacing: Pacing::default(),
@@ -2152,6 +2166,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
             },
             table_full: voter.node().table_full(),
+            flush_causes: self.flush_causes,
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
@@ -2677,7 +2692,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // What the events so far owe the runtime goes before the
                 // flush, not after it (task-d115, lever 8).
                 self.hand_off_for(coord_daemon::metrics::HandOff::Flush);
-                if self.stops_on_flush(transport) {
+                let cause = if self.queued() >= FLUSH_QUEUED && !appending {
+                    Flush::Queued
+                } else {
+                    Flush::Events
+                };
+                if self.stops_on_flush(transport, cause) {
                     return;
                 }
             }
@@ -2831,7 +2851,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = std::future::ready(()), if owes_flush => {
                         // Work, not waiting: it is counted as busy.
                         self.pacing.woke();
-                        if self.stops_on_flush(transport) {
+                        if self.stops_on_flush(transport, Flush::Idle) {
                             return;
                         }
                         continue;
@@ -2874,7 +2894,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = std::future::ready(()), if owes_flush => {
                         // Work, not waiting: it is counted as busy.
                         self.pacing.woke();
-                        if self.stops_on_flush(transport) {
+                        if self.stops_on_flush(transport, Flush::Idle) {
                             return;
                         }
                         continue;
@@ -3543,7 +3563,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Lower what the voter's rounds left queued as one group and send
     /// what that released (task-d47). Returns whether the voter must
     /// stop: it cannot make its transitions durable, or it is fenced.
-    fn stops_on_flush(&mut self, api: &Transport) -> bool {
+    fn stops_on_flush(&mut self, api: &Transport, cause: Flush) -> bool {
         let taken = u64::from(self.since_flush);
         let from_api = u64::from(self.since_flush_api);
         self.flushes.count(from_api, taken.saturating_sub(from_api));
@@ -3552,6 +3572,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };
+        match cause {
+            Flush::Idle => self.flush_causes.idle += 1,
+            Flush::Events => self.flush_causes.events += 1,
+            Flush::Queued => self.flush_causes.queued += 1,
+        }
+        if voter.appending() {
+            self.flush_causes.appending += 1;
+        }
         // What the journal append released goes out before the execution
         // group's projection commit, and the group's results after it.
         let journaled = voter.flush();

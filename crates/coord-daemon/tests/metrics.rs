@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Flushes, Frontiers, Gate,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, FlushCauses, Flushes, Frontiers, Gate,
     HandOffs, Headroom, History, Interval, Jobs, JournalGroups, Lane, LaneReading, Latency,
     MAX_REPORTED_PATHS, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Offers, OldestWait, Path,
     PipelineWaits, Plane, ProposalBytes, Reads, Recorder, Relay, Release, ReleaseDistributions,
@@ -560,6 +560,12 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 executed_bytes: 2_520_000,
             },
             table_full: 31,
+            flush_causes: FlushCauses {
+                idle: 5000,
+                events: 40,
+                queued: 2,
+                appending: 900,
+            },
         }),
         // A replica is named by four bytes, as the log lines name it: not
         // an identity-shaped run.
