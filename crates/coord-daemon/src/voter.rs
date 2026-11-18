@@ -35,8 +35,8 @@
 //! from looking like a quorum.
 
 use coord_collector::{
-    IngressError, MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, admitted_from_submit,
-    decode_read, read_answer_frame,
+    FreshnessAnswerV1, IngressError, MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal,
+    admitted_from_submit, decode_freshness, decode_read, freshness_answer_frame, read_answer_frame,
 };
 use coord_core::effect::{BootId, PeerId};
 use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
@@ -845,6 +845,16 @@ impl<P: Persistence> Voter<P> {
         }
     }
 
+    /// Whether this voter leads a ballot in which it has proposed
+    /// nothing yet (#320). Such a leader has no read index, so it refuses
+    /// every read and every freshness ask (`ReadRefusal::NothingProposed`)
+    /// until something is proposed. A read is ordered instead, which
+    /// proposes; an ask is not, so the serve loop has the leader propose
+    /// (it takes lease authority again).
+    pub fn leads_with_nothing_proposed(&self) -> bool {
+        self.leading().is_some_and(|l| l.index.is_none())
+    }
+
     /// A current read a collector sent this voter as the leader it
     /// follows, from `origin` (task-d50; design Section 6.3).
     ///
@@ -872,6 +882,33 @@ impl<P: Persistence> Voter<P> {
         out
     }
 
+    /// A freshness ask a voter's frontend sent this voter as the leader
+    /// it follows, from `origin` (#320).
+    ///
+    /// Held at the read barrier as a read is, and answered on a read's
+    /// two conditions with the position this leader had executed
+    /// through then; or refused at once. Either way the answer goes back
+    /// in [`Outbound::reads`]. A frame that does not decode as an ask is
+    /// dropped: the frontend that sent it asks again.
+    pub fn on_freshness_ask(
+        &mut self,
+        frame: &coord_types::wire_v1::Frame,
+        origin: Origin,
+        now: MonotonicMillis,
+    ) -> Outbound {
+        let mut out = Outbound::default();
+        let Ok(ask) = decode_freshness(frame) else {
+            return out;
+        };
+        let leading = self.leading();
+        if let Err((origin, answer)) = self.reads.admit_ask(origin, ask, leading, now) {
+            push_freshness(&mut out, origin, &answer);
+            return out;
+        }
+        out.absorb(self.pump_reads(now));
+        out
+    }
+
     /// When the round a read this leader holds waits for may start, if it
     /// waits on [`crate::reads::ROUND_SPACING_MILLIS`]: the serve loop
     /// wakes then, since on an idle domain nothing else arrives to pump
@@ -892,7 +929,7 @@ impl<P: Persistence> Voter<P> {
         // A materialization may also be what a release published again
         // waited for (task-d100, step A).
         let mut out = self.publish_releases_again();
-        if self.reads.held() == 0 {
+        if !self.reads.holds_any() {
             self.reads_behind_at = None;
             return out;
         }
@@ -919,6 +956,25 @@ impl<P: Persistence> Voter<P> {
                     ));
                 }
             }
+        }
+        // The freshness asks first (#320): they share the reads' rounds,
+        // and `take_due` drops the rounds that have aged out.
+        let answers = match self.node.machine() {
+            Machine::Leader(leader) => self.reads.take_due_asks(
+                leading,
+                now,
+                |index| leader.executed_below(index),
+                leader.executed_through(),
+            ),
+            Machine::Follower(_) => self.reads.take_due_asks(
+                None,
+                now,
+                |_| false,
+                coord_types::ids::ExecutionPosition::ZERO,
+            ),
+        };
+        for (origin, answer) in answers {
+            push_freshness(&mut out, origin, &answer);
         }
         let (due, refused) = match self.node.machine() {
             Machine::Leader(leader) => self.reads.take_due(
@@ -1318,6 +1374,14 @@ fn highest(a: Ballot, b: Ballot) -> Ballot {
 /// Queue `answer` for `origin`'s collector.
 fn push_answer(out: &mut Outbound, origin: Origin, answer: &ReadAnswerV1) {
     if let Ok(frame) = read_answer_frame(answer) {
+        out.reads.push((origin, frame));
+    }
+}
+
+/// Queue a freshness ask's answer for `origin`'s frontend (#320), on
+/// the way a read's answer goes.
+fn push_freshness(out: &mut Outbound, origin: Origin, answer: &FreshnessAnswerV1) {
+    if let Ok(frame) = freshness_answer_frame(answer) {
         out.reads.push((origin, frame));
     }
 }

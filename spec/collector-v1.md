@@ -65,6 +65,19 @@ anyone else or no answer within 1.5 s orders the read as a `Submit`
 instead (task-d50). The answer goes through the same output gate as an
 ordered result.
 
+A voter's frontend answers from that voter's policy only while it is
+fresh (#320). Every half allowance (`[limits]
+max_policy_staleness_millis`, 5 s by default), it sends `Freshness`
+(`0x0108`) to the leader of the ballot the voter follows, or asks its
+own voter when that voter leads. The leader answers `FreshnessAnswer`
+(`0x0703`) with how far it had executed once a later round confirmed
+its ballot. The voter takes the answer only from the voter it asked,
+and once its committed projection has reached that position, the ask's
+send time is its stamp: the policy answers while the stamp is within
+the allowance. Past it, a bind is refused as unavailable, output is
+held as pending and a watch closes as source-lost. A process with no
+voter is never fresh, and refuses every bind.
+
 ## Admission
 
 A request enters through the admission interface with the connection's

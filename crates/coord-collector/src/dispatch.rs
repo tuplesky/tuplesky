@@ -459,22 +459,32 @@ impl Dispatcher {
     /// complete-revision batches chunked with `complete` on the last
     /// chunk, progress, and the close. `authorize` is the output
     /// authorization of each selected batch (task-37 binds it to one
-    /// fresh policy barrier per bounded pump).
+    /// fresh policy barrier per bounded pump). A batch it denies closes
+    /// the watch as unauthorized; one it cannot decide closes it as
+    /// source-lost, at the same last complete revision.
     pub fn pump_watch(
         &mut self,
         hub: &WatchHub,
         connection: u64,
         watch_id: u64,
         max_items: usize,
-        mut authorize: impl FnMut(&WatchBatch) -> bool,
+        mut authorize: impl FnMut(&WatchBatch) -> BatchVerdict,
     ) -> Vec<Vec<u8>> {
         let Some(id) = self.watches.get(&(connection, watch_id)).copied() else {
             return Vec::new();
         };
         let mut out = Vec::new();
         let mut taken = 0;
+        let mut undecided = false;
         while taken < max_items
-            && let Some(item) = hub.next(id, &mut authorize)
+            && let Some(item) = hub.next(id, |batch| match authorize(batch) {
+                BatchVerdict::Permit => true,
+                BatchVerdict::Deny => false,
+                BatchVerdict::Undecided => {
+                    undecided = true;
+                    false
+                }
+            })
         {
             taken += 1;
             match item {
@@ -511,9 +521,18 @@ impl Dispatcher {
                     last_complete_revision,
                 } => {
                     self.watches.remove(&(connection, watch_id));
+                    // The hub closes a batch that was not permitted as
+                    // unauthorized. One that could not be decided is not
+                    // a refusal: the caller is told the source is lost,
+                    // and resumes from the same revision.
+                    let reason = if undecided && matches!(reason, CloseReason::Unauthorized) {
+                        WatchCloseReasonV1::SourceLost
+                    } else {
+                        close_reason(reason)
+                    };
                     out.push(close_frame(
                         watch_id,
-                        close_reason(reason),
+                        reason,
                         (last_complete_revision.get() > 0).then_some(last_complete_revision),
                     ));
                     break;
@@ -1066,6 +1085,21 @@ fn close_frame(watch_id: u64, reason: WatchCloseReasonV1, last: Option<KvRevisio
     })
     .encode()
     .expect("bounded")
+}
+
+/// What a watch's output authorization decided for one selected batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchVerdict {
+    /// The batch may be delivered.
+    Permit,
+    /// Current policy does not permit it: the watch closes as
+    /// unauthorized.
+    Deny,
+    /// This node cannot decide now (its policy may be behind the
+    /// domain's, #312): nothing is delivered, and the watch closes as
+    /// source-lost at its last complete revision, which the caller
+    /// resumes from.
+    Undecided,
 }
 
 const fn close_reason(reason: CloseReason) -> WatchCloseReasonV1 {

@@ -169,6 +169,17 @@ pub const KIND_COLLECTOR_READ: u16 = 0x0107;
 /// The only schema version of a collector read this build understands.
 pub const COLLECTOR_READ_VERSION: u16 = 1;
 
+/// A voter's freshness ask, sent by the frontend beside it to the leader
+/// of the ballot the voter follows (#320): has that leader, confirmed by
+/// a quorum after the ask arrived, executed everything committed before
+/// it, and through which execution position? A raw kind of the API
+/// range like [`KIND_COLLECTOR_READ`], admitted on the same terms. Its
+/// payload is `coord_collector::wire::FreshnessAskV1`.
+pub const KIND_COLLECTOR_FRESHNESS: u16 = 0x0108;
+
+/// The only schema version of a freshness ask this build understands.
+pub const COLLECTOR_FRESHNESS_VERSION: u16 = 1;
+
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
