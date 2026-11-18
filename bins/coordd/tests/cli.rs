@@ -1958,13 +1958,23 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let answered = tokio::time::timeout(Duration::from_secs(10), try_ask(&connection, &bind))
         .await
         .unwrap_or_else(|_| panic!("a frontend held a binding:\n{}", daemon.said()));
+    // A refusal ends the bind stream unanswered and closes the
+    // connection after it, so the read can see either first: an empty
+    // stream is a refusal only if the close that follows it says so.
+    let closed = match &answered {
+        Err(lost) => Some(lost.clone()),
+        Ok(None) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .ok(),
+        Ok(Some(_)) => None,
+    };
     assert!(
         matches!(
-            &answered,
-            Err(quinn::ConnectionError::ApplicationClosed(close))
+            &closed,
+            Some(quinn::ConnectionError::ApplicationClosed(close))
                 if close.reason[..] == b"bind refused"[..]
         ),
-        "a frontend with no voter took a binding: {answered:?}\n{}",
+        "a frontend with no voter took a binding: {answered:?} then {closed:?}\n{}",
         daemon.said()
     );
     let said = daemon.said();
