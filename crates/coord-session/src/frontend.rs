@@ -390,6 +390,12 @@ impl BoundFrontend {
             Ok(b) => b,
             Err(_) => return Ingress::Rejected(BindError::Malformed),
         };
+        // A node that can't decide from its policy now refuses before it
+        // reads the credential, so its refusal is the same for every
+        // token and the caller may keep the one it has (#320 follow-up).
+        if !policy.fresh() {
+            return Ingress::Rejected(BindError::Stale);
+        }
         let existing = self.bindings.get(&connection);
         let binding = match verify_bind(&self.config, bind.token.as_slice(), clock, existing) {
             Ok(b) => b,
@@ -405,9 +411,10 @@ impl BoundFrontend {
         self.sessions_checked += 1;
         let barrier = match policy.barrier(self.config.namespace(), &binding.session) {
             Ok(b) => b,
+            Err(PolicyError::Stale) => return Ingress::Rejected(BindError::Stale),
             // Replicated policy cannot be read, so whether the session
             // exists is not known. Nothing is bound on a guess.
-            Err(_) => return Ingress::Rejected(BindError::Unavailable),
+            Err(PolicyError::Unavailable) => return Ingress::Rejected(BindError::Unavailable),
         };
         match barrier.session_record() {
             Some(record) if binding.agrees_with(record) => {

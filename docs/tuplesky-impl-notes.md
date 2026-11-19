@@ -10998,69 +10998,6 @@ window.
   its first reading, the rows exported by kind at two positions, waits
   for it.
 
-## A fresh proposal's acceptance in its proposal batch (task-d89)
-
-task-d84's reading had the leader syncing three times a command at one
-caller, each once the one before it was durable: the proposal row, its
-ACCEPT row, and the execution group. When the dependency guard passes as
-the leader proposes, the proposal batch now carries the ACCEPT row
-(design Section 4.7). The leader accepts each of its own proposals as it
-proposes it, so every later command's guard passes too: in steady state
-every fresh proposal takes the merged batch, at any load. Learning starts
-from ACCEPT, so the old order also kept the leader from committing a
-command before its proposal was durable; that gate is now explicit
-(`Learner::commit_learned_where`), and a model test pins it.
-
-**The reading.** task-d84's script, base #179's head (`df72e28`)
-against the head, alternating, two runs a side, three voters on one host,
-stores on the local disk, 2,500 operations at 1 and 10 callers. CPU is
-every voter's process a command, summed. Latency is the bench's `service`
-time for puts.
-
-| profile | callers | side | `ok`/s | leader syncs/cmd | leader protocol groups/cmd | syncs/cmd, voter mean | CPU/cmd, all voters (ms) | put p50 (ms) | put p99 (ms) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| strict | 1 | base | 755, 779 | 2.91 | 2.00 | 2.45 | 6.91, 6.43 | 2.06, 1.86 | 4.11, 4.20 |
-| strict | 1 | head | 831, 785 | 2.00 | 1.00 | 2.13 | 6.00, 6.23 | 1.76, 1.83 | 3.11, 4.60 |
-| strict | 10 | base | 1648, 1632 | 1.14, 1.16 | 0.98, 1.00 | 1.10 | 3.87, 3.90 | 5.55, 5.55 | 14.6, 15.2 |
-| strict | 10 | head | 1714, 1624 | 0.99, 0.98 | 0.66 | 1.03 | 3.59, 3.71 | 5.33, 5.52 | 12.6, 16.2 |
-| replay | 1 | base | 846, 866 | 2.91 | 2.00 | 2.45 | 5.75, 5.68 | 1.68, 1.64 | 5.92, 7.98 |
-| replay | 1 | head | 884, 853 | 2.00 | 1.00 | 2.15 | 5.47, 5.55 | 1.55, 1.57 | 8.73, 9.77 |
-| replay | 10 | base | 1822, 1804 | 1.13, 1.06 | 0.93 | 1.06 | 3.29, 3.32 | 5.09, 5.13 | 15.3, 16.2 |
-| replay | 10 | head | 1780, 1892 | 0.91, 0.90 | 0.61 | 1.01 | 3.35, 3.22 | 5.21, 4.49 | 14.6, 15.6 |
-
-**What it says:**
-- **The leader's second sync is gone.** At one caller its protocol groups
-  fall from two a command to one, and its syncs from 2.91 to 2.00, as
-  task-d84's reading predicted. At ten callers its syncs fall 14 to 18%.
-- **CPU falls with them,** 3 to 10% over the voters at one caller, and
-  flat to 5% at ten.
-- **Latency moves less than a sync.** A sync on this host's disk is
-  about 0.3 ms, and at one caller the put p50 falls 0.1 to 0.3 ms. The
-  p99 at one caller under `replay` is worse in both head runs, 8.7 and
-  9.8 ms against 5.9 and 8.0, above both base runs. The base's own two
-  runs differ by 2 ms, so two runs a side do not settle it.
-- **Read again at one caller under `replay` (#180 review):** six more
-  runs a side, alternating, with the same binaries. The host was about
-  40% slower than for the table above (`ok`/s about 530 against 860), so
-  these runs are compared with each other only.
-
-  | side | `ok`/s | put p50 (ms) | put p99 (ms) | CPU/cmd, all voters (ms) |
-  | --- | --- | --- | --- | --- |
-  | base | 475 to 550 | 2.59 to 2.97 | 9.0, 10.1, 10.5, 11.5, 12.2, 14.4 (median 11.0) | 8.50 to 9.27 |
-  | head | 504 to 571 | 2.42 to 2.59 | 6.4, 6.9, 8.8, 9.5, 12.7, 13.9 (median 9.1) | 7.84 to 8.53 |
-
-  The head's p99 isn't worse: its median is lower, and the two sides'
-  ranges overlap. Its p50 and CPU are lower in every pair, and its
-  `ok`/s is higher in five pairs of six. So the first reading's p99 was
-  noise. That fits the change: the gate keeps the leader's commit where
-  it was, after the proposal is durable, so nothing should add latency
-  at one caller. On the runner's disk a sync is about 2.3 ms, which is the
-  size the plan gave this lever.
-
-**Checks.** coord-consensus's suites. The protocol simulator at 1,000
-seeds a row and size, 13 of 13 with catch-up (1,009 s) and without
-(1,107 s).
-
 ## A disclosure the projection is behind for is held, not answered pending (task-d93)
 
 A follow-up to task-d74 (#167 review). The frontend's output gate reads
@@ -11188,6 +11125,69 @@ command.
 - **On the runner,** R2 sized a publication at the register row's
   length at 0.15 to 0.2 ms an operation over five voters. A third less
   is about −0.05 ms an operation. The batch's pairs read it.
+
+## A fresh proposal's acceptance in its proposal batch (task-d89)
+
+task-d84's reading had the leader syncing three times a command at one
+caller, each once the one before it was durable: the proposal row, its
+ACCEPT row, and the execution group. When the dependency guard passes as
+the leader proposes, the proposal batch now carries the ACCEPT row
+(design Section 4.7). The leader accepts each of its own proposals as it
+proposes it, so every later command's guard passes too: in steady state
+every fresh proposal takes the merged batch, at any load. Learning starts
+from ACCEPT, so the old order also kept the leader from committing a
+command before its proposal was durable; that gate is now explicit
+(`Learner::commit_learned_where`), and a model test pins it.
+
+**The reading.** task-d84's script, base #179's head (`df72e28`)
+against the head, alternating, two runs a side, three voters on one host,
+stores on the local disk, 2,500 operations at 1 and 10 callers. CPU is
+every voter's process a command, summed. Latency is the bench's `service`
+time for puts.
+
+| profile | callers | side | `ok`/s | leader syncs/cmd | leader protocol groups/cmd | syncs/cmd, voter mean | CPU/cmd, all voters (ms) | put p50 (ms) | put p99 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| strict | 1 | base | 755, 779 | 2.91 | 2.00 | 2.45 | 6.91, 6.43 | 2.06, 1.86 | 4.11, 4.20 |
+| strict | 1 | head | 831, 785 | 2.00 | 1.00 | 2.13 | 6.00, 6.23 | 1.76, 1.83 | 3.11, 4.60 |
+| strict | 10 | base | 1648, 1632 | 1.14, 1.16 | 0.98, 1.00 | 1.10 | 3.87, 3.90 | 5.55, 5.55 | 14.6, 15.2 |
+| strict | 10 | head | 1714, 1624 | 0.99, 0.98 | 0.66 | 1.03 | 3.59, 3.71 | 5.33, 5.52 | 12.6, 16.2 |
+| replay | 1 | base | 846, 866 | 2.91 | 2.00 | 2.45 | 5.75, 5.68 | 1.68, 1.64 | 5.92, 7.98 |
+| replay | 1 | head | 884, 853 | 2.00 | 1.00 | 2.15 | 5.47, 5.55 | 1.55, 1.57 | 8.73, 9.77 |
+| replay | 10 | base | 1822, 1804 | 1.13, 1.06 | 0.93 | 1.06 | 3.29, 3.32 | 5.09, 5.13 | 15.3, 16.2 |
+| replay | 10 | head | 1780, 1892 | 0.91, 0.90 | 0.61 | 1.01 | 3.35, 3.22 | 5.21, 4.49 | 14.6, 15.6 |
+
+**What it says:**
+- **The leader's second sync is gone.** At one caller its protocol groups
+  fall from two a command to one, and its syncs from 2.91 to 2.00, as
+  task-d84's reading predicted. At ten callers its syncs fall 14 to 18%.
+- **CPU falls with them,** 3 to 10% over the voters at one caller, and
+  flat to 5% at ten.
+- **Latency moves less than a sync.** A sync on this host's disk is
+  about 0.3 ms, and at one caller the put p50 falls 0.1 to 0.3 ms. The
+  p99 at one caller under `replay` is worse in both head runs, 8.7 and
+  9.8 ms against 5.9 and 8.0, above both base runs. The base's own two
+  runs differ by 2 ms, so two runs a side do not settle it.
+- **Read again at one caller under `replay` (#180 review):** six more
+  runs a side, alternating, with the same binaries. The host was about
+  40% slower than for the table above (`ok`/s about 530 against 860), so
+  these runs are compared with each other only.
+
+  | side | `ok`/s | put p50 (ms) | put p99 (ms) | CPU/cmd, all voters (ms) |
+  | --- | --- | --- | --- | --- |
+  | base | 475 to 550 | 2.59 to 2.97 | 9.0, 10.1, 10.5, 11.5, 12.2, 14.4 (median 11.0) | 8.50 to 9.27 |
+  | head | 504 to 571 | 2.42 to 2.59 | 6.4, 6.9, 8.8, 9.5, 12.7, 13.9 (median 9.1) | 7.84 to 8.53 |
+
+  The head's p99 isn't worse: its median is lower, and the two sides'
+  ranges overlap. Its p50 and CPU are lower in every pair, and its
+  `ok`/s is higher in five pairs of six. So the first reading's p99 was
+  noise. That fits the change: the gate keeps the leader's commit where
+  it was, after the proposal is durable, so nothing should add latency
+  at one caller. On the runner's disk a sync is about 2.3 ms, which is the
+  size the plan gave this lever.
+
+**Checks.** coord-consensus's suites. The protocol simulator at 1,000
+seeds a row and size, 13 of 13 with catch-up (1,009 s) and without
+(1,107 s).
 
 ## The waits' tails on the metrics line (task-d97)
 
@@ -11391,3 +11391,60 @@ each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
   transport admits a frame, on the first offer or a later one, so a frame
   kept and offered again is counted once. The table above was read before
   that, on one `send` a frame.
+
+## A voter's policy bounded in staleness: what the tests pin (#320)
+
+#320 bounds how long a voter's frontend answers from its own policy: it
+asks the leader it follows every half allowance (`Freshness`,
+`0x0108`), the leader answers once a round started after the ask
+arrived has confirmed and its read index has executed, and the voter
+stamps the ask's send time once its committed projection has reached
+the answer's position. Design 6.4 states the rule. The follow-up to
+#320's review adds the tests and limits below.
+
+- **A stale node refuses a bind before it reads the token.**
+  `PolicySource::fresh` is asked before the token is verified, and the
+  refusal is its own, `BindError::Stale`, closed as
+  `Rejected` with the reason "bind unavailable". A token that would
+  fail verification gets the same answer on a stale node as a good one
+  (`a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying`),
+  so the reason says nothing about the token. The kine client returns
+  `ErrBindUnavailable`, which the backend maps to gRPC `Unavailable`,
+  and keeps its token (`TestBindUnavailableKeepsTheToken`, with a
+  control that a refused token is still dropped once). The SDK's
+  `binding_unavailable` closes the connection and keeps the credential.
+- **An answer after the ballot moved still counts for the ask it
+  answers.** A later ballot's commits need a quorum that left the ask's
+  ballot after confirming, so they follow the ask's arrival, and the
+  answer covers only what was committed before it.
+  `an_answer_after_the_ballot_moved_still_stamps_its_send_time` pins
+  that the old leader's answer stamps its ask, an answer from the new
+  leader to an ask it never got is ignored, and the new leader's answer
+  to its own ask stamps that ask.
+- **A domain whose every voter is stale still turns fresh.** No client
+  write can be the first proposal, since no bind is admitted. A leader
+  with nothing proposed has no read index, so lease renewal proposes
+  `EstablishLeaseAuthority` for it.
+  `an_idle_leader_proposes_so_a_stale_domain_turns_fresh` pins the
+  wiring from `Expiry::renew` through the domain; without the renewal
+  the leader holds the ask and the voter stays stale
+  (`only_a_confirmed_ask_opens_the_policy`).
+- **One origin cannot take the leader's places.** A leader holds 256
+  asks, and 4 from one connection or its own voter
+  (`ASKS_HELD_PER_ORIGIN`). At most about three of a voter's asks can
+  still make it fresh, so 4 is room for those and one more.
+  `a_leader_holds_a_bounded_number_of_freshness_asks_from_each_origin`.
+- **End to end.** `a_cut_off_voter_stops_binding_and_binds_again_once_healed`
+  (`bins/coordd/tests/multi_host.rs`) runs three voters with a 2 s
+  allowance, stops two with `SIGSTOP`, and checks that the third goes
+  stale and refuses a bind ("a binding was refused: Stale" in its log)
+  past the allowance, then that it turns fresh and binds again once the
+  two continue. A revocation in between is not driven end to end:
+  coordd has no command that revokes a session, so the revocation half
+  stays with the `coord-session` tests.
+- **Left as is for alpha.** The allowance runs on the monotonic clock,
+  which stops in suspend: a voter resumed after a freeze answers for at
+  most what was left of one allowance. A leader built before #320
+  closes the link on `0x0108`, so a voter with the bound under it stays
+  stale; voters move to the bound together. The stale transition is a
+  log line, not a metric.

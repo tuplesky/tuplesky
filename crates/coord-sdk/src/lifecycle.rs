@@ -367,6 +367,15 @@ impl<P: CredentialProvider> Client<P> {
         self.pool.closed(connection);
     }
 
+    /// The frontend could not bind now (the connection closed as
+    /// `Rejected` with the reason "bind unavailable": its policy may be
+    /// behind the domain's). It said so before it read the credential,
+    /// so the cached credential is kept and the next connect, here later
+    /// or at another frontend, presents it again (#320 follow-up).
+    pub fn binding_unavailable(&mut self, connection: ConnectionId) {
+        self.pool.closed(connection);
+    }
+
     /// Submit a new operation with `deadline_ms` (0: none).
     pub fn submit(
         &mut self,
