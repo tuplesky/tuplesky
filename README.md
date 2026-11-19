@@ -17,7 +17,11 @@ cluster and restoring from a backup,
 [Kubernetes certification](docs/operations/kubernetes-certification.md) for
 the storage profile qualification and what it currently reports, and
 [WAN benchmarks](docs/operations/wan-benchmarks.md) for the measured matrix
-and how to read one of its runs.
+and how to read one of its runs, and
+[Jepsen tests](docs/operations/jepsen.md) for the native client a Jepsen test
+drives and what it has found.
+What changes for an operator from one build to the next is in the
+[release notes](docs/operations/release-notes.md).
 
 ```text
 cargo xtask check-tools --install   # pinned cargo-deny, cargo-nextest, mermaid-cli

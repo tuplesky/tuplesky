@@ -15,6 +15,7 @@
 //! bounds and the latter re-derives the digest, so no field can change after
 //! sealing.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -27,7 +28,7 @@ use coord_types::ids::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1};
+use crate::frontier::{CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT};
 use crate::stream::StorageStreamId;
 
 /// Durable record format version. Bumped only by a reviewed schema change;
@@ -39,12 +40,37 @@ pub const JOURNAL_RECORD_FORMAT_V1: u16 =
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Most logical updates in one record.
 pub const MAX_RECORD_UPDATES: usize = 4096;
-/// Longest ordered key in an update.
-pub const MAX_RECORD_KEY_BYTES: usize = 16 * 1024;
+/// Longest ordered key in an update: a row key of a logical key at its
+/// limit, escaped (each zero byte written as two), with its prefix and
+/// terminator, as a checkpoint's row bound allows. Two assertions hold it
+/// between them: `coord_storage::codecs`, that it is at least the longest
+/// row key a command writes, and `coord_checkpoint::manifest`, that it is at
+/// most a checkpoint's `MAX_ROW_KEY_BYTES`.
+///
+/// It was 16 KiB, which a key of 8 KiB zeros passes once escaped: the
+/// journal refused that put's batch and every voter stopped on it. A build
+/// from before the raise can't read a record holding such a key, so a
+/// voter that wrote one can't go back to it without a restore; no other
+/// record changes.
+pub const MAX_RECORD_KEY_BYTES: usize = 32 * 1024;
 /// Longest encoded value in an update (an envelope at its payload limit).
 pub const MAX_RECORD_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
 /// Predecessor digest of the first record of a stream.
 pub const GENESIS_PREDECESSOR: Digest32 = Digest32([0; 32]);
+/// The first record format whose records may hold a group's application
+/// outcomes ([`RecordBody::ApplicationGroup`]). This build reads it and
+/// writes [`JOURNAL_RECORD_FORMAT_V1`]: the writer of groups is its
+/// successor (the batching-rule doc's 10.7, steps 1a and 1b), and a voter
+/// can go back from that successor to this build.
+pub const JOURNAL_RECORD_FORMAT_GROUPS: u16 = 2;
+const _: () = assert!(
+    coord_types::formats::Format::JournalRecord.supports(JOURNAL_RECORD_FORMAT_GROUPS as u32)
+);
+
+/// Whether this build reads records of `format`.
+fn readable(format: u16) -> bool {
+    coord_types::formats::Format::JournalRecord.supports(format as u32)
+}
 
 /// Where a record comes from: the local identity and stream that wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +160,45 @@ pub enum RecordBody {
     PublishLocalCheckpoint(CheckpointPointerV1),
     /// Lifecycle metadata.
     Lifecycle(LifecycleRecordV1),
+    /// The application outcomes of a run of established commands, in
+    /// execution order: the same facts as one
+    /// [`RecordBody::ApplicationOutcome`] each, in one record (the
+    /// batching-rule doc's 10.7, step 1). Only in records of
+    /// [`JOURNAL_RECORD_FORMAT_GROUPS`] and later.
+    ///
+    /// The first outcome extends `base`, and each later one the position
+    /// before it. The updates are every outcome's, in order, so the
+    /// record's updates read as the per-command records' would one after
+    /// another.
+    ApplicationGroup {
+        /// Effect context, the same for every outcome.
+        context: TransitionContext,
+        /// Base the first outcome's plan was computed against.
+        base: ApplyBase,
+        /// Each command's outcome, in execution order.
+        outcomes: Vec<GroupOutcomeV1>,
+        /// Every outcome's complete immutable updates, in order.
+        updates: Vec<StoreUpdate>,
+    },
+}
+
+/// One command's application outcome in a
+/// [`RecordBody::ApplicationGroup`]: what a
+/// [`RecordBody::ApplicationOutcome`] carries but its context, its base
+/// and its updates, which the group holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupOutcomeV1 {
+    /// Execution position assigned: the one after the outcome before it,
+    /// or after the group's base for the first.
+    pub position: ExecutionPosition,
+    /// KV revision produced, if the command mutated KV.
+    pub revision: Option<KvRevision>,
+    /// Digest of the exact result.
+    pub result_digest: Digest32,
+    /// How many of the group's updates are this one's, taken in order
+    /// after those of the outcomes before it. A command that changed no
+    /// rows has none, and still took its position.
+    pub updates: u32,
 }
 
 impl RecordBody {
@@ -142,8 +207,36 @@ impl RecordBody {
     pub fn updates(&self) -> &[StoreUpdate] {
         match self {
             RecordBody::ProtocolTransition { updates, .. }
-            | RecordBody::ApplicationOutcome { updates, .. } => updates,
+            | RecordBody::ApplicationOutcome { updates, .. }
+            | RecordBody::ApplicationGroup { updates, .. } => updates,
             RecordBody::PublishLocalCheckpoint(_) | RecordBody::Lifecycle(_) => &[],
+        }
+    }
+
+    /// How the record moves the execution frontier: the base its first
+    /// application outcome extends, and the position its last takes.
+    /// `None` for a record that holds no application outcome.
+    pub fn execution(&self) -> Option<(ApplyBase, ExecutionPosition)> {
+        match self {
+            RecordBody::ApplicationOutcome { base, position, .. } => Some((*base, *position)),
+            RecordBody::ApplicationGroup { base, outcomes, .. } => {
+                outcomes.last().map(|last| (*base, last.position))
+            }
+            RecordBody::ProtocolTransition { .. }
+            | RecordBody::PublishLocalCheckpoint(_)
+            | RecordBody::Lifecycle(_) => None,
+        }
+    }
+
+    /// How many established commands' application outcomes the record
+    /// holds.
+    pub fn application_outcomes(&self) -> usize {
+        match self {
+            RecordBody::ApplicationOutcome { .. } => 1,
+            RecordBody::ApplicationGroup { outcomes, .. } => outcomes.len(),
+            RecordBody::ProtocolTransition { .. }
+            | RecordBody::PublishLocalCheckpoint(_)
+            | RecordBody::Lifecycle(_) => 0,
         }
     }
 }
@@ -210,6 +303,17 @@ pub enum RecordError {
     TrailingBytes,
     /// Encoding is not a valid record.
     Malformed,
+    /// A group of application outcomes in a record of a format before
+    /// [`JOURNAL_RECORD_FORMAT_GROUPS`].
+    GroupBeforeItsFormat,
+    /// A group of no application outcomes.
+    EmptyGroup,
+    /// A group's outcomes don't account for exactly its updates.
+    GroupUpdatesMismatch,
+    /// The bytes decode to a valid record but are not its encoding: a
+    /// varint written longer than it needs, which decodes to the same
+    /// value. No encoder of this format writes one.
+    NonCanonical,
 }
 
 impl fmt::Display for RecordError {
@@ -286,15 +390,58 @@ struct RecordWireV1 {
     digest: Digest32,
 }
 
+/// [`RecordWireV1`] borrowed from a record: the same fields in the same
+/// order, so the same bytes, encoded without copying the body (task-d60).
+#[derive(Serialize)]
+#[serde(rename = "RecordWireV1")]
+struct RecordWireRefV1<'a> {
+    format: u16,
+    origin: &'a RecordOrigin,
+    seq: LocalJournalSeq,
+    predecessor: Digest32,
+    body: &'a RecordBody,
+    digest: Digest32,
+}
+
+/// A postcard flavor that appends to a caller's buffer.
+struct Append<'a>(&'a mut Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Append<'_> {
+    type Output = ();
+
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
+}
+
 /// An immutable complete record.
+///
+/// The body is shared: a sealed record never changes, and the storage
+/// path holds the same record in the group it appends and in what it
+/// materializes, so a clone is a reference count rather than a copy of
+/// every update (task-d60).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecordV1 {
     format: u16,
     origin: RecordOrigin,
     seq: LocalJournalSeq,
     predecessor: Digest32,
-    body: RecordBody,
+    body: Arc<RecordBody>,
     digest: Digest32,
+    /// The encoding's length, counted once where the record is made: at
+    /// [`Self::seal`], and at [`Self::decode`] as the bytes decoded. A
+    /// function of the fields above, so it never disagrees with them.
+    encoded_len: usize,
 }
 
 fn digest_of(
@@ -357,6 +504,7 @@ fn check_updates(updates: &[StoreUpdate]) -> Result<(), RecordError> {
 }
 
 fn check_body(
+    format: u16,
     origin: &RecordOrigin,
     seq: LocalJournalSeq,
     predecessor: &Digest32,
@@ -411,8 +559,52 @@ fn check_body(
             }
             check_update_sizes(updates)
         }
+        RecordBody::ApplicationGroup {
+            context,
+            base,
+            outcomes,
+            updates,
+        } => {
+            if format < JOURNAL_RECORD_FORMAT_GROUPS {
+                return Err(RecordError::GroupBeforeItsFormat);
+            }
+            if context.ballot.epoch != context.configuration
+                || base.configuration != context.configuration
+            {
+                return Err(RecordError::EpochMismatch);
+            }
+            // A record of nothing: no position taken, no row written.
+            if outcomes.is_empty() {
+                return Err(RecordError::EmptyGroup);
+            }
+            // Contiguous, as each per-command outcome is with its base:
+            // the first takes the position after the group's base, and
+            // each later one the position after the one before it.
+            let mut before = base.execution_position;
+            let mut counted = 0usize;
+            for outcome in outcomes {
+                let next = before
+                    .checked_next()
+                    .map_err(|_| RecordError::PositionNotAfterBase)?;
+                if outcome.position != next {
+                    return Err(RecordError::PositionNotAfterBase);
+                }
+                before = next;
+                counted = counted
+                    .checked_add(outcome.updates as usize)
+                    .ok_or(RecordError::GroupUpdatesMismatch)?;
+            }
+            if counted != updates.len() {
+                return Err(RecordError::GroupUpdatesMismatch);
+            }
+            check_update_sizes(updates)
+        }
         RecordBody::PublishLocalCheckpoint(pointer) => {
-            if pointer.format != LOCAL_CHECKPOINT_FORMAT_V1 {
+            // Any format a pointer has named decodes: the record's layout
+            // didn't change with the image's, and a journal that retains a
+            // pointer published before a raise must still open. The image
+            // is refused where it is loaded (#247, Codex).
+            if !(OLDEST_POINTER_FORMAT..=LOCAL_CHECKPOINT_FORMAT_V1).contains(&pointer.format) {
                 return Err(RecordError::UnsupportedFormat {
                     found: pointer.format,
                 });
@@ -426,7 +618,7 @@ fn check_body(
             Ok(())
         }
         RecordBody::Lifecycle(LifecycleRecordV1::Genesis { format }) => {
-            if *format != JOURNAL_RECORD_FORMAT_V1 {
+            if !readable(*format) {
                 return Err(RecordError::UnsupportedFormat { found: *format });
             }
             Ok(())
@@ -440,26 +632,47 @@ fn encode_body(body: &RecordBody) -> Result<Vec<u8>, RecordError> {
 }
 
 impl JournalRecordV1 {
-    /// Seal a draft: validate bounds and guards, derive the digest.
+    /// Seal a draft at the format this build writes: validate bounds and
+    /// guards, derive the digest.
     pub fn seal(draft: RecordDraft) -> Result<Self, RecordError> {
-        check_body(&draft.origin, draft.seq, &draft.predecessor, &draft.body)?;
+        Self::seal_as(JOURNAL_RECORD_FORMAT_V1, draft)
+    }
+
+    /// Seal a draft at `format`, one this build reads. A stream's writer
+    /// seals at the format it writes ([`Self::seal`]). This is for a
+    /// reader's fixtures: the records of a format its successor writes,
+    /// such as [`JOURNAL_RECORD_FORMAT_GROUPS`].
+    pub fn seal_as(format: u16, draft: RecordDraft) -> Result<Self, RecordError> {
+        if !readable(format) {
+            return Err(RecordError::UnsupportedFormat { found: format });
+        }
+        check_body(
+            format,
+            &draft.origin,
+            draft.seq,
+            &draft.predecessor,
+            &draft.body,
+        )?;
         let body_bytes = encode_body(&draft.body)?;
         let digest = digest_of(
-            JOURNAL_RECORD_FORMAT_V1,
+            format,
             &draft.origin,
             draft.seq,
             &draft.predecessor,
             &body_bytes,
         );
-        let record = JournalRecordV1 {
-            format: JOURNAL_RECORD_FORMAT_V1,
+        let mut record = JournalRecordV1 {
+            format,
             origin: draft.origin,
             seq: draft.seq,
             predecessor: draft.predecessor,
-            body: draft.body,
+            body: Arc::new(draft.body),
             digest,
+            encoded_len: 0,
         };
-        if record.encoded_len()? > MAX_RECORD_BYTES {
+        record.encoded_len = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if record.encoded_len > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
         }
         Ok(record)
@@ -482,7 +695,7 @@ impl JournalRecordV1 {
         self.predecessor
     }
     /// Body.
-    pub const fn body(&self) -> &RecordBody {
+    pub fn body(&self) -> &RecordBody {
         &self.body
     }
     /// Digest over format, origin, sequence, predecessor and body.
@@ -490,10 +703,32 @@ impl JournalRecordV1 {
         self.digest
     }
 
-    /// Verify the record against what the stream expects: origin fields,
-    /// index, predecessor chain and re-derived digest.
+    /// Verify the record against what the stream expects: its format,
+    /// origin fields, index and predecessor chain.
+    ///
+    /// The body's bounds and guards and the digest over the whole record
+    /// are not checked again here (#185, lead 17:43): they hold of every
+    /// value of this type.
+    /// - **A record is made two ways:** [`JournalRecordV1::seal`] checks
+    ///   the body and derives the digest from its encoding, and
+    ///   [`JournalRecordV1::decode`] checks the body and re-derives the
+    ///   digest from the bytes it read, refusing a mismatch.
+    /// - **Nothing changes it after that:** the fields are private and the
+    ///   body is shared immutably.
+    /// - **What that check protected against,** then, is only a record
+    ///   corrupted in this process's memory between its making and its
+    ///   append. Bytes corrupted after the append, on the way to the
+    ///   disk or on it, are what [`JournalRecordV1::decode`] refuses when
+    ///   they are read back, and a record received from elsewhere is
+    ///   decoded before it is a record.
+    ///
+    /// The append verifies every record a moment after this process
+    /// sealed it, and the body's encoding and digest again were 40% of
+    /// the appender's thread in testing's profile on the 9V45 runner
+    /// (#98). Debug builds still derive the digest again here, and stop
+    /// on a difference.
     pub fn verify(&self, expect: &RecordExpectation) -> Result<(), RecordError> {
-        if self.format != JOURNAL_RECORD_FORMAT_V1 {
+        if !readable(self.format) {
             return Err(RecordError::UnsupportedFormat { found: self.format });
         }
         if self.origin.cluster != expect.origin.cluster {
@@ -520,42 +755,88 @@ impl JournalRecordV1 {
         if self.predecessor != expect.predecessor {
             return Err(RecordError::PredecessorMismatch);
         }
-        check_body(&self.origin, self.seq, &self.predecessor, &self.body)?;
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            self.derived(),
+            Ok(self.digest),
+            "a record's digest no longer matches its body"
+        );
+        Ok(())
+    }
+
+    /// The body checked and the digest derived again from the record's
+    /// fields: what [`JournalRecordV1::seal`] and
+    /// [`JournalRecordV1::decode`] establish, for a debug build to check.
+    #[cfg(debug_assertions)]
+    fn derived(&self) -> Result<Digest32, RecordError> {
+        check_body(
+            self.format,
+            &self.origin,
+            self.seq,
+            &self.predecessor,
+            &self.body,
+        )?;
         let body_bytes = encode_body(&self.body)?;
-        let derived = digest_of(
+        Ok(digest_of(
             self.format,
             &self.origin,
             self.seq,
             &self.predecessor,
             &body_bytes,
-        );
-        if derived != self.digest {
-            return Err(RecordError::DigestMismatch);
-        }
-        Ok(())
+        ))
     }
 
-    /// Encoded length in bytes.
-    pub fn encoded_len(&self) -> Result<usize, RecordError> {
-        Ok(self.encode()?.len())
-    }
-
-    /// Durable encoding.
-    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let wire = RecordWireV1 {
+    fn wire(&self) -> RecordWireRefV1<'_> {
+        RecordWireRefV1 {
             format: self.format,
-            origin: self.origin,
+            origin: &self.origin,
             seq: self.seq,
             predecessor: self.predecessor,
-            body: self.body.clone(),
+            body: &self.body,
             digest: self.digest,
-        };
-        postcard::to_allocvec(&wire).map_err(|_| RecordError::TooLarge)
+        }
+    }
+
+    /// Encoded length in bytes, counted once when the record was sealed
+    /// or decoded.
+    pub fn encoded_len(&self) -> Result<usize, RecordError> {
+        Ok(self.encoded_len)
+    }
+
+    /// Durable encoding, into a buffer sized once.
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let mut buf = Vec::with_capacity(self.encoded_len);
+        self.encode_into(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Append the durable encoding to `buf`, the bytes [`Self::encode`]
+    /// returns. The room is reserved once, from the length counted when
+    /// the record was made, rather than grown a field at a time. On an
+    /// error `buf` is left as it was.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
+        let start = buf.len();
+        buf.reserve(self.encoded_len);
+        postcard::serialize_with_flavor(&self.wire(), Append(buf)).map_err(|_| {
+            buf.truncate(start);
+            RecordError::TooLarge
+        })?;
+        debug_assert_eq!(buf.len() - start, self.encoded_len);
+        Ok(())
     }
 
     /// Decode exactly: bounds are checked before nested allocation is
     /// trusted, the digest is re-derived, trailing bytes are rejected, and
     /// a decode error is never end of data.
+    ///
+    /// Only the record's own encoding is taken. A varint written longer
+    /// than it needs decodes to the same value, and the digest is derived
+    /// from the decoded fields and the body encoded again, so such bytes
+    /// would pass every other check while being longer than the record's
+    /// encoding (#284, Codex). They are refused, so a decoded record
+    /// encodes to exactly the bytes it was read from, and its stored
+    /// length is theirs. Every field encodes to at least its canonical
+    /// length, so equal lengths mean equal bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecordError::TooLarge);
@@ -568,10 +849,16 @@ impl JournalRecordV1 {
         if !rest.is_empty() {
             return Err(RecordError::TrailingBytes);
         }
-        if wire.format != JOURNAL_RECORD_FORMAT_V1 {
+        if !readable(wire.format) {
             return Err(RecordError::UnsupportedFormat { found: wire.format });
         }
-        check_body(&wire.origin, wire.seq, &wire.predecessor, &wire.body)?;
+        check_body(
+            wire.format,
+            &wire.origin,
+            wire.seq,
+            &wire.predecessor,
+            &wire.body,
+        )?;
         let body_bytes = encode_body(&wire.body)?;
         let derived = digest_of(
             wire.format,
@@ -583,13 +870,20 @@ impl JournalRecordV1 {
         if derived != wire.digest {
             return Err(RecordError::DigestMismatch);
         }
-        Ok(JournalRecordV1 {
+        let record = JournalRecordV1 {
             format: wire.format,
             origin: wire.origin,
             seq: wire.seq,
             predecessor: wire.predecessor,
-            body: wire.body,
+            body: Arc::new(wire.body),
             digest: wire.digest,
-        })
+            encoded_len: bytes.len(),
+        };
+        let canonical = postcard::experimental::serialized_size(&record.wire())
+            .map_err(|_| RecordError::TooLarge)?;
+        if canonical != bytes.len() {
+            return Err(RecordError::NonCanonical);
+        }
+        Ok(record)
     }
 }

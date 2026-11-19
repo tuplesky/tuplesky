@@ -147,7 +147,12 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
 
 fn peer(from: u8, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            r(from),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }
@@ -210,7 +215,7 @@ fn acknowledged(f: &mut Follower, seq: u64) -> (CommandId, ProtocolMessage) {
         released.extend(f.step(d));
     }
     let sent = sends(&released);
-    assert_eq!(sent.len(), 3, "two peers and the frontend");
+    assert_eq!(sent.len(), 2, "the leader and the frontend (task-d74)");
     let (_, ack) = sent
         .into_iter()
         .find(|(to, _)| *to == FRONTEND.replica)
@@ -267,16 +272,24 @@ fn a_leader_publishes_its_reply_again_to_the_frontend_only() {
         released.extend(l.step(d));
     }
     let first = sends(&released);
-    assert_eq!(first.len(), 3, "two proposals and the reply");
-    let reply = first
+    // Two proposals and the reply, and the leader's adoption to the
+    // frontend (task-d74): its acceptance rides in the proposal batch
+    // (task-d89).
+    assert_eq!(first.len(), 4, "{first:?}");
+    let to_frontend: Vec<ProtocolMessage> = first
         .iter()
-        .find(|(to, _)| *to == FRONTEND.replica)
+        .filter(|(to, _)| *to == FRONTEND.replica)
         .map(|(_, m)| m.clone())
-        .expect("the reply");
-    assert!(matches!(reply, ProtocolMessage::LeaderReply { command, .. } if command == c));
+        .collect();
+    let [reply, adoption] = to_frontend.as_slice() else {
+        panic!("the reply and the adoption: {to_frontend:?}")
+    };
+    assert!(matches!(reply, ProtocolMessage::LeaderReply { command, .. } if *command == c));
+    assert!(matches!(adoption, ProtocolMessage::SlowAck(a) if a.command == c));
 
+    // Both rest on the same durable batch, so a duplicate repairs both.
     let again = frontend_only(&l.step(admitted(1, 1, 1).0));
-    assert_eq!(again, vec![reply]);
+    assert_eq!(again, to_frontend);
     assert_eq!(l.take_rejections(), vec![Rejection::Duplicate(c)]);
     assert_eq!(l.evidence_repairs(&c), 1);
     assert!(
@@ -330,12 +343,21 @@ fn a_retried_proposal_is_replayed_under_its_retrys_barrier() {
     for d in durable_of(&retried, 2) {
         released.extend(l.step(d));
     }
-    let reply = sends(&released)
+    // Its reply and the leader's adoption, which rides in the same batch
+    // (task-d89).
+    let to_frontend: Vec<ProtocolMessage> = sends(&released)
         .into_iter()
-        .find(|(to, _)| *to == FRONTEND.replica)
+        .filter(|(to, _)| *to == FRONTEND.replica)
         .map(|(_, m)| m)
-        .expect("the retry's reply reached the frontend");
-    assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), vec![reply]);
+        .collect();
+    assert!(
+        matches!(
+            to_frontend.first(),
+            Some(ProtocolMessage::LeaderReply { .. })
+        ),
+        "the retry's reply reached the frontend: {to_frontend:?}"
+    );
+    assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), to_frontend);
     assert_eq!(l.take_rejections(), vec![Rejection::Duplicate(c)]);
     assert_eq!(l.evidence_repairs(&c), 1);
 }
@@ -352,8 +374,16 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
     let (c, _) = acknowledged(&mut f, 1);
     let accepted = f.payload(&c).expect("held").admission_digest();
 
+    // Nothing replayed: only the reason, to the frontend (task-d22).
     let effects = f.step(presented(1, 1, 1, 8).0);
-    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(
+        frontend_only(&effects),
+        vec![ProtocolMessage::Refused {
+            ballot: f.quorum().ballot(),
+            command: c,
+            refusal: coord_consensus::SubmissionRefusal::OtherFacts { accepted },
+        }]
+    );
     assert_eq!(
         f.take_rejections(),
         vec![FollowerRejection::RequestFactsConflict {
@@ -370,7 +400,17 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
         l.step(d);
     }
     l.take_rejections();
-    assert!(l.step(presented(1, 1, 1, 8).0).is_empty());
+    let answered = frontend_only(&l.step(presented(1, 1, 1, 8).0));
+    assert!(
+        matches!(
+            answered.as_slice(),
+            [ProtocolMessage::Refused {
+                refusal: coord_consensus::SubmissionRefusal::OtherFacts { .. },
+                ..
+            }]
+        ),
+        "{answered:?}"
+    );
     assert!(matches!(
         l.take_rejections().as_slice(),
         [Rejection::RequestFactsConflict { command, .. }] if *command == c
@@ -383,7 +423,13 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
 fn another_payload_under_the_same_key_is_still_an_identity_conflict() {
     let mut f = follower(1);
     let (c, _) = acknowledged(&mut f, 1);
-    assert!(f.step(admitted(1, 1, 7).0).is_empty());
+    let answered = frontend_only(&f.step(admitted(1, 1, 7).0));
+    assert!(
+        matches!(answered.as_slice(), [ProtocolMessage::Refused {
+            refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, ..
+        }] if *bound == c),
+        "{answered:?}"
+    );
     assert!(matches!(
         f.take_rejections().as_slice(),
         [FollowerRejection::RequestIdentityConflict { bound, .. }] if *bound == c
@@ -474,6 +520,7 @@ fn a_fenced_replica_replays_nothing() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     f.take_rejections();
@@ -503,6 +550,7 @@ fn a_fenced_replica_replays_nothing() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     l.take_rejections();

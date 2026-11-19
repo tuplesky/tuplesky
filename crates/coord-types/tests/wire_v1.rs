@@ -416,6 +416,9 @@ fn identity_payloads_must_be_canonical() {
         from_wire,
         CommandId::derive(&retry_key(), &logical()).unwrap()
     );
+    // `command` checks the payload as `logical` does and derives the same
+    // identity from the bytes it checked.
+    assert_eq!(request.command().unwrap(), (logical(), from_wire));
 
     // Non-canonical transaction bytes (unsorted compares) are rejected even
     // though they decode.
@@ -447,6 +450,7 @@ fn identity_payloads_must_be_canonical() {
         deadline_ms: 0,
     };
     assert_eq!(smuggled.logical(), Err(WireError::NonCanonicalPayload));
+    assert_eq!(smuggled.command(), Err(WireError::NonCanonicalPayload));
     assert!(RequestV1::new(retry_key(), &unsorted, 0, 0).is_err());
 
     // Trailing bytes inside the logical payload are rejected.

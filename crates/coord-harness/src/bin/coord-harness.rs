@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use coord_harness::domain::{Address, Plan, Provisioned};
+use coord_harness::domain::{Address, JournalPlan, JournalProfile, Plan, Provisioned};
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +64,124 @@ struct Provisioning {
     /// other off-loopback address.
     #[arg(long, value_parser = Address::parse)]
     issuer_listen: Option<Address>,
+    /// The journal profile every voter runs: `strict` (the default) or
+    /// `replay`, the replay-backed projection of task-j06. Without the
+    /// flag, `COORD_HARNESS_JOURNAL_PROFILE` is read, so a driver that
+    /// runs this harness from its own environment (Jepsen's control
+    /// node) can select it without passing anything through.
+    #[arg(long, value_parser = JournalProfile::parse)]
+    journal_profile: Option<JournalProfile>,
+    /// Under `--journal-profile replay`, working projection commits at
+    /// most between durable ones (`COORD_HARNESS_PROJECTION_DURABLE_COMMITS`).
+    #[arg(long)]
+    projection_durable_commits: Option<u32>,
+    /// Under `--journal-profile replay`, records at most applied by
+    /// working commits between durable ones
+    /// (`COORD_HARNESS_PROJECTION_DURABLE_RECORDS`).
+    #[arg(long)]
+    projection_durable_records: Option<u32>,
+    /// Under `--journal-profile replay`, milliseconds at most a working
+    /// commit waits for a durable one (`COORD_HARNESS_PROJECTION_DURABLE_MS`).
+    #[arg(long)]
+    projection_durable_ms: Option<u64>,
+    /// Under `--journal-profile replay`, journal records a projection
+    /// commit is held for, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_RECORDS`).
+    #[arg(long)]
+    projection_commit_records: Option<u32>,
+    /// Under `--journal-profile replay`, milliseconds at most a record is
+    /// held for a larger projection commit, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_MS`).
+    #[arg(long)]
+    projection_commit_ms: Option<u64>,
+    /// Journal records each voter holds past its last local checkpoint
+    /// before it publishes the next, where not the daemon's 4096; zero
+    /// never publishes (`COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`).
+    #[arg(long)]
+    checkpoint_after_records: Option<u64>,
+    /// New requests each voter's frontend admits a second, where not the
+    /// daemon's 1,000 (`COORD_HARNESS_MAX_ADMITTED_PER_SECOND`); at least
+    /// one.
+    #[arg(long)]
+    max_admitted_per_second: Option<u32>,
+}
+
+/// A `COORD_HARNESS_*` variable: `None` when unset or empty, refused
+/// when it does not parse, since a run would otherwise be labelled by a
+/// setting it did not run.
+fn from_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+    match std::env::var(name) {
+        Ok(text) if text.is_empty() => Ok(None),
+        Ok(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{name}=`{text}` does not parse")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+impl Provisioning {
+    /// The journal plan the flags name, each one absent falling back to
+    /// its `COORD_HARNESS_*` variable. An empty variable is unset; one
+    /// that does not parse is refused rather than ignored, since a run
+    /// would otherwise be labelled by a profile it did not run.
+    fn journal(&self) -> Result<JournalPlan, String> {
+        let profile = match self.journal_profile {
+            Some(profile) => profile,
+            None => match std::env::var("COORD_HARNESS_JOURNAL_PROFILE") {
+                Ok(text) if text.is_empty() => JournalProfile::Strict,
+                Ok(text) => JournalProfile::parse(&text)
+                    .map_err(|e| format!("COORD_HARNESS_JOURNAL_PROFILE: {e}"))?,
+                Err(std::env::VarError::NotPresent) => JournalProfile::Strict,
+                Err(e) => return Err(format!("COORD_HARNESS_JOURNAL_PROFILE: {e}")),
+            },
+        };
+        Ok(JournalPlan {
+            profile,
+            projection_durable_commits: match self.projection_durable_commits {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_COMMITS")?,
+            },
+            projection_durable_records: match self.projection_durable_records {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_RECORDS")?,
+            },
+            projection_durable_ms: match self.projection_durable_ms {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_MS")?,
+            },
+            projection_commit_records: match self.projection_commit_records {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_RECORDS")?,
+            },
+            projection_commit_ms: match self.projection_commit_ms {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_MS")?,
+            },
+        })
+    }
+
+    /// `checkpoint_after_records` from its flag, or from its variable.
+    fn checkpoint_after_records(&self) -> Result<Option<u64>, String> {
+        match self.checkpoint_after_records {
+            Some(n) => Ok(Some(n)),
+            None => from_env("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS"),
+        }
+    }
+
+    /// `max_admitted_per_second` from its flag, or from its variable.
+    /// Zero is refused here, as the daemon would refuse it at start.
+    fn max_admitted_per_second(&self) -> Result<Option<u32>, String> {
+        let rate = match self.max_admitted_per_second {
+            Some(n) => Some(n),
+            None => from_env("COORD_HARNESS_MAX_ADMITTED_PER_SECOND")?,
+        };
+        if rate == Some(0) {
+            return Err("max_admitted_per_second must be at least 1".into());
+        }
+        Ok(rate)
+    }
 }
 
 #[derive(Subcommand)]
@@ -88,10 +206,10 @@ enum Command {
         #[command(flatten)]
         provisioning: Provisioning,
     },
-    /// Initialize one voter if it has no store yet, start it from its
-    /// own directory, wait until it serves, and stay in the foreground
-    /// until it exits. This is how a voter of a multi-host domain is run
-    /// on its host.
+    /// Start one voter from its own directory, wait until it serves, and
+    /// stay in the foreground until it exits. This is how a voter of a
+    /// multi-host domain is run on its host. A voter with no store is
+    /// refused unless `--init` is given.
     Start {
         /// The directory holding the voter's `nN/` bundle: the run
         /// directory, or wherever the bundle was copied to.
@@ -103,6 +221,13 @@ enum Command {
         /// The `coordd` binary to run.
         #[arg(long)]
         coordd: PathBuf,
+        /// Create the voter's first store before starting it. Only for a
+        /// voter that has never run: a bundle copied again after its
+        /// host lost it looks the same, and initializing that would
+        /// start an empty voter under an identity that has voted. A
+        /// voter initialized once is refused it all the same.
+        #[arg(long)]
+        init: bool,
     },
     /// Run the credential endpoint alone, in the foreground.
     Issuer {
@@ -150,7 +275,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             coordd,
             provisioning,
         } => up(&dir, &coordd, provisioning),
-        Command::Start { dir, node, coordd } => start(&dir, node, &coordd),
+        Command::Start {
+            dir,
+            node,
+            coordd,
+            init,
+        } => start(&dir, node, &coordd, init),
         Command::Issuer { dir, listen } => {
             let endpoint = Arc::new(coord_harness::issuer::Endpoint::bind_on(&dir, listen)?);
             println!("issuer listening {}", endpoint.address()?);
@@ -186,8 +316,22 @@ fn provision(
     if voters == 0 {
         return Err("a domain with no voters has no quorum".into());
     }
+    // What the voters would refuse at start, said before anything is
+    // provisioned (task-d31).
+    if !coord_membership::membership::supported_voter_count(usize::from(voters)) {
+        return Err(format!(
+            "--voters {voters}: an epoch has three or five voters (one is the test profile)"
+        )
+        .into());
+    }
+    let journal = provisioning.journal()?;
+    let checkpoint_after_records = provisioning.checkpoint_after_records()?;
+    let max_admitted_per_second = provisioning.max_admitted_per_second()?;
     Ok(coord_harness::provision(&Plan {
         hosts,
+        journal,
+        checkpoint_after_records,
+        max_admitted_per_second,
         listen_any: provisioning.listen_any,
         edge_host: provisioning.edge_host,
         issuer_listen: provisioning.issuer_listen,
@@ -208,6 +352,7 @@ fn start(
     dir: &std::path::Path,
     node: u8,
     coordd: &std::path::Path,
+    init: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = dir.join(format!("n{node}"));
     let config = directory.join("coordd.toml");
@@ -215,7 +360,11 @@ fn start(
         return Err(format!("{} is not a provisioned voter", config.display()).into());
     }
     let label = format!("n{node}");
-    coord_harness::run::initialize_node(coordd, &label, &config, &directory)?;
+    if init {
+        coord_harness::run::initialize_node(coordd, &label, &config, &directory)?;
+    } else {
+        coord_harness::run::resume_node(&label, &directory)?;
+    }
     let mut daemon = coord_harness::run::start_node(coordd, &label, &config, &directory)?;
     let pid = directory.join("coordd.pid");
     std::fs::write(&pid, format!("{}\n", daemon.pid()))?;
@@ -314,12 +463,21 @@ fn up(
     // it would certify an outage instead. Only once fewer than a quorum
     // remain does the harness stop, because a run that kept going then
     // would report the wrong thing about the domain it was measuring.
+    // A voter a driver started again, and named in its directory's
+    // replacement file, counts as running while that process does
+    // (`coord_harness::run::replacement`).
     let mut stopped = vec![false; daemons.len()];
+    let mut replaced: Vec<Option<u32>> = vec![None; daemons.len()];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let mut alive = 0;
         let mut changed = false;
-        for (daemon, gone) in daemons.iter_mut().zip(stopped.iter_mut()) {
+        for (((daemon, gone), standing_in), voter) in daemons
+            .iter_mut()
+            .zip(stopped.iter_mut())
+            .zip(replaced.iter_mut())
+            .zip(&provisioned.voters)
+        {
             if daemon.alive() {
                 alive += 1;
                 continue;
@@ -332,6 +490,18 @@ fn up(
                     daemon.node,
                     daemon.log.display()
                 );
+            }
+            let now = coord_harness::run::replacement(&voter.directory, &voter.config);
+            if now.is_some() {
+                alive += 1;
+            }
+            if now != *standing_in {
+                changed = true;
+                match now {
+                    Some(pid) => println!("harness voter-replaced node={} pid={pid}", daemon.node),
+                    None => println!("harness replacement-stopped node={}", daemon.node),
+                }
+                *standing_in = now;
             }
         }
         match coord_harness::run::standing(alive, daemons.len()) {

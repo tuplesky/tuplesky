@@ -198,6 +198,21 @@ pub struct Provisioned {
     pub issuer: Issuer,
     /// The Kubernetes storage edge.
     pub edge: Edge,
+    /// The journal profile every voter was provisioned with (task-j06),
+    /// so a run is labelled by what it ran. Written only when it is not
+    /// the strict default, so a strict description is what it always
+    /// was; one without it was strict.
+    #[serde(default, skip_serializing_if = "JournalProfile::is_strict")]
+    pub journal_profile: JournalProfile,
+    /// `checkpoint_after_records` every voter was provisioned with, where
+    /// not the daemon's default (task-d55). Written only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_after_records: Option<u64>,
+    /// `max_admitted_per_second` every voter's frontend was provisioned
+    /// with, where not the daemon's default (task-d26). Written only when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admitted_per_second: Option<u32>,
 }
 
 impl Provisioned {
@@ -240,6 +255,134 @@ pub struct Plan {
     /// Where the credential endpoint is reached, `host:port`, when that
     /// is not loopback. Its server certificate carries the host.
     pub issuer_listen: Option<Address>,
+    /// The journal profile every voter runs (task-j06).
+    pub journal: JournalPlan,
+    /// `[limits] checkpoint_after_records` for every voter, where not
+    /// the daemon's default (task-d55): how far the journal runs past the
+    /// last local checkpoint before the next is published. Zero never
+    /// publishes.
+    pub checkpoint_after_records: Option<u64>,
+    /// `[limits] max_admitted_per_second` for every voter, where not the
+    /// daemon's default of 1,000 (task-d26): new requests each frontend
+    /// admits a second, the rest refused `BACKPRESSURE`.
+    pub max_admitted_per_second: Option<u32>,
+}
+
+/// The `[limits]` a voter's configuration carries when the plan sets one
+/// of them; empty otherwise, so the configuration is byte for byte what
+/// this harness has always written. The section's other required fields
+/// are written at the daemon's defaults, which `coordd`'s tests check
+/// against its own; a limit the plan leaves unset is left out, so the
+/// daemon's default for it stands.
+fn limits_section(
+    checkpoint_after_records: Option<u64>,
+    max_admitted_per_second: Option<u32>,
+) -> String {
+    if checkpoint_after_records.is_none() && max_admitted_per_second.is_none() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+         max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n",
+    );
+    if let Some(n) = checkpoint_after_records {
+        section.push_str(&format!("checkpoint_after_records = {n}\n"));
+    }
+    if let Some(n) = max_admitted_per_second {
+        section.push_str(&format!("max_admitted_per_second = {n}\n"));
+    }
+    section
+}
+
+/// The journal profile a provisioned domain's voters run, written into
+/// each voter's `[journal]` (task-j06). The default is the strict
+/// profile, and writes nothing: the configuration is byte for byte what
+/// this harness has always written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalPlan {
+    /// The profile.
+    pub profile: JournalProfile,
+    /// `projection_durable_commits`, where not the daemon's default.
+    pub projection_durable_commits: Option<u32>,
+    /// `projection_durable_records`, where not the daemon's default.
+    pub projection_durable_records: Option<u32>,
+    /// `projection_durable_ms`, where not the daemon's default.
+    pub projection_durable_ms: Option<u64>,
+    /// `projection_commit_records`, where not the daemon's default: the
+    /// records a projection commit is held for (task-d86). Zero holds
+    /// nothing.
+    pub projection_commit_records: Option<u32>,
+    /// `projection_commit_ms`, where not the daemon's default: the
+    /// longest a record is held for a larger commit (task-d86). Zero
+    /// holds nothing.
+    pub projection_commit_ms: Option<u64>,
+}
+
+/// A journal profile `coordd` serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JournalProfile {
+    /// `journaled-strict-v1`: every projection commit is durable.
+    #[default]
+    Strict,
+    /// `journaled-replay-v1`: projection commits are working commits,
+    /// made durable on a cadence and replayed from the journal after a
+    /// crash. Not a default and not a supported production profile
+    /// until task-j05.
+    Replay,
+}
+
+impl JournalProfile {
+    /// The name `[journal] profile` takes.
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            JournalProfile::Strict => "journaled-strict-v1",
+            JournalProfile::Replay => "journaled-replay-v1",
+        }
+    }
+
+    /// Whether this is the strict default.
+    pub fn is_strict(&self) -> bool {
+        *self == JournalProfile::Strict
+    }
+
+    /// Parse `strict`, `replay`, or the profile's own name.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "strict" | "journaled-strict-v1" => Ok(JournalProfile::Strict),
+            "replay" | "journaled-replay-v1" => Ok(JournalProfile::Replay),
+            other => Err(format!(
+                "`{other}` is not a journal profile: strict or replay"
+            )),
+        }
+    }
+}
+
+impl JournalPlan {
+    /// The lines this plan adds under `[journal]`, each ending in a
+    /// newline; none for the strict default.
+    fn lines(&self) -> String {
+        let mut out = String::new();
+        if self.profile != JournalProfile::Strict {
+            out.push_str(&format!("profile = \"{}\"\n", self.profile.config_name()));
+        }
+        if let Some(n) = self.projection_durable_commits {
+            out.push_str(&format!("projection_durable_commits = {n}\n"));
+        }
+        if let Some(n) = self.projection_durable_records {
+            out.push_str(&format!("projection_durable_records = {n}\n"));
+        }
+        if let Some(n) = self.projection_durable_ms {
+            out.push_str(&format!("projection_durable_ms = {n}\n"));
+        }
+        if let Some(n) = self.projection_commit_records {
+            out.push_str(&format!("projection_commit_records = {n}\n"));
+        }
+        if let Some(n) = self.projection_commit_ms {
+            out.push_str(&format!("projection_commit_ms = {n}\n"));
+        }
+        out
+    }
 }
 
 impl Plan {
@@ -254,6 +397,9 @@ impl Plan {
             listen_any: false,
             edge_host: None,
             issuer_listen: None,
+            journal: JournalPlan::default(),
+            checkpoint_after_records: None,
+            max_admitted_per_second: None,
         }
     }
 }
@@ -450,6 +596,34 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
             plan.voters
         )));
     }
+    // A cadence means nothing to the strict profile, and a run that set
+    // one and ran strict would be read as what it did not run. Zero is
+    // what the daemon refuses at start; it is refused here first.
+    let journal = &plan.journal;
+    let cadence = [
+        journal.projection_durable_commits.map(u64::from),
+        journal.projection_durable_records.map(u64::from),
+        journal.projection_durable_ms,
+    ];
+    // The commit hold is the replay profile's too (task-d86); zero is
+    // how it is turned off, so only the profile is checked for it.
+    let hold = [
+        journal.projection_commit_records.map(u64::from),
+        journal.projection_commit_ms,
+    ];
+    if journal.profile == JournalProfile::Strict && hold.iter().any(Option::is_some) {
+        return Err(invalid(
+            "a projection commit hold is the replay profile's: name it as well".into(),
+        ));
+    }
+    if journal.profile == JournalProfile::Strict && cadence.iter().any(Option::is_some) {
+        return Err(invalid(
+            "a projection cadence is the replay profile's: name it as well".into(),
+        ));
+    }
+    if cadence.contains(&Some(0)) {
+        return Err(invalid("a projection cadence of zero".into()));
+    }
     // What a certificate is reached at, settled before anything is
     // written: a host a certificate cannot name is refused here rather
     // than as a handshake failure on another machine.
@@ -530,8 +704,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         // it dials the others. One key per certificate, issued once, so
         // the key the genesis below commits is the key this leaf holds.
         let issue = |role| match voter_reach.get(usize::from(n) - 1) {
-            None => ca.issue_node(SERVER_NAME, cluster, node, incarnation, role),
-            Some(at) => ca.issue_node_at(SERVER_NAME, cluster, node, incarnation, role, at.clone()),
+            None => ca.issue_node(SERVER_NAME, cluster, domain, node, incarnation, role),
+            Some(at) => ca.issue_node_at(
+                SERVER_NAME,
+                cluster,
+                domain,
+                node,
+                incarnation,
+                role,
+                at.clone(),
+            ),
         };
         let issued = issue(PeerRole::Voter);
         voter_keys.push(issued.spki());
@@ -658,6 +840,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
                 &hex(&principal),
                 &hex(&namespace),
                 &hex(&trust_rule),
+                plan,
             ),
         )?;
         voters_out.push(Node {
@@ -680,7 +863,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     // if the authority outlives provisioning.
     let caller_certificate = dir.join("caller.pem");
     let caller_key = dir.join("caller.key");
-    issue_caller(&ca, cluster, 0).write(&caller_certificate, &caller_key)?;
+    issue_caller(&ca, cluster, domain, 0).write(&caller_certificate, &caller_key)?;
     let authority_key = dir.join("domain-ca.key");
     std::fs::write(&authority_key, coord_sts::keys::b64url(&ca.signing_key()))?;
     restrict(&authority_key)?;
@@ -715,6 +898,9 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         authority_key,
         issuer,
         edge,
+        journal_profile: plan.journal.profile,
+        checkpoint_after_records: plan.checkpoint_after_records,
+        max_admitted_per_second: plan.max_admitted_per_second,
     };
     std::fs::write(
         dir.join("harness.json"),
@@ -723,14 +909,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     Ok(provisioned)
 }
 
-/// One caller credential. `ordinal` distinguishes concurrent callers:
-/// each is a different client identity, as separate processes would be.
-pub fn issue_caller(ca: &Ca, cluster: ClusterId, ordinal: u16) -> Issued {
+/// One caller credential for `domain`. `ordinal` distinguishes concurrent
+/// callers: each is a different client identity, as separate processes
+/// would be.
+pub fn issue_caller(ca: &Ca, cluster: ClusterId, domain: DomainId, ordinal: u16) -> Issued {
     let mut node = [0x0c; 16];
     node[14..].copy_from_slice(&ordinal.to_be_bytes());
     ca.issue_node(
         "caller.tuplesky.harness",
         cluster,
+        domain,
         ReplicaId(node),
         ReplicaIncarnation::new(1).expect("one is positive"),
         PeerRole::Client,
@@ -844,6 +1032,7 @@ fn node_config(
     principal: &str,
     namespace: &str,
     trust_rule: &str,
+    plan: &Plan,
 ) -> String {
     format!(
         r#"# Written by `coord-harness provision`. A strict configuration: the
@@ -871,7 +1060,7 @@ root = "state"
 [journal]
 root = "journal"
 shards = 1
-
+{journal}
 [identity]
 trust_bundle = "{roots}"
 node_certificate = "{node_certificate}"
@@ -888,8 +1077,10 @@ trust_rule = "{trust_rule}"
 [[grant]]
 principal = "{principal}"
 namespace = "{namespace}"
-"#,
+{limits}"#,
         preamble = layout.preamble(),
+        journal = plan.journal.lines(),
+        limits = limits_section(plan.checkpoint_after_records, plan.max_admitted_per_second),
         manifest = layout.shared("genesis.json"),
         admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),

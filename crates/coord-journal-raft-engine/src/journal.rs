@@ -851,6 +851,12 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
         Ok(receipt)
     }
 
+    fn syncs(&self) -> Option<u64> {
+        // A poisoned lock is a stopped journal; its count is no longer
+        // a reading of anything.
+        self.stats().ok().map(|stats| stats.syncs)
+    }
+
     fn durable_head(&self, stream: StorageStreamId) -> Result<LocalJournalSeq, JournalError> {
         let inner = self.lock()?;
         if !inner.mappings.contains_key(&stream) {

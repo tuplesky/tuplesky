@@ -651,6 +651,11 @@ impl coord_storage::Persistence for Stamped {
 /// A booted voter over a [`Stamped`] store: replica `me`, the leader of
 /// the genesis ballot when `me` is 0 and a follower otherwise.
 fn stamped(me: u8) -> Voter<Stamped> {
+    stamped_at(me, None)
+}
+
+/// [`stamped`], started as having executed through `at`.
+fn stamped_at(me: u8, at: Option<coord_types::ids::ExecutionPosition>) -> Voter<Stamped> {
     let boot = BootId([7; 16]);
     let mut worker =
         StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
@@ -691,7 +696,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
                 capacity: 64,
             },
             None,
-            bootstrapped,
+            at.unwrap_or(bootstrapped),
         );
         leader.set_learning(LearningMode::Full);
         Machine::Leader(Box::new(leader))
@@ -703,7 +708,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
             frontend: FRONTEND,
             capacity: 64,
         })
-        .restore_execution(bootstrapped, []);
+        .restore_execution(at.unwrap_or(bootstrapped), []);
         follower.set_learning(LearningMode::Full);
         Machine::Follower(Box::new(follower))
     };
@@ -725,7 +730,11 @@ fn new_leader(voter: &mut Voter<Stamped>, from: u8, ballot: Ballot) -> coord_dae
     voter
         .on_peer(
             PeerProvenance::from_local_voter(r(from), inc()),
-            coord_consensus::ProtocolMessage::NewLeader { ballot }.encode(),
+            coord_consensus::ProtocolMessage::NewLeader {
+                ballot,
+                executed: coord_types::ids::ExecutionPosition::ZERO,
+            }
+            .encode(),
         )
         .expect("stepped")
 }
@@ -765,7 +774,7 @@ fn a_campaign_records_its_promise_under_the_ballot_it_campaigns_for() {
     assert_eq!(store.fences, vec![campaigned]);
     let asked: Vec<ReplicaId> = messages(&out)
         .into_iter()
-        .filter(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::NewLeader { ballot } if *ballot == campaigned))
+        .filter(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::NewLeader { ballot, .. } if *ballot == campaigned))
         .map(|(to, _)| to)
         .collect();
     assert_eq!(asked, vec![r(0), r(2)]);
@@ -816,6 +825,204 @@ fn a_new_leader_the_machine_refuses_moves_nothing() {
     assert!(out.peer.is_empty());
 }
 
+/// A frame on an observer's or learner's link moves nothing, though the
+/// replica it names is a voter (design Section 10.1). A higher
+/// `NewLeader` doesn't raise the ballot -- `on_peer` raises it before the
+/// machine sees the frame, so the role is checked before that -- nor
+/// fence the store, nor draw a promise; a catch-up ask doesn't reach the
+/// donor at all. The same frames on the voter's own link do each.
+#[test]
+fn a_frame_on_a_non_voter_link_moves_nothing_though_it_names_a_voter() {
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    let campaign = coord_consensus::ProtocolMessage::NewLeader {
+        ballot: candidate,
+        executed: coord_types::ids::ExecutionPosition::ZERO,
+    }
+    .encode();
+    let ask = coord_consensus::ProtocolMessage::CatchUpRequest {
+        ballot: ballot(),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+    }
+    .encode();
+    let on = |role| PeerProvenance::from_transport(r(1), inc(), role, 7);
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut voter = stamped(2);
+        let asked = voter.on_peer(on(role), ask.clone()).expect("stepped");
+        assert!(asked.peer.is_empty(), "{role:?}: a page went back");
+        assert_eq!(
+            voter.node().unserved,
+            coord_daemon::node::Unserved::default(),
+            "{role:?}: the ask reached the donor"
+        );
+        let out = voter.on_peer(on(role), campaign.clone()).expect("stepped");
+        assert_eq!(voter.ballot(), ballot(), "{role:?}: the ballot moved");
+        let store = voter.node().applier().store();
+        assert_eq!(store.ballot, Some(ballot()));
+        assert!(store.fences.is_empty(), "{role:?}: the store was fenced");
+        assert!(out.peer.is_empty(), "{role:?}: {:?}", messages(&out));
+
+        // The control: the voter's own link. The ask reaches the donor,
+        // past its sender check, and the campaign is promised.
+        let asked = voter
+            .on_peer(on(PeerRole::Voter), ask.clone())
+            .expect("stepped");
+        let unserved = voter.node().unserved;
+        assert_eq!(unserved.sender, 0);
+        assert!(!asked.peer.is_empty() || unserved != coord_daemon::node::Unserved::default());
+        let out = voter
+            .on_peer(on(PeerRole::Voter), campaign.clone())
+            .expect("stepped");
+        assert_eq!(voter.ballot(), candidate);
+        assert_eq!(voter.node().applier().store().fences, vec![candidate]);
+        assert!(
+            messages(&out).iter().any(|(to, m)| *to == r(1)
+                && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == candidate)),
+            "no promise went back to the candidate: {:?}",
+            messages(&out)
+        );
+    }
+}
+
+/// A voter refuses a candidate more than a table behind it, naming its
+/// position, and its own next campaign goes above the refused ballot
+/// (task-d10): that candidate promised itself the ballot and hears
+/// nothing below it, and it can only catch up by following.
+#[test]
+fn a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot() {
+    let at = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voter = stamped_at(2, Some(at));
+    let refused = Ballot {
+        epoch: epoch(),
+        number: 5,
+        leader: r(1),
+    };
+    let out = new_leader(&mut voter, 1, refused);
+    let sent = messages(&out);
+    assert!(
+        sent.iter().any(|(to, m)| *to == r(1)
+            && matches!(
+                m,
+                coord_consensus::ProtocolMessage::PromiseRefused { ballot, executed, .. }
+                    if *ballot == refused && *executed == at
+            )),
+        "{sent:?}"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::Promise { .. })),
+        "{sent:?}"
+    );
+    assert_eq!(voter.node().machine().promised(), ballot());
+    let (campaigned, _) = voter.campaign().expect("stepped").expect("campaigns");
+    assert_eq!(
+        campaigned.compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "{campaigned:?}"
+    );
+}
+
+/// Deliver every peer frame among `voters` (indexed by replica byte)
+/// until none is left, starting from `out` sent by voter `from`.
+fn route(voters: &mut [Voter<Stamped>], from: u8, out: coord_daemon::Outbound) {
+    let mut queue: std::collections::VecDeque<(u8, u8, Vec<u8>)> = out
+        .peer
+        .into_iter()
+        .map(|(to, frame)| (from, to.replica.0[0], frame))
+        .collect();
+    let mut steps = 0;
+    while let Some((from, to, frame)) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 10_000, "the voters did not settle");
+        let Some(voter) = voters.get_mut(to as usize) else {
+            continue;
+        };
+        let out = voter
+            .on_peer(PeerProvenance::from_local_voter(r(from), inc()), frame)
+            .expect("stepped");
+        queue.extend(
+            out.peer
+                .into_iter()
+                .map(|(next, frame)| (to, next.replica.0[0], frame)),
+        );
+    }
+}
+
+/// A live leader that refuses a behind candidate leads again above the
+/// refused ballot, and the behind voter follows it (task-d10).
+///
+/// A restarted voter's timer can fire before it hears the leader (rgb-2
+/// and rgb-6 on #98). Refused by everyone, it would stay promised to its
+/// own ballot, above the live one, and deaf until the next election. The
+/// leader steps down and campaigns above that ballot instead.
+#[test]
+fn a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it() {
+    let ahead = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voters = vec![
+        stamped_at(0, Some(ahead)),
+        stamped(1),
+        stamped_at(2, Some(ahead)),
+    ];
+    assert!(voters[0].leads());
+    let (refused, out) = voters[1].campaign().expect("stepped").expect("campaigns");
+    route(&mut voters, 1, out);
+
+    assert!(voters[0].leads(), "the leader leads again");
+    let led = voters[0].ballot();
+    assert_eq!(
+        led.compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "{led:?} is above the refused {refused:?}"
+    );
+    for i in [1usize, 2] {
+        assert_eq!(voters[i].ballot(), led, "voter {i} follows it");
+        assert_eq!(voters[i].node().machine().promised(), led, "voter {i}");
+    }
+    assert!(!voters[1].leads());
+    assert!(!voters[1].node().machine().campaigning());
+}
+
+/// Every leader a node becomes sends early as the node does (task-d98).
+///
+/// The setting is the node's: the domain activated the feature, not the
+/// ballot. A leader that steps down and leads again above a refused
+/// candidate is a new machine, made from the follower it was; given
+/// nothing, it would lead without the early send until a restart.
+#[test]
+fn a_leader_a_node_becomes_sends_early_as_the_node_does() {
+    let ahead = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voters = vec![
+        stamped_at(0, Some(ahead)),
+        stamped(1),
+        stamped_at(2, Some(ahead)),
+    ];
+    for voter in &mut voters {
+        voter.node_mut().set_early_proposal(true);
+    }
+    let Machine::Leader(first) = voters[0].node().machine() else {
+        panic!("voter 0 leads the genesis ballot")
+    };
+    assert!(first.early_proposal(), "the leader it holds now");
+    let (refused, out) = voters[1].campaign().expect("stepped").expect("campaigns");
+    route(&mut voters, 1, out);
+
+    assert!(voters[0].leads(), "the leader leads again");
+    assert_eq!(
+        voters[0].ballot().compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "at a ballot of its own, as a new machine"
+    );
+    let Machine::Leader(again) = voters[0].node().machine() else {
+        panic!("voter 0 leads")
+    };
+    assert!(again.early_proposal(), "and the leader it became");
+    assert!(voters[1].node().early_proposal());
+}
+
 /// A transition the store refuses as fenced fails its barrier and the
 /// voter goes on serving (task-d01).
 ///
@@ -838,7 +1045,11 @@ fn a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on() {
     let out = voter
         .on_peer(
             PeerProvenance::from_local_voter(r(1), inc()),
-            coord_consensus::ProtocolMessage::NewLeader { ballot: candidate }.encode(),
+            coord_consensus::ProtocolMessage::NewLeader {
+                ballot: candidate,
+                executed: coord_types::ids::ExecutionPosition::ZERO,
+            }
+            .encode(),
         )
         .expect("a refusal the voter expects does not end its turn");
     assert_eq!(voter.node().fenced, 1);
@@ -1092,6 +1303,7 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
                         path: coord_consensus::empty_path(),
                         paths: Vec::new(),
                         seqnum: 0,
+                        admission: None,
                     },
                 )
             })
@@ -1112,4 +1324,118 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
     );
     assert_eq!(coord_storage::Persistence::queued(store), 0);
     assert_eq!(voter.node().held(), 0, "every send was released");
+}
+
+/// A follower below its own fence takes a request and serves on (#197
+/// review): the store refuses its vote batch as fenced, and nothing is
+/// written again at that failure. A write there was refused the same way
+/// and written again until `carry_out` gave up and the node stopped; an
+/// election race puts a follower in this state, as Jepsen's repeated
+/// leader kills found (task-d01).
+#[test]
+fn a_fenced_follower_takes_a_request_and_serves_on() {
+    let mut follower = stamped(1);
+    promise_that_fails(
+        &mut follower,
+        2,
+        Ballot {
+            epoch: epoch(),
+            number: 1,
+            leader: r(2),
+        },
+    );
+    let _ = follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(8),
+        )
+        .expect("a follower below its fence serves on");
+}
+
+/// A command's vote batch fails and then its adoption batch, in the order
+/// a definite journal failure fails a group and the queue behind it (#197
+/// review). A later command on the same key names it: the batch that
+/// names it carries its rows, so no durable record here names a command
+/// with no row here.
+#[test]
+fn both_of_a_commands_batches_fail_then_a_later_vote_names_it() {
+    let mut leader = stamped(0);
+    let mut follower = stamped(1);
+    follower.node_mut().applier_mut().store_mut().hold = true;
+    let out = leader
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(7),
+        )
+        .expect("serves")
+        .expect("admitted");
+    for (_, f) in out.peer.into_iter().filter(|(to, _)| to.replica == r(1)) {
+        follower
+            .on_peer(PeerProvenance::from_local_voter(r(0), inc()), f)
+            .expect("stepped");
+    }
+    follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(8),
+        )
+        .expect("stepped")
+        .expect("admitted");
+    // Command A's vote batch and adoption batch, failed in submission
+    // order, as a definite journal failure fails a group and its queue.
+    let held = core::mem::take(&mut follower.node_mut().applier_mut().store_mut().held);
+    assert!(held.len() >= 2, "both of A's batches were held: {held:?}");
+    follower.node_mut().applier_mut().store_mut().hold = false;
+    let at = follower.ballot();
+    for barrier in held {
+        follower
+            .node_mut()
+            .on_storage(
+                coord_core::event::StorageEvent::Failed {
+                    barrier_id: barrier,
+                    error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                },
+                &at,
+            )
+            .expect("a storage fact");
+    }
+    // Command B, same key: the follower acknowledges it to the leader.
+    let out = leader
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(2)),
+            Origin::Connection(7),
+        )
+        .expect("serves")
+        .expect("admitted");
+    for (_, f) in out.peer.into_iter().filter(|(to, _)| to.replica == r(1)) {
+        follower
+            .on_peer(PeerProvenance::from_local_voter(r(0), inc()), f)
+            .expect("stepped");
+    }
+    follower
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(2)),
+            Origin::Connection(8),
+        )
+        .expect("stepped")
+        .expect("admitted");
+    let Machine::Follower(f) = follower.node().machine() else {
+        panic!("a follower")
+    };
+    let report = f.report(ballot());
+    let durable: BTreeSet<_> = report.entries.iter().map(|e| e.command).collect();
+    assert!(report.entries.len() >= 2, "{report:?}");
+    for e in &report.entries {
+        assert!(
+            e.deps.iter().all(|d| durable.contains(d)),
+            "{:?} names {:?}",
+            e.command,
+            e.deps
+        );
+    }
 }

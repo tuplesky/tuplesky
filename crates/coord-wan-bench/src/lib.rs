@@ -13,6 +13,8 @@
 //! * [`run`] schedules arrivals against absolute instants so that a
 //!   caller falling behind widens the reported wait instead of quietly
 //!   stretching the measurement window.
+//! * [`register`] is a register history and the check that it is
+//!   linearizable, for the `coord-register` workload (task-d50).
 //! * [`report`] is the published shape: offered against achieved load,
 //!   three separate latency distributions per operation kind, refusals
 //!   by bounded reason, this host's resources, and the domain's own
@@ -28,6 +30,7 @@
 #![warn(missing_docs)]
 
 pub mod caller;
+pub mod register;
 pub mod report;
 pub mod run;
 pub mod workload;

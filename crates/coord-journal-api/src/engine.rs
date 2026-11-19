@@ -110,4 +110,13 @@ pub trait JournalEngine {
         high_water: StreamHighWater,
         mapping: &StreamMappingV1,
     ) -> Result<(), JournalFailure>;
+
+    /// Synced writes this engine has issued since it opened, groups,
+    /// mappings and compactions alike (task-d45), or `None` when the
+    /// engine does not count them. A count, not a guess: an engine that
+    /// cannot say says so rather than reporting its group appends,
+    /// which are fewer.
+    fn syncs(&self) -> Option<u64> {
+        None
+    }
 }

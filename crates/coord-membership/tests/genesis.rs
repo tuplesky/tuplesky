@@ -28,6 +28,17 @@ use time::OffsetDateTime;
 
 const CLUSTER: ClusterId = ClusterId([1; 16]);
 const DOMAIN: DomainId = DomainId([2; 16]);
+/// A sibling domain of the same cluster, under the same issuer.
+const SIBLING: DomainId = DomainId([3; 16]);
+/// A node of either domain, in any role, issued to one workload that
+/// names the role and the domain it asks for.
+const ANY_ROLE: [(u8, PeerRole); 5] = [
+    (9, PeerRole::Observer),
+    (10, PeerRole::Learner),
+    (11, PeerRole::Frontend),
+    (12, PeerRole::KineCollector),
+    (13, PeerRole::Client),
+];
 const NOW: u64 = 1_700_000_000;
 const AUD: &str = "node-enrollment";
 const K8S_ISS: &str = "https://kubernetes.default.svc";
@@ -110,13 +121,14 @@ fn build_issuer() -> Issuer {
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_der = ca_cert.der().to_vec();
     let ca = Ca::load(&ca_der, &ca_key.serialize_der(), NOW).unwrap();
-    let policy = |node: u8, role: PeerRole, ns: &str, sa: &str| RolePolicy {
+    let policy_in = |domain: DomainId, node: u8, role: PeerRole, ns: &str, sa: &str| RolePolicy {
         issuer: "k8s".into(),
         required: [("namespace", ns), ("serviceaccount", sa)]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         cluster: CLUSTER,
+        domain,
         nodes: vec![ReplicaId([node; 16])],
         role,
         min_incarnation: 1,
@@ -124,12 +136,21 @@ fn build_issuer() -> Issuer {
         dns_names: vec![],
         ip_addresses: vec![],
     };
-    let rules = vec![
+    let policy = |node, role, ns, sa| policy_in(DOMAIN, node, role, ns, sa);
+    let mut rules = vec![
         policy(1, PeerRole::Voter, "voters", "voter-1"),
         policy(2, PeerRole::Voter, "voters", "voter-2"),
         policy(3, PeerRole::Voter, "voters", "voter-3"),
         policy(9, PeerRole::Observer, "observers", "observer-0"),
+        policy(1, PeerRole::Observer, "impostors", "observer-1"),
+        policy(2, PeerRole::Learner, "impostors", "learner-2"),
     ];
+    for domain in [DOMAIN, SIBLING] {
+        rules.push(policy_in(domain, 1, PeerRole::Voter, "any", "any"));
+        for (node, role) in ANY_ROLE {
+            rules.push(policy_in(domain, node, role, "any", "any"));
+        }
+    }
     Issuer {
         issuer: NodeIssuer::new(verifier, ca, rules),
         idp_key: idp,
@@ -157,19 +178,33 @@ impl Issuer {
 
     /// Issue a certificate for a node; returns the leaf DER.
     fn issue(&mut self, node: u8, incarnation: u64, role: PeerRole, ns: &str, sa: &str) -> Vec<u8> {
-        let key = ecdsa();
+        let _ = role;
+        self.issue_as(&ecdsa(), node, incarnation, ns, sa, None)
+    }
+
+    /// Issue a certificate for a node under `key`, asking for `choice`'s
+    /// role and domain among the workload's rules.
+    fn issue_as(
+        &mut self,
+        key: &KeyPair,
+        node: u8,
+        incarnation: u64,
+        ns: &str,
+        sa: &str,
+        choice: Option<(PeerRole, DomainId)>,
+    ) -> Vec<u8> {
         let mut params = CertificateParams::default();
         params.distinguished_name.push(DnType::CommonName, "csr");
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let csr = params.serialize_request(&key).unwrap();
-        let _ = role;
+        let csr = params.serialize_request(key).unwrap();
         let request = NodeRequest {
             assertion: self.assertion(ns, sa),
             csr_der: csr.der().to_vec(),
             node: [node; 16],
             incarnation,
             lifetime_secs: 300,
-            role: None,
+            role: choice.map(|(role, _)| role),
+            domain: choice.map(|(_, domain)| domain.0),
         };
         self.issuer
             .enroll(&request, &ClockHealth::healthy(NOW, 5))
@@ -196,9 +231,22 @@ fn spki(cert_der: &[u8]) -> String {
 /// A manifest committing the three founding voters by key, together with
 /// the certificates those keys belong to.
 fn manifest_with_voters(issuer: &mut Issuer, admin: &AdminKey) -> (GenesisManifest, Vec<Vec<u8>>) {
+    let (manifest, certs, _) = manifest_with_voter_keys(issuer, admin);
+    (manifest, certs)
+}
+
+/// The same, with the voters' keys.
+fn manifest_with_voter_keys(
+    issuer: &mut Issuer,
+    admin: &AdminKey,
+) -> (GenesisManifest, Vec<Vec<u8>>, Vec<KeyPair>) {
     let _ = admin;
+    let keys: Vec<KeyPair> = (1u8..=3).map(|_| ecdsa()).collect();
     let certs: Vec<Vec<u8>> = (1u8..=3)
-        .map(|n| issuer.issue(n, 1, PeerRole::Voter, "voters", &format!("voter-{n}")))
+        .map(|n| {
+            let sa = format!("voter-{n}");
+            issuer.issue_as(&keys[usize::from(n - 1)], n, 1, "voters", &sa, None)
+        })
         .collect();
     let manifest = GenesisManifest {
         cluster: hex(&CLUSTER.0),
@@ -221,14 +269,18 @@ fn manifest_with_voters(issuer: &mut Issuer, admin: &AdminKey) -> (GenesisManife
         admin: hex(&PrincipalId([0xa; 16]).0),
         protocol_version: 1,
     };
-    (manifest, certs)
+    (manifest, certs, keys)
 }
 
 fn hello(role: PeerRole, incarnation: Option<u64>) -> HelloV1 {
+    hello_in(DOMAIN, role, incarnation)
+}
+
+fn hello_in(domain: DomainId, role: PeerRole, incarnation: Option<u64>) -> HelloV1 {
     HelloV1 {
         role,
         cluster_id: CLUSTER,
-        domain_id: DOMAIN,
+        domain_id: domain,
         incarnation: incarnation.map(|i| ReplicaIncarnation::new(i).unwrap()),
         capabilities: BoundedVec::new(vec![1]).unwrap(),
     }
@@ -298,12 +350,16 @@ fn a_signed_genesis_initializes_pinned_membership() {
     assert_eq!(init.membership.epoch().get(), 1);
     let again = initialize(&verified, &mut store).unwrap();
     assert!(!again.first_boot);
+    // Five voters, not four: another manifest the design allows
+    // (task-d31).
     let mut other_manifest = manifest.clone();
-    other_manifest.voters.push(VoterSeed {
-        node: hex(&[4; 16]),
-        incarnation: 1,
-        public_key: spki(&voter_certs[0]),
-    });
+    for n in [4u8, 5] {
+        other_manifest.voters.push(VoterSeed {
+            node: hex(&[n; 16]),
+            incarnation: 1,
+            public_key: spki(&voter_certs[0]),
+        });
+    }
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
     let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
     assert!(matches!(
@@ -451,6 +507,135 @@ fn the_binder_admits_current_voters_and_refuses_everything_else() {
     assert!(
         binder
             .bind(&[der(&voter2_g2)], &hello(PeerRole::Voter, Some(2)))
+            .is_ok()
+    );
+}
+
+/// A non-voter peer never holds a committed voter's name (design Section
+/// 10.1). The transport keys a voter's link by its replica, and the
+/// provenance of every frame names the replica it came from; an observer
+/// or learner certificate the issuer signed for a voter's node would be
+/// that voter to both. It is refused at the committed generation and at
+/// any other, while the same roles for nodes that aren't voters bind.
+#[test]
+fn an_observer_or_learner_certificate_naming_a_committed_voter_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let binder = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+
+    for incarnation in [1, 7] {
+        let observer = issuer.issue(
+            1,
+            incarnation,
+            PeerRole::Observer,
+            "impostors",
+            "observer-1",
+        );
+        assert_eq!(
+            binder.bind(
+                &[der(&observer)],
+                &hello(PeerRole::Observer, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "an observer certificate for voter 1 at generation {incarnation}"
+        );
+        let learner = issuer.issue(2, incarnation, PeerRole::Learner, "impostors", "learner-2");
+        assert_eq!(
+            binder.bind(
+                &[der(&learner)],
+                &hello(PeerRole::Learner, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "a learner certificate for voter 2 at generation {incarnation}"
+        );
+    }
+
+    // The control: the same roles for nodes no voter is known by bind,
+    // with their own replica identity.
+    let observer = issuer.issue(9, 1, PeerRole::Observer, "observers", "observer-0");
+    let bound = binder
+        .bind(&[der(&observer)], &hello(PeerRole::Observer, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Observer, Some(ReplicaId([9; 16])))
+    );
+    let learner = issuer.issue_as(
+        &ecdsa(),
+        10,
+        1,
+        "any",
+        "any",
+        Some((PeerRole::Learner, DOMAIN)),
+    );
+    let bound = binder
+        .bind(&[der(&learner)], &hello(PeerRole::Learner, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Learner, Some(ReplicaId([10; 16])))
+    );
+}
+
+/// A certificate reaches only the domain it names (design Section 11.1,
+/// Codex's P1 on #267). Two domains of one cluster share its issuer, so a
+/// certificate a sibling domain's rule issued is signed by the same CA
+/// and names the same cluster. It used to bind here in any role whose
+/// binding membership doesn't check -- a frontend's among them, which
+/// submits and establishes sessions -- by naming this domain in its
+/// `Hello`. Every role is refused here, and binds on its own domain.
+#[test]
+fn a_certificate_for_a_sibling_domain_is_refused_here_in_every_role() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, voter_certs, voter_keys) = manifest_with_voter_keys(&mut issuer, &admin);
+    let here = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+    // The sibling commits the same voters, so the voter's case turns on
+    // the domain alone: the same node, generation and committed key.
+    let mut sibling = manifest.clone();
+    sibling.domain = hex(&SIBLING.0);
+    let there = PeerBinder::new(Membership::from_genesis(&sibling).unwrap());
+
+    let mut roles = vec![(1u8, PeerRole::Voter)];
+    roles.extend(ANY_ROLE);
+    for (node, role) in roles {
+        let peer = coord_transport::identity::role_class(role) == coord_transport::Class::Peer;
+        let incarnation = peer.then_some(1);
+        let key = if role == PeerRole::Voter {
+            &voter_keys[0]
+        } else {
+            &ecdsa()
+        };
+        let mine = issuer.issue_as(key, node, 1, "any", "any", Some((role, DOMAIN)));
+        let theirs = issuer.issue_as(key, node, 1, "any", "any", Some((role, SIBLING)));
+
+        // The same role, issued for this domain, binds here.
+        let bound = here
+            .bind(&[der(&mine)], &hello(role, incarnation))
+            .unwrap_or_else(|e| panic!("{role:?} of this domain: {e:?}"));
+        assert_eq!(bound.role, role);
+        // The sibling's, naming this domain in its Hello, does not.
+        assert_eq!(
+            here.bind(&[der(&theirs)], &hello(role, incarnation)),
+            Err(BindError::DomainMismatch),
+            "{role:?} issued for the sibling domain"
+        );
+        // Nor does this domain's, naming the sibling, on the sibling's.
+        assert_eq!(
+            there.bind(&[der(&mine)], &hello_in(SIBLING, role, incarnation)),
+            Err(BindError::DomainMismatch),
+            "{role:?} issued for this domain, on the sibling"
+        );
+        // The sibling's binds where it was issued for.
+        let bound = there
+            .bind(&[der(&theirs)], &hello_in(SIBLING, role, incarnation))
+            .unwrap_or_else(|e| panic!("{role:?} on its own domain: {e:?}"));
+        assert_eq!(bound.role, role);
+    }
+    // The founding voter's own certificate is this domain's.
+    assert!(
+        here.bind(&[der(&voter_certs[0])], &hello(PeerRole::Voter, Some(1)))
             .is_ok()
     );
 }

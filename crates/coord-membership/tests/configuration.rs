@@ -517,8 +517,11 @@ fn every_fabrication_is_rejected() {
         ChainError::PreviousCertificateMismatch,
     ));
     // Approvals signed over a different record (tampered after signing).
+    // (Another incarnation of a voter, not one voter fewer: a count the
+    // design does not allow is refused before any signature is read.)
     let mut tampered = good.clone();
-    tampered.voters.pop();
+    let last = tampered.voters.last_mut().expect("voters");
+    last.incarnation = ReplicaIncarnation::new(last.incarnation.get() + 1).unwrap();
     cases.push((
         "tampered",
         tampered,

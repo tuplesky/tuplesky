@@ -7,9 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use coord_transport::{
-    BoundIdentity, CloseReason, Lane, Limits, SendError, TransportError, evidence_frame,
+    BoundIdentity, CloseReason, Congestion, Lane, Limits, Reordering, SendError, TransportError,
+    evidence_frame,
 };
 use coord_transport_sim::{LinkFaults, NodeConfig, PacketWorld, SimEvent};
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
@@ -166,9 +168,13 @@ fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_out
             duplicate_ppm: 200_000,
             ..LinkFaults::default()
         },
+        // Loss enough to drop some of a dozen datagrams (about a dozen at
+        // the default acknowledgement cadence, task-d70): at 5% the check
+        // below that the schedule lost any turned on one datagram, and
+        // quinn-proto 0.11.18 sends one fewer here than 0.11.17 did.
         LinkFaults {
             mtu: 1300,
-            loss_ppm: 50_000,
+            loss_ppm: 150_000,
             ..LinkFaults::default()
         },
     ];
@@ -520,4 +526,468 @@ fn the_dialer_binds_the_server_certificate_before_it_accepts_the_ack() {
     )
     .unwrap();
     assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}
+
+#[test]
+fn a_sibling_domains_certificate_is_refused_here_as_the_real_binder_refuses_it() {
+    // A cluster's domains share its issuer, so a sibling domain's node
+    // holds a certificate from the authority every node here trusts, and
+    // TLS succeeding says nothing about which domain it is for. The
+    // binder takes the domain from the credential, never from the Hello
+    // (Codex's P1 on #267), and the simulator refuses it where the real
+    // adapter does: at the acceptor, and at a dialer that reached it.
+    let sibling = DomainId([3; 16]);
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter, PeerRole::Observer]);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    binder.register(&f.ids[0]);
+    binder.register(&f.ids[1]);
+    binder.register_in(&f.ids[2], sibling);
+    let expected: Vec<BoundIdentity> = f.ids.iter().map(TestIdentity::expected).collect();
+    let binder = Arc::new(binder);
+    let configs = f
+        .ids
+        .iter()
+        .map(|id| NodeConfig {
+            identity: TestIdentity {
+                name: id.name.clone(),
+                replica: id.replica,
+                incarnation: id.incarnation,
+                role: id.role,
+                chain: id.chain.clone(),
+                key: id.key.clone_key(),
+            },
+            roots: f.ca.roots(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            binder: binder.clone(),
+            limits: Limits::default(),
+            capabilities: vec![1],
+        })
+        .collect();
+    let mut w = PacketWorld::new([17; 32], configs);
+    let refused = |events: Vec<SimEvent>, what: &str| {
+        events.into_iter().any(|e| {
+            matches!(
+                e,
+                SimEvent::Closed {
+                    reason: CloseReason::Rejected(ref m),
+                    ..
+                } if m.contains(what)
+            )
+        })
+    };
+
+    // The sibling's observer dials a voter here, naming this domain.
+    w.connect(
+        2,
+        0,
+        PeerRole::Observer,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        expected[0].clone(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(
+        w.connections(0),
+        0,
+        "the sibling's observer is no peer here"
+    );
+    assert!(
+        refused(w.take_events(0), "DomainMismatch"),
+        "the acceptor refuses the sibling's certificate by its domain"
+    );
+
+    // A voter here dials the sibling's node: its certificate is refused
+    // by the dialer's own binding.
+    w.connect(
+        0,
+        2,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-2",
+        expected[2].clone(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(w.connections(0), 0, "the sibling's node is no peer here");
+    assert!(
+        refused(w.take_events(0), "identity"),
+        "the dialer refuses the server's certificate by its domain"
+    );
+
+    // This domain's own voters still negotiate.
+    w.connect(
+        1,
+        0,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        expected[0].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}
+
+#[test]
+fn a_non_voter_naming_a_voters_replica_is_refused_as_the_real_binder_refuses_it() {
+    // An observer's certificate naming voter 1's replica would be that
+    // voter to the link it is keyed by and to every frame's provenance
+    // (design Section 10.1). The binder refuses a non-voter peer whose
+    // replica is a voter's, and the simulator, holding the same binder,
+    // refuses it where the real adapter does: at the acceptor.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let posing =
+        f.ca.issue("node-1-observer", r(1), inc(), PeerRole::Observer);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    for id in f.ids.iter().chain([&posing]) {
+        binder.register(id);
+    }
+    let binder = Arc::new(binder);
+    let configs = f
+        .ids
+        .iter()
+        .chain([&posing])
+        .map(|id| NodeConfig {
+            identity: TestIdentity {
+                name: id.name.clone(),
+                replica: id.replica,
+                incarnation: id.incarnation,
+                role: id.role,
+                chain: id.chain.clone(),
+                key: id.key.clone_key(),
+            },
+            roots: f.ca.roots(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            binder: binder.clone(),
+            limits: Limits::default(),
+            capabilities: vec![1],
+        })
+        .collect();
+    let mut w = PacketWorld::new([19; 32], configs);
+
+    w.connect(
+        2,
+        0,
+        PeerRole::Observer,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        f.ids[0].expected(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(w.connections(0), 0, "the observer took voter 1's name");
+    assert!(
+        w.take_events(0).into_iter().any(|e| matches!(
+            e,
+            SimEvent::Closed {
+                reason: CloseReason::Rejected(ref m),
+                ..
+            } if m.contains("NonVoterNamesVoter")
+        )),
+        "the acceptor refuses it by its role"
+    );
+
+    // Voter 1 itself still negotiates.
+    w.connect(
+        1,
+        0,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-0",
+        f.ids[0].expected(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1));
+}
+
+/// What one voter's stream of frames to another cost under a link's
+/// faults: virtual time to move them all, and what the sender's QUIC
+/// counted.
+#[derive(Debug)]
+struct Moved {
+    ticks: u64,
+    lost: u64,
+    congestion_events: u64,
+    dropped: u64,
+    /// Acknowledgement frames both ends sent.
+    acks: u64,
+}
+
+/// Voter 0 sends voter 1 `frames` evidence frames of a kilobyte, one a
+/// millisecond, and voter 1 answers each with a small one: a peer lane
+/// under steady load. A frame the lane's queue refuses is offered again
+/// a millisecond later. Returns once both ends have every frame.
+fn steady(f: &Fixture, seed: u8, faults: LinkFaults, limits: Limits, frames: usize) -> Moved {
+    stream(f, seed, faults, limits, frames, true)
+}
+
+/// As [`steady`], with voter 1 answering each frame only if `answers`:
+/// without, voter 1 sends nothing but acknowledgements.
+fn stream(
+    f: &Fixture,
+    seed: u8,
+    faults: LinkFaults,
+    limits: Limits,
+    frames: usize,
+    answers: bool,
+) -> Moved {
+    let (mut w, expected) = registered_world(f, seed, limits);
+    w.set_default_faults(faults);
+    w.connect(
+        0,
+        1,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-1",
+        expected[1].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1 && w.connections(1) == 1));
+    let start = w.tick();
+    let mut sent = 0;
+    let offer = |w: &mut PacketWorld, from: usize, to: u8, bytes: Vec<u8>| loop {
+        match w.send(
+            from,
+            r(to),
+            inc(),
+            Lane::Control,
+            DOMAIN,
+            evidence_frame(&bytes).unwrap(),
+        ) {
+            Ok(()) => return,
+            Err(SendError::QueueFull { .. } | SendError::TooManyGroups { .. }) => {
+                let t = w.tick();
+                w.advance_to(t + 1);
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    // Frame `n` is offered at `start + n`, a frame each millisecond
+    // whatever the transport's wakeups, so every setting compared gets
+    // the same offered load.
+    while sent < frames {
+        w.advance_to(start + sent as u64);
+        let mut big = vec![0xa0; 1000];
+        big[..8].copy_from_slice(&(sent as u64).to_be_bytes());
+        offer(&mut w, 0, 1, big);
+        if answers {
+            let mut small = vec![0xb0; 40];
+            small[..8].copy_from_slice(&(sent as u64).to_be_bytes());
+            offer(&mut w, 1, 0, small);
+        }
+        sent += 1;
+    }
+    let answered = if answers { frames } else { 0 };
+    let done = |w: &PacketWorld| {
+        let o = w.visible_outcome();
+        o.get(&(1, r(0), Lane::Control)).map_or(0, Vec::len) == frames
+            && o.get(&(0, r(1), Lane::Control)).map_or(0, Vec::len) == answered
+    };
+    assert!(w.run_until(600_000, done), "every frame arrives");
+    let paths = w.path_stats(0);
+    assert_eq!(paths.len(), 1, "one connection");
+    let acks = (0..2)
+        .flat_map(|n| w.connection_stats(n))
+        .map(|s| s.frame_tx.acks)
+        .sum();
+    Moved {
+        ticks: w.tick() - start,
+        lost: paths[0].lost_packets,
+        congestion_events: paths[0].congestion_events,
+        dropped: w.datagrams().1,
+        acks,
+    }
+}
+
+/// A link whose delay jitters reorders datagrams and loses none (#98's
+/// +jitter10 cell, here in virtual time). At QUIC's thresholds the
+/// sender calls lost what is only late, cuts its window for it, and
+/// moves the same frames many times slower; with loss called by time
+/// alone ([`Reordering::BY_TIME`]) it calls a tenth as many lost at most
+/// (here none, against QUIC's 199) and moves the frames many times
+/// sooner (1.1 s against 29.6 s). On the
+/// same link with real loss that setting still finds the losses, and
+/// every frame arrives.
+#[test]
+fn a_jittered_link_that_loses_nothing_is_not_called_lossy_when_loss_is_by_time() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    // One-way delay 50 ms with uniform jitter of 10 either side: a
+    // standard deviation near 12% of the delay.
+    let jitter = LinkFaults {
+        delay_min: 40,
+        delay_max: 60,
+        ..LinkFaults::default()
+    };
+    let frames = 1000;
+    let thresholds = |reordering| Limits {
+        reordering,
+        ..Limits::node()
+    };
+    let quic = steady(&f, 2, jitter, thresholds(Reordering::QUIC), frames);
+    let by_time = steady(&f, 2, jitter, thresholds(Reordering::BY_TIME), frames);
+    assert_eq!(
+        (quic.dropped, by_time.dropped),
+        (0, 0),
+        "the link loses nothing"
+    );
+    // The hypothesis, reproduced: reordering alone is called loss.
+    assert!(
+        quic.lost >= 50 && quic.congestion_events >= 20,
+        "QUIC's thresholds call reordering loss: {quic:?}"
+    );
+    assert!(
+        by_time.lost * 10 <= quic.lost && by_time.congestion_events * 10 <= quic.congestion_events,
+        "loss by time calls a tenth as many lost at most: {by_time:?} against {quic:?}"
+    );
+    assert!(
+        by_time.ticks * 3 <= quic.ticks,
+        "and moves the frames at least three times sooner: {by_time:?} against {quic:?}"
+    );
+
+    // Real loss on the same link is still found, and recovered.
+    let lossy = LinkFaults {
+        loss_ppm: 10_000,
+        ..jitter
+    };
+    let found = steady(&f, 2, lossy, thresholds(Reordering::BY_TIME), frames);
+    assert!(found.dropped > 0 && found.lost > 0, "{found:?}");
+}
+
+/// At 1% loss over a long round trip, a controller that reads every loss
+/// as congestion cannot carry a peer lane's steady load: each loss cuts
+/// its window, and the frames queue behind it. BBR does not cut its
+/// window for a loss, and carries the same load in a fraction of the
+/// time. Both call loss by time alone, so neither takes reordering for
+/// loss: the difference is the controller (`COORDD_CONGESTION`).
+#[test]
+fn at_one_percent_loss_bbr_carries_a_steady_load_that_cubic_falls_behind() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    // A constant 70 ms round trip that loses one datagram in a hundred.
+    let lossy = LinkFaults {
+        delay_min: 35,
+        delay_max: 35,
+        loss_ppm: 10_000,
+        ..LinkFaults::default()
+    };
+    let controller = |congestion| Limits {
+        congestion,
+        reordering: Reordering::BY_TIME,
+        ..Limits::node()
+    };
+    // Enough frames that CUBIC's cuts outlast its slow start at every seed
+    // tried (2 to 6): at 1,000 its time varies too much from seed to seed.
+    let frames = 2000;
+    let cubic = steady(&f, 2, lossy, controller(Congestion::Cubic), frames);
+    let bbr = steady(&f, 2, lossy, controller(Congestion::Bbr), frames);
+    assert!(
+        cubic.dropped > 0 && bbr.dropped > 0 && cubic.lost > 0 && bbr.lost > 0,
+        "both lose datagrams and find the losses: {cubic:?}, {bbr:?}"
+    );
+    assert!(
+        bbr.ticks * 2 <= cubic.ticks,
+        "BBR moves the frames at least twice as soon: {bbr:?} against {cubic:?}"
+    );
+}
+
+/// With loss called by time alone, the peer is asked to take no special
+/// action for an out of order arrival ([`Reordering::peer_threshold`]):
+/// on a link that reorders it acknowledges about as often as on one that
+/// keeps order. Left at quinn's threshold of 2, it acknowledges at once
+/// every arrival that leaves a gap of two, and a jittered link makes
+/// many. The stream is one way, so the receiver's acknowledgements go
+/// alone rather than riding on frames it sends anyway.
+#[test]
+fn a_reordering_link_does_not_make_the_peer_acknowledge_sooner_when_loss_is_by_time() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let fixed = LinkFaults {
+        delay_min: 50,
+        delay_max: 50,
+        ..LinkFaults::default()
+    };
+    let jitter = LinkFaults {
+        delay_min: 40,
+        delay_max: 60,
+        ..LinkFaults::default()
+    };
+    let by_time = Limits {
+        reordering: Reordering::BY_TIME,
+        ..Limits::node()
+    };
+    let frames = 1000;
+    let in_order = stream(&f, 2, fixed, by_time, frames, false);
+    let reordered = stream(&f, 2, jitter, by_time, frames, false);
+    eprintln!("acks: in order {in_order:?}, reordered {reordered:?}");
+    assert_eq!(
+        (in_order.dropped, reordered.dropped),
+        (0, 0),
+        "the links lose nothing"
+    );
+    assert!(
+        reordered.acks * 4 <= in_order.acks * 5,
+        "reordering adds at most a quarter more acknowledgements: \
+         {reordered:?} against {in_order:?}"
+    );
+}
+
+/// A dialer whose first flight is lost sends it again at its probe
+/// timeout, which before any round trip is measured is three initial
+/// round trips. quinn's initial round trip is 333 ms, so a lost first
+/// flight costs about a second; set to the path's own
+/// (`Limits::initial_rtt`, `COORDD_INITIAL_RTT`), it costs three round
+/// trips.
+#[test]
+fn a_lost_first_flight_is_sent_again_sooner_at_the_paths_initial_round_trip() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let link = LinkFaults {
+        delay_min: 35,
+        delay_max: 35,
+        ..LinkFaults::default()
+    };
+    let connect = |initial_rtt: Option<Duration>| {
+        let limits = Limits {
+            initial_rtt,
+            ..Limits::node()
+        };
+        let (mut w, expected) = registered_world(&f, 2, limits);
+        w.set_default_faults(link);
+        // The dialer's first datagram, its Initial, is lost.
+        w.drop_next(0, 1, 1);
+        let start = w.tick();
+        w.connect(
+            0,
+            1,
+            PeerRole::Voter,
+            Some(inc()),
+            Lane::Control,
+            "node-1",
+            expected[1].clone(),
+        )
+        .unwrap();
+        while !(w.connections(0) == 1 && w.connections(1) == 1) {
+            assert!(w.tick() - start < 20_000, "the dialer connects");
+            let t = w.tick();
+            w.advance_to(t + 1);
+        }
+        assert_eq!(w.datagrams().1, 1, "only the first flight was lost");
+        w.tick() - start
+    };
+    let quinns = connect(None);
+    let paths = connect(Some(Duration::from_millis(70)));
+    eprintln!("connected after a lost first flight: quinn's {quinns} ms, the path's {paths} ms");
+    assert!(
+        quinns >= 999,
+        "at quinn's 333 ms, the first flight goes again after three: {quinns} ms"
+    );
+    assert!(
+        paths * 2 <= quinns,
+        "at the path's 70 ms it goes again at least twice as soon: {paths} ms against {quinns} ms"
+    );
 }

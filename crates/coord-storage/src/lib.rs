@@ -98,13 +98,18 @@
 #![warn(missing_docs)]
 
 pub mod apply;
+pub mod authorizations;
 pub mod codecs;
 pub mod compaction;
 pub mod cut;
+pub mod intake;
 pub mod journaled;
+pub mod kv_index;
+pub mod latency;
 pub mod lowering;
 pub mod materialize;
 pub mod persistence;
+pub mod pipeline;
 pub mod policy;
 pub mod protocol;
 pub mod retry;
@@ -115,25 +120,33 @@ pub mod views;
 pub mod watch;
 pub mod worker;
 
-pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
+pub use apply::{AppliedOutcomeParts, Applier, ApplyError, ReadView};
+pub use authorizations::AuthorizationCacheStats;
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    CutError, DomainStatus, FlushReport, JournalLimits, JournaledError, JournaledStore, Published,
-    Submission, SubmitRefused, TransitionKind,
+    AppendDone, AppendJob, Appender, AskCause, CutError, DomainStatus, FlushReport, GroupMix,
+    HoldEnds, JournalLimits, JournaledError, JournaledStore, LoweringCost, MaterializeDone,
+    MaterializeJob, Materializer, PublishPhases, PublishThread, Published, Replayed, Submission,
+    SubmitRefused, ThreadClock, ThreadTime, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{
-    ApplyOutcome, Pending, Submitted, apply_plan, complete, plan_to_batch, prepare, submit,
+    ApplyOutcome, Pending, Submitted, apply_plan, apply_refused_plan, complete, plan_to_batch,
+    prepare, submit,
 };
-pub use persistence::{JournaledDomain, Lowered, Persistence, Refused};
+pub use persistence::{JournaledDomain, Lowered, Persistence, Refused, StorageCost};
+pub use pipeline::{
+    JobTimes, ManualAppendHandle, ManualAppender, ManualHandle, ManualMaterializer, ThreadAppender,
+    ThreadMaterializer, Waits, Waker,
+};
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use speculate::{Overlay, SpeculationLimits, SpeculationRefused, speculable, speculate};
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{
     ActiveLeasePage, StoredEvent, ViewBudget, ViewBuildError, active_leases, active_leases_page,
-    build_authorized_view, build_internal_view, build_read_view, events_at, load_authorization,
-    scan_current_page, stored_events_at,
+    build_authorized_view, build_internal_view, build_read_view, build_view_under, events_at,
+    load_authorization, scan_current_page, stored_events_at,
 };
 pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};

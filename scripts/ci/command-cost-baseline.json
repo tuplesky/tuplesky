@@ -1,0 +1,13 @@
+{
+  "recorded": "ubuntu-24.04 runner, build-test run 36908805251 (9b02d3b, task-d46): the default mix without scans, the largest of three repeats per caller count",
+  "margins": {
+    "busy_ms_per_command": 0.25,
+    "tail_busy_ms_per_command": 0.30,
+    "tail_ratio": 0.30,
+    "journal_syncs_per_command": 0.10
+  },
+  "runs": [
+    {"callers": 1, "busy_ms_per_command": 1.32, "tail_busy_ms_per_command": 1.45, "tail_ratio": 1.19, "journal_syncs_per_command": 3.00},
+    {"callers": 10, "busy_ms_per_command": 1.46, "tail_busy_ms_per_command": 1.65, "tail_ratio": 1.19, "journal_syncs_per_command": 3.00}
+  ]
+}

@@ -204,6 +204,26 @@ pub fn floor<V: OrderedRead>(
     }
 }
 
+/// The floor of `key`'s client instance, with its window width taken
+/// from the session record when no floor row exists yet; `None` when the
+/// session is unknown. What [`admit`] measures a request's window from,
+/// before the request's own acknowledgement moves it.
+pub fn session_floor<V: OrderedRead>(
+    view: &V,
+    key: &RetryKey,
+) -> Result<Option<RetryFloorV1>, EngineError> {
+    let Some(session) = session_state(view, &key.session_id)? else {
+        return Ok(None);
+    };
+    floor(
+        view,
+        &key.session_id,
+        &key.client_instance_id,
+        session.window,
+    )
+    .map(Some)
+}
+
 /// Retained record for a retry key.
 pub fn lookup<V: OrderedRead>(
     view: &V,
@@ -226,7 +246,7 @@ pub fn lookup<V: OrderedRead>(
 pub fn admit<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Admission, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -240,6 +260,59 @@ pub fn admit<V: OrderedRead>(
         &key.client_instance_id,
         session.window,
     )?;
+    admit_at(view, binding, binding.retires, &floor, authorize)
+}
+
+/// [`retirement`] and [`admit`] for one command, from its session's
+/// standing already in hand: the session record and whether it may
+/// execute now, as [`record_executable`] would read them from `view`, or
+/// `None` for a session `view` doesn't hold.
+///
+/// Gives what [`retirement`] and then [`admit`] give over `view`, with
+/// `binding.retires` set to that retirement. With the session's two rows
+/// in hand it reads the floor, once for both, and the retry record. The
+/// applier takes the standing from the authorization context its command
+/// executes under, which holds both rows ([`crate::authorizations`]), so
+/// a session's rows are read once until a landing writes one of them.
+pub fn retire_and_admit<V: OrderedRead>(
+    view: &V,
+    binding: &RetryBinding,
+    ack_through: u64,
+    session: Option<(&SessionRecord, bool)>,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
+) -> Result<(Option<Retirement>, Admission), EngineError> {
+    let key = &binding.retry_key;
+    let Some((record, executable)) = session else {
+        return Ok((None, Admission::UnknownSession));
+    };
+    // Neither needs the floor: nothing retired, and nothing admitted.
+    if ack_through == 0 && !executable {
+        return Ok((None, Admission::SessionRetired));
+    }
+    let current = floor(
+        view,
+        &key.session_id,
+        &key.client_instance_id,
+        record.window,
+    )?;
+    let retires = retires_from(&current, key, ack_through);
+    if !executable {
+        return Ok((retires, Admission::SessionRetired));
+    }
+    let admission = admit_at(view, binding, retires, &current, authorize)?;
+    Ok((retires, admission))
+}
+
+/// The rest of [`admit`] once the session may execute: `floor` is its
+/// client's, and `retires` what this command's acknowledgement retires.
+fn admit_at<V: OrderedRead>(
+    view: &V,
+    binding: &RetryBinding,
+    retires: Option<Retirement>,
+    floor: &RetryFloorV1,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
+) -> Result<Admission, EngineError> {
+    let key = &binding.retry_key;
     if key.request_sequence <= floor.floor {
         return Ok(Admission::TooOld { floor: floor.floor });
     }
@@ -255,7 +328,7 @@ pub fn admit<V: OrderedRead>(
     // an admitted request advances the floor. The binding's retirement
     // is resolved from the same view (see [`retirement`]), so this
     // stays a function of the durable state and the accepted payload.
-    let reopened = binding.retires.map_or(floor.floor, |r| r.through);
+    let reopened = retires.map_or(floor.floor, |r| r.through);
     if key.request_sequence.get() - reopened.get() > u64::from(floor.width) {
         return Ok(Admission::OutOfWindow {
             floor: floor.floor,
@@ -264,7 +337,7 @@ pub fn admit<V: OrderedRead>(
     }
     match lookup(view, key)? {
         Some(record) if record.command_id == binding.command_id => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Admission::Retry(record))
             } else {
                 Ok(Admission::Unauthorized)
@@ -282,7 +355,7 @@ pub fn admit<V: OrderedRead>(
 pub fn resolve<V: OrderedRead>(
     view: &V,
     binding: &RetryBinding,
-    authorize: impl FnOnce(&RetryRecordV1) -> bool,
+    authorize: impl FnOnce(&RetryRecordV1) -> Result<bool, EngineError>,
 ) -> Result<Resolution, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
@@ -303,7 +376,7 @@ pub fn resolve<V: OrderedRead>(
             bound: record.command_id,
         }),
         Some(record) => {
-            if authorize(&record) {
+            if authorize(&record)? {
                 Ok(Resolution::Result(record))
             } else {
                 Ok(Resolution::Unauthorized)
@@ -316,6 +389,30 @@ pub fn resolve<V: OrderedRead>(
 /// Digest of an encoded response.
 pub fn result_digest(response: &[u8]) -> Digest32 {
     HashDomain::CommandResult.digest(&[response])
+}
+
+/// The row saying `command` executed, at `position`, with the result
+/// digested as `result_digest`.
+///
+/// Every executed command has one, whether or not its outcome is bound
+/// under a retry key: a restart replays these rows as the commands this
+/// voter executed, and a command without one comes back unexecuted and is
+/// executed again at another position.
+pub fn executed_update(
+    command: &CommandId,
+    position: coord_types::ids::ExecutionPosition,
+    revision: Option<coord_types::ids::KvRevision>,
+    result_digest: Digest32,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ExecutedV1.id(),
+        key: codecs::executed_key(command),
+        value: Some(codecs::encode_executed(&ExecutedRecordV1 {
+            position,
+            revision,
+            result_digest,
+        })?),
+    })
 }
 
 /// Rows binding a plan to its invocation: the retry record and the
@@ -334,22 +431,13 @@ pub fn binding_updates(
         response,
         result_digest: digest,
     };
-    let executed = ExecutedRecordV1 {
-        position,
-        revision,
-        result_digest: digest,
-    };
     let mut updates = vec![
         StoreUpdate {
             collection: Collection::RetryV1.id(),
             key: codecs::retry_key(&binding.retry_key),
             value: Some(codecs::encode_retry(&record)?),
         },
-        StoreUpdate {
-            collection: Collection::ExecutedV1.id(),
-            key: codecs::executed_key(&binding.command_id),
-            value: Some(codecs::encode_executed(&executed)?),
-        },
+        executed_update(&binding.command_id, position, revision, digest)?,
     ];
     if let Some(retires) = binding.retires {
         updates.extend(retirement_updates(&binding.retry_key, retires)?);
@@ -430,20 +518,26 @@ pub fn retirement<V: OrderedRead>(
         return Ok(None);
     };
     let current = floor(view, &key.session_id, &key.client_instance_id, state.window)?;
+    Ok(retires_from(&current, key, ack_through))
+}
+
+/// The rest of [`retirement`] once the client's floor is read.
+fn retires_from(current: &RetryFloorV1, key: &RetryKey, ack_through: u64) -> Option<Retirement> {
+    if ack_through == 0 {
+        return None;
+    }
     // Nothing a client may acknowledge reaches its own sequence.
     let capped = ack_through.min(key.request_sequence.get().saturating_sub(1));
     let capped = capped.min(current.floor.get().saturating_add(MAX_RETIRE_PER_COMMAND));
     if capped <= current.floor.get() {
-        return Ok(None);
+        return None;
     }
-    let Ok(through) = RequestSequence::new(capped) else {
-        return Ok(None);
-    };
-    Ok(Some(Retirement {
+    let through = RequestSequence::new(capped).ok()?;
+    Some(Retirement {
         from: current.floor,
         through,
         width: current.width,
-    }))
+    })
 }
 
 /// Rows retiring every retained result of the client at or below
