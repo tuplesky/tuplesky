@@ -2080,11 +2080,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// again first at how far the committed projection has reached if
     /// the policy is stale (#320). An answer the store had not reached
     /// when it came may be reached by now: the projection commits on
-    /// the materializer's thread, between the loop's turns. So each of
-    /// the four places that build a barrier asks here, right before it
-    /// builds one: an answer, a frame's admission, a retained answer and
-    /// a watch's batch. Asks go out on the turn, which the loop wakes
-    /// for (`Recency::next_ask_at`).
+    /// the materializer's thread, between the loop's turns. So each
+    /// place that builds a barrier asks here, right before it builds
+    /// one: an answer and a held answer's release (task-d93), a frame's
+    /// admission, a retained answer and a watch's batch. Asks go out on
+    /// the turn, which the loop wakes for (`Recency::next_ask_at`).
     ///
     /// One clock read serves both the look and the check (#320 review):
     /// read twice, a short allowance could lapse between them and close
@@ -2257,6 +2257,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 denied: self.frontend.frontend.denied,
                 deferred: self.frontend.frontend.deferred,
                 remembered: u64::try_from(self.frontend.frontend.remembered()).unwrap_or(u64::MAX),
+                holds: self.frontend.frontend.holds,
             },
             evidence_for_marked: self
                 .frontend
@@ -3580,6 +3581,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .dispatcher()
             .next_read_deadline()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A disclosure the gate holds is answered `Pending` at its
+        // deadline, and nothing arrives to say it has passed (task-d93).
+        let held = self
+            .frontend
+            .frontend
+            .next_hold_deadline()
+            .map(|at| self.started + std::time::Duration::from_millis(at.get()));
         // A voter asks its leader for freshness on its period, and on an
         // idle domain nothing else arrives to say the period has run
         // (#320).
@@ -3618,6 +3626,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             pages,
             report,
             read,
+            held,
             read_round,
             freshness,
             durable_projection,
@@ -3709,6 +3718,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     voter.node().batched_round(),
                 );
                 self.carry(api, out, provenance);
+                // And what a disclosure the gate held waited for: the
+                // projection may now show its caller's session
+                // (task-d93).
+                self.release_held();
                 false
             }
             Err(DriveError::Fenced(what)) => {
@@ -3735,6 +3748,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let expired = self.frontend.frontend.dispatcher_mut().expire_reads(now);
         self.read_orders.extend(expired);
         self.send_read_orders(api);
+        // A held disclosure whose session the projection now shows, or
+        // whose hold has run out (task-d93).
+        self.release_held();
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
@@ -5189,15 +5205,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let fresh = self.policy_open();
-        let policy = Fresh {
-            source: ReadViewPolicy {
-                applier: self.backing.applier(),
-                budget: ViewBudget::default(),
-            },
-            fresh,
-        };
-        let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
+        let policy = answer_policy(self.backing.applier(), fresh);
+        let now = self.now_millis();
+        let delivery = match self.frontend.frontend.deliver_at(now, delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
+            // This node has not projected the caller's session yet
+            // (task-d93). The caller's stream stays held, and
+            // `release_held` answers it once the projection shows the
+            // session or the hold's deadline passes.
+            Delivered::Held => return,
             // The session this caller's credential named was not
             // established. Its bind stream ends with no answer, which
             // is the whole of what an unbound caller is told; the
@@ -5220,6 +5236,37 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 return;
             }
         };
+        self.write_answer(delivery);
+    }
+
+    /// The disclosures the frontend's gate held for this node's
+    /// projection that can go out now (task-d93): once the projection
+    /// shows the caller's session, or at the hold's deadline as
+    /// `Pending`.
+    ///
+    /// A held disclosure is gated again against the barrier `answer`
+    /// gates with ([`answer_policy`]), looked at again now.
+    fn release_held(&mut self) {
+        if !self.frontend.frontend.holds_any() {
+            return;
+        }
+        if self.answered_otherwise.is_some()
+            || self.admission_halt.is_some()
+            || self.cycle_halt.is_some()
+            || self.caught_up_otherwise.is_some()
+        {
+            return;
+        }
+        let fresh = self.policy_open();
+        let policy = answer_policy(self.backing.applier(), fresh);
+        let now = self.now_millis();
+        for delivery in self.frontend.frontend.release_held(now, &policy) {
+            self.write_answer(delivery);
+        }
+    }
+
+    /// Write a gated delivery on the stream its caller is waiting on.
+    fn write_answer(&mut self, delivery: coord_collector::Delivery) {
         match self
             .frontend
             .pending
@@ -7126,6 +7173,25 @@ impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
     }
 }
 
+/// The barrier an answer is gated against, and a disclosure the gate held
+/// is gated against again at its release (task-d93): over the applier's
+/// read view, so a revoke in a group the projection hasn't committed yet
+/// is seen (#281), and only while this voter's policy is fresh, so a stale
+/// one answers `Pending` (#320). Both build it here, so a release
+/// can't authorize from an older view, or a staler policy, than an answer.
+fn answer_policy<P: Persistence>(
+    applier: &Applier<P>,
+    fresh: bool,
+) -> Fresh<ReadViewPolicy<'_, P>> {
+    Fresh {
+        source: ReadViewPolicy {
+            applier,
+            budget: ViewBudget::default(),
+        },
+        fresh,
+    }
+}
+
 /// What the durable record answers for a request or a resolve, ahead of
 /// admission and of the collector's memory: the retained result, gated
 /// as a fresh one is, or a status from the record. `None` sends the frame
@@ -7291,7 +7357,8 @@ fn retained_answer<P: Persistence>(
     };
     match frontend.deliver_retained(delivery, command, &logical, &policy) {
         Delivered::Answer(delivery) => Some(delivery.frame),
-        Delivered::Unbound { .. } => None,
+        // A retained result is answered at once, never held.
+        Delivered::Unbound { .. } | Delivered::Held => None,
     }
 }
 

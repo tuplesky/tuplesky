@@ -1414,6 +1414,372 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     assert_eq!(f.denied, 1);
 }
 
+/// A frontend bound from an establishment this node has not projected
+/// yet, with one read of `a` admitted as `command` under `deadline_ms`.
+fn bound_behind(
+    ring: &KeyRing,
+    hub: &WatchHub,
+    domain: &Domain,
+    deadline_ms: u32,
+) -> (BoundFrontend, CommandId) {
+    let mut f = frontend(ring);
+    let credential = token(ring, SESSION, NOW + 1000);
+    let bind = frame_of(&bind_frame(&credential).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, hub, &Behind),
+        Ingress::Establishing(_)
+    ));
+    let key = coord_session::verify_bind(&config(ring), &credential, &clock(NOW), None)
+        .unwrap()
+        .establishment_key(&config(ring));
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let retry = retry_key(1);
+    let command = CommandId::derive(&retry, &logical).unwrap();
+    let read = frame_of(
+        &MessageV1::Request(RequestV1::new(retry, &logical, deadline_ms, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    let mut created = delivery(7, 1, command, Outcome::SessionCreated { session: SESSION });
+    created.retry_key = key;
+    assert!(matches!(
+        f.deliver(created, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &read, hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    (f, command)
+}
+
+/// A disclosure the gate holds keeps its request's record while it is
+/// held, through any number of requests accepted since (task-d93, Codex on
+/// #98): the dispatcher let a leader-read answer go when it was answered,
+/// so without the hold counting as held the record turned over, and the
+/// release found no record to authorize from and refused a permitted read
+/// with a final `OUTPUT_WITHHELD`.
+#[test]
+fn a_held_disclosure_keeps_its_record_through_request_churn() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let mut f = frontend_remembering(&ring, 4);
+    f.dispatcher_mut().set_leader_reads(true);
+    let credential = token(&ring, SESSION, NOW + 1000);
+    let bind = frame_of(&bind_frame(&credential).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &Behind),
+        Ingress::Establishing(_)
+    ));
+    let key = coord_session::verify_bind(&config(&ring), &credential, &clock(NOW), None)
+        .unwrap()
+        .establishment_key(&config(&ring));
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let command = CommandId::derive(&retry_key(1), &logical).unwrap();
+    let mut created = delivery(7, 1, command, Outcome::SessionCreated { session: SESSION });
+    created.retry_key = key;
+    assert!(matches!(
+        f.deliver(created, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    let (_, req) = request(1, range(b"a"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), at(NOW), 7, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::Read(_))
+    ));
+    let response = postcard::to_allocvec(&Response {
+        revision: KvRevision::new(1).unwrap(),
+        outcome: range_outcome(b"a"),
+    })
+    .unwrap();
+    let Some(coord_collector::ReadResolution::Answer(answer)) = f.dispatcher_mut().on_read_answer(
+        at(NOW),
+        PeerProvenance::from_transport(
+            r(0),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
+        coord_collector::ReadAnswerV1 {
+            retry_key: retry_key(1),
+            ballot: Ballot {
+                epoch: ConfigurationEpoch::new(1).unwrap(),
+                number: 0,
+                leader: r(0),
+            },
+            outcome: coord_collector::ReadOutcomeV1::Served { response },
+        },
+    ) else {
+        panic!("answered")
+    };
+    assert!(matches!(
+        f.deliver_at(at(NOW), answer, &Behind),
+        coord_session::Delivered::Held
+    ));
+    // More requests than the frontend remembers are accepted and answered
+    // while the projection lags.
+    for seq in 2..=11 {
+        let mut logical = LogicalRequest::new(NS, range(b"a"));
+        logical.canonicalize();
+        let command = CommandId::derive(&retry_key(seq), &logical).unwrap();
+        f.deliver_retained(
+            delivery(7, seq, command, range_outcome(b"a")),
+            command,
+            &logical,
+            &Behind,
+        );
+    }
+    assert!(f.remembered() <= 6, "{} remembered", f.remembered());
+    // The projection catches up: the held read goes out, disclosed.
+    let out = f.release_held(at(NOW).plus(20), &domain.policy());
+    assert_eq!(out.len(), 1);
+    assert!(
+        !is_denied(&out[0]) && !is_pending(&out[0]),
+        "{:?}",
+        outcome_of(&out[0])
+    );
+}
+
+/// Delivered at a time, a disclosure whose session this node has not
+/// projected yet is held at the gate, and goes out, disclosed, once the
+/// projection shows the session (task-d93).
+///
+/// A follower projects a command one leader turn and a hop after the
+/// leader does (task-d74), so a read right after a bind there would
+/// otherwise come back `Pending`: the client library reports that as an
+/// unknown outcome, and resolving a read finds nothing, so the
+/// application reads again for what was a few milliseconds of lag.
+#[test]
+fn a_disclosure_the_projection_is_behind_for_is_held_until_it_catches_up() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 0));
+    assert_eq!(
+        f.next_hold_deadline(),
+        Some(at(NOW).plus(coord_session::GATE_HOLD_MILLIS))
+    );
+
+    // Still behind: it stays held, and nothing is written.
+    assert!(f.release_held(at(NOW).plus(10), &Behind).is_empty());
+    assert!(f.holds_any());
+
+    // The projection catches up: the held answer goes out, disclosed.
+    let out = f.release_held(at(NOW).plus(20), &domain.policy());
+    assert_eq!(out.len(), 1);
+    assert!(
+        !is_denied(&out[0]) && !is_pending(&out[0]),
+        "{:?}",
+        outcome_of(&out[0])
+    );
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 0));
+}
+
+/// A held disclosure the projection still has not caught up with by its
+/// deadline is answered `Pending`, as it was before the hold: the
+/// client's own deadline when it named an earlier one than the gate's
+/// bound, and the gate's bound otherwise (task-d93).
+#[test]
+fn a_held_disclosure_still_behind_at_its_deadline_is_answered_pending() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+
+    // The client named 50 ms.
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 50);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!(f.next_hold_deadline(), Some(at(NOW).plus(50)));
+    assert!(f.release_held(at(NOW).plus(49), &Behind).is_empty());
+    let out = f.release_held(at(NOW).plus(50), &Behind);
+    assert_eq!(out.len(), 1);
+    assert!(is_pending(&out[0]), "{:?}", outcome_of(&out[0]));
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 1, 0));
+
+    // The client named none: the gate's own bound.
+    let (mut g, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        g.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    let bound = coord_session::GATE_HOLD_MILLIS;
+    assert!(g.release_held(at(NOW).plus(bound - 1), &Behind).is_empty());
+    let out = g.release_held(at(NOW).plus(bound), &Behind);
+    assert!(out.len() == 1 && is_pending(&out[0]));
+}
+
+/// A retry the dispatcher accepts waits under the deadline it presented,
+/// and so does the disclosure the gate holds for it: the first request's
+/// deadline is not the one the caller is now waiting on (#186 review).
+#[test]
+fn a_held_disclosure_waits_under_the_deadline_its_retry_presented() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    // The first request named no deadline: the gate's own bound.
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    assert_eq!(
+        f.next_hold_deadline(),
+        Some(at(NOW).plus(coord_session::GATE_HOLD_MILLIS))
+    );
+
+    // Its retry, 10 ms later, names 50 ms.
+    let mut logical = LogicalRequest::new(NS, range(b"a"));
+    logical.canonicalize();
+    let retry = frame_of(
+        &MessageV1::Request(RequestV1::new(retry_key(1), &logical, 50, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    let accepted = f.on_frame(
+        &clock(NOW),
+        at(NOW).plus(10),
+        7,
+        &retry,
+        &hub,
+        &domain.policy(),
+    );
+    assert!(
+        matches!(
+            accepted,
+            Ingress::Action(Action::Pending { .. } | Action::FanOut(_))
+        ),
+        "the retry was not accepted"
+    );
+    assert_eq!(f.next_hold_deadline(), Some(at(NOW).plus(60)));
+    assert!(f.release_held(at(NOW).plus(59), &Behind).is_empty());
+    let out = f.release_held(at(NOW).plus(60), &Behind);
+    assert!(out.len() == 1 && is_pending(&out[0]));
+}
+
+/// A held disclosure goes with its connection: nobody is waiting for it,
+/// and nothing is written later to a stream that is gone.
+#[test]
+fn a_held_disclosure_goes_with_its_connection() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    f.on_connection_closed(7, &hub);
+    assert!(!f.holds_any());
+    assert!(
+        f.release_held(at(NOW).plus(10), &domain.policy())
+            .is_empty()
+    );
+}
+
+/// A held disclosure is gated again at its release, and a policy that
+/// can't be read then withholds it, as it does an answer. The disclosure
+/// is neither left held nor answered `Pending`.
+#[test]
+fn a_held_disclosure_is_withheld_when_its_release_cannot_read_the_policy() {
+    struct Down;
+    impl coord_session::PolicySource for Down {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Unavailable)
+        }
+    }
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    let out = f.release_held(at(NOW).plus(10), &Down);
+    assert_eq!(out.len(), 1);
+    assert!(is_denied(&out[0]), "{:?}", outcome_of(&out[0]));
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 0, 1));
+}
+
+/// coordd releases a held disclosure with the barrier it answers with,
+/// which is stale once the voter's policy is past its allowance (#320).
+/// Stale is "not yet", not "no": the disclosure goes out at that release
+/// as `Pending`, as an answer would, and is not denied. It is not held
+/// on: the voter is cut off, and the caller's resolve may reach one that
+/// isn't.
+#[test]
+fn a_held_disclosure_released_while_the_policy_is_stale_is_answered_pending() {
+    struct Stale;
+    impl coord_session::PolicySource for Stale {
+        fn barrier(
+            &self,
+            _: NamespaceId,
+            _: &SessionId,
+        ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+            Err(coord_session::PolicyError::Stale)
+        }
+    }
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let (mut f, command) = bound_behind(&ring, &hub, &domain, 0);
+    assert!(matches!(
+        f.deliver_at(
+            at(NOW),
+            delivery(7, 1, command, range_outcome(b"a")),
+            &Behind
+        ),
+        coord_session::Delivered::Held
+    ));
+    let out = f.release_held(at(NOW).plus(10), &Stale);
+    assert_eq!(out.len(), 1);
+    assert!(is_pending(&out[0]), "{:?}", outcome_of(&out[0]));
+    assert!(!f.holds_any());
+    assert_eq!((f.holds, f.deferred, f.denied), (1, 1, 0));
+}
+
 /// A second binding of a session whose establishment already executed
 /// is settled from that outcome, also before this node's projection
 /// shows the row.
