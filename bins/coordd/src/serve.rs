@@ -2080,11 +2080,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// again first at how far the committed projection has reached if
     /// the policy is stale (#320). An answer the store had not reached
     /// when it came may be reached by now: the projection commits on
-    /// the materializer's thread, between the loop's turns. So each of
-    /// the four places that build a barrier asks here, right before it
-    /// builds one: an answer, a frame's admission, a retained answer and
-    /// a watch's batch. Asks go out on the turn, which the loop wakes
-    /// for (`Recency::next_ask_at`).
+    /// the materializer's thread, between the loop's turns. So each
+    /// place that builds a barrier asks here, right before it builds
+    /// one: an answer and a held answer's release (task-d93), a frame's
+    /// admission, a retained answer and a watch's batch. Asks go out on
+    /// the turn, which the loop wakes for (`Recency::next_ask_at`).
     ///
     /// One clock read serves both the look and the check (#320 review):
     /// read twice, a short allowance could lapse between them and close
@@ -2257,6 +2257,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 denied: self.frontend.frontend.denied,
                 deferred: self.frontend.frontend.deferred,
                 remembered: u64::try_from(self.frontend.frontend.remembered()).unwrap_or(u64::MAX),
+                holds: self.frontend.frontend.holds,
             },
             evidence_for_marked: self
                 .frontend
@@ -5204,13 +5205,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let fresh = self.policy_open();
-        let policy = Fresh {
-            source: ReadViewPolicy {
-                applier: self.backing.applier(),
-                budget: ViewBudget::default(),
-            },
-            fresh,
-        };
+        let policy = answer_policy(self.backing.applier(), fresh);
         let now = self.now_millis();
         let delivery = match self.frontend.frontend.deliver_at(now, delivery, &policy) {
             Delivered::Answer(delivery) => delivery,
@@ -5248,6 +5243,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// projection that can go out now (task-d93): once the projection
     /// shows the caller's session, or at the hold's deadline as
     /// `Pending`.
+    ///
+    /// A held disclosure is gated again against the barrier `answer`
+    /// gates with ([`answer_policy`]), looked at again now.
     fn release_held(&mut self) {
         if !self.frontend.frontend.holds_any() {
             return;
@@ -5259,16 +5257,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         {
             return;
         }
-        // A held disclosure goes out under the same staleness cap as any
-        // other (#320): a stale voter answers it pending.
         let fresh = self.policy_open();
-        let policy = Fresh {
-            source: StorePolicySource {
-                store: self.backing.applier().store(),
-                budget: ViewBudget::default(),
-            },
-            fresh,
-        };
+        let policy = answer_policy(self.backing.applier(), fresh);
         let now = self.now_millis();
         for delivery in self.frontend.frontend.release_held(now, &policy) {
             self.write_answer(delivery);
@@ -7180,6 +7170,25 @@ impl<P: Persistence> PolicySource for ReadViewPolicy<'_, P> {
             budget: self.budget,
         }
         .barrier(namespace, session)
+    }
+}
+
+/// The barrier an answer is gated against, and a disclosure the gate held
+/// is gated against again at its release (task-d93): over the applier's
+/// read view, so a revoke in a group the projection hasn't committed yet
+/// is seen (#281), and only while this voter's policy is fresh, so a stale
+/// one answers `Pending` (#320). Both build it here, so a release
+/// can't authorize from an older view, or a staler policy, than an answer.
+fn answer_policy<P: Persistence>(
+    applier: &Applier<P>,
+    fresh: bool,
+) -> Fresh<ReadViewPolicy<'_, P>> {
+    Fresh {
+        source: ReadViewPolicy {
+            applier,
+            budget: ViewBudget::default(),
+        },
+        fresh,
     }
 }
 

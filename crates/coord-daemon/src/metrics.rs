@@ -1380,16 +1380,26 @@ pub struct Answered {
 /// A refusal here is `OUTPUT_WITHHELD`, which a client takes as final: an
 /// executed command whose result its session may not see. Counted on the
 /// node, a run shows refusals without a client to report them.
+///
+/// A result whose session this node hasn't projected yet is held until it
+/// has, up to the caller's deadline or the gate's own bound (task-d93).
+/// [`Gate::holds`] counts the holds however each ended; [`Gate::deferred`]
+/// the results still answered `Pending`, at the end of a hold or at once
+/// where nothing holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gate {
     /// Results withheld: the barrier didn't permit them, or the gate had no
     /// record of what the request asked.
     pub denied: u64,
-    /// Results held because this node hadn't yet projected the session
-    /// they were for; the caller is told to ask again.
+    /// Results answered `Pending` because this node hadn't yet projected
+    /// the session they were for; the caller is told to ask again.
     pub deferred: u64,
     /// Request records the gate kept, as the snapshot found them.
     pub remembered: u64,
+    /// Results held for the projection to catch up (task-d93). Zero in a
+    /// reading from a build before the hold.
+    #[serde(default)]
+    pub holds: u64,
 }
 
 /// The distributions of a command's waits from learned to released on

@@ -120,6 +120,27 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reads["mean_served_ms"], 4.0)
         self.assertNotIn("reads", cost.per_command("n1", snapshot()))
 
+    def test_the_output_gate_is_read_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["gate"] = {"holds": 40, "deferred": 3, "denied": 1}
+        gate = cost.per_command("n1", snap)["gate"]
+        self.assertEqual(gate, {"holds": 40, "deferred": 3, "denied": 1})
+        quiet = snapshot()
+        quiet["cost"]["Observed"]["gate"] = {"holds": 0, "deferred": 0, "denied": 0}
+        self.assertNotIn("gate", cost.per_command("n1", quiet))
+        self.assertNotIn("gate", cost.per_command("n1", snapshot()))
+        # A binary from before the hold reports no holds, and the records
+        # the gate keeps are a gauge, not something it did.
+        older = snapshot()
+        older["cost"]["Observed"]["gate"] = {"denied": 2, "deferred": 1, "remembered": 40}
+        gate = cost.per_command("n1", older)["gate"]
+        self.assertEqual(gate, {"holds": 0, "deferred": 1, "denied": 2})
+        keeping = snapshot()
+        keeping["cost"]["Observed"]["gate"] = {
+            "denied": 0, "deferred": 0, "remembered": 40, "holds": 0,
+        }
+        self.assertNotIn("gate", cost.per_command("n1", keeping))
+
     def test_the_read_waits_are_taken_apart_into_three(self):
         snap = snapshot()
         snap["cost"]["Observed"]["reads"] = {

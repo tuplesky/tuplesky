@@ -14,7 +14,8 @@
 //!   denied batch closes the watch as unauthorized before any progress
 //!   crosses it. An unreadable barrier denies (fail closed). A stale one
 //!   (#312, [`PolicyError::Stale`]) discloses nothing either, but is not
-//!   a denial: the disclosure is held as pending and the watch closes as
+//!   a denial: the disclosure is answered `Pending` (not held for the
+//!   projection, as a session not yet shown is) and the watch closes as
 //!   source-lost.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -906,8 +907,10 @@ impl BoundFrontend {
             // is "not yet", as below, not "no": a refusal is read as a
             // credential that is no longer good, and this node may be
             // fresh again in a moment, or the caller may reach one that
-            // is. The request's record stays, so its retry is gated
-            // afresh.
+            // is. It is answered pending now rather than held: a stale
+            // voter is cut off, and a hold would only delay the caller's
+            // resolve, which may reach a voter that is not. The request's
+            // record stays, so its retry is gated afresh.
             Err(PolicyError::Stale) => {
                 return Decision::Out(self.defer(delivery, response.command_id));
             }

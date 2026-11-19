@@ -469,6 +469,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 denied: 2,
                 deferred: 1,
                 remembered: 40,
+                holds: 30,
             },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
@@ -661,6 +662,22 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
     let older: MetricsSnapshot = serde_json::from_value(older).expect("an older line parses");
     assert_eq!(older.offers, Offers::default());
     assert_eq!(older.paths_unreported, 0);
+
+    // A reading from a build before the gate's holds (task-d93) parses,
+    // with them zero.
+    let mut older: serde_json::Value = serde_json::from_str(&rendered).expect("a value");
+    let gate = older["cost"]
+        .as_object_mut()
+        .and_then(|m| m.values_mut().next())
+        .and_then(|v| v["gate"].as_object_mut())
+        .expect("an observed cost's gate");
+    assert!(gate.remove("holds").is_some(), "the holds are on the line");
+    let older: MetricsSnapshot = serde_json::from_value(older).expect("an older line parses");
+    let Measure::Observed(cost) = older.cost else {
+        panic!("the cost is still observed");
+    };
+    assert_eq!(cost.gate.holds, 0);
+    assert_eq!(cost.gate.remembered, 40, "the rest of the gate stands");
 }
 
 /// A snapshot reports at most [`MAX_REPORTED_PATHS`] paths, in the order
