@@ -59,7 +59,7 @@ use crate::clock::MonotonicMillis;
 use crate::codes;
 
 use crate::trace::{CollectorEvent, command_hex, replica_hex};
-use crate::wire::{SubmitV1, submit_frame};
+use crate::wire::{SubmitV1, submit_frame, submit_frame_answer_on_release, submit_frame_relayed};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
@@ -291,6 +291,43 @@ pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 /// this node's durable record of the command, if it has one.
 pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
 
+/// How long a command answered on the release alone (task-d100, step A)
+/// may hold neither half of a release before it is submitted again to
+/// its ballot's leader only, once, in milliseconds (#204 review).
+///
+/// Such a command has no votes at this collector, so a lost release is
+/// what it waits on, and only the leader can publish that again. One
+/// frame, once a command, bounds what this costs under overload; the
+/// all-voter solicit at [`SOLICIT_AFTER_MILLIS`] stays as it is, and this
+/// one doesn't count toward settling from the record, so a collector
+/// whose view of the leader is stale ends as it would without it.
+pub const SOLICIT_LEADER_AFTER_MILLIS: u64 = OFFER_CEILING_MILLIS;
+
+/// How long a relayed entry (task-d102, task-d100's step B) waits on its
+/// leader before the collector acts on it, in milliseconds: at the first
+/// bound it asks a leader that took the entry again, and otherwise, or at
+/// the next bound, it fans out.
+///
+/// A relayed submission reaches one voter, so a leader that went away,
+/// or a view of the leader that is stale, would hold it until the
+/// all-voter solicit -- and that one goes to the leader alone too.
+///
+/// At this bound, an entry whose leader took the relayed frame is
+/// submitted to that leader alone again, once (storm fix 3 on #185). The
+/// leader is the one voter that can publish a lost release again: an
+/// exact duplicate makes it do so once it has executed the command. One
+/// frame, where fanning out is a frame to every follower and their
+/// evidence back, and the followers are where a full table drops
+/// relayed payloads.
+///
+/// Past the bound again, or at the first bound for an entry its leader
+/// never took (the link refused it or went away), the entry is submitted
+/// as it would have been without the relay, and the voters' own
+/// acknowledgements to their leader decide it. A leader that answers
+/// that it isn't leading ([`SubmissionRefusal::NotLeading`]) brings the
+/// fan-out forward to at once, without asking it again.
+pub const RELAY_FALLBACK_MILLIS: u64 = OFFER_CEILING_MILLIS;
+
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Submitted {
@@ -350,8 +387,9 @@ pub enum EvidenceError {
     NotEvidence,
     /// A second, different release for the command.
     ReleaseMismatch,
-    /// A refusal from a replica that is not a voter of the current
-    /// configuration (task-d22).
+    /// Evidence from a replica that is not a voter of the current
+    /// configuration (task-d22), or from a link bound under any role but
+    /// a voter's (design Section 10.1).
     NotAVoter {
         /// Sender.
         sender: ReplicaId,
@@ -380,6 +418,12 @@ pub enum HoldReason {
     /// admission facts, or executed it long ago and forgot its payload
     /// (task-d22). The entry is settled from this node's record.
     AwaitingRecord,
+    /// A command answered on the release alone holds a release it may
+    /// not be answered on (task-d100, step A): a speculative one, or one
+    /// naming another admission than the one it was submitted under. It
+    /// is settled from this node's record against that release, or by a
+    /// voter's refusal, as one holding a release without learning is.
+    ReleaseNotAnswerable,
 }
 
 /// A released result for a caller.
@@ -621,11 +665,36 @@ struct Pending {
     solicit_at: MonotonicMillis,
     /// How many times it has been.
     solicited: u32,
+    /// When a marked entry is submitted again to its ballot's leader
+    /// alone, once, if it still holds neither half of a release
+    /// ([`SOLICIT_LEADER_AFTER_MILLIS`]); `None` for an unmarked entry
+    /// and once it has been.
+    solicit_leader_at: Option<MonotonicMillis>,
     /// Whether this node's durable record of the command may settle it
     /// with nothing of the collector's own to corroborate it: a voter
     /// refused it in a way only the record answers, it was asked for
     /// more than once, or a ballot change voided what it held (task-d22).
     from_record: bool,
+    /// Whether it was submitted as answered on the leader's release
+    /// alone (task-d100, step A): the voters send this frontend no
+    /// evidence for it, so it is answered on a final release whose
+    /// admission is the one it was submitted under.
+    marked: bool,
+    /// Whether it is still relayed to its ballot's leader alone
+    /// (task-d102, task-d100's step B): `frame` is the relayed
+    /// submission, and every voter but the leader is no destination.
+    relayed: bool,
+    /// When a relayed entry still waiting is next acted on
+    /// ([`RELAY_FALLBACK_MILLIS`]): asked of its leader again, or fanned
+    /// out as a step-A submission. `None` once it has been fanned out,
+    /// and for an entry never relayed.
+    relay_fallback_at: Option<MonotonicMillis>,
+    /// Whether a relayed entry's leader was asked again at the bound, or
+    /// said it isn't leading: either way, the next bound fans it out.
+    relay_asked_leader: bool,
+    /// The step-A submission a relayed entry falls back to: the same
+    /// payload under the answer-on-release version.
+    fanout_frame: Option<Arc<[u8]>>,
 }
 
 /// The collector of one domain.
@@ -656,6 +725,32 @@ pub struct Collector {
     /// destination's congestion cannot spend the whole budget on the
     /// same command every turn.
     offer_cursor: usize,
+    /// Whether new submissions are marked as answered on the leader's
+    /// release alone (task-d100, step A): while this collector's node
+    /// reads `Feature::AnswerOnRelease` active.
+    answer_on_release: bool,
+    /// Evidence frames taken for commands submitted as answered on the
+    /// release alone (diagnostic, #204 review): what a voter that learned
+    /// such a command from the leader's proposal alone still sends.
+    evidence_for_marked: u64,
+    /// Early solicits sent to the leader alone for marked entries still
+    /// waiting at [`SOLICIT_LEADER_AFTER_MILLIS`] (diagnostic, #204
+    /// review): the commands whose release took over a second.
+    early_solicits: u64,
+    /// Whether marked submissions are relayed to the leader alone
+    /// (task-d102, task-d100's step B): while this collector's node reads
+    /// `Feature::BatchedRound` active. Only beside `answer_on_release`.
+    relay: bool,
+    /// Relayed entries fanned out to every voter (diagnostic, task-d102):
+    /// at [`RELAY_FALLBACK_MILLIS`], or at once on a `NotLeading`.
+    relay_fallbacks: u64,
+    /// Relayed entries asked of their leader alone again at
+    /// [`RELAY_FALLBACK_MILLIS`] (diagnostic, storm fix 3).
+    relay_leader_asks: u64,
+    /// `NotLeading` refusals taken for relayed entries (diagnostic).
+    not_leading: u64,
+    /// Submissions sent to the leader alone (diagnostic, task-d102).
+    relayed: u64,
 }
 
 impl Collector {
@@ -670,6 +765,14 @@ impl Collector {
             trace: None,
             undelivered_bytes: 0,
             offer_cursor: 0,
+            answer_on_release: false,
+            evidence_for_marked: 0,
+            early_solicits: 0,
+            relay: false,
+            relay_fallbacks: 0,
+            relay_leader_asks: 0,
+            not_leading: 0,
+            relayed: 0,
         }
     }
 
@@ -687,6 +790,75 @@ impl Collector {
     /// outstanding: what evidence for it has to agree with.
     pub fn admission(&self, command: &CommandId) -> Option<coord_types::identity::Digest32> {
         self.pending.get(command).map(|p| p.admission)
+    }
+
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A). Entries
+    /// already pending keep what they were submitted as, so marked and
+    /// unmarked commands mix while the feature activates and neither
+    /// waits for evidence nobody sends.
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.answer_on_release = on;
+    }
+
+    /// Whether new submissions are marked as answered on the release.
+    pub const fn answers_on_release(&self) -> bool {
+        self.answer_on_release
+    }
+
+    /// Relay the marked submissions made from now on to the ballot's
+    /// leader alone, or stop (task-d102, task-d100's step B). Only marked
+    /// ones: a submission relayed is answered on the release alone, so
+    /// this does nothing while [`Collector::set_answer_on_release`] is
+    /// off. Entries already pending keep how they were submitted.
+    pub fn set_relay(&mut self, on: bool) {
+        self.relay = on;
+    }
+
+    /// Whether new marked submissions are relayed to the leader alone.
+    pub const fn relays(&self) -> bool {
+        self.relay && self.answer_on_release
+    }
+
+    /// Relayed entries fanned out to every voter (task-d102): at
+    /// [`RELAY_FALLBACK_MILLIS`] or on a leader's `NotLeading`.
+    pub const fn relay_fallbacks(&self) -> u64 {
+        self.relay_fallbacks
+    }
+
+    /// Relayed entries asked of their leader alone again at
+    /// [`RELAY_FALLBACK_MILLIS`], before any fan-out (storm fix 3): one
+    /// frame each, where a fan-out is one to every follower.
+    pub const fn relay_leader_asks(&self) -> u64 {
+        self.relay_leader_asks
+    }
+
+    /// `NotLeading` refusals this collector took for relayed entries.
+    pub const fn not_leading(&self) -> u64 {
+        self.not_leading
+    }
+
+    /// Submissions this collector sent to the leader alone (task-d102).
+    pub const fn relayed(&self) -> u64 {
+        self.relayed
+    }
+
+    /// Evidence frames this collector took for commands it submitted as
+    /// answered on the release alone, while they were pending (#204
+    /// review): the acknowledgements that still reach a frontend for
+    /// them, from voters that learned them from the leader's proposal
+    /// alone. One that arrives after the answer is counted as settled
+    /// evidence, not here.
+    pub const fn evidence_for_marked(&self) -> u64 {
+        self.evidence_for_marked
+    }
+
+    /// Early solicits this collector sent to its ballot's leader alone,
+    /// one at most for each marked entry (#204 review): how many commands
+    /// waited past [`SOLICIT_LEADER_AFTER_MILLIS`] for their release,
+    /// which is the frames the early solicit costs under overload.
+    pub const fn early_solicits(&self) -> u64 {
+        self.early_solicits
     }
 
     /// Whether `command` is outstanding here.
@@ -729,6 +901,11 @@ impl Collector {
     /// one whose result is retained.
     pub fn is_bound(&self, key: &RetryKey) -> bool {
         self.bindings.contains_key(key)
+    }
+
+    /// Retry keys bound to a command here: being collected, or retained.
+    pub fn bound(&self) -> usize {
+        self.bindings.len()
     }
 
     /// Submit at `now` a request admitted at `since`, its client deadline
@@ -784,11 +961,28 @@ impl Collector {
                 pending: self.pending.len(),
             });
         }
-        let frame = submit_frame(&SubmitV1 {
+        let marked = self.answer_on_release;
+        let relayed = marked && self.relay;
+        let submit = SubmitV1 {
             receipt: admitted.receipt.facts(),
             request: request.clone(),
-        })
+        };
+        let frame = if relayed {
+            submit_frame_relayed(&submit)
+        } else if marked {
+            submit_frame_answer_on_release(&submit)
+        } else {
+            submit_frame(&submit)
+        }
         .map_err(|_| SubmitRefusal::Malformed)?;
+        // What a relayed entry falls back to: the step-A submission.
+        let fanout_frame = if relayed {
+            let f =
+                submit_frame_answer_on_release(&submit).map_err(|_| SubmitRefusal::Malformed)?;
+            Some(Arc::<[u8]>::from(f.into_boxed_slice()))
+        } else {
+            None
+        };
         // The second half of the reservation, and the last point at
         // which refusing is honest. Accepting a command means owing its
         // dissemination until it settles, and that obligation is the
@@ -808,7 +1002,13 @@ impl Collector {
             });
         }
         let frame: Arc<[u8]> = Arc::from(frame.into_boxed_slice());
-        let targets: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        // A relayed submission goes to its ballot's leader alone.
+        let targets: Vec<ReplicaId> = if relayed {
+            self.relayed += 1;
+            vec![self.config.quorum.leader()]
+        } else {
+            self.config.quorum.voters().iter().copied().collect()
+        };
         self.undelivered_bytes += bytes;
         self.bindings.insert(key, command);
         self.pending.insert(
@@ -825,7 +1025,16 @@ impl Collector {
                 frame: Arc::clone(&frame),
                 solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
                 solicited: 0,
+                // A relayed entry goes to the leader alone already; it
+                // falls back to fan-out instead.
+                solicit_leader_at: (marked && !relayed)
+                    .then(|| now.plus(SOLICIT_LEADER_AFTER_MILLIS)),
                 from_record: false,
+                marked,
+                relayed,
+                relay_fallback_at: relayed.then(|| now.plus(RELAY_FALLBACK_MILLIS)),
+                relay_asked_leader: false,
+                fanout_frame,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
                     reserved: bytes,
@@ -996,24 +1205,116 @@ impl Collector {
     /// all, and this is about what a voter that took it said. From the
     /// second time on the entry may be settled from this node's durable
     /// record ([`Collector::settle_from_record`]).
+    ///
+    /// A marked entry (task-d100, step A) is also submitted once, at
+    /// [`SOLICIT_LEADER_AFTER_MILLIS`], to its ballot's leader alone: one
+    /// destination of the budget. That one leaves the all-voter schedule
+    /// and the count toward the record as they are.
+    ///
+    /// A relayed entry (task-d102) still waiting at
+    /// [`RELAY_FALLBACK_MILLIS`] is asked of its leader alone again, once,
+    /// if that leader took it, and fanned out to every voter a bound later
+    /// -- at once if the leader never took it or said it isn't leading.
     pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
         let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        let leader = self.config.quorum.leader();
         let mut out = Vec::new();
         let mut spent = 0usize;
         for (command, entry) in &mut self.pending {
+            let waiting = entry.released.is_none() && entry.votes.learned().is_none();
+            // A relayed entry its leader took and hasn't answered within
+            // the bound is asked of that leader alone again, once: the
+            // leader is the one voter that can publish a lost release
+            // again (storm fix 3).
+            if waiting
+                && entry.relay_fallback_at.is_some_and(|at| at <= now)
+                && !entry.relay_asked_leader
+                && matches!(entry.dissemination.owed.get(&leader), Some(Owed::Queued))
+            {
+                if spent + 1 > budget {
+                    break;
+                }
+                entry.relay_asked_leader = true;
+                entry.relay_fallback_at = Some(now.plus(RELAY_FALLBACK_MILLIS));
+                spent += 1;
+                self.relay_leader_asks += 1;
+                record(&mut self.trace, || CollectorEvent::RelayAskedLeader {
+                    command: command_hex(command),
+                    to: replica_hex(&leader),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets: vec![leader],
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
+            // One its leader still hasn't answered a bound after that, or
+            // never took, or whose leader said it isn't leading, is
+            // submitted as a step-A one to every voter (task-d102).
+            if waiting && entry.relay_fallback_at.is_some_and(|at| at <= now) {
+                if spent + voters.len() > budget {
+                    break;
+                }
+                let targets = fall_back(entry, &voters, now, &mut self.undelivered_bytes);
+                spent += targets.len();
+                self.relay_fallbacks += 1;
+                record(&mut self.trace, || CollectorEvent::RelayFellBack {
+                    command: command_hex(command),
+                    targets: targets.iter().map(replica_hex).collect(),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets,
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
+            if waiting
+                && entry.solicit_leader_at.is_some_and(|at| at <= now)
+                && entry.solicit_at > now
+            {
+                if spent + 1 > budget {
+                    break;
+                }
+                entry.solicit_leader_at = None;
+                spent += 1;
+                self.early_solicits += 1;
+                record(&mut self.trace, || CollectorEvent::SolicitedLeader {
+                    command: command_hex(command),
+                    to: replica_hex(&leader),
+                });
+                out.push(FanOut {
+                    command: *command,
+                    retry_key: entry.retry_key,
+                    targets: vec![leader],
+                    frame: Arc::clone(&entry.frame),
+                });
+                continue;
+            }
             if spent + voters.len() > budget {
                 break;
             }
-            if entry.solicit_at > now || entry.released.is_some() || entry.votes.learned().is_some()
-            {
+            if entry.solicit_at > now || !waiting {
                 continue;
             }
+            // The all-voter solicit covers the leader too.
+            entry.solicit_leader_at = None;
             entry.solicit_at = now.plus(SOLICIT_AFTER_MILLIS);
             entry.solicited = entry.solicited.saturating_add(1);
             if entry.solicited >= 2 {
                 entry.from_record = true;
             }
-            spent += voters.len();
+            // Still relayed: asked of the leader alone, as it was
+            // submitted (task-d102).
+            let targets = if entry.relayed {
+                vec![leader]
+            } else {
+                voters.clone()
+            };
+            spent += targets.len();
             record(&mut self.trace, || CollectorEvent::Solicited {
                 command: command_hex(command),
                 times: entry.solicited,
@@ -1021,7 +1322,7 @@ impl Collector {
             out.push(FanOut {
                 command: *command,
                 retry_key: entry.retry_key,
-                targets: voters.clone(),
+                targets,
                 frame: Arc::clone(&entry.frame),
             });
         }
@@ -1092,7 +1393,12 @@ impl Collector {
         self.pending
             .values()
             .filter(|entry| entry.released.is_none() && entry.votes.learned().is_none())
-            .map(|entry| entry.solicit_at)
+            .map(|entry| {
+                let at = entry
+                    .solicit_leader_at
+                    .map_or(entry.solicit_at, |at| at.min(entry.solicit_at));
+                entry.relay_fallback_at.map_or(at, |f| f.min(at))
+            })
             .min()
     }
 
@@ -1117,6 +1423,11 @@ impl Collector {
         message: ProtocolMessage,
     ) -> Result<Progress, EvidenceError> {
         let sender = from.from();
+        // An observer's or learner's link names a replica too, and may
+        // name any; only a voter's is a vote.
+        if !from.is_voter() {
+            return Err(EvidenceError::NotAVoter { sender });
+        }
         let (kind, vote) = match message {
             ProtocolMessage::LeaderReply {
                 ballot,
@@ -1159,6 +1470,9 @@ impl Collector {
         let result = if claimed != sender {
             Err(EvidenceError::SenderMismatch { sender, claimed })
         } else if let Some(entry) = self.pending.get_mut(&command) {
+            if entry.marked {
+                self.evidence_for_marked += 1;
+            }
             entry.votes.add(vote).map_err(EvidenceError::Vote)
         } else if self.is_resolved(&command) {
             record(&mut self.trace, || {
@@ -1205,6 +1519,7 @@ impl Collector {
             SubmissionRefusal::OtherCommand { .. } => "other-command",
             SubmissionRefusal::OtherFacts { .. } => "other-facts",
             SubmissionRefusal::Forgotten => "forgotten",
+            SubmissionRefusal::NotLeading => "not-leading",
         };
         if !self.config.quorum.voters().contains(&sender) {
             record(&mut self.trace, || {
@@ -1238,6 +1553,18 @@ impl Collector {
         // ([`Collector::settle_from_record`] for this command's own
         // record, [`Collector::settle_conflict_from_record`] for another's).
         let entry = self.pending.get_mut(&command).expect("present");
+        // A voter that isn't leading says nothing about the command
+        // (task-d102): a relayed entry falls back to fan-out at once, and
+        // any other is waiting on voters that are deciding it.
+        if matches!(refusal, SubmissionRefusal::NotLeading) {
+            if entry.relayed {
+                self.not_leading += 1;
+                entry.relay_fallback_at = Some(MonotonicMillis::ZERO);
+                // Asking it again would get the same answer.
+                entry.relay_asked_leader = true;
+            }
+            return Ok(Progress::Held(HoldReason::AwaitingRelease));
+        }
         entry.from_record = true;
         Ok(Progress::Held(HoldReason::AwaitingRecord))
     }
@@ -1249,6 +1576,9 @@ impl Collector {
         released: ReleasedResult,
     ) -> Result<Progress, EvidenceError> {
         let sender = from.from();
+        if !from.is_voter() {
+            return Err(EvidenceError::NotAVoter { sender });
+        }
         let command = released.established().command();
         let result = self.check_release(sender, &released);
         match result {
@@ -1341,11 +1671,41 @@ impl Collector {
     }
 
     /// The release rule: both the collector's learning predicate and the
-    /// leader's release must hold.
+    /// leader's release must hold. For a marked entry (task-d100, step
+    /// A), the leader's release alone, once it is final and names the
+    /// admission the entry was submitted under: the leader released it
+    /// only after learning it over the same acknowledgements, and a
+    /// release under other facts, or a speculative one, is held as one
+    /// without learning is held.
     fn try_release(&mut self, command: CommandId) -> Progress {
         let Some(entry) = self.pending.get(&command) else {
             return Progress::Settled;
         };
+        if entry.marked && entry.votes.learned().is_none() {
+            let Some((sender, released)) = entry.released.clone() else {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "awaiting-release".into(),
+                });
+                return Progress::Held(HoldReason::AwaitingRelease);
+            };
+            if released.speculative() || released.admission() != Some(entry.admission) {
+                record(&mut self.trace, || CollectorEvent::Held {
+                    command: command_hex(&command),
+                    reason: "release-not-answerable".into(),
+                });
+                return Progress::Held(HoldReason::ReleaseNotAnswerable);
+            }
+            let entry = self.pending.remove(&command).expect("present");
+            self.undelivered_bytes = self
+                .undelivered_bytes
+                .saturating_sub(entry.dissemination.reserved);
+            let established = released.established();
+            let fast = established.fast_path();
+            let response = self.answer_of(command, established.revision(), released.response());
+            let executed = Said::released(sender, &released);
+            return self.finish(command, entry, (response, executed), false, fast);
+        }
         let Some(learned) = entry.votes.learned() else {
             record(&mut self.trace, || CollectorEvent::Held {
                 command: command_hex(&command),
@@ -1692,9 +2052,20 @@ impl Collector {
             // it now. Saturation never got a say in either: this is the
             // configuration changing, not a busy queue being
             // reinterpreted as a membership change.
-            entry.dissemination.owed.retain(|r, _| voters.contains(r));
+            // A relayed entry's one destination is the new leader
+            // (task-d102), which the solicit due at once asks too.
+            let leader = quorum.leader();
+            let destinations: &[ReplicaId] = if entry.relayed {
+                core::slice::from_ref(&leader)
+            } else {
+                &voters
+            };
+            entry
+                .dissemination
+                .owed
+                .retain(|r, _| destinations.contains(r));
             let held = entry.dissemination.envelope.is_some();
-            for voter in &voters {
+            for voter in destinations {
                 let owed = entry
                     .dissemination
                     .owed
@@ -1736,6 +2107,48 @@ impl Collector {
         });
         self.config.quorum = quorum;
     }
+}
+
+/// Fan a relayed entry out to every voter as a step-A submission
+/// (task-d102): its frame becomes the step-A one, every voter but those
+/// that took the relayed one becomes a destination, due at once, and its
+/// bytes are reserved again if the leader's taking the relayed frame had
+/// given them back. Returns the voters to offer it to now.
+fn fall_back(
+    entry: &mut Pending,
+    voters: &[ReplicaId],
+    now: MonotonicMillis,
+    undelivered_bytes: &mut usize,
+) -> Vec<ReplicaId> {
+    entry.relayed = false;
+    entry.relay_fallback_at = None;
+    let frame = entry
+        .fanout_frame
+        .take()
+        .expect("a relayed entry keeps its fallback");
+    if entry.dissemination.envelope.is_none() {
+        *undelivered_bytes += frame.len();
+    } else {
+        *undelivered_bytes =
+            undelivered_bytes.saturating_sub(entry.dissemination.reserved) + frame.len();
+    }
+    entry.dissemination.reserved = frame.len();
+    entry.dissemination.envelope = Some(Arc::clone(&frame));
+    entry.frame = frame;
+    // Answered on the release alone from here, as any step-A entry.
+    entry.solicit_leader_at = Some(now.plus(SOLICIT_LEADER_AFTER_MILLIS));
+    let mut targets = Vec::new();
+    for voter in voters {
+        let owed = entry
+            .dissemination
+            .owed
+            .entry(*voter)
+            .or_insert(Owed::Stalled(OfferOutcome::Unreachable));
+        if !matches!(owed, Owed::Queued) {
+            targets.push(*voter);
+        }
+    }
+    targets
 }
 
 /// How long the `attempts`-th repeat waits, in milliseconds.

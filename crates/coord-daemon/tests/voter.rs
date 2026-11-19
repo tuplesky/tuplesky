@@ -825,6 +825,68 @@ fn a_new_leader_the_machine_refuses_moves_nothing() {
     assert!(out.peer.is_empty());
 }
 
+/// A frame on an observer's or learner's link moves nothing, though the
+/// replica it names is a voter (design Section 10.1). A higher
+/// `NewLeader` doesn't raise the ballot -- `on_peer` raises it before the
+/// machine sees the frame, so the role is checked before that -- nor
+/// fence the store, nor draw a promise; a catch-up ask doesn't reach the
+/// donor at all. The same frames on the voter's own link do each.
+#[test]
+fn a_frame_on_a_non_voter_link_moves_nothing_though_it_names_a_voter() {
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    let campaign = coord_consensus::ProtocolMessage::NewLeader {
+        ballot: candidate,
+        executed: coord_types::ids::ExecutionPosition::ZERO,
+    }
+    .encode();
+    let ask = coord_consensus::ProtocolMessage::CatchUpRequest {
+        ballot: ballot(),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+    }
+    .encode();
+    let on = |role| PeerProvenance::from_transport(r(1), inc(), role, 7);
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        let mut voter = stamped(2);
+        let asked = voter.on_peer(on(role), ask.clone()).expect("stepped");
+        assert!(asked.peer.is_empty(), "{role:?}: a page went back");
+        assert_eq!(
+            voter.node().unserved,
+            coord_daemon::node::Unserved::default(),
+            "{role:?}: the ask reached the donor"
+        );
+        let out = voter.on_peer(on(role), campaign.clone()).expect("stepped");
+        assert_eq!(voter.ballot(), ballot(), "{role:?}: the ballot moved");
+        let store = voter.node().applier().store();
+        assert_eq!(store.ballot, Some(ballot()));
+        assert!(store.fences.is_empty(), "{role:?}: the store was fenced");
+        assert!(out.peer.is_empty(), "{role:?}: {:?}", messages(&out));
+
+        // The control: the voter's own link. The ask reaches the donor,
+        // past its sender check, and the campaign is promised.
+        let asked = voter
+            .on_peer(on(PeerRole::Voter), ask.clone())
+            .expect("stepped");
+        let unserved = voter.node().unserved;
+        assert_eq!(unserved.sender, 0);
+        assert!(!asked.peer.is_empty() || unserved != coord_daemon::node::Unserved::default());
+        let out = voter
+            .on_peer(on(PeerRole::Voter), campaign.clone())
+            .expect("stepped");
+        assert_eq!(voter.ballot(), candidate);
+        assert_eq!(voter.node().applier().store().fences, vec![candidate]);
+        assert!(
+            messages(&out).iter().any(|(to, m)| *to == r(1)
+                && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == candidate)),
+            "no promise went back to the candidate: {:?}",
+            messages(&out)
+        );
+    }
+}
+
 /// A voter refuses a candidate more than a table behind it, naming its
 /// position, and its own next campaign goes above the refused ballot
 /// (task-d10): that candidate promised itself the ballot and hears

@@ -69,6 +69,8 @@ coord-membership.workspace = true
 coord-session.workspace = true
 coord-store-api.workspace = true
 coord-store-testkit.workspace = true
+# Reading a projection's rows in the activation tests.
+redb.workspace = true
 coord-sts.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

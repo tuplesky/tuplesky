@@ -56,8 +56,8 @@ pub use head::{
     HeadError, HeadState, PendingBatch, Reconciled, StreamHead, StreamPosition, WrittenBytes,
 };
 pub use record::{
-    JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordExpectation,
-    RecordOrigin, TransitionContext,
+    GroupOutcomeV1, JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError,
+    RecordExpectation, RecordOrigin, TransitionContext,
 };
 pub use stream::{
     ShardId, StorageStreamId, StreamAllocator, StreamError, StreamHighWater, StreamKey,

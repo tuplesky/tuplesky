@@ -207,6 +207,8 @@ pub struct Ca {
     /// endpoint catalog with it, which is the only way a catalog becomes
     /// this domain's rather than anybody's.
     node_key: Vec<u8>,
+    /// The cluster this authority's callers and catalog belong to.
+    cluster: [u8; 16],
 }
 
 impl Ca {
@@ -224,6 +226,7 @@ impl Ca {
             certificate,
             node_spki: Vec::new(),
             node_key: Vec::new(),
+            cluster: CLUSTER,
         }
     }
 
@@ -250,13 +253,40 @@ impl Ca {
         role: coord_types::wire_v1::PeerRole,
         incarnation: u64,
     ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        self.issue_in(name, cluster, DOMAIN, replica, role, incarnation)
+    }
+
+    /// The same, for a chosen domain of the cluster: what a sibling
+    /// domain's node is issued under the same authority.
+    fn issue_in(
+        &self,
+        name: &str,
+        cluster: [u8; 16],
+        domain: [u8; 16],
+        replica: u8,
+        role: coord_types::wire_v1::PeerRole,
+        incarnation: u64,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(cluster),
+            domain: coord_types::ids::DomainId(domain),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(incarnation).expect("positive"),
             role,
         };
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let certificate = self.sign_in(&key, name, identity);
+        (certificate, key)
+    }
+
+    /// A leaf for `identity` over a key the caller holds: what the
+    /// authority issues when a node asks with its own key.
+    fn sign_in(
+        &self,
+        key: &rcgen::KeyPair,
+        name: &str,
+        identity: coord_node_issuer::NodeIdentity,
+    ) -> rcgen::Certificate {
         let mut params =
             rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
         params.extended_key_usages = vec![
@@ -280,8 +310,7 @@ impl Ca {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let issuer = rcgen::Issuer::from_params(&ca_params, &self.key);
-        let certificate = params.signed_by(&key, &issuer).expect("leaf cert");
-        (certificate, key)
+        params.signed_by(key, &issuer).expect("leaf cert")
     }
 
     fn root_pem(&self) -> String {
@@ -301,6 +330,7 @@ fn credentials_of_cluster(
     role: coord_types::wire_v1::PeerRole,
 ) -> Ca {
     let mut ca = Ca::new();
+    ca.cluster = cluster;
     let (certificate, key) = ca.issue(SERVER_NAME, cluster, replica, role);
     ca.node_spki = spki_of(certificate.der());
     ca.node_key = key.serialize_der();
@@ -379,7 +409,7 @@ fn endpoints(dir: &Path, ca: &Ca, count: u8, addresses: &[(u8, Vec<String>)]) {
         })
         .collect();
     let mut catalog = EndpointCatalogV1 {
-        cluster: coord_types::ids::ClusterId(CLUSTER),
+        cluster: coord_types::ids::ClusterId(ca.cluster),
         domain: coord_types::ids::DomainId(DOMAIN),
         epoch: coord_types::ids::ConfigurationEpoch::new(1).expect("nonzero"),
         generation: coord_types::ids::EndpointGeneration::new(1).expect("nonzero"),
@@ -906,6 +936,7 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     // Same node identity shape, different cluster.
     let identity = coord_node_issuer::NodeIdentity {
         cluster: coord_types::ids::ClusterId([0x77; 16]),
+        domain: coord_types::ids::DomainId(DOMAIN),
         node: coord_types::ids::ReplicaId([1; 16]),
         incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
         role: coord_types::wire_v1::PeerRole::Voter,
@@ -932,6 +963,306 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
         !dir.join("state").exists(),
         "a foreign node initialized this domain's store"
     );
+}
+
+/// A certificate of a sibling domain -- the same cluster, under the same
+/// issuer -- is refused here too: the domain a node serves is the one its
+/// certificate names, and a node holding another's would open this
+/// domain's store as a node of that one.
+#[test]
+fn a_certificate_of_another_domain_never_reaches_this_domains_store() {
+    let dir = workspace("foreign-domain");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    // The committed voter, its key and generation, under this domain's
+    // authority: everything this domain commits to but the domain. A
+    // node that serves two domains with one key is issued this.
+    let identity = coord_node_issuer::NodeIdentity {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        domain: coord_types::ids::DomainId([0x33; 16]),
+        node: coord_types::ids::ReplicaId([1; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+        role: coord_types::wire_v1::PeerRole::Voter,
+    };
+    let key = rcgen::KeyPair::try_from(ca.node_key.as_slice()).expect("the node's key");
+    let sibling = ca.sign_in(&key, SERVER_NAME, identity);
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", sibling.der())).expect("cert");
+
+    let refused = run(&path, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("another domain"),
+        "the refusal did not name the mismatch: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a node of another domain initialized this domain's store"
+    );
+
+    // And `inspect`, which reports a credential `place` would refuse,
+    // says which mismatch it is rather than reading it as this domain's.
+    let inspected = run(&path, &["inspect"]);
+    assert_eq!(
+        inspected.code,
+        Some(2),
+        "{}{}",
+        inspected.out,
+        inspected.err
+    );
+    assert!(
+        inspected.err.contains("another domain"),
+        "inspect did not name the mismatch: {}{}",
+        inspected.out,
+        inspected.err
+    );
+}
+
+/// Present `certificate` and `key` on `daemon`'s API plane with a
+/// `Hello` naming this cluster and domain in `role`, and return what the
+/// node answered on the control stream: its acknowledgement, or `None`
+/// once it closed the stream or the connection without one.
+async fn hello_on_api(
+    daemon: &Running,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
+    let to = Plane {
+        addr: daemon.api,
+        alpn: coord_transport::ALPN_API,
+        incarnation: None,
+        lane: coord_transport::Lane::Unary,
+    };
+    hello_on(to, ca, certificate, key, role).await
+}
+
+/// Where a raw `Hello` goes: a daemon's plane, the incarnation it
+/// claims and the lane it asks for.
+struct Plane {
+    addr: std::net::SocketAddr,
+    alpn: &'static [u8],
+    incarnation: Option<u64>,
+    lane: coord_transport::Lane,
+}
+
+/// [`hello_on_api`] on any plane.
+async fn hello_on(
+    to: Plane,
+    ca: &Ca,
+    certificate: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    role: coord_types::wire_v1::PeerRole,
+) -> Option<coord_types::wire_v1::MessageV1> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(
+            ca.certificate.der().to_vec(),
+        ))
+        .expect("ca root");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls_pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            )],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .expect("client auth");
+    tls.alpn_protocols = vec![to.alpn.to_vec()];
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
+    )));
+    let connection = endpoint
+        .connect(to.addr, SERVER_NAME)
+        .expect("dialable")
+        .await
+        .ok()?;
+    let (mut control, mut control_recv) = connection.open_bi().await.ok()?;
+    let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
+        role,
+        cluster_id: coord_types::ids::ClusterId(CLUSTER),
+        domain_id: coord_types::ids::DomainId(DOMAIN),
+        incarnation: to
+            .incarnation
+            .map(|i| coord_types::ids::ReplicaIncarnation::new(i).expect("positive")),
+        capabilities: coord_types::wire_v1::BoundedVec::new(vec![to.lane.capability()])
+            .expect("bounded"),
+    })
+    .encode()
+    .expect("hello");
+    control.write_all(&hello).await.ok()?;
+    let answered = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reader = coord_types::wire_v1::FrameReader::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = control_recv.read(&mut buf).await.ok()??;
+            reader.push(&buf[..n]).ok()?;
+            if let Some(frame) = reader.next_frame().ok()? {
+                return coord_types::wire_v1::decode(&frame).ok();
+            }
+        }
+    })
+    .await
+    .expect("the node answered or closed within the bound");
+    connection.close(0u32.into(), b"done");
+    answered
+}
+
+/// A non-voter peer certificate naming a committed voter is refused at
+/// the handshake (design Section 10.1; the owner's decision on #185).
+/// The issuer may sign an observer's or learner's certificate for any
+/// node its rule lists, and a voter's link and the provenance of every
+/// frame are keyed by the node's replica identity. Such a certificate
+/// used to bind at n3 as n1 over a key genesis never committed: it took
+/// n1's link at n3, and n3 served its catch-up ask and promised its
+/// campaign (#185, 6846891832). Now n3 refuses it, as an observer or a
+/// learner, at n1's committed generation and at another, on either lane
+/// those roles may use, and the cluster keeps answering. An observer's
+/// certificate for a node that is no voter still binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_voter_certificate_naming_a_voter_is_refused_at_the_handshake() {
+    use coord_transport::Lane;
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("non-voter-naming-a-voter");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("peers connected=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let n3 = |incarnation, lane| Plane {
+        addr: format!("127.0.0.1:{}", cluster.peer[2])
+            .parse()
+            .expect("address"),
+        alpn: coord_transport::ALPN_PEER,
+        incarnation: Some(incarnation),
+        lane,
+    };
+    for role in [PeerRole::Observer, PeerRole::Learner] {
+        for incarnation in [1, 2] {
+            let (certificate, key) =
+                cluster
+                    .ca
+                    .issue_at(SERVER_NAME, CLUSTER, 1, role, incarnation);
+            for lane in [Lane::Control, Lane::Bulk] {
+                let answered =
+                    hello_on(n3(incarnation, lane), &cluster.ca, &certificate, &key, role).await;
+                assert!(
+                    !matches!(answered, Some(MessageV1::HelloAck(_))),
+                    "{role:?} naming n1 at generation {incarnation} bound on {lane:?}"
+                );
+            }
+        }
+    }
+
+    // The control: the same role for a node no voter is known by binds,
+    // on either lane. The same certificate issued in a sibling domain
+    // does not: the peer plane takes the domain from the certificate too
+    // (#271).
+    for lane in [Lane::Control, Lane::Bulk] {
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_at(SERVER_NAME, CLUSTER, 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            matches!(answered, Some(MessageV1::HelloAck(_))),
+            "an observer for node 9 was refused on {lane:?}: {answered:?}"
+        );
+        let (certificate, key) =
+            cluster
+                .ca
+                .issue_in(SERVER_NAME, CLUSTER, [0x33; 16], 9, PeerRole::Observer, 1);
+        let answered = hello_on(
+            n3(1, lane),
+            &cluster.ca,
+            &certificate,
+            &key,
+            PeerRole::Observer,
+        )
+        .await;
+        assert!(
+            !matches!(answered, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's observer for node 9 bound on {lane:?}: {answered:?}"
+        );
+    }
+
+    // And the cluster still answers.
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("written");
+}
+
+/// A frontend's certificate reaches only the domain it names (design
+/// Section 11.1, Codex's P1 on #267). The cluster's domains share its
+/// issuer, so a sibling domain's frontend certificate is signed by the
+/// authority this node trusts and names this cluster. It used to bind
+/// here as a frontend -- the role that submits on callers' behalf and
+/// establishes their sessions -- by naming this domain in its `Hello`.
+/// The handshake now refuses it; this domain's own frontend still binds.
+/// The same holds for a Kine collector's certificate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_certificate_of_another_domain_is_refused_at_the_handshake() {
+    use coord_types::wire_v1::{MessageV1, PeerRole};
+    let dir = workspace("frontend-domain");
+    let ca = credentials(&dir, 7, PeerRole::Frontend);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
+            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
+    )
+    .expect("write");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    // Both collector roles: the frontend, and the Kine collector, the
+    // role the code calls "for one domain", which submits too.
+    for role in [PeerRole::Frontend, PeerRole::KineCollector] {
+        let (mine, mine_key) = ca.issue_in("frontend.coordd.test", CLUSTER, DOMAIN, 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &mine, &mine_key, role).await;
+        assert!(
+            matches!(answer, Some(MessageV1::HelloAck(_))),
+            "this domain's {role:?} binds: {answer:?}"
+        );
+
+        let (theirs, theirs_key) =
+            ca.issue_in("frontend.coordd.test", CLUSTER, [0x33; 16], 0x0f, role, 1);
+        let answer = hello_on_api(&daemon, &ca, &theirs, &theirs_key, role).await;
+        assert!(
+            !matches!(answer, Some(MessageV1::HelloAck(_))),
+            "a sibling domain's {role:?} bound here: {answer:?}"
+        );
+    }
 }
 
 /// Start `coordd` and read its startup report, then stop it.
@@ -1140,6 +1471,28 @@ fn start(config: &Path) -> Running {
     start_with(config, &[])
 }
 
+/// Whether the last thing `said` says about this voter's policy is that
+/// it is fresh (#320): the voter says so on each turn to fresh or stale.
+fn policy_fresh(said: &str) -> bool {
+    said.lines()
+        .rev()
+        .find(|line| line.contains("this voter's policy is "))
+        .is_some_and(|line| line.contains("this voter's policy is fresh"))
+}
+
+/// Wait for a restarted single voter to lead again before a caller
+/// binds to it. A restarted voter answers from its own policy only once
+/// its leader has confirmed its store (#320), and a single voter is its
+/// own leader once its campaign wins: a bind before that is refused.
+/// `Caller::bind` then waits for the policy's fresh line.
+fn leads_again(daemon: &Running) {
+    assert!(
+        daemon.waits_until(60, |said| said.contains("this voter leads")),
+        "the restarted voter never led\n{}",
+        daemon.said()
+    );
+}
+
 /// Start `coordd` with `env` added to its environment and leave it
 /// serving.
 fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
@@ -1229,6 +1582,7 @@ fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
 struct Caller {
     connection: quinn::Connection,
     session: coord_types::ids::SessionId,
+    cluster: [u8; 16],
     _endpoint: quinn::Endpoint,
     // Kept alive: dropping the control stream ends the negotiation the
     // daemon bound this connection under.
@@ -1239,12 +1593,30 @@ struct Caller {
 impl Caller {
     /// Dial `daemon`, negotiate as a client of this domain, and bind
     /// `session` with a token the daemon's own keys verify.
+    ///
+    /// A voter answers from its policy only while its leader has
+    /// confirmed, within the allowance, a position its store has reached
+    /// (#320). Until then it refuses a bind as unavailable. It says on
+    /// its log when its policy turns fresh, and a caller binds once the
+    /// last thing it said about its policy is that: "voters submittable"
+    /// says a node holds its submission links, not that its policy is
+    /// current.
     async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
+        assert!(
+            daemon.waits_until(60, policy_fresh),
+            "the voter's policy never turned fresh\n{}",
+            daemon.said()
+        );
         let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
         let token = service_token(ring, session);
         let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
-        let answer = ask(&connection, &bind)
-            .await
+        let answer = try_ask(&connection, &bind).await.unwrap_or_else(|e| {
+            panic!(
+                "the binding's connection was lost: {e:?}\n{}",
+                daemon.said()
+            )
+        });
+        let answer = answer
             .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
         assert_eq!(
@@ -1257,6 +1629,7 @@ impl Caller {
         Caller {
             connection,
             session: ack.session,
+            cluster: ca.cluster,
             _endpoint: endpoint,
             _control: control,
             _control_recv: control_recv,
@@ -1279,7 +1652,7 @@ impl Caller {
     ) {
         use coord_types::wire_v1::PeerRole;
 
-        let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
+        let (certificate, key) = ca.issue("caller.coordd.test", ca.cluster, 0x0c, PeerRole::Client);
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(rustls_pki_types::CertificateDer::from(
@@ -1316,7 +1689,7 @@ impl Caller {
         let (mut control, mut control_recv) = connection.open_bi().await.expect("control stream");
         let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
             role: PeerRole::Client,
-            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            cluster_id: coord_types::ids::ClusterId(ca.cluster),
             domain_id: coord_types::ids::DomainId(DOMAIN),
             incarnation: None,
             capabilities: coord_types::wire_v1::BoundedVec::new(vec![
@@ -1365,7 +1738,7 @@ impl Caller {
     /// The retry key of this caller's `sequence`th invocation.
     fn invocation(&self, sequence: u64) -> coord_types::RetryKey {
         coord_types::RetryKey {
-            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            cluster_id: coord_types::ids::ClusterId(self.cluster),
             domain_id: coord_types::ids::DomainId(DOMAIN),
             session_id: self.session,
             client_instance_id: coord_types::ids::ClientInstanceId([0x0c; 16]),
@@ -1463,8 +1836,20 @@ impl Caller {
 /// Write `frame` on a fresh stream and read the answer the daemon
 /// writes back on it, or `None` if it never comes.
 async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types::wire_v1::Frame> {
-    let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
-    send.write_all(frame).await.expect("written");
+    try_ask(connection, frame).await.expect("readable")
+}
+
+/// [`ask`], with the connection's loss returned rather than a panic.
+async fn try_ask(
+    connection: &quinn::Connection,
+    frame: &[u8],
+) -> Result<Option<coord_types::wire_v1::Frame>, quinn::ConnectionError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    match send.write_all(frame).await {
+        Ok(()) => {}
+        Err(quinn::WriteError::ConnectionLost(lost)) => return Err(lost),
+        Err(e) => panic!("written: {e:?}"),
+    }
     send.finish().expect("finished");
     // Generous on purpose. Every caller of this helper asserts that an
     // answer arrived, never that one arrived quickly: the timeout is
@@ -1473,22 +1858,29 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     // can legitimately take tens of seconds for one request without
     // anything being wrong. A test that needs the whole load to finish
     // inside a bound sets that bound itself.
-    let bytes = tokio::time::timeout(Duration::from_secs(45), async {
+    let read = tokio::time::timeout(Duration::from_secs(45), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
-        while let Some(n) = recv.read(&mut buf).await.expect("readable") {
-            bytes.extend_from_slice(&buf[..n]);
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => bytes.extend_from_slice(&buf[..n]),
+                Ok(None) => return Ok(bytes),
+                Err(quinn::ReadError::ConnectionLost(lost)) => return Err(lost),
+                Err(e) => panic!("readable: {e:?}"),
+            }
         }
-        bytes
     })
-    .await
-    .ok()?;
+    .await;
+    let Ok(bytes) = read else {
+        return Ok(None);
+    };
+    let bytes = bytes?;
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut reader = coord_types::wire_v1::FrameReader::new();
     reader.push(&bytes).expect("within the reader bound");
-    reader.next_frame().expect("a frame")
+    Ok(reader.next_frame().expect("a frame"))
 }
 
 /// A caller binds a session against the running daemon, and the
@@ -1527,7 +1919,8 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 }
 
 /// A process that only serves clients starts, binds no peer listener,
-/// and takes a caller's binding to the voters.
+/// negotiates with a caller, and refuses the caller's binding as
+/// unavailable.
 ///
 /// A frontend reaches every committed voter over the api plane, as a
 /// collector: they are its destinations, not peers it votes with. A
@@ -1535,9 +1928,12 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 /// has a peer plane" would demand a peer listener a frontend is not
 /// required to bind, and so a supported role could never start.
 ///
-/// A binding is a replicated command, so with none of the committed
-/// voters running the frontend holds it rather than answering it: that
-/// it negotiates and holds the binding is what says it is serving.
+/// It has no voter, so no leader confirms that the policy it would
+/// answer from is current, and under the staleness cap (#320) it
+/// answers nothing from that policy: a binding is refused at the door,
+/// before it is submitted to any voter, and the caller may present its
+/// credential again elsewhere. So it submits nothing, and has nothing to
+/// offer again (task-c01's quiet re-offer is no longer reachable here).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let dir = workspace("frontend");
@@ -1558,93 +1954,41 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let daemon = start(&path);
     let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
     let token = service_token(&ring, [0x45; 16]);
-    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
-    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+    let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+    let answered = tokio::time::timeout(Duration::from_secs(10), try_ask(&connection, &bind))
         .await
-        .expect("written");
-    send.finish().expect("finished");
-    let mut buf = [0u8; 4096];
-    let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+        .unwrap_or_else(|_| panic!("a frontend held a binding:\n{}", daemon.said()));
+    // A refusal ends the bind stream unanswered and closes the
+    // connection after it, so the read can see either first: an empty
+    // stream is a refusal only if the close that follows it says so. A
+    // serving-only process is never fresh, so it says it can't bind now
+    // rather than refusing the token (#320 follow-up): a client keeps
+    // its credential for a node that can.
+    let closed = match &answered {
+        Err(lost) => Some(lost.clone()),
+        Ok(None) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .ok(),
+        Ok(Some(_)) => None,
+    };
     assert!(
-        early.is_err(),
-        "a frontend answered a binding no voter agreed to: {early:?}"
+        matches!(
+            &closed,
+            Some(quinn::ConnectionError::ApplicationClosed(close))
+                if close.reason[..] == b"bind unavailable"[..]
+        ),
+        "a frontend with no voter took a binding: {answered:?} then {closed:?}\n{}",
+        daemon.said()
     );
     let said = daemon.said();
     assert!(
         !said.contains("peer listener"),
         "a frontend was asked for a peer plane: {said}"
     );
-}
-
-/// A submission no voter could take is offered again on a quiet
-/// frontend-only domain, without the caller sending anything more
-/// (task-c01).
-///
-/// The collector schedules the re-offer, but nothing in it runs on its
-/// own: the domain loop carries it out. A rejected fan-out is recorded
-/// before the retry floor has passed, so the pass that recorded it finds
-/// nothing due, and a frontend-only domain has no voter turn and no
-/// payload timer -- it waited on its sockets, and the submission was
-/// offered again only when unrelated traffic arrived or the caller gave
-/// up and retried. The loop now wakes when the collector's next re-offer
-/// falls due. Here no voter is running, so every offer is refused as
-/// unavailable, and the caller sends its binding once and then nothing.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_quiet_frontend_offers_a_refused_submission_again_without_a_caller_retry() {
-    let dir = workspace("frontend-reoffer");
-    let ca = credentials(&dir, 7, coord_types::wire_v1::PeerRole::Frontend);
-    genesis(&dir, Some(&ca.node_spki));
-    endpoints(&dir, &ca, 3, &[]);
-    let ring = sts_keys(&dir);
-    let path = config_only(&dir);
-    let text = std::fs::read_to_string(&path).expect("read");
-    std::fs::write(
-        &path,
-        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
-            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
-    )
-    .expect("write");
-
-    assert_eq!(run(&path, &["init"]).code, Some(0));
-    let daemon = start(&path);
-    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
-    let token = service_token(&ring, [0x46; 16]);
-    let (mut send, _recv) = connection.open_bi().await.expect("bind stream");
-    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
-        .await
-        .expect("written");
-    send.finish().expect("finished");
-
-    // The binding is a replicated command: the frontend submits it to
-    // the three committed voters, none of which is there. After that the
-    // caller is silent and nothing else reaches this process.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let said = loop {
-        let said = daemon.said();
-        if said.contains("offered a submission again") {
-            break said;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a quiet frontend never offered the refused submission again:\n{said}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    // And it goes on doing so on the collector's schedule, still with
-    // nothing arriving: the wake is not a one-off.
-    let before = said.matches("offered a submission again").count();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let said = daemon.said();
-        if said.matches("offered a submission again").count() > before {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the re-offers stopped on a quiet frontend:\n{said}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        !said.contains("offered a submission again"),
+        "a frontend submitted a binding it refused: {said}"
+    );
 }
 
 /// A request is carried all the way through by the voter in this
@@ -1864,6 +2208,7 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     // process that held it; what answers now is the record the command
     // left behind.
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
@@ -1878,6 +2223,56 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
         again.outcome, first.outcome,
         "the same invocation was answered differently by the next process"
     );
+}
+
+/// A new session's first read is answered while the group that created
+/// the session waits for the projection to commit it (#281).
+///
+/// A read is served over the projection's snapshot with the journaled
+/// groups still in flight laid over it, and doesn't ask for a commit. Its
+/// output is reauthorized on the way out. That barrier read the committed
+/// snapshot, so a session created in a group held for a larger commit was
+/// one the node had never seen, and its read was answered pending. Here
+/// the hold outlasts the test. A session's record can still reach the
+/// commit first (the settle of a half-established entry asks for one), so
+/// five sessions each read once, and every read has to be answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_sessions_first_read_is_answered_while_the_projection_holds_its_commit() {
+    let dir = workspace("read-held-commit");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("the config was written");
+    let journal = "[journal]\nroot = \"journal\"\nshards = 1\n";
+    assert!(text.contains(journal), "the config's journal section moved");
+    std::fs::write(
+        &path,
+        text.replace(
+            journal,
+            &format!(
+                "{journal}profile = \"journaled-replay-v1\"\n\
+                 projection_commit_records = 1000000\n\
+                 projection_commit_ms = 600000\n"
+            ),
+        ),
+    )
+    .expect("the config was rewritten");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let daemon = start(&path);
+    for session in 0x47..0x4c {
+        let caller = Caller::bind(&daemon, &ca, &ring, [session; 16]).await;
+        let answer = ask(&caller.connection, &caller.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the read\n{}", daemon.said()));
+        let outcome = response_of(&answer).outcome;
+        assert!(
+            matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+            "session {session:#x}'s first read was answered {outcome:?}:\n{}",
+            daemon.said()
+        );
+    }
 }
 
 /// A read retried after a restart is answered with its retained result,
@@ -1921,6 +2316,7 @@ async fn a_read_retried_after_a_restart_gets_its_retained_result() {
     );
 
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
     let answer = ask(&caller.connection, &caller.range(2, b"k"))
         .await
@@ -2293,13 +2689,32 @@ async fn one_co_located_voter_is_not_a_quorum() {
         .expect("written");
     send.finish().expect("finished");
 
-    // Held, not answered and not closed. The caller is waiting on
-    // evidence from two voters that are not running, which is the
-    // correct thing for it to be waiting on.
+    // Not acknowledged. Held, the caller waits on evidence from two
+    // voters that are not running, which is the correct thing for it to
+    // be waiting on. Or refused at the door: a voter whose leader has
+    // not confirmed its freshness answers nothing from its policy (#312,
+    // #320), and this one, alone of three, has no leader to ask, so it
+    // says it can't bind now. A refusal ends the bind stream unanswered
+    // and closes the connection after it, so the read can see either
+    // first.
     let mut buf = [0u8; 4096];
     let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+    let bind_unavailable = |closed: &quinn::ConnectionError| {
+        matches!(
+            closed,
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.reason[..] == b"bind unavailable"[..]
+        )
+    };
+    let refused = match &early {
+        Ok(Err(quinn::ReadError::ConnectionLost(closed))) => bind_unavailable(closed),
+        Ok(Ok(None)) => tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .is_ok_and(|closed| bind_unavailable(&closed)),
+        _ => false,
+    };
     assert!(
-        early.is_err(),
+        early.is_err() || refused,
         "one voter established a session for a quorum of three: {early:?}"
     );
 }
@@ -2432,11 +2847,17 @@ struct Cluster {
     ring: coord_sts::KeyRing,
     configs: Vec<PathBuf>,
     api: Vec<u16>,
+    peer: Vec<u16>,
 }
 
 fn three_voters(dir: &Path) -> Cluster {
-    let ca = Ca::new();
-    let mut ca = ca;
+    three_voters_of(dir, CLUSTER)
+}
+
+/// [`three_voters`] of `cluster`.
+fn three_voters_of(dir: &Path, cluster: [u8; 16]) -> Cluster {
+    let mut ca = Ca::new();
+    ca.cluster = cluster;
     let mut spki = Vec::new();
     let mut keys = Vec::new();
     let api: Vec<u16> = (0..3).map(|_| free_port()).collect();
@@ -2455,7 +2876,7 @@ fn three_voters(dir: &Path) -> Cluster {
         std::fs::create_dir_all(&node).expect("node dir");
         let (certificate, key) = ca.issue(
             SERVER_NAME,
-            CLUSTER,
+            cluster,
             n,
             coord_types::wire_v1::PeerRole::Voter,
         );
@@ -2471,7 +2892,7 @@ fn three_voters(dir: &Path) -> Cluster {
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod");
         }
-        collector_credential(&node, &ca, CLUSTER, n);
+        collector_credential(&node, &ca, cluster, n);
         std::fs::write(
             node.join("sts-jwks.json"),
             serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
@@ -2491,7 +2912,7 @@ fn three_voters(dir: &Path) -> Cluster {
         })
         .collect();
     let manifest = serde_json::json!({
-        "cluster": hex(&CLUSTER),
+        "cluster": hex(&cluster),
         "domain": hex(&DOMAIN),
         "epoch": 1,
         "voters": voters,
@@ -2590,6 +3011,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         ring,
         configs,
         api,
+        peer,
     }
 }
 
@@ -3158,6 +3580,12 @@ impl SdkCaller {
     ) -> Self {
         use coord_types::wire_v1::PeerRole;
 
+        // As `Caller::bind`: once the voter says its policy is fresh.
+        assert!(
+            daemon.waits_until(60, policy_fresh),
+            "the voter's policy never turned fresh\n{}",
+            daemon.said()
+        );
         let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
         let mut roots = rustls::RootCertStore::empty();
         roots
@@ -3651,6 +4079,7 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
     // the image was taken, so it is inside the image; the journal no
     // longer holds the records that produced it.
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
@@ -3747,6 +4176,62 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
         !refused.err.contains("collector certificate"),
         "refused for the collector's leaf, not the node's: {}",
         refused.err
+    );
+}
+
+/// A node whose own certificate is an observer's naming a committed
+/// voter: `inspect` says so, and the node refuses to start, rather than
+/// starting to be refused by every peer with nothing said on its own
+/// side (design Section 10.1). The same certificate for a node no voter
+/// holds is reported as what it is.
+#[test]
+fn an_observer_certificate_naming_a_committed_voter_is_named_on_its_own_node() {
+    let dir = workspace("observer-names-voter");
+    let voter = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 3, Some(&voter.node_spki));
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    let config = std::fs::read_to_string(&path).expect("config");
+    assert!(config.contains("role = \"voter-frontend-observer\""));
+    std::fs::write(
+        &path,
+        config.replace(
+            "role = \"voter-frontend-observer\"",
+            "role = \"frontend-observer\"",
+        ),
+    )
+    .expect("config");
+
+    let _ = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report
+            .out
+            .contains("role=Observer state=names-a-committed-voter"),
+        "expected the role named:\n{}",
+        report.out
+    );
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+    assert!(
+        refused.err.contains("a committed voter"),
+        "refused for another reason: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a refused node created a store"
+    );
+
+    // The control: an observer of a node no voter holds.
+    let _ = credentials(&dir, 9, coord_types::wire_v1::PeerRole::Observer);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report.out.contains("role=Observer state=not-a-voter"),
+        "{}",
+        report.out
     );
 }
 
@@ -3980,6 +4465,7 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
     std::fs::write(dir.join("collector.pem"), &retired_collector).expect("collector cert");
     std::fs::write(dir.join("collector.key"), &retired_collector_key).expect("collector key");
     let daemon = start(&path);
+    leads_again(&daemon);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x5a; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
@@ -4259,6 +4745,127 @@ async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
     assert_eq!(again.code, Some(2), "{}", again.out);
 }
 
+/// One backup restores every voter of a three-voter successor, and the
+/// three serve the restored state and agree past it (#307; task-d27's
+/// note on a restore's boundary).
+///
+/// The runbook fills one node. A voter of the successor that started
+/// from `init` instead would hold nothing at or below the backup's
+/// boundary, and no donor can serve it those commands with a decided
+/// record, because a shared checkpoint carries none. So until task-d32
+/// every voter of a successor is restored from the same backup, under
+/// the same attestation, each on its own configuration. This is that
+/// flow end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_backup_restores_every_voter_of_a_successor() {
+    // Three voters on both sides, so that a release build serves them
+    // too: it refuses the one-voter test profile.
+    let dir = workspace("restore-every-voter");
+    let old = three_voters(&dir);
+    for config in &old.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    {
+        let running: Vec<Running> = old.configs.iter().map(|c| start(c)).collect();
+        for node in &running {
+            assert!(
+                node.waits_to_say("voters submittable=2 of 2"),
+                "{}",
+                node.said()
+            );
+        }
+        let caller = Caller::bind(&running[0], &old.ca, &old.ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the cluster answered the request\n{}", running[0].said()));
+        // The backup is voter 1's store, so voter 1 has executed it.
+        let read = ask(&caller.connection, &caller.range(2, b"k"))
+            .await
+            .expect("voter 1 answered the read");
+        assert_eq!(read_value(&read).as_deref(), Some(&b"v"[..]));
+    }
+    let out = dir.join("backup");
+    let taken = run(&old.configs[0], &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+
+    let new_dir = workspace("restore-every-voter-successor");
+    let new_cluster = [0xc7u8; 16];
+    let successor = three_voters_of(&new_dir, new_cluster);
+    let attestation = fencing_file(
+        &dir,
+        "fencing.json",
+        CLUSTER,
+        new_cluster,
+        &manifest["root"],
+    );
+    for (n, config) in successor.configs.iter().enumerate() {
+        let restored = run(
+            config,
+            &[
+                "restore",
+                "--dir",
+                out.to_str().unwrap(),
+                "--fencing",
+                attestation.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            restored.code,
+            Some(0),
+            "voter {} of the successor was not restored:\n{}{}",
+            n + 1,
+            restored.out,
+            restored.err
+        );
+    }
+
+    let running: Vec<Running> = successor.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "restored voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    // The three agree on a command past the boundary...
+    let caller = Caller::bind(&running[0], &successor.ca, &successor.ring, [0x5b; 16]).await;
+    let Some(answer) = ask(&caller.connection, &caller.put(1, b"k2", b"w")).await else {
+        panic!(
+            "the restored voters never agreed on a new command\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+            running[0].said(),
+            running[1].said(),
+            running[2].said()
+        );
+    };
+    assert!(
+        matches!(
+            response_of(&answer).outcome,
+            coord_types::wire_v1::OutcomeV1::Ok { .. }
+        ),
+        "the restored voters answered the new command with {:?}",
+        response_of(&answer)
+    );
+
+    // ...and serve what the backup held, from each of them.
+    for (n, node) in running.iter().enumerate() {
+        let reader = Caller::bind(node, &successor.ca, &successor.ring, [0x60 + n as u8; 16]).await;
+        let read = ask(&reader.connection, &reader.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("restored voter {} did not answer the read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"v"[..]),
+            "restored voter {} did not serve the backup's key",
+            n + 1
+        );
+    }
+}
+
 /// A restore that stopped after its policy and before its pin is refused
 /// by a start and finished by `init`, which keeps the restored rows and
 /// writes none of the policy twice (task-59).
@@ -4461,6 +5068,14 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         report.contains("build schema=1") && report.contains("features=checkpoint-floor"),
         "the daemon did not report what this build is:\n{report}"
     );
+    // The journal's window reads ahead, so the line gives the versions
+    // read, and the one written beside them: an operator checking a fleet
+    // before a rollback sees which nodes read what a successor writes,
+    // and which already write it (10.7, step 1a).
+    assert!(
+        report.contains("journal=1..2 journal_writes=1 "),
+        "the build line did not give the journal's read window and written version:\n{report}"
+    );
 
     // Nothing activated: it serves, which is the coexistence half.
     assert_eq!(run(&path, &["--check"]).code, Some(0));
@@ -4475,6 +5090,15 @@ fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
         refused.code,
         Some(2),
         "a node served a store it cannot fully read:\n{}{}",
+        refused.out,
+        refused.err
+    );
+    // It says why as an operator needs it: this build is too old, and the
+    // id it doesn't know, not a corrupt record (#227 review).
+    assert!(
+        format!("{}{}", refused.out, refused.err).contains("too old")
+            && format!("{}{}", refused.out, refused.err).contains("0x7fff"),
+        "the refusal didn't say this build is too old:\n{}{}",
         refused.out,
         refused.err
     );
@@ -5568,6 +6192,7 @@ impl Ca {
     ) -> (Vec<u8>, u64) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(CLUSTER),
+            domain: coord_types::ids::DomainId(DOMAIN),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
             role,
@@ -5674,6 +6299,7 @@ impl NodeIssuerFixture {
                 .into_iter()
                 .collect(),
                 cluster: coord_types::ids::ClusterId(CLUSTER),
+                domain: coord_types::ids::DomainId(DOMAIN),
                 nodes: vec![coord_types::ids::ReplicaId([*n; 16])],
                 role,
                 min_incarnation: 1,
@@ -5883,10 +6509,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&early.connection, &early.put(1, b"k", b"v"))
         .await
         .expect("a caller connected before the renewal is served inside the old leaf's life");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the early caller's write was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     // ...and closed at it: that connection was authenticated under the
     // old leaf, and nothing is carried under a leaf past its end.
     until_past(old_not_after + 1).await;
@@ -5907,10 +6535,12 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let answer = ask(&late.connection, &late.range(1, b"k"))
         .await
         .expect("a caller arriving after the old leaf's end is served");
-    assert!(matches!(
-        response_of(&answer).outcome,
-        coord_types::wire_v1::OutcomeV1::Ok { .. }
-    ));
+    let outcome = response_of(&answer).outcome;
+    assert!(
+        matches!(outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the late caller's read was answered {outcome:?}:\n{}",
+        daemon.said()
+    );
     assert!(
         !daemon.said().contains("renewal expired"),
         "{}",
@@ -6313,34 +6943,6 @@ async fn peers_admit_a_voters_renewed_leaf() {
     }
 }
 
-/// A `Range` of exactly `key` at `caller`'s node, asked again while the
-/// node answers it `Pending`.
-///
-/// The frontend's output gate answers a read `Pending`, not refused, when
-/// its own node has not yet projected the caller's session. A follower executes a command one
-/// leader turn and a hop after the leader does (task-d74), so a session
-/// bound at a follower just before the read can be that far behind. A
-/// read changes nothing, so a test that wants the value presents it
-/// again, under the same invocation, until the node has caught up.
-async fn read_projected(
-    caller: &Caller,
-    sequence: u64,
-    key: &[u8],
-) -> Option<coord_types::wire_v1::Frame> {
-    let until = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let answer = ask(&caller.connection, &caller.range(sequence, key)).await?;
-        let pending = matches!(
-            response_of(&answer).outcome,
-            coord_types::wire_v1::OutcomeV1::Pending
-        );
-        if !pending || std::time::Instant::now() >= until {
-            return Some(answer);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// The value a `Range` of one key answered with, if any.
 fn read_value(answer: &coord_types::wire_v1::Frame) -> Option<Vec<u8>> {
     let response = response_of(answer);
@@ -6441,7 +7043,7 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
         Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x64; 16]).await,
     ];
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 1, b"k")
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
@@ -6459,7 +7061,7 @@ async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_i
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 3, b"k")
+        let read = ask(&caller.connection, &caller.range(3, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
@@ -6578,7 +7180,7 @@ async fn a_leader_that_sent_early_and_restarted_comes_back_following() {
         Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x68; 16]).await,
     ];
     for (n, caller) in callers.iter().enumerate() {
-        let read = read_projected(caller, 1, b"k")
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
             .await
             .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
         assert_eq!(
@@ -6856,13 +7458,15 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
     // the write made under the old leader is still what a read sees
     // before it.
     let after = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
-    let read = read_projected(&after, 1, b"k").await.unwrap_or_else(|| {
-        panic!(
-            "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
-            running[0].said(),
-            running[1].said()
-        )
-    });
+    let read = ask(&after.connection, &after.range(1, b"k"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
     assert_eq!(read_value(&read).as_deref(), Some(&b"before"[..]));
     let put = ask(&after.connection, &after.put(2, b"k", b"after"))
         .await

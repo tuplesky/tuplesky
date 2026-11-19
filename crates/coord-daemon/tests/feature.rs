@@ -600,3 +600,84 @@ fn a_voter_holding_the_record_answers_even_without_its_support_row() {
     d.resend(1);
     assert!(d.features(1).holders(EP).contains(&replica(3)));
 }
+
+/// task-d102: the relay (`BatchedRound`) is activated only once
+/// `AnswerOnRelease` is active, since a relayed command is answered on
+/// the leader's release alone. Asked first, it is refused and nothing is
+/// written; asked after, it activates as any feature does.
+#[test]
+fn the_relay_is_activated_only_after_answer_on_release() {
+    let mut d = Domain::new(3, &[]);
+    assert_eq!(
+        d.activate(1, Feature::BatchedRound),
+        Err(ActivateRefusal::Requires {
+            feature: Feature::BatchedRound,
+            before: Feature::AnswerOnRelease,
+        })
+    );
+    assert_eq!(d.record(1), None, "a refused activation wrote nothing");
+    assert_eq!(
+        d.activate(1, Feature::AnswerOnRelease),
+        Ok(Activation::Started)
+    );
+    assert_eq!(
+        d.activate(1, Feature::BatchedRound),
+        Ok(Activation::Started)
+    );
+    for n in 1..=3 {
+        assert_eq!(
+            d.features(n).active(),
+            set(&[Feature::AnswerOnRelease, Feature::BatchedRound]),
+            "voter {n}'s switches"
+        );
+    }
+}
+
+/// A store whose activation record names a feature this build has never
+/// heard of is refused at open (Codex on #98), not read as nothing active:
+/// `Features::active` turns a record whose features do not parse into an
+/// empty set, so a voter opened over it would run without what its cluster
+/// activated. The same record with only features this build supports opens.
+#[test]
+fn an_activation_record_this_build_cannot_run_is_refused_at_open() {
+    let members: BTreeSet<ReplicaId> = (1..=3).map(replica).collect();
+    let voters = EpochVoters::new(epoch(3), members).unwrap();
+    for (features, opens) in [(vec![0x7fff], false), (vec![EP.id()], true)] {
+        let record = coord_checkpoint::feature::ActiveFeaturesV1 {
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            configuration: epoch(3),
+            features: features.clone(),
+            reporters: vec![replica(1), replica(2), replica(3)],
+        };
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        let update = record.update().unwrap();
+        tx.put(
+            update.collection,
+            &update.key,
+            update.value.as_ref().unwrap(),
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+        let view = engine.reader().snapshot().unwrap();
+        let opened = Features::open(
+            CLUSTER,
+            DOMAIN,
+            replica(1),
+            voters.clone(),
+            &view,
+            ReplicaIncarnation::new(1).unwrap(),
+            BootId([1; 16]),
+        );
+        match (opened, opens) {
+            (Ok(features), true) => assert_eq!(features.active(), set(&[EP])),
+            (Err(e), false) => assert!(e.contains("too old") && e.contains("0x7fff"), "{e}"),
+            (Ok(features), false) => panic!(
+                "{features:?}: opened over a record it cannot run, active {:?}",
+                features.active()
+            ),
+            (Err(e), true) => panic!("{features:?}: refused a record it can run: {e}"),
+        }
+    }
+}

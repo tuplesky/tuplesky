@@ -52,9 +52,11 @@ fn a_binding_is_acknowledged_and_its_stream_ends() {
 /// refused stops being served. Ignoring the frame is not the same as
 /// closing: the same frame can simply be sent again.
 ///
-/// All three close as `Rejected` and say no more. Whether a token was
+/// All of them close as `Rejected` and say no more. Whether a token was
 /// wrong, absent or merely late is not something an unbound caller is
-/// entitled to distinguish, and the reason crosses the wire.
+/// entitled to distinguish, and the reason crosses the wire. The one
+/// other reason, "bind unavailable", is a stale node's, given before it
+/// read the token (#320 follow-up): it says nothing about the token.
 #[test]
 fn a_connection_without_a_live_binding_stops_being_served() {
     for (ingress, reason) in [
@@ -66,6 +68,10 @@ fn a_connection_without_a_live_binding_stops_being_served() {
             }),
             "bind refused",
         ),
+        // A node that can't decide from its policy now refused before it
+        // read the credential (#320 follow-up), so it can say so without
+        // saying anything about the token: the caller keeps it.
+        (Ingress::Rejected(BindError::Stale), "bind unavailable"),
     ] {
         let decided = step(ingress, Some(key(1)));
         assert_eq!(

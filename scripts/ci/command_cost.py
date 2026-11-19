@@ -21,8 +21,11 @@ spreads it over commands that ran while the history was short.
 commands a voter established on the slow path missed the fast one, the
 pre-acceptances it held that the leader had not ordered, the leader's
 waits from learned to released, the read waits taken apart, the peer
-frames and streams per command, and the journal's and the projection's
-jobs per command, queued, served and completed. A run
+frames and streams per command, what a voter sent while it led (its
+fresh proposals, its proposal frames and its `Committed` frontier
+announcements, task-d102, each a follower, per command), and the
+journal's and the projection's jobs per command, queued, served and
+completed. A run
 in which no voter decided anything fast is printed as a finding.
 
 `table` prints a fourth table (task-d97): the tails of the waits the
@@ -33,7 +36,7 @@ the voter started:
 - the leader's round from a submission to learned, then from learned to
   released, in all and by part;
 - the read barrier's wait;
-- the domain loop's run-queue time a pass, sampled one pass in sixteen,
+- the domain loop's run-queue time a pass, sampled one pass every 10 ms,
   over every sampled pass and over those that executed a command;
 - the journal appender's and the projection's jobs, each job's time
   served (for the appender, an append and its sync: the disk's own
@@ -136,11 +139,14 @@ def per_command(node: str, snapshot: dict) -> dict:
         **paths_of(cost),
         **release_of(cost),
         **reads_of(cost),
+        **gate_of(cost),
         **cpu_of(cost, executed),
         **waits_of(cost, executed),
         **traffic_of(cost, executed),
+        **proposals_of(cost, executed),
         **groups_of(cost, executed, syncs["Observed"]),
         **tails_of(cost),
+        **({"flush_causes_per_command": f} if (f := flush_causes_of(cost, executed)) else {}),
     }
 
 
@@ -276,8 +282,9 @@ def traffic_of(cost: dict, executed: int) -> dict:
     lost before they were written. Beside them, frames per stream each
     way, the batching factor (task-d61), and frames lost per stream lost.
     The api plane's QUIC counts (task-d70) are a block of their own in the
-    reading, and per command as `api_<count>`. Empty for a binary older
-    than the reading."""
+    reading, and per command as `api_<count>`; its frames by kind
+    (task-d88's R3) likewise, as `api_frames_<kind>`. Empty for a binary
+    older than the reading."""
     traffic = cost.get("traffic")
     if not isinstance(traffic, dict) or "Observed" not in traffic:
         return {}
@@ -296,6 +303,18 @@ def traffic_of(cost: dict, executed: int) -> dict:
     if traffic.get("sent_lost_streams"):
         out["frames_per_lost_stream"] = traffic["sent_lost"] / traffic["sent_lost_streams"]
     return out
+
+
+def proposals_of(cost: dict, executed: int) -> dict:
+    """What a voter sent while it led, per command (task-d102): its fresh
+    proposals, the proposal frames that carried more than one, and its
+    commit frontier announcements (`Committed`), each counted once a
+    follower, with their bytes. Empty for a binary older than the counts
+    and for a voter that never led."""
+    proposals = cost.get("proposals")
+    if not isinstance(proposals, dict) or not any(proposals.values()):
+        return {}
+    return {"proposals_per_command": {k: v / executed for k, v in proposals.items()}}
 
 
 def groups_of(cost: dict, executed: int, syncs: int) -> dict:
@@ -321,6 +340,17 @@ def groups_of(cost: dict, executed: int, syncs: int) -> dict:
     if with_application:
         out["commands_per_execution_group"] = groups["application_records"] / with_application
     return out
+
+
+def flush_causes_of(cost: dict, executed: int) -> dict:
+    """Why the domain loop lowered (task-d73), per command: with nothing
+    more ready, at the event bound, with a full group queued, and of all
+    of them, while an append was out. Empty for a binary older than the
+    reading."""
+    causes = cost.get("flush_causes")
+    if not isinstance(causes, dict) or not executed:
+        return {}
+    return {k: causes[k] / executed for k in ("idle", "events", "queued", "appending")}
 
 
 def reads_of(cost: dict) -> dict:
@@ -411,6 +441,23 @@ def release_of(cost: dict) -> dict:
             "journal_ms": per(journal),
         }
     }
+
+
+def gate_of(cost: dict) -> dict:
+    """What this node's output gate did with disclosures to its own
+    callers (task-d93): how many it held for the projection to catch up
+    with their session, how many it still answered `Pending`, and how
+    many a barrier denied. Empty for a binary older than the counts, or a
+    node whose gate did none of these. A binary from before the hold
+    reports no `holds`, read as none; `remembered`, a gauge of the
+    records kept, is not a count of what the gate did."""
+    gate = cost.get("gate")
+    if not isinstance(gate, dict):
+        return {}
+    counts = {k: gate.get(k, 0) for k in ("holds", "deferred", "denied")}
+    if not any(counts.values()):
+        return {}
+    return {"gate": counts}
 
 
 def resends_of(cost: dict, executed: int) -> dict:
@@ -639,14 +686,16 @@ def paths_table(result: dict) -> str:
         "| read ms: confirm/after confirm/after index | reads/round | behind/read "
         "| peer frames/cmd sent/received (streams sent/received) "
         "| peer datagrams/cmd sent/received (send calls, ACKs sent) "
+        "| led, sent/cmd: proposals/frames/Committed "
         "| journal ms/cmd queued/served/completed | projection ms/cmd queued/served/completed |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- |",
     ]
     dash = "--"
     for run in result["runs"]:
         for finding in run.get("findings", []):
             lines.append(f"| {run['callers']} | **finding** | {finding} "
-                         "| | | | | | | | | | | |")
+                         "| | | | | | | | | | | | |")
         for v in run["voters"]:
             share = v.get("fast_path_share")
             share = dash if share is None else f"{share:.1%}"
@@ -676,13 +725,16 @@ def paths_table(result: dict) -> str:
             packets = dash if not traffic_cmd or "datagrams_sent" not in traffic_cmd else (
                 f"{traffic_cmd['datagrams_sent']:.2f}/{traffic_cmd['datagrams_received']:.2f} "
                 f"({traffic_cmd['send_calls']:.2f}, {traffic_cmd['acks_sent']:.2f})")
+            sent = v.get("proposals_per_command")
+            sent = dash if sent is None else "/".join(
+                f"{sent[f]:.2f}" for f in ("proposals", "frames", "frontiers"))
             jobs = lambda side: dash if f"{side}_jobs" not in v else "/".join(
                 f"{v[f'{side}_jobs'][f'{t}_ms_per_command']:.3f}"
                 for t in ("queued", "served", "completed"))
             lines.append(
                 f"| {run['callers']} | {v['node']} | {share} | {missed} | {acks} | {held} "
                 f"| {release} | {waits} | {per_round} | {behind} | {traffic} | {packets} "
-                f"| {jobs('appender')} | {jobs('materializer')} |")
+                f"| {sent} | {jobs('appender')} | {jobs('materializer')} |")
     return "\n".join(lines)
 
 
@@ -744,6 +796,27 @@ def groups_table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def flush_causes_table(result: dict) -> str:
+    """Why each voter's loop lowered (task-d73), one row per voter per run:
+    flushes a command by cause, beside commands an append and a commit."""
+    lines = [
+        "| callers | node | idle | event bound | full group | while appending "
+        "| commands/append | commands/commit |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for run in result["runs"]:
+        for v in run["voters"]:
+            f = v.get("flush_causes_per_command")
+            if f is None:
+                continue
+            split = " | ".join(f"{f[k]:.3f}" for k in ("idle", "events", "queued", "appending"))
+            lines.append(
+                f"| {run['callers']} | {v['node']} | {split} "
+                f"| {1 / v['journal_appends_per_command']:.2f} "
+                f"| {1 / v['projection_commits_per_command']:.2f} |")
+    return "\n".join(lines)
+
+
 def per_command_or_dash(voter: dict, field: str) -> str:
     """A per-command reading to three places, or `--` when the binary
     did not report it."""
@@ -791,6 +864,8 @@ def main(argv: list[str]) -> int:
             print(groups_table(result))
             print()
             print(tails_table(result))
+            print()
+            print(flush_causes_table(result))
         else:
             baseline = json.loads(args.baseline.read_text())
             result = json.loads(args.result.read_text())

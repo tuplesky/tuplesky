@@ -17,7 +17,9 @@ use coord_checkpoint::local::{
 };
 use coord_checkpoint::manifest::RowV1;
 use coord_checkpoint::store::{LocalCheckpointStore, StoreError};
-use coord_journal_api::frontier::{LOCAL_CHECKPOINT_FORMAT_V1, select_recovery_pointer};
+use coord_journal_api::frontier::{
+    CheckpointPointerV1, LOCAL_CHECKPOINT_FORMAT_V1, OLDEST_POINTER_FORMAT, select_recovery_pointer,
+};
 use coord_journal_api::record::RecordOrigin;
 use coord_journal_api::stream::StorageStreamId;
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
@@ -256,6 +258,32 @@ fn a_written_image_loads_exactly_and_a_directory_selects_nothing() {
     let selected = select_recovery_pointer(&origin(3), [&pointer, &later_pointer]);
     assert_eq!(selected, Some(&later_pointer));
     // And the older one still loads, because nothing has reclaimed it.
+    assert_eq!(store.load(&pointer).expect("loads"), checkpoint);
+}
+
+/// A pointer that names an image format from before the raise is refused
+/// where its image is loaded, as a quarantine naming the format: the
+/// journal that holds it opens, and the baseline it selects stops the
+/// node rather than reading a layout this build doesn't know (#247,
+/// Codex).
+#[test]
+fn a_pointer_naming_an_older_image_format_is_refused_at_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LocalCheckpointStore::open(dir.path()).expect("store");
+    let engine = engine();
+    let checkpoint = exported(&engine);
+    let pointer = store.write(&checkpoint).expect("written");
+    let before_the_raise = CheckpointPointerV1 {
+        format: OLDEST_POINTER_FORMAT,
+        ..pointer
+    };
+    assert_ne!(before_the_raise.format, LOCAL_CHECKPOINT_FORMAT_V1);
+    match store.load(&before_the_raise) {
+        Err(StoreError::Quarantine { reason }) => {
+            assert!(reason.contains("format"), "{reason}");
+        }
+        other => panic!("expected a quarantine naming the format, got {other:?}"),
+    }
     assert_eq!(store.load(&pointer).expect("loads"), checkpoint);
 }
 
@@ -543,4 +571,91 @@ fn the_emptiness_check_sees_a_row() {
         .scan_page(Collection::ProtocolV1.id(), &ScanRequest::all(1, 1 << 20))
         .unwrap();
     assert!(!page.rows.is_empty());
+}
+
+/// A chunk's encoding is the one serde's derive gives a byte vector,
+/// a sequence of `u8` (task-d92): writing the key and value as bytes
+/// changes how they are copied, not one byte of what is written, so an
+/// image written before the change and one written after are the same
+/// files at the same represented position.
+#[test]
+fn a_chunk_encodes_as_it_did_with_bytes_as_a_sequence() {
+    use coord_checkpoint::manifest::ChunkV1;
+
+    #[derive(serde::Serialize)]
+    struct PlainRow {
+        collection: u16,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct PlainChunk {
+        ordinal: u32,
+        rows: Vec<PlainRow>,
+    }
+
+    // Lengths on each side of a varint's width, and an empty value.
+    let lengths = [0usize, 1, 127, 128, 300, 16_383, 16_384, 70_000];
+    let rows: Vec<RowV1> = lengths
+        .iter()
+        .enumerate()
+        .map(|(i, n)| RowV1 {
+            collection: [0u16, 1, 127, 128, 300, 16_384, u16::MAX, 7][i],
+            key: (0..*n % 1000).map(|b| b as u8).collect(),
+            value: (0..*n).map(|b| (b * 7) as u8).collect(),
+        })
+        .collect();
+    for ordinal in [0u32, 1, 127, 128, u32::MAX] {
+        let chunk = ChunkV1 {
+            ordinal,
+            rows: rows.clone(),
+        };
+        let plain = PlainChunk {
+            ordinal,
+            rows: rows
+                .iter()
+                .map(|r| PlainRow {
+                    collection: r.collection,
+                    key: r.key.clone(),
+                    value: r.value.clone(),
+                })
+                .collect(),
+        };
+        let encoded = chunk.encode().expect("encodes");
+        assert_eq!(encoded, postcard::to_allocvec(&plain).unwrap());
+        assert_eq!(ChunkV1::decode(&encoded).expect("decodes"), chunk);
+    }
+}
+
+/// An image that does not verify is not written: the store refuses it
+/// as before, and the pending directory its chunks went to is gone
+/// (task-d92 writes each chunk as it verifies).
+#[test]
+fn an_image_that_does_not_verify_leaves_nothing_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LocalCheckpointStore::open(dir.path()).expect("store");
+    let engine = engine();
+    let good = exported(&engine);
+
+    // The rows disagree with the summary only once every chunk is read.
+    let mut tampered = good.clone();
+    tampered.manifest.collections[0].rows += 1;
+    tampered.manifest.root = tampered.manifest.compute_root();
+    assert!(matches!(
+        store.write(&tampered),
+        Err(StoreError::Invalid(LocalError::Rows))
+    ));
+    // A chunk that does not hash to its descriptor.
+    let mut tampered = good.clone();
+    tampered.chunks[0].rows[0].value = b"other".to_vec();
+    assert!(matches!(
+        store.write(&tampered),
+        Err(StoreError::Invalid(LocalError::ChunkDigest { ordinal: 0 }))
+    ));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(store.images().unwrap().is_empty());
+
+    // And the good image still writes and loads exactly.
+    let pointer = store.write(&good).expect("written");
+    assert_eq!(store.load(&pointer).expect("loads"), good);
 }
