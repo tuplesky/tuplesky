@@ -84,11 +84,26 @@ struct Provisioning {
     /// commit waits for a durable one (`COORD_HARNESS_PROJECTION_DURABLE_MS`).
     #[arg(long)]
     projection_durable_ms: Option<u64>,
+    /// Under `--journal-profile replay`, journal records a projection
+    /// commit is held for, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_RECORDS`).
+    #[arg(long)]
+    projection_commit_records: Option<u32>,
+    /// Under `--journal-profile replay`, milliseconds at most a record is
+    /// held for a larger projection commit, zero for none (task-d86;
+    /// `COORD_HARNESS_PROJECTION_COMMIT_MS`).
+    #[arg(long)]
+    projection_commit_ms: Option<u64>,
     /// Journal records each voter holds past its last local checkpoint
     /// before it publishes the next, where not the daemon's 4096; zero
     /// never publishes (`COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`).
     #[arg(long)]
     checkpoint_after_records: Option<u64>,
+    /// New requests each voter's frontend admits a second, where not the
+    /// daemon's 1,000 (`COORD_HARNESS_MAX_ADMITTED_PER_SECOND`); at least
+    /// one.
+    #[arg(long)]
+    max_admitted_per_second: Option<u32>,
 }
 
 /// A `COORD_HARNESS_*` variable: `None` when unset or empty, refused
@@ -136,6 +151,14 @@ impl Provisioning {
                 Some(n) => Some(n),
                 None => from_env("COORD_HARNESS_PROJECTION_DURABLE_MS")?,
             },
+            projection_commit_records: match self.projection_commit_records {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_RECORDS")?,
+            },
+            projection_commit_ms: match self.projection_commit_ms {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_COMMIT_MS")?,
+            },
         })
     }
 
@@ -145,6 +168,19 @@ impl Provisioning {
             Some(n) => Ok(Some(n)),
             None => from_env("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS"),
         }
+    }
+
+    /// `max_admitted_per_second` from its flag, or from its variable.
+    /// Zero is refused here, as the daemon would refuse it at start.
+    fn max_admitted_per_second(&self) -> Result<Option<u32>, String> {
+        let rate = match self.max_admitted_per_second {
+            Some(n) => Some(n),
+            None => from_env("COORD_HARNESS_MAX_ADMITTED_PER_SECOND")?,
+        };
+        if rate == Some(0) {
+            return Err("max_admitted_per_second must be at least 1".into());
+        }
+        Ok(rate)
     }
 }
 
@@ -290,10 +326,12 @@ fn provision(
     }
     let journal = provisioning.journal()?;
     let checkpoint_after_records = provisioning.checkpoint_after_records()?;
+    let max_admitted_per_second = provisioning.max_admitted_per_second()?;
     Ok(coord_harness::provision(&Plan {
         hosts,
         journal,
         checkpoint_after_records,
+        max_admitted_per_second,
         listen_any: provisioning.listen_any,
         edge_host: provisioning.edge_host,
         issuer_listen: provisioning.issuer_listen,

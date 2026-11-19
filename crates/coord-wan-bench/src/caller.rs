@@ -127,8 +127,12 @@ impl Caller {
         // An api link is keyed by the identity on the certificate, so
         // callers that presented one credential would queue behind each
         // other and the run would be measuring the harness.
-        let issued =
-            coord_harness::domain::issue_caller(&authority(provisioned)?, cluster, instance);
+        let issued = coord_harness::domain::issue_caller(
+            &authority(provisioned)?,
+            cluster,
+            domain,
+            instance,
+        );
         let chain = vec![rustls_pki_types::CertificateDer::from(
             issued.certificate.der().to_vec(),
         )];
@@ -315,8 +319,13 @@ impl Caller {
         }
         let completions = self.client.take_completions();
         let Some(completion) = completions.iter().find(|c| c.request == id) else {
+            // The SDK completes nothing on `BACKPRESSURE`: it queues the
+            // same invocation again for after its backoff. This call's one
+            // attempt refused that way had nothing submitted, so the run
+            // counts it as refused, not as an outcome it failed to learn.
+            let answer = uncompleted(self.client.backpressured(id), self.client.attempts(id));
             self.release(id);
-            return Err(Answer::Unknown);
+            return Err(answer);
         };
         // Release the invocation. The SDK retains a completed request so
         // that a caller which never saw the answer can still resolve it
@@ -332,6 +341,24 @@ impl Caller {
         Ok(outcome)
     }
 }
+
+/// How a call the SDK completed nothing for ends. The SDK queues an
+/// invocation refused `BACKPRESSURE` again for after its backoff, so a
+/// call whose every attempt was refused that way had nothing submitted:
+/// the run counts it as refused, under [`BACKPRESSURE`]. Any other
+/// attempt may have been submitted, so its outcome is unknown.
+fn uncompleted(backpressured: u32, attempts: u32) -> Answer {
+    if backpressured == attempts {
+        Answer::Refused(BACKPRESSURE.into())
+    } else {
+        Answer::Unknown
+    }
+}
+
+/// The reason a report groups the frontend's `BACKPRESSURE` refusals
+/// under: a session at its pending bound, or the frontend's admission
+/// rate (task-d26). The daemon's metrics line counts the two apart.
+pub const BACKPRESSURE: &str = "backpressure";
 
 /// A bounded name for a refusal. Never the detail bytes: a report is
 /// published and a detail is not a label.
@@ -389,4 +416,21 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore, CallerError> {
             .map_err(|e| CallerError::Material(format!("trust bundle: {e}")))?;
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Answer, BACKPRESSURE, uncompleted};
+
+    /// A call refused `BACKPRESSURE` on every attempt is a refusal under
+    /// its own reason, and one with any other attempt is an unknown
+    /// outcome (#228 review: without the classification, a run's rate
+    /// refusals read as outcomes it failed to learn).
+    #[test]
+    fn a_call_refused_backpressure_on_every_attempt_is_refused() {
+        assert_eq!(uncompleted(1, 1), Answer::Refused(BACKPRESSURE.into()));
+        assert_eq!(uncompleted(3, 3), Answer::Refused(BACKPRESSURE.into()));
+        assert_eq!(uncompleted(2, 3), Answer::Unknown);
+        assert_eq!(uncompleted(0, 1), Answer::Unknown);
+    }
 }

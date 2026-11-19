@@ -38,6 +38,10 @@
 #   WARMUP        warm-up operations per row            (default 200)
 #   MEASURED      measured operations per row           (default 2000)
 #   DEADLINE_MS   per-operation deadline                (default 10000)
+#   ADMITTED_PER_SECOND  new requests each frontend admits a second,
+#                written into every voter's [limits] and stated in each
+#                reading's label (default 1000, the daemon's own default,
+#                set explicitly so a reading says what it ran under)
 #   RATES         inter-arrival times in ns, space separated
 #                 (default "0 2000000 1000000 500000 250000")
 #   CALLER_STEPS  caller counts for the `concurrency` row
@@ -71,6 +75,12 @@ FRONTENDS=${FRONTENDS:-3}
 WARMUP=${WARMUP:-200}
 MEASURED=${MEASURED:-2000}
 DEADLINE_MS=${DEADLINE_MS:-10000}
+# The admission rate every frontend runs under, set rather than left to
+# the daemon's default: the busiest frontend admits up to about 1,000 new
+# requests a second at full load, the default's own value, so the rate
+# can bind and a reading states it (task-d26).
+ADMITTED_PER_SECOND=${ADMITTED_PER_SECOND:-1000}
+export COORD_HARNESS_MAX_ADMITTED_PER_SECOND=$ADMITTED_PER_SECOND
 RATES=${RATES:-"0 2000000 1000000 500000 250000"}
 CALLER_STEPS=${CALLER_STEPS:-"1 2 4 8 16"}
 DURABILITY=${DURABILITY:-"journal-first, one fsync per record"}
@@ -178,7 +188,7 @@ offer() {
   fi
   note "wan-matrix.sh: $row at ${rate}ns"
   if "$BENCH" --dir "$DOMAIN" \
-      --label "$row (${VOTERS} voters, ${CALLERS} callers, ${rate}ns)" \
+      --label "$row (${VOTERS} voters, ${CALLERS} callers, ${rate}ns, admitting ${ADMITTED_PER_SECOND}/s a frontend)" \
       --durability "$DURABILITY" \
       --topology "single-host loopback, ${VOTERS} voters" \
       --arrival-ns "$rate" --warmup-ops "$warmup" --measured-ops "$MEASURED" \

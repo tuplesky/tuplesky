@@ -617,11 +617,16 @@ fn check_target<V: OrderedRead>(view: &V, manifest: &SharedManifestV1) -> Result
     if installed_baseline(view)?.is_some() {
         return Err(InstallError::AlreadyInstalled);
     }
-    if !empty(view, Collection::ProtocolV1)? {
+    // Payloads pending execution are obligations too (task-d113, step 2).
+    if !empty(view, Collection::ProtocolV1)? || !empty(view, Collection::PendingPayloadV1)? {
         return Err(InstallError::ExistingObligations);
     }
+    // A decided record moved at execution (task-d113, step 2) is history
+    // this node executed, as `execution_v1` is.
     for collection in Collection::ALL {
-        if collection.in_common_hash() && !empty(view, collection)? {
+        if (collection.in_common_hash() || collection == Collection::DecidedV1)
+            && !empty(view, collection)?
+        {
             return Err(InstallError::TargetNotEmpty {
                 collection: collection.id().0,
             });

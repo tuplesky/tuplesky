@@ -202,6 +202,11 @@ pub enum BindError {
     /// binding needed did not happen. Nothing is bound; the caller may
     /// present the credential again.
     Unavailable,
+    /// This node's policy may be behind the domain's (#312, #320), so it
+    /// binds nothing now. The node said so before it read the credential,
+    /// so this says nothing about the credential: the caller keeps it and
+    /// binds again, here once the node is fresh or at another node.
+    Stale,
 }
 
 fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {

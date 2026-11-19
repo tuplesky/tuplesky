@@ -212,6 +212,24 @@ pub trait WriteTxn: OrderedRead + Sized {
     /// Delete.
     fn delete(&mut self, collection: CollectionId, key: &[u8]) -> Result<(), EngineError>;
 
+    /// Apply `updates` in order: a value is a put, none a delete. The
+    /// same as one [`WriteTxn::put`] or [`WriteTxn::delete`] each, in
+    /// order, and that is what this default does; an engine whose
+    /// collections each cost an open per call may open each once for the
+    /// whole batch (task-d86).
+    fn apply_updates<'u>(
+        &mut self,
+        updates: impl IntoIterator<Item = &'u coord_core::effect::StoreUpdate>,
+    ) -> Result<(), EngineError> {
+        for update in updates {
+            match &update.value {
+                Some(value) => self.put(update.collection, &update.key, value)?,
+                None => self.delete(update.collection, &update.key)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Abort; nothing becomes visible.
     fn abort(self) -> Result<(), EngineError>;
 

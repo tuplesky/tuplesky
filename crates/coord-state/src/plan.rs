@@ -202,7 +202,12 @@ pub enum RejectionReason {
     NamespaceMismatch,
     /// The response would exceed the semantic response budget.
     ResponseTooLarge,
-    /// The mutation would exceed the events-per-revision budget.
+    /// The mutation would exceed the events-per-revision budget: too many
+    /// events, or rows that one journal record can't hold (too many, a row
+    /// key or value too long, or too many bytes in all). A node journals
+    /// each command as one record, so a command whose rows don't fit one is
+    /// refused here, at every voter alike, rather than stopping each voter
+    /// that tries to record it.
     TooManyEvents,
     /// The range delete would remove more keys than allowed.
     TooManyDeletes,

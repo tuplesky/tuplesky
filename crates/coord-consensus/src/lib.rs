@@ -145,16 +145,19 @@ pub use ballot::{
     PromiseRejection, ReplicaRole, SealEffects, SealRejection, SyncRejection,
 };
 pub use campaign::Campaign;
-pub use catch_up::{CatchUpDivergence, DonorExecution, OwnExecution};
+pub use catch_up::{CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution};
 pub use commands::{
-    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RetireError,
+    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RelayRoom,
+    RetireError, TableWait, TableWaits,
 };
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
     FloorInstall, FloorLedger, Readiness, ReadinessError, ReadinessLedger, activate, discover,
 };
 pub use follower::{
-    Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal,
+    COMMIT_ROWS_BATCH_BYTES, COMMIT_ROWS_BATCH_UPDATES, FRAME_BATCH_BYTES, FRAME_BATCH_UPDATES,
+    Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal, LearnPasses,
+    MAX_KEPT_RELAYED_BYTES, RelayTaken, UnreportedDrops, kept_relayed_size,
 };
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, Position, anchored_path, chain,
@@ -168,12 +171,13 @@ pub use handoff::{
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal,
     REPROPOSE_BATCH, RESEND_BACKOFF_CAP, RESEND_HANDOFF_CALLS, RESEND_INTERVAL_CAP,
-    RESEND_LATENCY_SAMPLES, RESEND_PER_VOTER, Rejection, ResendCounts,
+    RESEND_LATENCY_SAMPLES, RESEND_PER_VOTER, Rejection, ResendCounts, SentBytes,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{
-    CatchUpEntry, FeatureRecord, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
-    MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, SubmissionRefusal, is_payload_transfer,
+    CatchUpEntry, FeatureRecord, FramedProposal, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS,
+    MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, MAX_PROPOSAL_FRAME_BYTES, PathAnchors, ProtocolMessage,
+    SubmissionRefusal, is_payload_transfer,
 };
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
@@ -184,7 +188,7 @@ pub use recovery::{
     max_report_entries, select, select_decided, select_from, select_ruled, select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
-pub use role::{PendingReport, RecoveredState};
+pub use role::{PendingReport, RecoveredState, ServedRefusal};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
     SealRecordV1, SyncRecordV1, bounded_sync_update, decode_dependency, decode_payload,
@@ -198,8 +202,8 @@ pub use speculation::{
     TentativeOutcome,
 };
 pub use summary::{
-    DurableLedger, MAX_PAGE_ASK, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler,
-    ReportPage, ServedReport, paginate,
+    DurableLedger, HistoryMaps, MAX_PAGE_ASK, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError,
+    ReportAssembler, ReportPage, ServedReport, paginate,
 };
 pub use vote::{
     FastAck, FastPathCounts, Learned, LearnedBy, MissedFast, MissedLog, SlowAck, Vote, VoteError,

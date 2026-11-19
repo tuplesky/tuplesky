@@ -68,7 +68,9 @@ pub const TICK: Duration = Duration::from_millis(1);
 pub struct LinkFaults {
     /// Minimum one-way delay in ticks.
     pub delay_min: u64,
-    /// Maximum one-way delay in ticks.
+    /// Maximum one-way delay in ticks. Both bounds are inclusive: each
+    /// datagram's delay is drawn uniformly from `delay_min..=delay_max`,
+    /// so equal bounds make a constant delay.
     pub delay_max: u64,
     /// Loss per datagram, parts per million.
     pub loss_ppm: u32,
@@ -331,13 +333,7 @@ impl Node {
         let quic_server = QuicServerConfig::try_from(server).expect("quic server");
         let limits = config.limits;
         let lane_config = |l: &LaneLimits| {
-            coord_transport::lane::transport_config(
-                l,
-                limits.idle_timeout,
-                limits.keep_alive,
-                limits.ack_frequency,
-            )
-            .expect("lane config")
+            coord_transport::lane::transport_config(l, &limits).expect("lane config")
         };
         let lane_transport = [
             lane_config(&limits.lanes[0]),
@@ -784,7 +780,12 @@ impl Node {
         self.events.push(SimEvent::PeerFrame {
             node: self.id,
             lane,
-            provenance: PeerProvenance::from_transport(replica, incarnation, connection_id),
+            provenance: PeerProvenance::from_transport(
+                replica,
+                incarnation,
+                identity.role,
+                connection_id,
+            ),
             kind: frame.kind,
             payload: frame.payload,
         });
@@ -1041,6 +1042,7 @@ pub struct PacketWorld {
     trace: blake3::Hasher,
     datagrams: u64,
     dropped: u64,
+    drop_next: BTreeMap<(NodeId, NodeId), u32>,
     time: Arc<VirtualTime>,
     sequence: u64,
 }
@@ -1072,6 +1074,7 @@ impl PacketWorld {
             trace: blake3::Hasher::new(),
             datagrams: 0,
             dropped: 0,
+            drop_next: BTreeMap::new(),
             time,
             sequence: 0,
         }
@@ -1085,6 +1088,13 @@ impl PacketWorld {
     /// Faults of one directed link.
     pub fn set_link(&mut self, from: NodeId, to: NodeId, faults: LinkFaults) {
         self.faults.insert((from, to), faults);
+    }
+
+    /// Drop the next `count` datagrams sent from `from` to `to`, before
+    /// the link's own faults: a loss placed where a test needs it, such
+    /// as a connection's first flight.
+    pub fn drop_next(&mut self, from: NodeId, to: NodeId, count: u32) {
+        self.drop_next.insert((from, to), count);
     }
 
     /// Current tick.
@@ -1275,6 +1285,27 @@ impl PacketWorld {
             .count()
     }
 
+    /// What quinn counts on each of a node's connections, in handle
+    /// order: packets sent, packets it called lost, congestion events,
+    /// the window and the round trip.
+    pub fn path_stats(&self, node: NodeId) -> Vec<quinn_proto::PathStats> {
+        self.connection_stats(node)
+            .into_iter()
+            .map(|s| s.path)
+            .collect()
+    }
+
+    /// All quinn counts on each of a node's connections, in handle order:
+    /// the path's, and the datagrams and frames sent and received (the
+    /// acknowledgements a node sent among them).
+    pub fn connection_stats(&self, node: NodeId) -> Vec<quinn_proto::ConnectionStats> {
+        self.nodes[node]
+            .connections
+            .values()
+            .map(|c| c.conn.stats())
+            .collect()
+    }
+
     /// Frames a node queued, per lane (the message-level view).
     pub fn sent(&self, node: NodeId) -> &[(Lane, Vec<u8>)] {
         &self.nodes[node].sent
@@ -1284,6 +1315,12 @@ impl PacketWorld {
     /// across the links, then advance to the next wakeup. Returns false
     /// when nothing is pending.
     pub fn step(&mut self) -> bool {
+        self.step_within(u64::MAX)
+    }
+
+    /// One step, as [`PacketWorld::step`], that moves virtual time no
+    /// further than `limit` (which is past the current tick).
+    fn step_within(&mut self, limit: u64) -> bool {
         for i in 0..self.nodes.len() {
             self.nodes[i].drive_incoming(&self.clock);
             self.nodes[i].drive_outgoing(&self.clock);
@@ -1301,10 +1338,24 @@ impl PacketWorld {
             Some(t) => {
                 // Never spin at one tick: a timer that re-arms at "now"
                 // still moves virtual time forward by one tick.
-                self.clock.tick = t.max(self.clock.tick + 1);
+                self.clock.tick = t.max(self.clock.tick + 1).min(limit);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Move virtual time to `tick` without passing it, driving every
+    /// node at each wakeup before it. A step jumps to the next wakeup,
+    /// which can be tens of milliseconds away, so a caller that acts on
+    /// a schedule (a frame each millisecond) advances to each time it
+    /// acts at rather than stepping. Nodes are driven at `tick` by the
+    /// next step, after the caller has acted. No-op at or past `tick`.
+    pub fn advance_to(&mut self, tick: u64) {
+        while self.clock.tick < tick {
+            if !self.step_within(tick) {
+                self.clock.tick = tick;
+            }
         }
     }
 
@@ -1340,6 +1391,13 @@ impl PacketWorld {
             .get(&(from, to))
             .copied()
             .unwrap_or(self.default_faults);
+        if let Some(left) = self.drop_next.get_mut(&(from, to))
+            && *left > 0
+        {
+            *left -= 1;
+            self.dropped += 1;
+            return;
+        }
         let name = format!("link-{from}-{to}");
         if faults.cut || bytes.len() > faults.mtu || self.rng.chance(&name, faults.loss_ppm) {
             self.dropped += 1;
@@ -1354,7 +1412,7 @@ impl PacketWorld {
             let mut delay = self.rng.range(
                 &name,
                 faults.delay_min,
-                faults.delay_max.max(faults.delay_min) + 1,
+                faults.delay_max.max(faults.delay_min),
             );
             if self.rng.chance(&name, faults.reorder_ppm) {
                 delay += faults.reorder_ticks;

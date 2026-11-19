@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::PeerRole;
 
 /// A certificate and the key that owns it.
@@ -162,12 +162,13 @@ impl Ca {
     }
 
     /// Issue a node credential: the identity URI is what says which
-    /// replica and which role a process is, so a certificate without one
-    /// is not an identity at all.
+    /// replica and which role a process is, and which domain it reaches,
+    /// so a certificate without one is not an identity at all.
     pub fn issue_node(
         &self,
         name: &str,
         cluster: ClusterId,
+        domain: DomainId,
         node: ReplicaId,
         incarnation: ReplicaIncarnation,
         role: PeerRole,
@@ -176,7 +177,7 @@ impl Ca {
         // dial, and a harness has no DNS. It adds a way to reach the node
         // and no authority whatsoever -- the URI is what carries the
         // identity.
-        self.issue_node_at(name, cluster, node, incarnation, role, loopback())
+        self.issue_node_at(name, cluster, domain, node, incarnation, role, loopback())
     }
 
     /// The same credential, reachable at `reach` instead of loopback.
@@ -189,10 +190,12 @@ impl Ca {
     /// node: the binder decides which voter answered from the URI, so a
     /// certificate valid for the right host and the wrong replica is
     /// refused exactly as before.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_node_at(
         &self,
         name: &str,
         cluster: ClusterId,
+        domain: DomainId,
         node: ReplicaId,
         incarnation: ReplicaIncarnation,
         role: PeerRole,
@@ -200,6 +203,7 @@ impl Ca {
     ) -> Issued {
         let identity = coord_node_issuer::NodeIdentity {
             cluster,
+            domain,
             node,
             incarnation,
             role,

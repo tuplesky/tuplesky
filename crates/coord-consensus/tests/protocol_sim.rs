@@ -104,8 +104,10 @@
 //! fast-set followers too, and must fail: at three voters one of them then
 //! commits over a vote the leader may lose.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Once;
 
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, CommandRecord, ConfigurationIdentity, FastAck, Follower,
@@ -142,6 +144,15 @@ fn r(i: u8) -> ReplicaId {
 
 fn epoch() -> ConfigurationEpoch {
     ConfigurationEpoch::new(1).unwrap()
+}
+
+/// Whether `ballot` is behind `promised`, as `coordd`'s store compares a
+/// submission's stamp with its fence.
+fn obsolete(ballot: &Ballot, promised: &Ballot) -> bool {
+    match ballot.compare_same_epoch(promised) {
+        Some(order) => order.is_lt(),
+        None => ballot.epoch < promised.epoch,
+    }
 }
 
 fn ballot(number: u64, leader: u8) -> Ballot {
@@ -220,6 +231,43 @@ struct Knobs {
     /// from the leader's frontier alone, as every follower does with
     /// acknowledgements to the leader only (task-d74).
     peer_ack_loss: u32,
+    /// Chance a command is submitted as answered on the leader's release
+    /// alone (task-d100, step A): every voter is told so before it steps
+    /// a presentation of it, sends its frontend no evidence for it, and
+    /// the collector answers it on a final release from its ballot's
+    /// leader naming the admission it was submitted under, or on the
+    /// release a leader publishes again for a duplicate, rebuilt from its
+    /// record, or from its own node's record as any entry.
+    ///
+    /// The model applies the collector's rule, not the `Collector`: its
+    /// released arm checks neither the release's sender nor its ballot,
+    /// so it counts as answered some releases the collector would hold.
+    /// Safety is still covered, because the oracle compares every
+    /// release, but oracle 6's count of marked commands answered is an
+    /// upper bound (#204 review).
+    answer_on_release: u32,
+    /// Chance (parts per million) a marked command is relayed to its
+    /// ballot's leader alone (task-d102, task-d100's step B): presented,
+    /// with the relay mark, only at the leader among its hosts -- or at
+    /// its first host where none leads, which refuses it as `NotLeading`
+    /// -- and then, if no leader took it, presented to every host as a
+    /// step-A command, as the collector falls back to fan-out. The leader
+    /// proposes it with its payload, and the followers adopt it from the
+    /// proposal without pre-accepting it.
+    relay: u32,
+    /// Chance (parts per million) per step that a leader holding a turn's
+    /// fresh proposals sends them, one frame to each follower (task-d102,
+    /// the batched round): set, every leader queues its fresh proposals,
+    /// and they leave at whatever step the draw cuts them, as `coordd`'s
+    /// cut where its loop lowers a group. Off, a proposal leaves as it is
+    /// made.
+    frames: u32,
+    /// A follower's journal completes a run of its queued vote and
+    /// adoption batches at once, handed to it as one step of storage
+    /// events ([`Follower::step_storage`]), as `coordd`'s node hands it
+    /// what a journal group made durable (lever 2, step 1). Off, each
+    /// batch completes on its own.
+    storage_steps: bool,
     /// An execution's group reaches the journal after its outcome is
     /// taken, in journal order with the protocol batches, as `coordd`'s
     /// does, and the machines count an execution durable only once its
@@ -256,6 +304,22 @@ struct Knobs {
     /// review). Without it, only the drawn batch fails and the journal
     /// goes on past it.
     fail_queue: bool,
+    /// Whether a voter's store is fenced at each promise, as `coordd`'s
+    /// voter fences its journaled store (`JournaledStore::fence`): the
+    /// batches still queued under a ballot the promise left behind are
+    /// refused, definitely not committed, and every other is kept, the
+    /// promise row and what was submitted after it among them. `coordd`'s
+    /// voter journals what it queued before it fences (`Voter::fence`);
+    /// this doesn't, so it refuses more than `coordd` would, and a batch
+    /// of a ballot left behind never lands after the promise here. Nor is
+    /// the order `coordd`'s: there the fence comes before the change of
+    /// role, so a deposed leader hears its refused batches; here
+    /// [`Sim::fence`] runs after the conversion, and the follower the
+    /// leader became hears them (#314 review). Execution
+    /// groups are kept: `coordd` replans a refused application from the
+    /// frontier the domain reports, which the simulator's group stands
+    /// for already.
+    fence: bool,
     /// Chance per step a follower is crashed while a batch writes the
     /// payload row of a command whose dependency row is durable there
     /// without one (task-d90, point 4): restored, the record holds the
@@ -295,6 +359,57 @@ struct Knobs {
     /// commits a fast decision over a vote the leader may lose, and the
     /// oracle has to say so.
     early_to_fast_set: bool,
+    /// Chance per step the leader is crashed while it serves catch-up
+    /// pages to a voter behind it: a page with commands on its way to the
+    /// voter, or taken there and not yet executed (task-d106, #213
+    /// review). The voter's next donor, once it leads, is open to the
+    /// same crash, so a voter that restarted behind loses its donor twice
+    /// in a row; the third is spared, so the voter can follow its ballot.
+    donor_crash: u32,
+    /// Chance the execution of a pulled window, at a voter with a
+    /// catch-up page in hand, is put off (row 24): the page stays in hand
+    /// while its donor is crashed and a successor elected.
+    catch_up_lag: u32,
+    /// The most commands a donor's page carries: `MAX_CATCH_UP_COMMANDS`,
+    /// or fewer, as a donor whose byte bound cuts its pages (task-d25
+    /// review). A row runs 60 to 260 commands, so at a page of 125 no page
+    /// leaves the next asked ahead of a window in hand; at a few commands
+    /// a page the ask ahead runs under every fault the row has.
+    /// `PROTOCOL_SIM_PAGE` sets it in every row.
+    page: usize,
+    /// Chance (parts per million) that one donor serves a command of its
+    /// page with no decided record, as a donor that kept no dependency
+    /// row of it would (#302, #303 review). The command and the one donor
+    /// that withholds it are drawn by the command's identity and the
+    /// seed; every other donor serves its record. The voter served the
+    /// entry ends its window before it and asks another donor (seed 73).
+    /// The drawn donor withholds only while another voter has executed
+    /// the command, so another can serve it: withheld at the one voter
+    /// that holds it, the record is lost to every asker, which no donor
+    /// of an epoch is in `coordd`, and the voters behind stop there.
+    /// No row has a path that drops a donor's row of an executed command
+    /// within its epoch, so without this no entry comes with no record.
+    /// `PROTOCOL_SIM_FORGET_ROWS` sets it in every row.
+    forget_rows: u32,
+    /// Whether every donor withholds a drawn command's record, as the
+    /// knob did before seed 73's fix (#307 review). A voter behind then
+    /// finds no donor to serve it, which `coordd` reaches only below a
+    /// restore's boundary, and stops there; it is the mode the bare window's failures were found
+    /// in, kept so the fixture's lines for them separate a build that
+    /// installs such an entry from one that refuses it.
+    /// `PROTOCOL_SIM_FORGET_EVERYWHERE=1` sets it.
+    forget_everywhere: bool,
+    /// Every holder gone for good (task-d119's third option, #185). At
+    /// the first campaign given up as `Behind` on a command no voter
+    /// executed, while no voter leads and every voter that holds that
+    /// command, in its table or its durable rows, is down: with
+    /// `Some(true)` those voters never come back, their storage
+    /// destroyed; with `Some(false)` the moment is only marked, the
+    /// control. From the mark the run counts whether any voter led, the
+    /// campaigns given up as `Behind` and the boots of the voters left,
+    /// and while healing it restarts every live voter [`GONE_BOOTS`]
+    /// times more, as an operator's restarts would. `None`: neither.
+    holders_gone: Option<bool>,
 }
 
 impl Knobs {
@@ -322,6 +437,10 @@ impl Knobs {
         crash_candidate: false,
         heal_page_loss: false,
         peer_ack_loss: 0,
+        answer_on_release: 0,
+        relay: 0,
+        frames: 0,
+        storage_steps: false,
         late_execution: false,
         execution_lag: 0,
         total_crash: 0,
@@ -329,6 +448,7 @@ impl Knobs {
         capacity: CAPACITY,
         payload_fail: 0,
         fail_queue: false,
+        fence: true,
         payload_crash: 0,
         drop_payload_rows: false,
         gate_crash: 0,
@@ -338,6 +458,12 @@ impl Knobs {
         window_crash: 0,
         window_depose: 0,
         early_to_fast_set: false,
+        donor_crash: 0,
+        catch_up_lag: 0,
+        page: coord_consensus::MAX_CATCH_UP_COMMANDS,
+        forget_rows: 0,
+        forget_everywhere: false,
+        holders_gone: None,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -355,7 +481,7 @@ impl Knobs {
     }
 
     /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14, rows 16
-    /// and 17, and rows 18 to 22.
+    /// and 17, and rows 18 to 24.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -537,6 +663,23 @@ impl Knobs {
                 capacity: 8,
                 ..Knobs::row(18)
             },
+            // A voter restarted behind whose donor is crashed while it
+            // serves the voter's pages, and the next donor too (task-d106,
+            // #213 review): a page lost on its way, and a page taken from
+            // a donor that is gone before the voter executes it. Donors
+            // come back often enough for a second crash at three voters.
+            // A window stopped for a ballot the voter left is counted
+            // (`stopped_ballot`), not required: at these sizes a page
+            // seldom holds a second window, and the activation test
+            // `a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier`
+            // drives that shape.
+            24 => Knobs {
+                donor_crash: 300_000,
+                catch_up_lag: 990_000,
+                crash: 2_500,
+                restart: 40_000,
+                ..base
+            },
             _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
     }
@@ -580,6 +723,12 @@ struct Node {
     promised_out: Option<Ballot>,
     /// Highest durable promise row seen.
     durable_promise: Option<Ballot>,
+    /// The ballot each queued batch was submitted under: the one the
+    /// node's machine was promised at when it submitted it, as `coordd`'s
+    /// store stamps a submission with its voter's ballot (`Knobs::fence`).
+    stamps: BTreeMap<BarrierId, Ballot>,
+    /// The ballot the store was last fenced at since the node booted.
+    fenced: Option<Ballot>,
 }
 
 /// The rules every candidate here selects under: one build everywhere,
@@ -589,9 +738,24 @@ const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
     leave_out_unheld: true,
 };
 
+/// What a node is handed in one step: an event, or a step of storage
+/// events ([`Knobs::storage_steps`]).
+enum Input {
+    Event(Event),
+    Storage(Vec<StorageEvent>),
+}
+
 impl Node {
     fn alive(&self) -> bool {
         self.role.is_some()
+    }
+
+    /// The ballot the node's machine is promised at; `None` while down.
+    fn promised(&self) -> Option<Ballot> {
+        match self.role.as_ref()? {
+            Role::Leader(l) => Some(l.ballots().promised()),
+            Role::Follower(f) => Some(f.ballots().promised()),
+        }
     }
 
     /// Count executions durable only as the journal holds their groups
@@ -604,10 +768,23 @@ impl Node {
     }
 
     fn step(&mut self, e: Event) -> Vec<Effect> {
+        self.step_input(Input::Event(e))
+    }
+
+    fn step_input(&mut self, input: Input) -> Vec<Effect> {
         match self.role.as_mut().expect("alive") {
-            Role::Leader(m) => m.step(e),
+            Role::Leader(m) => match input {
+                Input::Event(e) => m.step(e),
+                Input::Storage(events) => events
+                    .into_iter()
+                    .flat_map(|e| m.step(Event::Storage(e)))
+                    .collect(),
+            },
             Role::Follower(m) => {
-                let mut effects = m.step(e);
+                let mut effects = match input {
+                    Input::Event(e) => m.step(e),
+                    Input::Storage(events) => m.step_storage(events),
+                };
                 // A campaign waiting on the rows of commands this node
                 // executed and forgot is answered by its runtime from its
                 // durable rows, as `coordd`'s is (task-d77).
@@ -672,6 +849,10 @@ const KEYS: usize = 4;
 /// admitted (oracle 6). In a round every message in flight is delivered,
 /// every journal completes, and every node executes what it can.
 const HEAL_BUDGET: u32 = 400;
+
+/// The restarts of every live voter while healing after
+/// `Knobs::holders_gone`'s mark, past the one healing starts with.
+const GONE_BOOTS: u32 = 3;
 /// Rounds between the frontend's offers of what has not settled.
 const OFFER_EVERY: u32 = 8;
 /// Rounds between the runtime's timers while healing.
@@ -725,6 +906,10 @@ struct Sim {
     offers: BTreeMap<CommandId, Offer>,
     /// Commands the frontend learned from evidence.
     learned: BTreeSet<CommandId>,
+    /// Commands submitted as answered on the release alone (task-d100,
+    /// step A), and those the collector answered on a release.
+    marked: BTreeSet<CommandId>,
+    answered: BTreeSet<CommandId>,
     /// Commands a voter refused for another bound under their retry key.
     refused_for: BTreeMap<CommandId, CommandId>,
     /// Commands a voter told the frontend it keeps no payload of any
@@ -735,6 +920,17 @@ struct Sim {
     reoffered: BTreeSet<CommandId>,
     /// Commands executed anywhere: each has a record that answers it.
     executed_anywhere: BTreeSet<CommandId>,
+    /// The command each node's current follower machine gave its
+    /// campaign up as `Behind` on, once counted: a machine that gave up
+    /// refuses every later campaign of its boot on the same command.
+    behind_counted: Vec<Option<CommandId>>,
+    /// The commands campaigns were given up as `Behind` on, counted in
+    /// this check and not yet read by `Knobs::holders_gone`.
+    gave_up: Vec<CommandId>,
+    /// The voters `Knobs::holders_gone` destroyed: they never restart.
+    destroyed: BTreeSet<u8>,
+    /// The command `Knobs::holders_gone` marked its moment on.
+    gone_mark: Option<CommandId>,
     /// Faults have stopped.
     healing: bool,
     /// Entries and edges of the Syncs each node's current machine was
@@ -764,11 +960,18 @@ struct Sim {
     /// work: a candidate installs its own selection as a Sync.
     selection_counted: Vec<Option<Ballot>>,
     /// Each node's catch-up pacer, as `coordd` keeps one (task-d08):
-    /// whether it has asked since it started, and the frontier at its last
+    /// whether the probe it makes after it starts is done, and the frontier at its last
     /// ask with the asks gone unanswered since.
     probed: Vec<bool>,
+    /// The catch-up pages a node had taken when its probe first asked:
+    /// a different count later is a page that answered it (#98).
+    probe_pages: Vec<Option<u64>>,
     asked_at: Vec<Option<usize>>,
     unanswered: Vec<usize>,
+    /// The node whose page with commands each voter last took, and the
+    /// donors crashed serving it since it last caught up (row 24).
+    donor_of: Vec<Option<u8>>,
+    donors_lost: Vec<u32>,
     /// Oracle 7 (task-d90): the result each command was first released
     /// with, as the bytes of its response, taken when a voter executed it
     /// in memory: what the release rule may hand a caller before the
@@ -795,6 +998,19 @@ struct Sim {
 struct Stats {
     executed: usize,
     learned: usize,
+    /// Commands answered on a release alone (task-d100, step A), and the
+    /// releases a leader published again for a duplicate.
+    answered_on_release: usize,
+    released_again: usize,
+    /// Commands presented relayed at a leader (task-d102), relayed ones
+    /// a voter that isn't leading refused and that fell back to fan-out,
+    /// and proposals sent with their payload.
+    relayed: usize,
+    relay_fallbacks: usize,
+    relayed_proposals: usize,
+    /// Proposal frames sent (task-d102), and the proposals they carried.
+    frames: usize,
+    framed: usize,
     campaigns: u32,
     crashes: u32,
     /// Crashes of a node that was leading its ballot.
@@ -846,6 +1062,8 @@ struct Stats {
     /// failure, as a vote batch and then the adoption batch behind it
     /// (#197 review).
     queue_orders: u32,
+    /// Batches a fence at a promise refused (`Knobs::fence`).
+    fenced: u32,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -871,6 +1089,63 @@ struct Stats {
     /// early was not durable (task-d98).
     window_crashes: u32,
     window_deposes: u32,
+    /// Leaders crashed while serving catch-up pages to a voter behind
+    /// them (row 24); of those, the ones with a page the voter had taken
+    /// and not installed, and the ones whose voter had lost a donor the
+    /// same way since it last caught up.
+    donor_crashes: u32,
+    donor_crashes_taken: u32,
+    donor_crashes_again: u32,
+    /// Windows voters stopped for a ballot they had left, and pages
+    /// stopped as stale (task-d106 step 0's counts), summed over every
+    /// follower machine of the run.
+    stopped_ballot: u64,
+    stopped_stale: u64,
+    /// Pages asked ahead of a window in hand, and taken behind it
+    /// (task-d25), likewise.
+    asked_ahead: u64,
+    taken_ahead: u64,
+    /// Entries donors served with no decided record (`Knobs::forget_rows`),
+    /// and the windows voters stopped at one, summed over every follower
+    /// machine of the run.
+    undecided_served: u64,
+    stopped_undecided: u64,
+    /// Learning passes a step of storage events passed over, at every
+    /// follower (lever 2, step 1).
+    storage_passes_skipped: u64,
+    /// Of those, the ones passed over while a follower campaigned, and at
+    /// a catch-up window's batch (#269 review).
+    storage_passes_skipped_campaigning: u64,
+    storage_passes_skipped_window: u64,
+    /// Campaigns given up as `Behind` (task-d05), and of those the ones
+    /// on a command no voter had executed when it gave up: what the
+    /// selection names and no report carries, which no catch-up brings
+    /// either, so nobody leads until a voter that holds it does
+    /// (task-d119).
+    behind: u32,
+    behind_unexecuted: u32,
+    /// Possible-fast candidates selections dropped whose dependencies
+    /// reach a command no report holds and the candidate doesn't hold
+    /// decided, every selection made counted, summed over every follower
+    /// machine; and whether the run had any (task-d119's note).
+    unreported_drops: u64,
+    unreported_drop_runs: u32,
+    /// Selections bound that dropped a possible-fast candidate whose
+    /// dependencies reach a command no report holds, where the candidate
+    /// holds every such command decided (task-d119). Where it doesn't,
+    /// the run fails.
+    bound_unreported: u64,
+    bound_unreported_undecided: u64,
+    /// `Knobs::holders_gone`: the command its mark is on, the voters it
+    /// destroyed (a mask), whether any voter led from the mark on, the
+    /// campaigns given up as `Behind` from it and of those the ones on
+    /// the marked command, and the boots of the voters left from it.
+    gone_on: Option<CommandId>,
+    gone: u8,
+    led_after_gone: bool,
+    behind_after_gone: u32,
+    behind_after_gone_on_it: u32,
+    boots_after_gone: u32,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -903,6 +1178,7 @@ impl Sim {
                 leader.set_learning(LearningMode::Full);
                 leader.observe_learning();
                 leader.set_early_proposal(knobs.early);
+                leader.set_batch_frames(knobs.frames > 0);
                 Role::Leader(leader)
             } else {
                 let mut follower = Follower::new(FollowerConfig {
@@ -927,6 +1203,8 @@ impl Sim {
                 boot: 1,
                 promised_out: None,
                 durable_promise: None,
+                stamps: BTreeMap::new(),
+                fenced: None,
             });
         }
         let mut sim = Sim {
@@ -952,10 +1230,16 @@ impl Sim {
             trace: std::env::var_os("PROTOCOL_SIM_TRACE").map(|_| VecDeque::new()),
             offers: BTreeMap::new(),
             learned: BTreeSet::new(),
+            marked: BTreeSet::new(),
+            answered: BTreeSet::new(),
             refused_for: BTreeMap::new(),
             forgotten: BTreeSet::new(),
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
+            behind_counted: vec![None; usize::from(n)],
+            gave_up: Vec::new(),
+            destroyed: BTreeSet::new(),
+            gone_mark: None,
             healing: false,
             sync_work: vec![0; usize::from(n)],
             sync_entries: vec![0; usize::from(n)],
@@ -969,8 +1253,11 @@ impl Sim {
             pages_lost: BTreeSet::new(),
             selection_counted: vec![None; usize::from(n)],
             probed: vec![false; usize::from(n)],
+            probe_pages: vec![None; usize::from(n)],
             asked_at: vec![None; usize::from(n)],
             unanswered: vec![0; usize::from(n)],
+            donor_of: vec![None; usize::from(n)],
+            donors_lost: vec![0; usize::from(n)],
             released: BTreeMap::new(),
             lagging: None,
             gate_seen: BTreeSet::new(),
@@ -1073,6 +1360,20 @@ impl Sim {
                             .retain(|u| u.collection != payloads || u.value.is_none());
                     }
                     let node = &mut self.nodes[usize::from(i)];
+                    if let Some(promised) = node.promised() {
+                        if node.stamps.len() > 4 * node.journal.len() + 64 {
+                            let queued: BTreeSet<BarrierId> = node
+                                .journal
+                                .iter()
+                                .filter_map(|e| match e {
+                                    Entry::Batch(b) => Some(*b),
+                                    Entry::Group(_) => None,
+                                })
+                                .collect();
+                            node.stamps.retain(|b, _| queued.contains(b));
+                        }
+                        node.stamps.insert(batch.barrier, promised);
+                    }
                     node.journal.push_back(Entry::Batch(batch.barrier));
                     node.storage.submit(batch);
                 }
@@ -1107,7 +1408,24 @@ impl Sim {
                     // A proposal that waits on nothing left before its
                     // batch was durable: every other copy names the batch
                     // (task-d98).
-                    if let Ok(ProtocolMessage::Proposal(p)) = &message
+                    if matches!(message, Ok(ProtocolMessage::RelayedProposal { .. })) {
+                        self.stats.relayed_proposals += 1;
+                    }
+                    if let Ok(ProtocolMessage::ProposalFrame { proposals, .. }) = &message {
+                        self.stats.frames += 1;
+                        self.stats.framed += proposals.len();
+                        self.stats.relayed_proposals +=
+                            proposals.iter().filter(|p| p.payload.is_some()).count();
+                    }
+                    let proposed = match &message {
+                        Ok(
+                            ProtocolMessage::Proposal(p)
+                            | ProtocolMessage::RelayedProposal { vote: p, .. },
+                        ) => Some(p.ballot),
+                        Ok(ProtocolMessage::ProposalFrame { ballot, .. }) => Some(*ballot),
+                        _ => None,
+                    };
+                    if let Some(proposed) = proposed
                         && requires.is_empty()
                     {
                         self.stats.early_sends += 1;
@@ -1118,7 +1436,7 @@ impl Sim {
                         // The negative control: the copy reaches the
                         // fast-set followers as well.
                         if self.knobs.early_to_fast_set {
-                            let q = quorum(p.ballot, self.n);
+                            let q = quorum(proposed, self.n);
                             if !q.fast_eligible(&to.replica) {
                                 for f in q.fast_set().iter().map(|f| f.0[0]) {
                                     if f != i {
@@ -1182,6 +1500,24 @@ impl Sim {
                         self.held.push(msg);
                     } else {
                         self.net.push(msg);
+                    }
+                }
+                // A marked command's collector answers on a final release
+                // naming the admission it submitted under (task-d100,
+                // step A). The release may be lost on the way, as evidence
+                // may.
+                Effect::Released(released) => {
+                    let c = released.established().command();
+                    if !self.marked.contains(&c) || released.speculative() {
+                        continue;
+                    }
+                    if !self.healing && self.chance("frontend-loss", self.knobs.frontend_loss) {
+                        continue;
+                    }
+                    if released.admission() == self.submitted.get(&c).copied()
+                        && self.answered.insert(c)
+                    {
+                        self.stats.answered_on_release += 1;
                     }
                 }
                 _ => {}
@@ -1325,6 +1661,7 @@ impl Sim {
                 };
                 node.role = Some(Role::Follower(f));
                 self.window[usize::from(i)] = false;
+                self.behind_counted[usize::from(i)] = None;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
                 }
@@ -1366,6 +1703,20 @@ impl Sim {
                         ));
                     }
                 }
+                let paths = f.catch_up_paths();
+                self.stats.stopped_ballot += paths.stopped_ballot;
+                self.stats.stopped_stale += paths.stopped_stale;
+                self.stats.stopped_undecided += paths.stopped_undecided;
+                self.stats.asked_ahead += paths.asked_ahead;
+                self.stats.taken_ahead += paths.taken_ahead;
+                let passes = f.learn_passes();
+                self.stats.storage_passes_skipped += passes.skipped_storage;
+                self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
+                self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
+                let drops = f.unreported_drops();
+                self.stats.unreported_drops += drops.undecided;
+                self.stats.bound_unreported += drops.bound_decided;
+                self.stats.bound_unreported_undecided += drops.bound_undecided;
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -1373,6 +1724,7 @@ impl Sim {
                 // The node's setting, given to every leader it becomes,
                 // as `coordd`'s node does (task-d98).
                 l.set_early_proposal(self.knobs.early);
+                l.set_batch_frames(self.knobs.frames > 0);
                 node.role = Some(Role::Leader(l));
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!(
@@ -1392,6 +1744,10 @@ impl Sim {
     }
 
     fn step_node(&mut self, i: u8, event: Event) {
+        self.step_node_input(i, Input::Event(event));
+    }
+
+    fn step_node_input(&mut self, i: u8, input: Input) {
         let decided_before = match &self.nodes[usize::from(i)].role {
             Some(Role::Follower(f)) => f.campaign_state().and_then(|c| c.decision()).is_some(),
             _ => true,
@@ -1419,15 +1775,15 @@ impl Sim {
                     };
                     Some((c, self.phase(i, &c), deps.unwrap_or_default()))
                 });
-        let acked = match &event {
-            Event::Peer(m) => match ProtocolMessage::decode(m.frame()) {
+        let acked = match &input {
+            Input::Event(Event::Peer(m)) => match ProtocolMessage::decode(m.frame()) {
                 Ok(ProtocolMessage::FastAck(a)) => Some(a.command),
                 Ok(ProtocolMessage::SlowAck(a)) => Some(a.command),
                 _ => None,
             },
             _ => None,
         };
-        let effects = self.nodes[usize::from(i)].step(event);
+        let effects = self.nodes[usize::from(i)].step_input(input);
         match &mut self.nodes[usize::from(i)].role {
             Some(Role::Leader(l)) => self.counted.extend(l.take_learned()),
             Some(Role::Follower(f)) => {
@@ -1546,6 +1902,64 @@ impl Sim {
         }
         self.handle(i, effects);
         self.convert(i);
+        self.fence(i);
+    }
+
+    /// Fence node `i`'s store at its promise once the promise has moved
+    /// past the last fence (`Knobs::fence`), after the step that promised:
+    /// what is still queued under a ballot left behind is refused,
+    /// definitely not committed, in journal order, and fed to the machine;
+    /// the rest is kept, in order.
+    ///
+    /// Not where `coordd` fences (#314 review). Its voter fences in
+    /// `Voter::follow_machine` before `Node::change_role`, having journaled
+    /// what was queued first, so a deposed leader is still the leader when
+    /// the refusals reach it, and retries them (`Leader::retry_proposal`).
+    /// Here the fence runs after [`Sim::convert`], so the follower the
+    /// leader became takes the refusals, and no row runs a leader's retry
+    /// across a deposition.
+    fn fence(&mut self, i: u8) {
+        if !self.knobs.fence {
+            return;
+        }
+        let node = &mut self.nodes[usize::from(i)];
+        let Some(promised) = node.promised() else {
+            return;
+        };
+        if node.fenced.is_some_and(|f| !obsolete(&f, &promised)) {
+            return;
+        }
+        node.fenced = Some(promised);
+        let mut refused = Vec::new();
+        let stamps = &node.stamps;
+        node.journal.retain(|e| match e {
+            Entry::Batch(b) if stamps.get(b).is_some_and(|s| obsolete(s, &promised)) => {
+                refused.push(*b);
+                false
+            }
+            _ => true,
+        });
+        let error = coord_core::event::StorageError::DefinitelyNotCommitted;
+        for barrier in refused {
+            let node = &mut self.nodes[usize::from(i)];
+            node.stamps.remove(&barrier);
+            node.failable.remove(&barrier);
+            if !node.storage.fail(barrier, error) {
+                continue;
+            }
+            self.stats.fenced += 1;
+            self.note(|| format!("fenced node {i} {barrier:?} at {}", bn(&promised)));
+            if self.nodes[usize::from(i)].role.is_none() {
+                continue;
+            }
+            self.step_node(
+                i,
+                Event::Storage(StorageEvent::Failed {
+                    barrier_id: barrier,
+                    error,
+                }),
+            );
+        }
     }
 
     fn admit(&mut self, seq: u64, key: u8, variant: u8, at: &[u8]) {
@@ -1572,6 +1986,38 @@ impl Sim {
             .unwrap();
         let command = CommandId::derive(&rk, &request).unwrap();
         let host = at.first().copied().unwrap_or(0);
+        let fresh = !self.offers.contains_key(&command);
+        if fresh && self.chance("answer-on-release", self.knobs.answer_on_release) {
+            self.marked.insert(command);
+        }
+        // Relayed (task-d102): to the leader among the hosts, or the
+        // first host where none leads, which refuses it. Only a
+        // presentation no leader took falls back to every host.
+        let mut at = at.to_vec();
+        if self.marked.contains(&command) && self.chance("relay", self.knobs.relay) {
+            let leader = at.iter().copied().find(|&i| {
+                self.nodes[usize::from(i)].alive()
+                    && matches!(self.nodes[usize::from(i)].role, Some(Role::Leader(_)))
+            });
+            let target = leader.or_else(|| at.first().copied());
+            if let Some(t) = target
+                && self.nodes[usize::from(t)].alive()
+            {
+                let before = self.holds(t, &command);
+                self.present(command, &frame, t, true);
+                // Held at a leader, now or already (a duplicate is the
+                // leader's to answer): nothing falls back.
+                if leader.is_some() && self.holds(t, &command) {
+                    if !before {
+                        self.stats.relayed += 1;
+                    }
+                    at.clear();
+                } else {
+                    self.stats.relay_fallbacks += 1;
+                }
+            }
+        }
+        let at = at.as_slice();
         self.offers.entry(command).or_insert(Offer {
             seq,
             key,
@@ -1583,44 +2029,82 @@ impl Sim {
             if !self.nodes[usize::from(i)].alive() {
                 continue;
             }
-            let receipt = AdmissionReceipt::submitting(
-                VerifierToken::for_boundary(),
-                AttestedAdmission {
-                    cluster: ClusterId([1; 16]),
-                    domain: DomainId([2; 16]),
-                    session: SessionId([3; 16]),
-                    rule_generation: 1,
-                    scope_ceiling: u32::MAX,
-                    receipt_id: Digest32([9; 32]),
-                    admitted_at_ticks: 0,
-                },
-            );
-            self.submitted.insert(
-                command,
-                coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
-            );
-            let known = self.holds(i, &command);
-            self.step_node(
-                i,
-                Event::Admitted(AdmittedRequest {
-                    receipt,
-                    frame: frame.clone(),
-                }),
-            );
-            // Oracle 5: new work is admitted only into the table's
-            // unreserved part (task-d24). Work that finishes a decision
-            // -- a command a Sync or a campaign selected, or whose turn
-            // has come -- takes the reserve and does not stay in
-            // PRE-ACCEPT.
-            if !known && self.phase(i, &command) == Some(coord_consensus::Phase::PreAccept) {
-                let records = self.table_len(i);
-                let capacity = self.knobs.capacity;
-                if records > capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS {
-                    self.fail(&format!(
-                        "node {i} admitted {} into the reserve: {records} records",
-                        short(&command)
-                    ));
-                }
+            self.present(command, &frame, i, false);
+        }
+    }
+
+    /// Present `frame` at node `i` as its collector's submission, relayed
+    /// to it alone as its ballot's leader or not (task-d102).
+    fn present(&mut self, command: CommandId, frame: &[u8], i: u8, relayed: bool) {
+        let receipt = AdmissionReceipt::submitting(
+            VerifierToken::for_boundary(),
+            AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+        );
+        self.submitted.insert(
+            command,
+            coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
+        );
+        let known = self.holds(i, &command);
+        // The voter's door marks the command before the machine steps
+        // the presentation (task-d100, step A).
+        // A relayed one (task-d102) is marked by the relay mark, which
+        // the machine applies once it derives the command.
+        if relayed {
+            match self.nodes[usize::from(i)].role.as_mut() {
+                Some(Role::Leader(l)) => l.mark_next_relayed(),
+                Some(Role::Follower(f)) => f.mark_next_relayed(),
+                None => {}
+            }
+        } else if self.marked.contains(&command) {
+            match self.nodes[usize::from(i)].role.as_mut() {
+                Some(Role::Leader(l)) => l.mark_answer_on_release(command),
+                Some(Role::Follower(f)) => f.mark_answer_on_release(command),
+                None => {}
+            }
+        }
+        self.step_node(
+            i,
+            Event::Admitted(AdmittedRequest {
+                receipt,
+                frame: frame.to_vec(),
+            }),
+        );
+        // A duplicate of a marked command its leader executed: the
+        // daemon publishes the release again from its retry record,
+        // which answers the collector when the record is there and
+        // names the admission it submitted under.
+        let again = match self.nodes[usize::from(i)].role.as_mut() {
+            Some(Role::Leader(l)) => l.take_release_again(),
+            _ => Vec::new(),
+        };
+        for (c, _, admission) in again {
+            self.stats.released_again += 1;
+            let recorded = self.nodes[usize::from(i)].executed.contains(&c);
+            if recorded && self.submitted.get(&c) == Some(&admission) && self.answered.insert(c) {
+                self.stats.answered_on_release += 1;
+            }
+        }
+        // Oracle 5: new work is admitted only into the table's
+        // unreserved part (task-d24). Work that finishes a decision
+        // -- a command a Sync or a campaign selected, or whose turn
+        // has come -- takes the reserve and does not stay in
+        // PRE-ACCEPT.
+        if !known && self.phase(i, &command) == Some(coord_consensus::Phase::PreAccept) {
+            let records = self.table_len(i);
+            let capacity = self.knobs.capacity;
+            if records > capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS {
+                self.fail(&format!(
+                    "node {i} admitted {} into the reserve: {records} records",
+                    short(&command)
+                ));
             }
         }
     }
@@ -1759,6 +2243,10 @@ impl Sim {
             }
             let page = self.page(msg.to, b, after);
             self.stats.catch_up_pages += 1;
+            if let ProtocolMessage::CatchUpPage { entries, .. } = &page {
+                self.stats.undecided_served +=
+                    entries.iter().filter(|e| e.decided.is_none()).count() as u64;
+            }
             self.net.push(Msg {
                 from: msg.to,
                 to: msg.from,
@@ -1780,12 +2268,48 @@ impl Sim {
         {
             let most = &mut self.pulled_entries[usize::from(msg.to)];
             *most = (*most).max(entries.len());
+            if !entries.is_empty() {
+                self.donor_of[usize::from(msg.to)] = Some(msg.from);
+            }
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                r(msg.from),
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             msg.frame,
         ));
         self.step_node(msg.to, event);
+    }
+
+    /// Whether `donor` serves `command` with no decided record
+    /// ([`Knobs::forget_rows`]): one donor a drawn command, while another
+    /// voter has executed it and can serve its record; with
+    /// [`Knobs::forget_everywhere`], every donor.
+    fn withholds(&self, donor: u8, command: &CommandId) -> bool {
+        let b = command.as_bytes();
+        let salt = (self.seed as u32).wrapping_mul(0x9E37_79B9);
+        let draw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ salt;
+        if draw % 1_000_000 >= self.knobs.forget_rows {
+            return false;
+        }
+        if self.knobs.forget_everywhere {
+            return true;
+        }
+        let which = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) ^ salt;
+        which % u32::from(self.n) == u32::from(donor) && self.executed_elsewhere(donor, command)
+    }
+
+    /// Whether a voter other than `donor` has executed `command` durably,
+    /// as its pages would serve it.
+    fn executed_elsewhere(&self, donor: u8, command: &CommandId) -> bool {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != usize::from(donor))
+            .any(|(_, n)| n.executed[..n.durable_executed].contains(command))
     }
 
     /// What `coordd` serves for a catch-up ask at `ballot` after
@@ -1805,7 +2329,7 @@ impl Sim {
             .iter()
             .enumerate()
             .skip(usize::try_from(after.get()).unwrap_or(usize::MAX))
-            .take(coord_consensus::MAX_CATCH_UP_COMMANDS)
+            .take(self.knobs.page)
         {
             let Some(payload) = payloads.get(c) else {
                 break;
@@ -1814,7 +2338,7 @@ impl Sim {
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
                 payload: payload.clone(),
-                decided: rows.get(c).cloned(),
+                decided: rows.get(c).cloned().filter(|_| !self.withholds(donor, c)),
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,
                 result_digest: digest_of(&response),
@@ -1915,25 +2439,50 @@ impl Sim {
                 return;
             }
         };
-        let seq = self.nodes[usize::from(i)]
-            .storage
-            .complete(barrier)
-            .expect("volatile");
+        // A follower's run of queued batches completes at once, as one
+        // journal group does (`Knobs::storage_steps`): up to eight more,
+        // stopping at an execution group or a batch the run may fail.
+        let mut barriers = vec![barrier];
+        if self.knobs.storage_steps
+            && matches!(self.nodes[usize::from(i)].role, Some(Role::Follower(_)))
+        {
+            let more = self.below("storage-step", 9);
+            while barriers.len() <= more {
+                let node = &mut self.nodes[usize::from(i)];
+                match node.journal.front() {
+                    Some(Entry::Batch(next)) if !node.failable.contains(next) => {
+                        barriers.push(*next);
+                        node.journal.pop_front();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let mut events = Vec::with_capacity(barriers.len());
+        for barrier in &barriers {
+            let seq = self.nodes[usize::from(i)]
+                .storage
+                .complete(*barrier)
+                .expect("volatile");
+            self.note(|| format!("durable node {i} {barrier:?}"));
+            events.push(StorageEvent::JournalDurable {
+                barrier_id: *barrier,
+                journal_seq: seq,
+            });
+        }
         if self.nodes[usize::from(i)].journal.is_empty() {
             self.window[usize::from(i)] = false;
-        }
-        self.note(|| format!("durable node {i} {barrier:?}"));
-        if self.nodes[usize::from(i)].journal.is_empty() {
             self.nodes[usize::from(i)].payload_window.clear();
         }
-        self.step_node(
-            i,
-            Event::Storage(StorageEvent::JournalDurable {
-                barrier_id: barrier,
-                journal_seq: seq,
-            }),
-        );
-        self.check_leader_vote(i, barrier);
+        if events.len() == 1 {
+            let event = events.pop().expect("one");
+            self.step_node(i, Event::Storage(event));
+        } else {
+            self.step_node_input(i, Input::Storage(events));
+        }
+        for barrier in barriers {
+            self.check_leader_vote(i, barrier);
+        }
         self.check_promise(i);
     }
 
@@ -1972,6 +2521,21 @@ impl Sim {
             }
         };
         let position = position.checked_next().unwrap();
+        // Oracle: an execution follows its payload row into the journal
+        // (#243 review, rule (b)). `coordd`'s lowering moves the pending
+        // payload to the execution's position, and refuses an execution
+        // with none: the voter is lost until its state is cleared. So a
+        // command whose payload is held executes only with a payload row
+        // durable or in a batch submitted before it. (One whose payload is
+        // not held is the simulator's: `coordd` waits there for it.)
+        let held = match node.role.as_ref().expect("alive") {
+            Role::Leader(m) => m.payload(&c).is_some(),
+            Role::Follower(m) => m.payload(&c).is_some(),
+        };
+        let unwritten = held
+            && !node
+                .storage
+                .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0);
         let response = response_of(&node.executed, &c, |x| self.offers.get(x).map(|o| o.key));
         let outcome = AppliedOutcome {
             position,
@@ -1997,6 +2561,12 @@ impl Sim {
             Ok(e) => e,
             Err(e) => self.fail(&format!("node {i} could not apply {c:?}: {e:?}")),
         };
+        if unwritten {
+            self.fail(&format!(
+                "node {i} executed {c:?} with its payload held and no payload row durable \
+                 or in a batch submitted"
+            ));
+        }
         if pulled {
             self.stats.caught_up += 1;
         }
@@ -2259,6 +2829,18 @@ impl Sim {
             let why = match node.role.as_mut() {
                 Some(Role::Follower(f)) => {
                     let rejections = f.take_rejections();
+                    for r in &rejections {
+                        if let FollowerRejection::Behind { missing } = r
+                            && self.behind_counted[usize::from(i)] != Some(*missing)
+                        {
+                            self.behind_counted[usize::from(i)] = Some(*missing);
+                            self.stats.behind += 1;
+                            if !self.executed_anywhere.contains(missing) {
+                                self.stats.behind_unexecuted += 1;
+                            }
+                            self.gave_up.push(*missing);
+                        }
+                    }
                     if let Some(t) = self.trace.as_mut() {
                         for r in &rejections {
                             let text = format!("{r:?}");
@@ -2296,6 +2878,58 @@ impl Sim {
                 self.fail(&format!("node {i} stopped: {why}"));
             }
         }
+        for missing in core::mem::take(&mut self.gave_up) {
+            self.holders_gone(missing);
+        }
+        if self.gone_mark.is_some() && self.leader_index().is_some() {
+            self.stats.led_after_gone = true;
+        }
+    }
+
+    /// `Knobs::holders_gone`, at a campaign given up as `Behind` on
+    /// `missing`.
+    fn holders_gone(&mut self, missing: CommandId) {
+        let Some(destroy) = self.knobs.holders_gone else {
+            return;
+        };
+        if let Some(on) = self.gone_mark {
+            self.stats.behind_after_gone += 1;
+            self.stats.behind_after_gone_on_it += u32::from(on == missing);
+            return;
+        }
+        if self.executed_anywhere.contains(&missing) || self.leader_index().is_some() {
+            return;
+        }
+        let holders: Vec<u8> = (0..self.n)
+            .filter(|v| self.holds_anywhere(*v, &missing))
+            .collect();
+        if holders.is_empty() || holders.iter().any(|v| self.nodes[usize::from(*v)].alive()) {
+            return;
+        }
+        self.gone_mark = Some(missing);
+        self.stats.gone_on = Some(missing);
+        if destroy {
+            for v in &holders {
+                self.destroyed.insert(*v);
+                self.stats.gone |= 1u8 << *v;
+            }
+        }
+        self.note(|| {
+            format!(
+                "holders of {} gone ({}): {holders:?}",
+                short(&missing),
+                if destroy { "destroyed" } else { "marked" }
+            )
+        });
+    }
+
+    /// Whether node `v` holds `command`: in its table, or in a durable
+    /// record or payload row it would restart with.
+    fn holds_anywhere(&self, v: u8, command: &CommandId) -> bool {
+        let storage = &self.nodes[usize::from(v)].storage;
+        self.phase(v, command).is_some()
+            || dependency_rows(storage).iter().any(|(c, _)| c == command)
+            || payload_rows(storage).iter().any(|(c, _)| c == command)
     }
 
     /// Node `i` was given the Sync `d`: its table may hold that many
@@ -2319,11 +2953,16 @@ impl Sim {
         self.net.retain(|m| m.from != i && m.to != i);
         self.held.retain(|m| m.from != i && m.to != i);
         self.window[usize::from(i)] = false;
+        self.fold_paths(i);
+        self.donor_of[usize::from(i)] = None;
+        self.donors_lost[usize::from(i)] = 0;
         let node = &mut self.nodes[usize::from(i)];
         node.role = None;
         node.journal.clear();
         node.payload_window.clear();
         node.failable.clear();
+        node.stamps.clear();
+        node.fenced = None;
         node.storage.crash();
         // What its materializer executed past its durable groups is gone
         // with the journal (task-d90).
@@ -2339,6 +2978,12 @@ impl Sim {
 
     /// Restart node `i` from its durable rows, as `coordd` does.
     fn restart(&mut self, i: u8) {
+        if self.destroyed.contains(&i) {
+            return;
+        }
+        if self.gone_mark.is_some() {
+            self.stats.boots_after_gone += 1;
+        }
         let n = self.n;
         let node = &mut self.nodes[usize::from(i)];
         let promise = promise_row(&node.storage);
@@ -2369,6 +3014,7 @@ impl Sim {
         *most = (*most).max(rows);
         self.booted_at[usize::from(i)] = self.step;
         self.probed[usize::from(i)] = false;
+        self.probe_pages[usize::from(i)] = None;
         self.asked_at[usize::from(i)] = None;
         self.unanswered[usize::from(i)] = 0;
         let executed = ExecutionPosition::new(node.executed.len() as u64).unwrap();
@@ -2401,6 +3047,7 @@ impl Sim {
         node.boot = node.boot.wrapping_add(1).max(1);
         let boot = node.boot;
         node.role = Some(Role::Follower(f));
+        self.behind_counted[usize::from(i)] = None;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
     }
@@ -2420,6 +3067,9 @@ impl Sim {
         };
         self.handle(i, effects);
         self.convert(i);
+        // `coordd`'s voter fences its store at the ballot it campaigns at
+        // (`Voter::campaign`).
+        self.fence(i);
     }
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
@@ -2447,18 +3097,32 @@ impl Sim {
                     }
                     // `coordd`'s pacer (task-d08): a voter that holds work
                     // it cannot execute asks, and so does one that has not
-                    // asked since it started, whatever it holds; the
-                    // leader first, then the other voters in turn.
-                    let holds = f.holds_unexecuted() || !self.probed[usize::from(i)];
-                    if self.catch_up && !executable && holds && !f.catching_up() {
-                        let k = usize::from(i);
+                    // had a page since it started, whatever it holds,
+                    // until every voter has been asked (#98); the leader
+                    // first, then the other voters in turn.
+                    let k = usize::from(i);
+                    let pages = f.catch_up_counts().0;
+                    if !self.probed[k]
+                        && (f.catching_up() || self.probe_pages[k].is_some_and(|p| p != pages))
+                    {
                         self.probed[k] = true;
+                    }
+                    let holds = f.holds_unexecuted() || !self.probed[k];
+                    if self.catch_up && !executable && holds && !f.catching_up() {
                         if self.asked_at[k] == Some(at) {
                             self.unanswered[k] += 1;
                         } else {
                             self.unanswered[k] = 0;
                         }
                         self.asked_at[k] = Some(at);
+                        if f.holds_unexecuted() {
+                            self.probed[k] = true;
+                        } else {
+                            self.probe_pages[k].get_or_insert(pages);
+                            if self.unanswered[k] + 1 >= 2 + usize::from(self.n) - 1 {
+                                self.probed[k] = true;
+                            }
+                        }
                         effects.extend(f.request_catch_up(r(donor)));
                     }
                     effects
@@ -2467,6 +3131,77 @@ impl Sim {
             };
             self.handle(i, effects);
             self.convert(i);
+        }
+    }
+
+    /// The leader and a voter behind it that it serves catch-up pages
+    /// to (row 24), and whether the voter has taken a page of the
+    /// leader's it has not installed; otherwise a page of the leader's
+    /// with commands is on its way to the voter.
+    fn serving(&self) -> Option<(u8, u8, bool)> {
+        let l = self.leader_index()?;
+        for v in (0..self.n).filter(|v| *v != l) {
+            let Some(Role::Follower(f)) = &self.nodes[usize::from(v)].role else {
+                continue;
+            };
+            // Twice in a row at most: the third donor lives to send its
+            // Sync, so the voter can move to its ballot.
+            if self.donors_lost[usize::from(v)] >= 2 {
+                continue;
+            }
+            if self.donor_of[usize::from(v)] == Some(l) && f.catching_up() {
+                return Some((l, v, true));
+            }
+            let in_flight = self.net.iter().any(|m| {
+                m.from == l
+                    && m.to == v
+                    && matches!(
+                        ProtocolMessage::decode(&m.frame),
+                        Ok(ProtocolMessage::CatchUpPage { entries, .. }) if !entries.is_empty()
+                    )
+            });
+            if in_flight {
+                return Some((l, v, false));
+            }
+        }
+        None
+    }
+
+    /// A voter that executed as far as any live node has caught up: the
+    /// donors it lost before no longer count toward a run (row 24).
+    fn caught_up_again(&mut self) {
+        let most = self
+            .nodes
+            .iter()
+            .filter(|n| n.alive())
+            .map(|n| n.executed.len())
+            .max()
+            .unwrap_or(0);
+        for (k, node) in self.nodes.iter().enumerate() {
+            if node.alive() && node.executed.len() >= most {
+                self.donors_lost[k] = 0;
+            }
+        }
+    }
+
+    /// Add node `i`'s catch-up stops to the run's, before its machine is
+    /// replaced (task-d106 step 0's counts).
+    fn fold_paths(&mut self, i: u8) {
+        if let Some(Role::Follower(f)) = &self.nodes[usize::from(i)].role {
+            let paths = f.catch_up_paths();
+            self.stats.stopped_ballot += paths.stopped_ballot;
+            self.stats.stopped_stale += paths.stopped_stale;
+            self.stats.stopped_undecided += paths.stopped_undecided;
+            self.stats.asked_ahead += paths.asked_ahead;
+            self.stats.taken_ahead += paths.taken_ahead;
+            let passes = f.learn_passes();
+            self.stats.storage_passes_skipped += passes.skipped_storage;
+            self.stats.storage_passes_skipped_campaigning += passes.skipped_storage_campaigning;
+            self.stats.storage_passes_skipped_window += passes.skipped_storage_window;
+            let drops = f.unreported_drops();
+            self.stats.unreported_drops += drops.undecided;
+            self.stats.bound_unreported += drops.bound_decided;
+            self.stats.bound_unreported_undecided += drops.bound_undecided;
         }
     }
 
@@ -2500,6 +3235,24 @@ impl Sim {
             self.due_admissions();
             if self.chance("admit", self.knobs.admit) {
                 self.admit_next();
+            }
+            // A leader's turn ends: its fresh proposals leave, one frame
+            // to each follower (task-d102). Drawn only in the runs that
+            // set it, so every other run's draws are as they were.
+            if self.knobs.frames > 0 {
+                for i in 0..self.n {
+                    let queued = matches!(
+                        &self.nodes[usize::from(i)].role,
+                        Some(Role::Leader(l)) if l.frames_queued()
+                    );
+                    if queued && self.chance("cut", self.knobs.frames) {
+                        let effects = match self.nodes[usize::from(i)].role.as_mut() {
+                            Some(Role::Leader(l)) => l.cut_frames(),
+                            _ => Vec::new(),
+                        };
+                        self.handle(i, effects);
+                    }
+                }
             }
             if self.chance("collector-crash", self.knobs.collector_crash) {
                 // What the collector counted is gone; what reached the
@@ -2597,6 +3350,20 @@ impl Sim {
                     let who = followers[self.below("depose-candidate", followers.len())];
                     self.campaign(who);
                 }
+            } else if self.knobs.donor_crash > 0
+                && alive.len() > majority
+                && let Some((l, v, taken)) = self.serving()
+                && self.chance("donor-crash", self.knobs.donor_crash)
+            {
+                // The donor of a voter behind it, with a page of its own
+                // in flight to the voter or taken there (row 24).
+                self.stats.donor_crashes += 1;
+                self.stats.donor_crashes_taken += u32::from(taken);
+                let k = usize::from(v);
+                self.stats.donor_crashes_again += u32::from(self.donors_lost[k] > 0);
+                self.donors_lost[k] += 1;
+                self.note(|| format!("leader {l} crashes serving node {v} (taken {taken})"));
+                self.crash(l);
             } else if alive.len() > majority && self.chance("crash", self.knobs.crash) {
                 let candidates: Vec<u8> = alive
                     .iter()
@@ -2633,12 +3400,39 @@ impl Sim {
             } else {
                 self.work();
             }
+            if self.knobs.donor_crash > 0 {
+                self.caught_up_again();
+            }
             self.check_halts();
             self.check_budgets();
             self.check_forgetting();
         }
         self.heal();
         self.check_released();
+        for i in 0..self.n {
+            self.fold_paths(i);
+        }
+        // A selection bound past a dropped possible-fast candidate whose
+        // dependencies reach a command no report holds and its candidate
+        // doesn't hold decided (task-d119). In the ways task-d119's note
+        // names, the selection's entries name such a command, and it is
+        // refused as `Behind`; the counting walk doesn't follow a record
+        // a Sync demoted (seed 2490, kept). A journal that goes on past a
+        // failed batch reaches one more way: a vote survives naming a
+        // command whose own batch failed at the only voter that held it,
+        // so no voter ever held that command durably (row 21, seed 10,
+        // three voters, kept with `fail_queue` off). `coordd`'s journal
+        // fails such a vote with that batch (#197 review), so the count
+        // fails the run only where the journal does that too.
+        let past_failed_batches = self.knobs.payload_fail > 0 && !self.knobs.fail_queue;
+        if self.stats.bound_unreported_undecided > 0 && !past_failed_batches {
+            self.fail(&format!(
+                "{} selections bound past a dropped candidate whose dependencies reach a \
+                 command no report holds and the candidate doesn't hold decided",
+                self.stats.bound_unreported_undecided
+            ));
+        }
+        self.stats.unreported_drop_runs = u32::from(self.stats.unreported_drops > 0);
         self.stats.ballots = self.highest_ballot;
         self.stats.gate_windows = self.gate_seen.len();
         let mut decisions = 0xcbf2_9ce4_8422_2325;
@@ -2794,6 +3588,18 @@ impl Sim {
                 }
                 _ => {
                     let i = runnable[self.below("run", runnable.len())];
+                    // A pulled window's execution put off (row 24): the
+                    // next window starts only once it has run, so a Sync
+                    // of a later ballot can be installed in between.
+                    if self.knobs.catch_up_lag > 0
+                        && matches!(
+                            &self.nodes[usize::from(i)].role,
+                            Some(Role::Follower(f)) if f.catching_up()
+                        )
+                        && self.chance("catch-up-lag", self.knobs.catch_up_lag)
+                    {
+                        return;
+                    }
                     self.execute(i);
                 }
             }
@@ -2865,9 +3671,15 @@ impl Sim {
         // at most one page past what they take (task-d28).
         let report_pages = (2 * capacity).div_ceil(coord_consensus::MAX_PAGE_ENTRIES) + 1;
         // The ledger, payloads, votes and bindings: the live and recently
-        // retired commands, swept once they pass four tables; the peak is
-        // those four, the live table and the retirement window the sweep
-        // goes down to, six tables in all.
+        // retired commands. A sweep keeps the live table and the
+        // retirement window, two tables, and after one that kept no more
+        // than that the next is due once they pass four (task-d110: due
+        // once what was added and executed since passes half of what it
+        // kept, which a ledger past four tables has). The peak is those
+        // four, the live table and the retirement window, six tables in
+        // all. A voter behind keeps more live records than a table, holds
+        // up to half again what its last sweep kept, and comes back under
+        // as it executes them; no row here takes a voter that far behind.
         let kept = 6 * capacity;
         for i in 0..self.n {
             let node = &self.nodes[usize::from(i)];
@@ -2988,7 +3800,7 @@ impl Sim {
     /// (`settle_conflict_from_record`). What the simulator knows some
     /// other node executed is not an answer.
     fn settled(&self, command: &CommandId) -> bool {
-        if self.learned.contains(command) {
+        if self.learned.contains(command) || self.answered.contains(command) {
             return true;
         }
         let from_record = self.reoffered.contains(command)
@@ -3054,6 +3866,16 @@ impl Sim {
         self.heal_start = start;
         for k in 0..HEAL_BUDGET {
             self.step = start + k;
+            // `Knobs::holders_gone`: every live voter restarts again, and
+            // each boot may campaign afresh.
+            if self.gone_mark.is_some() && k > 0 && k % (HEAL_BUDGET / (GONE_BOOTS + 1)) == 0 {
+                for i in 0..self.n {
+                    if self.nodes[usize::from(i)].alive() {
+                        self.crash(i);
+                        self.restart(i);
+                    }
+                }
+            }
             if k % OFFER_EVERY == 0 && self.leader_index().is_some() {
                 self.offer_unsettled();
             }
@@ -3094,6 +3916,11 @@ impl Sim {
         // run still holds every safety and budget oracle up to here, which
         // is what the sweep without catch-up is for (task-d71).
         if !self.catch_up {
+            return;
+        }
+        // With its holders destroyed the domain isn't meant to heal: the
+        // run reads what it did instead (`Knobs::holders_gone`).
+        if !self.destroyed.is_empty() {
             return;
         }
         let unsettled = self.unsettled();
@@ -3308,6 +4135,32 @@ fn describe(m: &ProtocolMessage) -> String {
             a.path.0[0],
             a.path.0[1]
         ),
+        ProtocolMessage::RelayedProposal { vote: a, .. } => format!(
+            "RelayedProposal {} {} deps[{}] seq{:?} path {:02x}{:02x}",
+            bn(&a.ballot),
+            short(&a.command),
+            shorts(&a.deps),
+            a.seqnum,
+            a.path.0[0],
+            a.path.0[1]
+        ),
+        ProtocolMessage::ProposalFrame {
+            ballot, proposals, ..
+        } => format!(
+            "ProposalFrame {} [{}]",
+            bn(ballot),
+            proposals
+                .iter()
+                .map(|p| format!(
+                    "{} deps[{}] seq{}{}",
+                    short(&p.command),
+                    shorts(&p.deps),
+                    p.seqnum,
+                    if p.payload.is_some() { " +payload" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ProtocolMessage::FastAck(a) => format!(
             "FastAck {} {} from {} deps[{}] path {:02x}{:02x}",
             bn(&a.ballot),
@@ -3513,6 +4366,17 @@ fn run_kept(
     early: bool,
     fail_queue: Option<bool>,
 ) -> Result<Stats, String> {
+    run_knobs(
+        n,
+        kept_knobs(row, early, peer_ack_loss, fail_queue),
+        seed,
+        catch_up,
+    )
+}
+
+/// `row`'s knobs, with early proposals, the loss of acknowledgements to
+/// followers and the failed queue as [`run_kept`] says.
+fn kept_knobs(row: u8, early: bool, peer_ack_loss: Option<u32>, fail_queue: Option<bool>) -> Knobs {
     let mut knobs = row_knobs(row);
     if early {
         knobs = knobs.with_early();
@@ -3523,7 +4387,79 @@ fn run_kept(
     if let Some(on) = fail_queue {
         knobs.fail_queue = on;
     }
-    run_knobs(n, knobs, seed, catch_up)
+    knobs
+}
+
+thread_local! {
+    /// Runs on this thread whose panic is caught and said with its seed
+    /// ([`quietly`]).
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// Where the last panic on this thread inside such a run was raised,
+    /// as `file:line`: the hook's location borrows from the panic, so it
+    /// is kept as text.
+    static WHERE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with its panic caught and the hook's output for it left out:
+/// the caller says the failure, with its seed.
+///
+/// Tests run side by side in one process, and the panic hook is the
+/// process's. Each test used to put a silent hook in for its runs and
+/// the one it took back after, so one test's silent hook could be in
+/// place when another's assertion failed, and its message was lost
+/// (`relayed_rows` on sweep run 43661328636). Two tests that swapped
+/// it at once could also leave the silent hook in for the rest of the
+/// process. Now one hook is put in, once, and it holds back only a
+/// panic raised on a thread inside this call; any other goes to the
+/// hook it replaced.
+fn quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if QUIET.with(Cell::get) == 0 {
+                previous(info);
+            } else {
+                let at = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()));
+                WHERE.with(|w| *w.borrow_mut() = at);
+            }
+        }));
+    });
+    QUIET.with(|q| q.set(q.get() + 1));
+    WHERE.with(|w| *w.borrow_mut() = None);
+    let outcome = catch_unwind(AssertUnwindSafe(f));
+    QUIET.with(|q| q.set(q.get() - 1));
+    outcome
+}
+
+/// A caught panic's message, and where it was raised.
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    let text = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    match WHERE.with(|w| w.borrow().clone()) {
+        Some(at) => format!("{text} (at {at})"),
+        None => text,
+    }
+}
+
+/// Fail with every failing run, each said with its row, size and seed.
+/// Each is also printed on its own line first, so a long list stays
+/// readable in the test's output.
+fn assert_none_failed(failures: &[String]) {
+    for f in failures {
+        eprintln!("FAILED {f}");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing seeds:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// One run with `knobs`, its panic caught and said with its seed.
@@ -3534,19 +4470,15 @@ fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<S
     } else {
         ""
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
+    let outcome = quietly(|| {
         let mut sim = Sim::new(n, knobs, seed);
         if let Some(on) = catch_up {
             sim.catch_up = on;
         }
         sim.run()
-    }));
+    });
     outcome.map_err(|e| {
-        let text = e
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-            .unwrap_or_default();
+        let text = panic_text(&*e);
         format!("row {row}{early} at {n} voters, seed {seed}: {text}")
     })
 }
@@ -3563,12 +4495,61 @@ fn row_knobs(row: u8) -> Knobs {
     {
         knobs.peer_ack_loss = loss;
     }
+    // `PROTOCOL_SIM_ANSWER_ON_RELEASE` (parts per million): the share of
+    // commands answered on the leader's release alone (task-d100, step A).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_ANSWER_ON_RELEASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.answer_on_release = share;
+    }
+    // `PROTOCOL_SIM_RELAY` (parts per million): the share of marked
+    // commands relayed to their ballot's leader alone (task-d102, step B).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_RELAY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.relay = share;
+    }
+    // `PROTOCOL_SIM_FRAMES` (parts per million): the chance per step a
+    // leader sends its turn's proposals in frames (task-d102).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.frames = share;
+    }
+    // `PROTOCOL_SIM_PAGE`: the most commands a donor's page carries
+    // (task-d25 review), at least one.
+    if let Some(page) = std::env::var("PROTOCOL_SIM_PAGE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        knobs.page = page.max(1);
+    }
+    // `PROTOCOL_SIM_FORGET_ROWS` (parts per million): the share of
+    // commands donors serve with no decided record (#303 review).
+    if let Some(share) = std::env::var("PROTOCOL_SIM_FORGET_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        knobs.forget_rows = share;
+    }
+    // `PROTOCOL_SIM_FORGET_EVERYWHERE=1`: every donor withholds the drawn
+    // commands' records, as before seed 73's fix (#307 review).
+    if std::env::var("PROTOCOL_SIM_FORGET_EVERYWHERE").as_deref() == Ok("1") {
+        knobs.forget_everywhere = true;
+    }
     // `PROTOCOL_SIM_FAIL_QUEUE=0` fails one batch at a time where the row
     // fails the queue behind it, `=1` the queue where it doesn't.
     match std::env::var("PROTOCOL_SIM_FAIL_QUEUE").as_deref() {
         Ok("0") => knobs.fail_queue = false,
         Ok("1") => knobs.fail_queue = true,
         _ => {}
+    }
+    // `PROTOCOL_SIM_FENCE=0` leaves a voter's store unfenced at a promise.
+    if std::env::var("PROTOCOL_SIM_FENCE").as_deref() == Ok("0") {
+        knobs.fence = false;
     }
     knobs
 }
@@ -3586,10 +4567,6 @@ fn seeds() -> u64 {
 }
 
 fn run_row(row: u8) {
-    // Silence the per-seed panic output; failures are gathered and
-    // reported together, with their seeds.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut totals = Stats::default();
     // Runs that learned nothing, and runs that did, at three and five.
@@ -3604,79 +4581,122 @@ fn run_row(row: u8) {
     } else {
         &[false]
     };
-    for n in [3u8, 5] {
-        for (seed, early) in (0..seeds()).flat_map(|s| variants.iter().map(move |e| (s, *e))) {
-            match run_kept(n, row, seed, None, None, early, None) {
-                Ok(s) => {
-                    if s.learned == 0 {
-                        idle[usize::from(n == 5)] += 1;
-                    } else {
-                        busy[usize::from(n == 5)] += 1;
+    // Row 21's cut (below) is reached in few runs: a follower crashed
+    // while it wrote a payload row again, in 15 to 20 of the 120 runs of
+    // seeds 0 to 59. A schedule change can leave the default seeds short
+    // of it, as keeping a failed catch-up window in hand did, so the next
+    // as many seeds then run too, each checked as every seed is. Raising
+    // the row's fault draws instead would move its kept seeds' schedules.
+    let cut_21 = |t: &Stats| t.restored_without_payload > 0 && t.payload_crashes > 0;
+    for range in [0..seeds(), seeds()..2 * seeds()] {
+        if range.start > 0 && (row != 21 || cut_21(&totals)) {
+            break;
+        }
+        if range.start > 0 {
+            println!(
+                "row 21: the first {} seeds missed the cut ({} payload crashes, {} restored \
+                 without payload); seeds {range:?} run too",
+                seeds(),
+                totals.payload_crashes,
+                totals.restored_without_payload
+            );
+        }
+        for n in [3u8, 5] {
+            for (seed, early) in range
+                .clone()
+                .flat_map(|s| variants.iter().map(move |e| (s, *e)))
+            {
+                match run_kept(n, row, seed, None, None, early, None) {
+                    Ok(s) => {
+                        if s.learned == 0 {
+                            idle[usize::from(n == 5)] += 1;
+                        } else {
+                            busy[usize::from(n == 5)] += 1;
+                        }
+                        totals.executed += s.executed;
+                        totals.learned += s.learned;
+                        totals.campaigns += s.campaigns;
+                        totals.crashes += s.crashes;
+                        totals.leader_crashes += s.leader_crashes;
+                        totals.catch_up_pages += s.catch_up_pages;
+                        totals.caught_up += s.caught_up;
+                        totals.ballots += s.ballots;
+                        totals.heal_steps = totals.heal_steps.max(s.heal_steps);
+                        totals.conflicts += s.conflicts;
+                        totals.peak_records = totals.peak_records.max(s.peak_records);
+                        totals.peak_ledger = totals.peak_ledger.max(s.peak_ledger);
+                        totals.peak_bindings = totals.peak_bindings.max(s.peak_bindings);
+                        totals.peak_held = totals.peak_held.max(s.peak_held);
+                        totals.peak_examinations_pct =
+                            totals.peak_examinations_pct.max(s.peak_examinations_pct);
+                        totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
+                        totals.released += s.released;
+                        totals.compared += s.compared;
+                        totals.executions_lost += s.executions_lost;
+                        totals.peak_undurable = totals.peak_undurable.max(s.peak_undurable);
+                        totals.total_crashes += s.total_crashes;
+                        totals.cut_decided += s.cut_decided;
+                        totals.votes_checked += s.votes_checked;
+                        totals.payload_crashes += s.payload_crashes;
+                        totals.payload_windows += s.payload_windows;
+                        totals.payload_failures += s.payload_failures;
+                        totals.queue_failures += s.queue_failures;
+                        totals.queue_orders += s.queue_orders;
+                        totals.fenced += s.fenced;
+                        totals.restored_without_payload += s.restored_without_payload;
+                        totals.cut_released += s.cut_released;
+                        totals.cut_durable += s.cut_durable;
+                        totals.gate_windows += s.gate_windows;
+                        totals.gate_crashes += s.gate_crashes;
+                        totals.left_out += s.left_out;
+                        totals.early_sends += s.early_sends;
+                        totals.window_crashes += s.window_crashes;
+                        totals.window_deposes += s.window_deposes;
+                        totals.left_out_executed += s.left_out_executed;
+                        totals.answered_on_release += s.answered_on_release;
+                        totals.released_again += s.released_again;
+                        totals.relayed += s.relayed;
+                        totals.relay_fallbacks += s.relay_fallbacks;
+                        totals.relayed_proposals += s.relayed_proposals;
+                        totals.frames += s.frames;
+                        totals.framed += s.framed;
+                        totals.donor_crashes += s.donor_crashes;
+                        totals.donor_crashes_taken += s.donor_crashes_taken;
+                        totals.donor_crashes_again += s.donor_crashes_again;
+                        totals.stopped_ballot += s.stopped_ballot;
+                        totals.stopped_stale += s.stopped_stale;
+                        totals.asked_ahead += s.asked_ahead;
+                        totals.taken_ahead += s.taken_ahead;
+                        totals.undecided_served += s.undecided_served;
+                        totals.stopped_undecided += s.stopped_undecided;
+                        totals.behind += s.behind;
+                        totals.behind_unexecuted += s.behind_unexecuted;
+                        totals.unreported_drops += s.unreported_drops;
+                        totals.unreported_drop_runs += s.unreported_drop_runs;
+                        totals.bound_unreported += s.bound_unreported;
                     }
-                    totals.executed += s.executed;
-                    totals.learned += s.learned;
-                    totals.campaigns += s.campaigns;
-                    totals.crashes += s.crashes;
-                    totals.leader_crashes += s.leader_crashes;
-                    totals.catch_up_pages += s.catch_up_pages;
-                    totals.caught_up += s.caught_up;
-                    totals.ballots += s.ballots;
-                    totals.heal_steps = totals.heal_steps.max(s.heal_steps);
-                    totals.conflicts += s.conflicts;
-                    totals.peak_records = totals.peak_records.max(s.peak_records);
-                    totals.peak_ledger = totals.peak_ledger.max(s.peak_ledger);
-                    totals.peak_bindings = totals.peak_bindings.max(s.peak_bindings);
-                    totals.peak_held = totals.peak_held.max(s.peak_held);
-                    totals.peak_examinations_pct =
-                        totals.peak_examinations_pct.max(s.peak_examinations_pct);
-                    totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
-                    totals.released += s.released;
-                    totals.compared += s.compared;
-                    totals.executions_lost += s.executions_lost;
-                    totals.peak_undurable = totals.peak_undurable.max(s.peak_undurable);
-                    totals.total_crashes += s.total_crashes;
-                    totals.cut_decided += s.cut_decided;
-                    totals.votes_checked += s.votes_checked;
-                    totals.payload_crashes += s.payload_crashes;
-                    totals.payload_windows += s.payload_windows;
-                    totals.payload_failures += s.payload_failures;
-                    totals.queue_failures += s.queue_failures;
-                    totals.queue_orders += s.queue_orders;
-                    totals.restored_without_payload += s.restored_without_payload;
-                    totals.cut_released += s.cut_released;
-                    totals.cut_durable += s.cut_durable;
-                    totals.gate_windows += s.gate_windows;
-                    totals.gate_crashes += s.gate_crashes;
-                    totals.left_out += s.left_out;
-                    totals.early_sends += s.early_sends;
-                    totals.window_crashes += s.window_crashes;
-                    totals.window_deposes += s.window_deposes;
-                    totals.left_out_executed += s.left_out_executed;
+                    Err(e) => failures.push(e),
                 }
-                Err(e) => failures.push(e),
             }
         }
     }
-    std::panic::set_hook(hook);
     println!("row {row}: {totals:?}; runs that learned nothing (3, 5 voters): {idle:?}");
-    // Said here as well as in the assertion: rows run side by side, and
-    // another row's silenced hook may be the one installed when this one
-    // panics.
-    for f in &failures {
-        eprintln!("FAILED {f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "{} failing seeds:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    assert_none_failed(&failures);
     // The scenario did something: commands executed, and elections and
     // crashes happened.
     assert!(
         totals.executed > 0 && totals.campaigns > 0,
         "row {row} ran idle: {totals:?}"
     );
+    // With the fence on (`Knobs::fence`), some promise refused a batch
+    // queued under a ballot left behind: the fence was reached, not only
+    // configured (#314 review).
+    if row_knobs(row).fence {
+        assert!(
+            totals.fenced > 0,
+            "row {row} fenced no batch at a promise: {totals:?}"
+        );
+    }
     // At each size, most runs learned something: the frontend's oracles
     // (one dependency set, every learned decision executed) are not
     // vacuous there.
@@ -3731,6 +4751,42 @@ fn run_row(row: u8) {
             "row 22 never crashed a leader in the gate's window: {totals:?}"
         );
     }
+    // A row run with marked commands (`PROTOCOL_SIM_ANSWER_ON_RELEASE`)
+    // answered some on a release alone (task-d100 step A): a sweep with
+    // the knob can't pass without reaching the rule.
+    if row_knobs(row).answer_on_release > 0 {
+        assert!(
+            totals.answered_on_release > 0,
+            "row {row} answered no marked command on its release: {totals:?}"
+        );
+    }
+    // A row run with relayed commands (`PROTOCOL_SIM_RELAY`) relayed
+    // some, and their leaders proposed them with the payload (task-d102).
+    if row_knobs(row).answer_on_release > 0 && row_knobs(row).relay > 0 {
+        assert!(
+            totals.relayed > 0 && totals.relayed_proposals > 0,
+            "row {row} relayed no command: {totals:?}"
+        );
+    }
+    // A row run with frames (`PROTOCOL_SIM_FRAMES`) sent some, each of
+    // more than one proposal (task-d102).
+    if row_knobs(row).frames > 0 {
+        assert!(
+            totals.frames > 0 && totals.framed > totals.frames,
+            "row {row} sent no proposal frame: {totals:?}"
+        );
+    }
+    // Row 24 is defined by its donors crashed (task-d106, #213 review):
+    // with a page on its way, with a page taken, and twice in a row for
+    // one voter. Healing then requires every voter caught up.
+    if row == 24 && std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none() {
+        assert!(
+            totals.donor_crashes > totals.donor_crashes_taken
+                && totals.donor_crashes_taken > 0
+                && totals.donor_crashes_again > 0,
+            "row 24 missed a donor crash: {totals:?}"
+        );
+    }
     // Oracle 9 ran.
     assert!(
         totals.votes_checked > 0,
@@ -3745,6 +4801,335 @@ fn run_row(row: u8) {
             "row {row} never reached the early window: {totals:?}"
         );
     }
+}
+
+/// task-d100, step A: rows 1, 9 and 14 with half their commands answered
+/// on the leader's release alone, at three and five voters. Marked and
+/// unmarked commands mix on the same keys; every oracle holds, and after
+/// healing every marked command is answered on a release, on one its
+/// leader published again for a duplicate, or from its host's record, as
+/// any entry is. `PROTOCOL_SIM_ANSWER_ON_RELEASE` runs every row so, at
+/// every loss and both catch-up settings, as the weekly sweep can.
+#[test]
+fn answer_on_release_rows() {
+    let mut failures = Vec::new();
+    let (mut answered, mut again) = (0usize, 0usize);
+    for row in [1u8, 9, 14] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        answered += stats.answered_on_release;
+                        again += stats.released_again;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    assert_none_failed(&failures);
+    assert!(answered > 0, "no command was answered on a release alone");
+    assert!(again > 0, "no leader published a release again");
+}
+
+/// task-d102, task-d100's step B: rows 1, 9 and 14 with half their
+/// commands answered on the release alone and most of those relayed to
+/// their ballot's leader alone, at three and five voters. The leader
+/// proposes a relayed command with its payload, the followers adopt it
+/// from the proposal without pre-accepting it, and one presented at a
+/// voter that isn't leading is refused and falls back to every host.
+/// Relayed, step-A and unmarked commands mix on the same keys; every
+/// oracle holds, and after healing every marked command is answered.
+#[test]
+fn relayed_rows() {
+    let mut failures = Vec::new();
+    let (mut answered, mut relayed, mut proposals, mut fallbacks) =
+        (0usize, 0usize, 0usize, 0usize);
+    for row in [1u8, 9, 14] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        knobs.relay = 750_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        answered += stats.answered_on_release;
+                        relayed += stats.relayed;
+                        proposals += stats.relayed_proposals;
+                        fallbacks += stats.relay_fallbacks;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    assert_none_failed(&failures);
+    assert!(answered > 0, "no command was answered on a release alone");
+    assert!(relayed > 0, "no command was relayed to a leader");
+    assert!(proposals > 0, "no proposal carried its payload");
+    assert!(fallbacks > 0, "no relayed command fell back");
+}
+
+/// The batched round's frames (task-d102): rows 1, 9, 14 and 23 at three
+/// and five voters, each leader's fresh proposals sent in frames cut at
+/// random steps, with half the commands marked and most of those relayed,
+/// so frames carry payloads. Row 23 sends early, so a frame leaves before
+/// its batches are durable too. Every oracle holds, frames were sent with
+/// more than one proposal each, and relayed proposals rode in them.
+#[test]
+fn framed_rows() {
+    let mut failures = Vec::new();
+    let (mut frames, mut framed, mut relayed) = (0usize, 0usize, 0usize);
+    for row in [1u8, 9, 14, 23] {
+        let mut knobs = row_knobs(row);
+        knobs.answer_on_release = 500_000;
+        knobs.relay = 750_000;
+        knobs.frames = 300_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        frames += stats.frames;
+                        framed += stats.framed;
+                        relayed += stats.relayed_proposals;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    assert_none_failed(&failures);
+    assert!(frames > 0, "no proposal frame was sent");
+    assert!(
+        framed > frames,
+        "frames held one proposal each: {framed} in {frames}"
+    );
+    assert!(relayed > 0, "no relayed proposal was sent");
+}
+
+/// Pages asked ahead under faults (task-d25 review): at a page of 125 no
+/// row's page leaves the next asked ahead of a window in hand, so the
+/// simulator never reached the ask ahead (0 of 1.19 M pages at 100 seeds)
+/// and its only randomized cover was the ordering test in `catch_up.rs`,
+/// with one ballot and one donor. Here rows 1, 9, 12 and 24 run with
+/// pages of three commands, as a donor whose byte bound cuts its pages:
+/// crashes, elections, lost and held-back frames, and donors crashed while
+/// they serve, with a page asked ahead. Every oracle holds, and pages were
+/// asked ahead and taken behind a window in hand. Catch-up is on whatever
+/// `PROTOCOL_SIM_NO_CATCH_UP` says: this is its test.
+#[test]
+fn rows_with_pages_of_three_ask_ahead() {
+    let mut failures = Vec::new();
+    let (mut pages, mut asked, mut taken) = (0u64, 0u64, 0u64);
+    for row in [1u8, 9, 12, 24] {
+        let mut knobs = row_knobs(row);
+        knobs.page = 3;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, Some(true)) {
+                    Ok(stats) => {
+                        pages += u64::from(stats.catch_up_pages);
+                        asked += stats.asked_ahead;
+                        taken += stats.taken_ahead;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    println!("pages of three: {pages} pages, {asked} asked ahead, {taken} taken ahead");
+    assert_none_failed(&failures);
+    assert!(
+        asked > 0 && taken > 0,
+        "no page asked ahead ({asked}) or taken ahead ({taken}) of {pages}"
+    );
+}
+
+/// Donors that kept no record of a command's decision, under faults
+/// (#303 review, seed 73). No row drops a donor's dependency row of an
+/// executed command, so the simulator never serves an entry with no
+/// decided record (none in every row at 40 seeds). Here rows 1, 9, 12
+/// and 24 run with one donor in twenty commands withholding the record,
+/// while elections, crashes, failed batches and Syncs go on around it.
+/// The voter served such an entry ends its window before it and asks
+/// another donor, and every run heals: every oracle holds and every
+/// voter executes everything. The follower's debug check that no window
+/// runs a command with no decided record runs where debug assertions are
+/// on. When the window ran such a command with no dependencies of its
+/// own instead, review's heavier knob, withholding at every donor, found
+/// two commands at one position and two dependency sets: a vote and an
+/// order that window took out of a report.
+#[test]
+fn rows_with_donors_that_kept_no_rows() {
+    let mut failures = Vec::new();
+    let (mut pages, mut served, mut stopped) = (0u64, 0u64, 0u64);
+    for row in [1u8, 9, 12, 24] {
+        let mut knobs = row_knobs(row);
+        knobs.forget_rows = 50_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, Some(true)) {
+                    Ok(stats) => {
+                        pages += u64::from(stats.catch_up_pages);
+                        served += stats.undecided_served;
+                        stopped += stats.stopped_undecided;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    println!(
+        "donors that kept no rows: {pages} pages, {served} entries with no decided record, \
+         {stopped} windows stopped at one"
+    );
+    assert_none_failed(&failures);
+    assert!(
+        served > 0 && stopped > 0,
+        "no window stopped at an entry with no decided record in {pages} pages"
+    );
+}
+
+/// The two runs review's heavier knob stopped a campaign in when it
+/// withheld a command's record at every donor (`IncompatibleAccepted`),
+/// with one donor withholding each instead: row 12 at three voters, seed
+/// 22, and row 1 with answers on release, seed 38, each with three in
+/// ten commands withheld. Each voter served an entry with no decided
+/// record ends its window and asks another donor, and both heal. With
+/// the record withheld at every donor, or at the one voter that has
+/// executed the command, the refusal leaves the voter nowhere to get
+/// it, and no voter of one epoch withholds it in `coordd`.
+#[test]
+fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
+    // Both were found before the simulator fenced a store at a promise.
+    let mut row_12 = kept_knobs(12, false, None, None);
+    row_12.forget_rows = 300_000;
+    row_12.fence = false;
+    let mut row_1 = kept_knobs(1, false, None, None);
+    row_1.forget_rows = 300_000;
+    row_1.answer_on_release = 500_000;
+    row_1.fence = false;
+    let outcomes = [
+        ("row 12, seed 22", run_knobs(3, row_12, 22, Some(true))),
+        (
+            "row 1 with answers on release, seed 38",
+            run_knobs(3, row_1, 38, Some(true)),
+        ),
+    ];
+    for (run, outcome) in outcomes {
+        let stats = outcome.unwrap_or_else(|e| panic!("{run}: {e}"));
+        assert!(
+            stats.undecided_served > 0,
+            "{run}: no donor served an entry with no decided record"
+        );
+    }
+}
+
+/// Option (c)'s permanent case (task-d121): the one voter that held a
+/// command another depends on loses its storage for good. Row 10 at
+/// three voters under task-d119's targeted schedule (acknowledgements to
+/// followers lost three times in four, no catch-up, holds, campaigns and
+/// crashes as its runs set them), seed 2135. Every voter is down, and
+/// node 2 alone holds the command in its rows, when a
+/// campaign is given up as `Behind` on it: a selection names it as a
+/// dependency and no report holds it. With node 2's storage destroyed,
+/// the two voters left are restarted three times more each while healing
+/// and neither ever leads: each campaign is given up as `Behind` on the
+/// same command, which nothing can bring back. With node 2's storage
+/// only marked, the same run leads again. Task-d121 reads such a
+/// dependency as undecided, and then this run leads.
+#[test]
+fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leader() {
+    let knobs = |destroy| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        ..Knobs::row(10)
+    };
+    let run =
+        |destroy| run_knobs(3, knobs(destroy), 2135, Some(false)).unwrap_or_else(|e| panic!("{e}"));
+    let (gone, marked) = (run(true), run(false));
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2135 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(
+        marked.gone_on,
+        Some(on),
+        "the control marks another command"
+    );
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        !gone.led_after_gone,
+        "a voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(
+        gone.behind_after_gone_on_it > 0,
+        "no campaign given up as `Behind` on {} after the mark",
+        short(&on)
+    );
+    assert!(
+        gone.boots_after_gone >= 2 * GONE_BOOTS,
+        "the two voters left booted {} times after the mark",
+        gone.boots_after_gone
+    );
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark: the stall is not the destroyed storage's"
+    );
+    assert_eq!(marked.gone, 0, "the control destroyed storage");
+}
+
+/// Lever 2, step 1: followers' journals complete runs of batches at
+/// once, each run handed over as one step of storage events, under rows
+/// that crash leaders, repeat elections, fail payload batches with the
+/// queue behind them, and execute late, with leaders sending frames.
+/// Every row's checks hold, debug builds check each learning pass passed
+/// over against every accepted command, and the steps pass some over.
+///
+/// Among them, passes passed over while a follower campaigned and at a
+/// catch-up window's batch made durable: the two cases
+/// `Follower::storage_touches_only` once ruled out and no longer does
+/// (#269 review). The check holds there too.
+#[test]
+fn rows_with_storage_steps_learn_once_a_step() {
+    let mut failures = Vec::new();
+    let (mut skipped, mut campaigning, mut window) = (0u64, 0u64, 0u64);
+    for row in [1u8, 9, 21, 23] {
+        let mut knobs = row_knobs(row);
+        knobs.storage_steps = true;
+        knobs.frames = 500_000;
+        for n in [3u8, 5] {
+            for seed in 0..seeds() {
+                match run_knobs(n, knobs, seed, None) {
+                    Ok(stats) => {
+                        skipped += stats.storage_passes_skipped;
+                        campaigning += stats.storage_passes_skipped_campaigning;
+                        window += stats.storage_passes_skipped_window;
+                    }
+                    Err(e) => failures.push(e),
+                }
+            }
+        }
+    }
+    println!(
+        "storage steps: {skipped} learning passes passed over, \
+         {campaigning} while campaigning, {window} at a catch-up window's batch"
+    );
+    assert_none_failed(&failures);
+    assert!(skipped > 0, "no step of storage events passed a pass over");
+    assert!(
+        campaigning > 0,
+        "no step passed a pass over while its follower campaigned"
+    );
+    assert!(
+        window > 0,
+        "no step passed a pass over at a catch-up window's batch"
+    );
 }
 
 #[test]
@@ -3813,17 +5198,28 @@ fn row_18_the_leaders_proposal_before_its_batch_is_durable() {
 /// acknowledgement, which at three voters is a fast quorum, and commits
 /// over a vote the leader may lose. If no seed failed, the row would not
 /// reach the case the per-follower rule exists for.
+///
+/// The seeds it failed at are tried first, then a budget wide enough to
+/// find another. A failing seed is rare (one in a few hundred), and any
+/// change to what the simulator draws moves it: the catch-up probe that
+/// goes on until a page or every voter (#98) moved the first one from
+/// seed 66 to 492. Re-pinning after each such change would rot (#226
+/// review), so the search goes on to `ROW_18_CONTROL_SEEDS`: it stops
+/// at the first failure, so while a pinned seed still fails it costs
+/// nothing, and it runs long only when the draws moved.
 #[test]
 fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    const FAILED_AT: [u64; 2] = [492, 66];
+    const ROW_18_CONTROL_SEEDS: u64 = 5_000;
     let knobs = Knobs {
         early_to_fast_set: true,
         ..Knobs::row(18)
     };
-    let budget = NEGATIVE_CONTROL_SEEDS.max(seeds());
-    let failed = (0..budget).find_map(|seed| run_knobs(3, knobs, seed, None).err());
-    std::panic::set_hook(hook);
+    let budget = ROW_18_CONTROL_SEEDS.max(seeds());
+    let failed = FAILED_AT
+        .into_iter()
+        .chain(0..budget)
+        .find_map(|seed| run_knobs(3, knobs, seed, None).err());
     let Some(failure) = failed else {
         panic!("row 18 passed {budget} seeds with the fast-set follower sent early too");
     };
@@ -3833,6 +5229,11 @@ fn row_18_fails_when_the_fast_set_follower_gets_the_proposal_early_too() {
 #[test]
 fn row_23_early_proposals_with_late_execution() {
     run_row(23);
+}
+
+#[test]
+fn row_24_a_voter_behind_loses_the_donor_serving_its_pages() {
+    run_row(24);
 }
 
 #[test]
@@ -3923,23 +5324,12 @@ fn first_failure(n: u8, knobs: Knobs) -> Option<String> {
 /// The first seed at which `knobs` fail, at `n` voters, with a failure
 /// that says `what`.
 fn first_failure_with(n: u8, knobs: Knobs, what: &str) -> Option<String> {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let found = (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
-        catch_unwind(AssertUnwindSafe(|| Sim::new(n, knobs, seed).run()))
+    (0..NEGATIVE_CONTROL_SEEDS).find_map(|seed| {
+        quietly(|| Sim::new(n, knobs, seed).run())
             .err()
-            .map(|e| {
-                let text = e
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                    .unwrap_or_default();
-                format!("seed {seed}: {text}")
-            })
+            .map(|e| format!("seed {seed}: {}", panic_text(&*e)))
             .filter(|f| f.contains(what))
-    });
-    std::panic::set_hook(hook);
-    found
+    })
 }
 
 /// Row 19's negative control (task-d90, point 2): with the machines
@@ -3981,9 +5371,92 @@ struct Kept {
     /// absent, as the row says.
     #[serde(default)]
     fail_queue: Option<bool>,
+    /// Whether it found it with storage steps (`Knobs::storage_steps`);
+    /// absent, not.
+    #[serde(default)]
+    storage_steps: bool,
+    /// The frame budget it found it with (`Knobs::frames`); absent, the
+    /// row's.
+    #[serde(default)]
+    frames: Option<u32>,
+    /// The share of commands answered on a release alone it found it
+    /// with (`Knobs::answer_on_release`); absent, the row's.
+    #[serde(default)]
+    answer_on_release: Option<u32>,
+    /// The share of marked commands relayed it found it with
+    /// (`Knobs::relay`); absent, the row's.
+    #[serde(default)]
+    relay: Option<u32>,
+    /// The share of commands a donor withheld the record of
+    /// (`Knobs::forget_rows`); absent, none.
+    #[serde(default)]
+    forget_rows: Option<u32>,
+    /// Whether every donor withheld it (`Knobs::forget_everywhere`);
+    /// absent, one donor.
+    #[serde(default)]
+    forget_everywhere: bool,
+    /// The page size (`Knobs::page`); absent, the row's.
+    #[serde(default)]
+    page: Option<usize>,
+    /// The chances it found it with, in parts per million, of a message
+    /// held back until a later ballot, of a campaign and of a crash
+    /// (`Knobs::hold`, `Knobs::campaign`, `Knobs::crash`: task-d119's
+    /// targeted schedule); absent, the row's.
+    #[serde(default)]
+    hold: Option<u32>,
+    #[serde(default)]
+    campaign: Option<u32>,
+    #[serde(default)]
+    crash: Option<u32>,
+    /// Whether it found it with each voter's store fenced at its promises
+    /// (`Knobs::fence`); absent, not. Every seed kept before the fence was
+    /// found without it, and runs as it was found.
+    #[serde(default)]
+    fence: bool,
     /// What it found, for the reader.
     #[allow(dead_code)]
     found: String,
+}
+
+impl Kept {
+    /// The seed run as it was found: as [`run_kept`] runs it, and with
+    /// storage steps and the frame budget it was found under, as
+    /// `rows_with_storage_steps_learn_once_a_step` runs its rows.
+    fn run(&self) -> Result<Stats, String> {
+        let mut knobs = kept_knobs(self.row, self.early, self.peer_ack_loss, self.fail_queue);
+        if self.storage_steps {
+            knobs.storage_steps = true;
+        }
+        if let Some(frames) = self.frames {
+            knobs.frames = frames;
+        }
+        if let Some(share) = self.answer_on_release {
+            knobs.answer_on_release = share;
+        }
+        if let Some(share) = self.relay {
+            knobs.relay = share;
+        }
+        if let Some(share) = self.forget_rows {
+            knobs.forget_rows = share;
+        }
+        if self.forget_everywhere {
+            knobs.forget_everywhere = true;
+        }
+        if let Some(page) = self.page {
+            knobs.page = page;
+        }
+        if let Some(hold) = self.hold {
+            knobs.hold = hold;
+        }
+        if let Some(campaign) = self.campaign {
+            knobs.campaign = campaign;
+        }
+        if let Some(crash) = self.crash {
+            knobs.crash = crash;
+        }
+        knobs.fence = self.fence;
+        run_knobs(self.voters, knobs, self.seed, self.catch_up)
+    }
 }
 
 #[test]
@@ -3993,22 +5466,8 @@ fn every_kept_seed_passes() {
         "/fixtures/protocol_sim/seeds.json"
     );
     let kept: Vec<Kept> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let failures: Vec<String> = kept
-        .iter()
-        .filter_map(|k| {
-            run_kept(
-                k.voters,
-                k.row,
-                k.seed,
-                k.catch_up,
-                k.peer_ack_loss,
-                k.early,
-                k.fail_queue,
-            )
-            .err()
-        })
-        .collect();
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let failures: Vec<String> = kept.iter().filter_map(|k| k.run().err()).collect();
+    assert_none_failed(&failures);
 }
 
 /// `PROTOCOL_SIM_ONE=row,voters,seed` runs that one seed, with
@@ -4031,12 +5490,103 @@ fn one_seed_from_the_environment() {
     println!("{stats:?}");
 }
 
+/// `PROTOCOL_SIM_RANGE=row,voters,from,to` runs those seeds and says
+/// what task-d119's note counts, summed: campaigns given up as `Behind`,
+/// and on a command no voter had executed; possible-fast candidates
+/// dropped behind a command no report holds and the candidate doesn't
+/// hold decided, and the runs with any; and selections bound with a
+/// candidate dropped behind a command no report holds and the new
+/// leader holds decided (one it doesn't hold decided fails the run).
+/// The loss of acknowledgements to followers and catch-up are the
+/// environment's, as in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
+/// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
+/// note's targeted runs did. Without it, nothing runs.
+#[test]
+fn seeds_from_the_environment() {
+    let Ok(spec) = std::env::var("PROTOCOL_SIM_RANGE") else {
+        return;
+    };
+    let v: Vec<u64> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
+    let (row, n) = (v[0] as u8, v[1] as u8);
+    let mut knobs = row_knobs(row);
+    let chance = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u32>().ok());
+    if let Some(hold) = chance("PROTOCOL_SIM_HOLD") {
+        knobs.hold = hold;
+    }
+    if let Some(campaign) = chance("PROTOCOL_SIM_CAMPAIGN") {
+        knobs.campaign = campaign;
+    }
+    if let Some(crash) = chance("PROTOCOL_SIM_CRASH") {
+        knobs.crash = crash;
+    }
+    // `PROTOCOL_SIM_HOLDERS_GONE=1` destroys the holders, `=0` only marks
+    // the moment (`Knobs::holders_gone`); each run that reaches it says
+    // what followed.
+    if let Ok(gone) = std::env::var("PROTOCOL_SIM_HOLDERS_GONE") {
+        knobs.holders_gone = Some(gone == "1");
+    }
+    let mut totals = Stats::default();
+    let mut failures = Vec::new();
+    for seed in v[2]..v[3] {
+        match run_knobs(n, knobs, seed, None) {
+            Ok(s) => {
+                if let Some(on) = s.gone_on {
+                    println!(
+                        "seed {seed}: holders of {} gone (mask {:b}), led after {}, \
+                         behind after {} ({} on it), boots after {}",
+                        short(&on),
+                        s.gone,
+                        s.led_after_gone,
+                        s.behind_after_gone,
+                        s.behind_after_gone_on_it,
+                        s.boots_after_gone
+                    );
+                }
+                totals.behind += s.behind;
+                totals.behind_unexecuted += s.behind_unexecuted;
+                totals.unreported_drops += s.unreported_drops;
+                totals.unreported_drop_runs += s.unreported_drop_runs;
+                totals.bound_unreported += s.bound_unreported;
+                totals.fenced += s.fenced;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    println!(
+        "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}), \
+         unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
+         fenced {}, failed {}",
+        v[2],
+        v[3],
+        totals.behind,
+        totals.behind_unexecuted,
+        totals.unreported_drops,
+        totals.unreported_drop_runs,
+        totals.bound_unreported,
+        totals.fenced,
+        failures.len()
+    );
+    assert_none_failed(&failures);
+}
+
 /// Row 21's queue failure reaches the order `coordd`'s journal fails a
 /// queue in (#197 review): a command's vote batch fails and then its
 /// adoption batch behind it. Kept in `seeds.json`; the rewrite at the
-/// failure, keyed on the vote batch, failed it.
+/// failure, keyed on the vote batch, failed it. The seed reaches that
+/// order under the row's own knobs, so it is replayed under them alone:
+/// a sweep's settings in the environment (answer on release, the relay,
+/// frames) change the schedule, and the seed then reaches nothing.
+///
+/// Seed 231 stopped reaching it when a candidate began asking one
+/// promised voter a batch, not all of them (the takeover gap on #98): the
+/// schedule moved, and the run still passes. Seeds 3 to 7 reach it now,
+/// and the first is kept.
 #[test]
 fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
-    let stats = run_kept(3, 21, 231, Some(true), None, false, Some(true)).unwrap();
+    let knobs = Knobs {
+        fail_queue: true,
+        ..Knobs::row(21)
+    };
+    let stats = run_knobs(3, knobs, 3, Some(true)).unwrap();
     assert!(stats.queue_orders > 0, "{stats:?}");
 }

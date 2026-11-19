@@ -128,8 +128,10 @@ validity.
 
 Close codes (in `CloseV1.code` and the QUIC application close): `0`
 orderly, `1` protocol violation (framing, unexpected frame), `2`
-negotiation rejected (origin, role class, version, identity), `3`
-deadline, `4` shutdown.
+negotiation rejected (origin, role class, version, identity) or a
+binding refused, `3` deadline, `4` shutdown, `5` expired (the
+credential the connection was authenticated under reached its end, or
+the connection reached its age cap, task-58).
 
 Lanes (task-31): a `Hello` declares exactly one lane through a frozen
 capability identifier; the acceptor admits it only for the dialing role.
@@ -163,19 +165,49 @@ offered or granted on the API plane.
 
 ## Collector frames (task-33)
 
-The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two
-are in the API range because they carry a client request and take its
-class limit; the answers and the evidence frame are in the
-collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
+The trusted collector (`spec/collector-v1.md`) uses seven raw kinds.
+Three are in the API range because they carry a client request, or ask
+on a client's behalf, and take its class limit; the answers and the
+evidence frame are in the collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
 kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
-| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
-| Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
-| Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); version 1, or version 2 for a command answered on the leader's release alone (the same payload: the version is the mark, task-d100 step A), or version 3 for one also relayed to its ballot's leader alone (the same payload, sent only to the leader while `Feature::BatchedRound` is active; a voter that isn't leading answers it with `Refused { NotLeading }` and holds nothing, task-d102); API class limit |
+| Release | `0x0701` | leader to collector | Version 1: `ReleasedResult` (postcard). Version 2, for a command marked by its submission: `ReleaseV2 { released: ReleasedResult, admission: Digest32 }`, the admission digest of the payload the leader decided; collector-evidence class limit |
+| Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`, `Refused`); collector-evidence class limit |
 | Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
 | ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
+| Freshness | `0x0108` | a voter's frontend to the leader of the ballot it follows | `FreshnessAskV1 { ballot, ask }` (postcard), version 1: the voter asks whether its policy is current (#320). The leader holds it as it holds a `Read` and answers once a round started after it arrived has confirmed its ballot and everything it proposed below its read index has executed; API class limit |
+| FreshnessAnswer | `0x0703` | leader to the asking voter | `FreshnessAnswerV1 { ballot, ask, outcome: Through { position } \| Refused { reason } }` (postcard), version 1: `position` is the `ExecutionPosition` the leader had executed through then, `reason` as `ReadAnswer`'s; collector-evidence class limit. Taken only by a voter, and only from the voter it asked. A leader holds an ask at most 1 s, then refuses it `Expired`; it holds 256 at once and 4 from one connection or its own voter, and refuses past either `Busy`. An endpoint built before #320 does not know `0x0108` and closes the connection on it, so a voter with the bound under such a leader stays stale (fails closed) |
+
+A relayed command's proposal (task-d102) is the peer message
+`RelayedProposal { vote, payload }`, appended after every older
+variant: the leader's proposal exactly as `Proposal` carries it, then
+the command's payload record. A follower checks the payload as it checks
+a `PayloadResponse` (it rehashes to the vote's command, and its
+admission digest is the vote's) and adopts the command from it without
+pre-accepting it; one it would not take leaves the proposal to be
+handled as a `Proposal`. An older build cannot decode the variant, which
+is why the leader sends it only for a version-3 submission.
+
+While `Feature::BatchedRound` is active and its node lowers persists in
+groups, a leader sends a turn's fresh proposals to each follower in one
+peer message (task-d102), `ProposalFrame { replica, ballot, proposals }`,
+appended after `RelayedProposal`. The sender and the ballot ride once;
+each entry is a `FramedProposal { command, deps, paths, path, admission,
+seqnum, payload }`: a `Proposal`'s vote without the two fields the frame
+names, and a relayed command's payload record (`None` for any other).
+Entries are in sequence-number order. The frame is cut where the
+leader's loop lowers the turn's group, with no timer, and waits on every
+batch its entries wait on; a turn's proposals to one follower past
+`MAX_PROPOSAL_FRAME_BYTES` (1 MiB) go in more than one frame, and a turn
+of one proposal sends it as the `Proposal` or `RelayedProposal` it is. A
+follower takes each entry as the message it stands for, in order, in one
+step, so their adoptions share its next journal group; an entry it
+refuses leaves the others as they are. Re-sends, re-presentations,
+answers to a follower's ask and the re-proposals after a Sync are never
+framed.
 
 A read is served only by the leader of the ballot named in it, after a
 confirmation round of that ballot (`ProtocolMessage::ReadConfirm` /
@@ -281,7 +313,14 @@ An API-class connection carries no session until its first frame after
 
 The frontend verifies the token locally against the STS's published keys
 under its clock health; a rejected binding closes the connection with
-code `2`. A later `Bind` on the same connection (rebind) must carry the
+code `2`. The reason tells a client whether to keep its token. "bind
+unavailable" is a node whose policy may be behind the domain's (#320):
+it refuses before it reads the token, so the reason says nothing about
+the token, and a client keeps it and binds again later or at another
+frontend. Every other refusal is "bind refused", and a client drops the
+token and exchanges for a new one. The close may follow an empty
+answer stream, so a client reads the connection's close as well as the
+stream. A later `Bind` on the same connection (rebind) must carry the
 same session: it refreshes validity, never identity or ceiling. Nothing
 is admitted before a binding, or after its validity ends; watches and
 results of already admitted work are released only through the fresh

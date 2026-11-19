@@ -29,15 +29,18 @@ use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
-use coord_types::wire_v1::{MessageV1, decode_stream};
+use coord_types::wire_v1::{MessageV1, RequestV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
-use crate::commands::{CommandTable, InitError};
+use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, SubmissionRefusal};
+use crate::messages::{
+    FramedProposal, MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_FRAME_BYTES, PathAnchors, ProtocolMessage,
+    SubmissionRefusal,
+};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
@@ -307,6 +310,67 @@ pub const RESEND_LATENCY_SAMPLES: usize = 128;
 /// off: its vote may be the one the leader still needs (task-d15).
 pub const RESEND_HANDOFF_CALLS: u64 = 8;
 
+/// What this leader sent of its fresh proposals and its frontier, by
+/// kind (task-d102): the bytes the batched round's frames save, and what
+/// is left. A re-send, a re-presentation and an answer to a follower's
+/// ask aren't counted here; [`ResendCounts`] counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentBytes {
+    /// Proposals sent, one to each follower, framed or not.
+    pub proposals: u64,
+    /// Their bytes, without the payload records relayed proposals carry:
+    /// the votes, and each frame's header and length prefixes.
+    pub proposal_bytes: u64,
+    /// The payload records relayed proposals carried.
+    pub payload_bytes: u64,
+    /// Proposal frames sent: more than one proposal in one message.
+    pub frames: u64,
+    /// The proposals those frames carried.
+    pub framed: u64,
+    /// Frontier announcements sent (`Committed`), one to each follower.
+    pub frontiers: u64,
+    /// Their bytes.
+    pub frontier_bytes: u64,
+}
+
+/// The bytes of the payload records `message` carries: a relayed
+/// proposal's, or a frame's relayed entries'.
+fn message_payload_bytes(message: &ProtocolMessage) -> usize {
+    let size = |p: &PayloadRecordV1| postcard::experimental::serialized_size(p).unwrap_or(0);
+    match message {
+        ProtocolMessage::RelayedProposal { payload, .. } => size(payload),
+        ProtocolMessage::ProposalFrame { proposals, .. } => proposals
+            .iter()
+            .filter_map(|p| p.payload.as_ref())
+            .map(size)
+            .sum(),
+        _ => 0,
+    }
+}
+
+impl SentBytes {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &SentBytes) {
+        self.proposals += other.proposals;
+        self.proposal_bytes += other.proposal_bytes;
+        self.payload_bytes += other.payload_bytes;
+        self.frames += other.frames;
+        self.framed += other.framed;
+        self.frontiers += other.frontiers;
+        self.frontier_bytes += other.frontier_bytes;
+    }
+}
+
+/// A follower's proposals of this turn, waiting for the turn to end
+/// (task-d102): the frame [`Leader::cut_frames`] sends it.
+#[derive(Clone, Debug)]
+struct QueuedFrame {
+    context: coord_core::effect::EffectContext,
+    ballot: Ballot,
+    requires: Vec<BarrierId>,
+    proposals: Vec<FramedProposal>,
+}
+
 /// What [`Leader::resend_unvoted`] sent and what came of it (task-d49),
 /// counted since the leader began leading; [`Leader::take_resend_counts`]
 /// hands them over and starts again.
@@ -323,6 +387,12 @@ pub struct ResendCounts {
     /// First sends of re-proposals held back from the first batch: not
     /// re-sends.
     pub deferred: u64,
+    /// First sends of held-back re-proposals that went out as a voter's
+    /// adoptions arrived, not on the re-send timer (the takeover gap on
+    /// #98): each voter is kept at [`RESEND_PER_VOTER`] of them
+    /// unanswered.
+    #[serde(default)]
+    pub topped_up: u64,
     /// Re-sends of a proposal the leader had decided.
     pub decided: u64,
     /// Re-sends of an undecided proposal to a voter that had acknowledged
@@ -378,6 +448,7 @@ impl ResendCounts {
     /// Add `other`'s counts to these.
     pub const fn add(&mut self, other: &ResendCounts) {
         self.deferred += other.deferred;
+        self.topped_up += other.topped_up;
         self.decided += other.decided;
         self.acknowledged += other.acknowledged;
         self.unanswered += other.unanswered;
@@ -405,6 +476,15 @@ enum Resend {
     Acknowledged,
     /// A re-send of one the voter has not answered.
     Unanswered,
+}
+
+/// A voter's first sends of held-back re-proposals ([`Leader::top_up`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FirstSends {
+    /// The highest sequence number in `held_back` its first sends reached.
+    through: Option<u64>,
+    /// The ones sent that it has not adopted yet.
+    out: BTreeSet<CommandId>,
 }
 
 /// One proposal's re-sends to one voter (task-d49).
@@ -436,6 +516,17 @@ pub struct Leader {
     /// history sweep. Kept exact by [`Leader::put_proposal`],
     /// [`Leader::settle`] and the sweep.
     unsettled: BTreeSet<(u64, CommandId)>,
+    /// Where the release gate's walk starts (task-d111's cut (e)): every
+    /// unexecuted proposal numbered below it has had its result released.
+    /// The gate passes over those, so [`Leader::release_ready`] starts
+    /// here rather than at the first unsettled proposal, and walks only
+    /// as far as the gate goes. A proposal entered below it lowers it
+    /// ([`Leader::put_proposal`]).
+    release_from: u64,
+    /// Proposals the release gate was handed (task-d111's cut (e)), for
+    /// the test that bounds them.
+    #[cfg(test)]
+    release_walked: core::cell::Cell<u64>,
     /// Each proposal's current batch (task-d46): what a storage event is
     /// matched with, instead of a pass over every proposal.
     by_barrier: BTreeMap<BarrierId, CommandId>,
@@ -473,6 +564,9 @@ pub struct Leader {
     /// The pages of the last report sent a candidate, which a lost page
     /// is answered from (task-d28).
     served_report: Option<crate::summary::ServedReport>,
+    /// The refusal sent a candidate at a report's cut in place of the
+    /// report, which a lost one is answered from (task-d119).
+    served_refusal: Option<crate::role::ServedRefusal>,
     /// The ballot this replica last reported for and the commands its
     /// report named (task-d24).
     report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
@@ -481,12 +575,33 @@ pub struct Leader {
     rejections: Vec<Rejection>,
     /// The commit frontier last announced to the other voters (task-d74).
     /// A follower learns only from it, so it goes out in the step that
-    /// moves it.
+    /// moves it, or at the end of that turn while `frontier_at_turn_end`.
     announced: Option<u64>,
+    /// Whether the frontier a step moves waits for the end of the node's
+    /// turn ([`Leader::set_frontier_at_turn_end`]).
+    frontier_at_turn_end: bool,
     /// The command the last admitted request became, once derived
     /// (task-d60, step 3): the voter files where its evidence is owed
     /// under it instead of decoding the request a second time.
     admitted: Option<CommandId>,
+    /// Whether the next admitted request's command is marked as answered
+    /// on the leader's release alone once it is derived (task-d100, step
+    /// A): the submission carried the mark, and the voter set this
+    /// before stepping it, so the command is derived once, here (#204
+    /// review).
+    mark_next_admitted: bool,
+    /// Whether the next admitted request was relayed to this voter alone
+    /// as its ballot's leader (task-d102, task-d100's step B): set by the
+    /// voter beside `mark_next_admitted`, so a leader proposes the
+    /// command with its payload and a voter that isn't leading says so.
+    mark_next_relayed: bool,
+    /// Whether this leader's configuration lets it lead at all: a voter,
+    /// in its quorum's epoch and voter set, and the leader its quorum's
+    /// ballot names (#185, lead 17:43). The configuration is fixed for
+    /// a leader's life (a reconfiguration makes a new one), so this is
+    /// read once at construction, not compared on every
+    /// [`Leader::is_leading`], which compared the voter sets each time.
+    configured_to_lead: bool,
     fenced: Option<FenceReason>,
     /// Entries of the selection this leader was handed that no order
     /// keeps: a dependency cycle, which is an invariant violation
@@ -520,6 +635,17 @@ pub struct Leader {
     /// Calls of `resend_unvoted` so far: the clock its back-off is
     /// counted on.
     resend_calls: u64,
+    /// Re-proposals held back from a new leader's first batch
+    /// (`REPROPOSE_BATCH`), by sequence number, until every voter has had
+    /// its first send of them. Empty but after a takeover.
+    held_back: BTreeSet<(u64, CommandId)>,
+    /// Per voter, the held-back re-proposals sent to it that it has not
+    /// adopted yet, and how far in `held_back` its first sends reached
+    /// (the takeover gap on #98). Each adoption that arrives tops the
+    /// voter up to [`RESEND_PER_VOTER`] unanswered, so the backlog goes
+    /// out at the pace of a round trip; paced by `resend_unvoted`'s timer
+    /// alone it went out 16 a voter every 250 ms, 64 commands a second.
+    first_sends: BTreeMap<ReplicaId, FirstSends>,
     /// Per proposal and voter it was re-sent to: when it may be re-sent
     /// again, and how often it was. Kept only while the proposal is held
     /// and the voter has not adopted it.
@@ -563,6 +689,34 @@ pub struct Leader {
     /// every follower as holding it, which only a build made for task-d98's
     /// local reading sets, and the tests of the send itself.
     early_holders: Option<BTreeSet<ReplicaId>>,
+    /// The commands whose collector answers on the release alone
+    /// (task-d100, step A), marked by the voter before each submission
+    /// of one is stepped: no reply and no copy of this leader's own
+    /// acknowledgement goes to the frontend for them, and their release
+    /// carries the decided payload's admission digest.
+    answer_on_release: BTreeSet<CommandId>,
+    /// The marked commands whose submission was relayed to this leader
+    /// alone (task-d102): every proposal of one carries its payload
+    /// ([`ProtocolMessage::RelayedProposal`]), since the followers never
+    /// got the submission. A subset of `answer_on_release`, let go with
+    /// it.
+    relayed: BTreeSet<CommandId>,
+    /// Whether a turn's fresh proposals wait for the turn's end, to go to
+    /// each follower in one frame (task-d102): set by the node while
+    /// `Feature::BatchedRound` is active and it lowers its persists in
+    /// groups.
+    batch_frames: bool,
+    /// Each follower's proposals of this turn, while `batch_frames`.
+    frames: BTreeMap<ReplicaId, QueuedFrame>,
+    /// What the fresh proposals and the frontier cost, by kind.
+    sent_bytes: SentBytes,
+    /// Marked commands this leader executed and was sent again as exact
+    /// duplicates, with the admission digest of the payload it decided
+    /// (task-d100, step A): their collector lost the release, and the
+    /// daemon publishes it again, rebuilt from this node's retry record,
+    /// since the release left the machine as an effect and nothing here
+    /// kept it.
+    release_again: Vec<(CommandId, RetryKey, Digest32)>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -608,6 +762,18 @@ fn ready_tails(decision: &SyncDecision, last: &[CommandId], ready: &[CommandId])
     tails
 }
 
+/// Whether `config` lets its leader lead at all, whatever its ballots
+/// say: what [`Leader::is_leading`] reads of the configuration.
+fn configured_to_lead(config: &LeaderConfig) -> bool {
+    let identity = &config.identity;
+    let quorum = &config.quorum;
+    identity.role == ReplicaRole::Voter
+        && identity.epoch == quorum.epoch()
+        && identity.voters == *quorum.voters()
+        && quorum.is_voter(&identity.replica)
+        && quorum.ballot().leader == identity.replica
+}
+
 impl Leader {
     /// A leader from its configuration, the recovered promise row and the
     /// application's durable execution position. The learner resumes from
@@ -642,11 +808,14 @@ impl Leader {
         );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
+            configured_to_lead: configured_to_lead(&config),
             replay: crate::replay::EvidenceStore::new(config.capacity),
             selection: None,
             // Every voter of the genesis ballot is in it from the start.
             joined: config.identity.voters.iter().copied().collect(),
             resend_calls: 0,
+            held_back: BTreeSet::new(),
+            first_sends: BTreeMap::new(),
             resent: digest::map(),
             latency: BTreeMap::new(),
             answered: digest::map(),
@@ -656,6 +825,12 @@ impl Leader {
             early: false,
             early_ready: false,
             early_holders: None,
+            answer_on_release: BTreeSet::new(),
+            relayed: BTreeSet::new(),
+            batch_frames: false,
+            frames: BTreeMap::new(),
+            sent_bytes: SentBytes::default(),
+            release_again: Vec::new(),
             config,
             boot: None,
             alloc: None,
@@ -665,6 +840,9 @@ impl Leader {
             bindings: BTreeMap::new(),
             proposals: digest::map(),
             unsettled: BTreeSet::new(),
+            release_from: 0,
+            #[cfg(test)]
+            release_walked: core::cell::Cell::new(0),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
@@ -678,12 +856,16 @@ impl Leader {
             seqnum: 0,
             report_due: None,
             served_report: None,
+            served_refusal: None,
             report_cut: None,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            frontier_at_turn_end: false,
             admitted: None,
+            mark_next_admitted: false,
+            mark_next_relayed: false,
             fenced: None,
             recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
@@ -713,6 +895,7 @@ impl Leader {
         RecoveredState {
             report_due: self.report_due,
             served_report: self.served_report,
+            served_refusal: self.served_refusal,
             report_cut: self.report_cut,
             identity: self.config.identity,
             ballots: self.ballots,
@@ -752,14 +935,16 @@ impl Leader {
         decision: &SyncDecision,
     ) -> (Self, Vec<Effect>) {
         let identity = state.identity.clone();
+        let config = LeaderConfig {
+            identity: state.identity,
+            genesis: quorum.ballot(),
+            quorum,
+            frontend: state.frontend,
+            capacity: state.capacity,
+        };
         let mut leader = Leader {
-            config: LeaderConfig {
-                identity: state.identity,
-                genesis: quorum.ballot(),
-                quorum,
-                frontend: state.frontend,
-                capacity: state.capacity,
-            },
+            configured_to_lead: configured_to_lead(&config),
+            config,
             boot: state.boot,
             alloc: state.alloc,
             outbox: state.outbox,
@@ -768,6 +953,9 @@ impl Leader {
             bindings: state.bindings,
             proposals: digest::map(),
             unsettled: BTreeSet::new(),
+            release_from: 0,
+            #[cfg(test)]
+            release_walked: core::cell::Cell::new(0),
             by_barrier: BTreeMap::new(),
             durable: BTreeSet::new(),
             adopted_through: BTreeMap::new(),
@@ -782,12 +970,16 @@ impl Leader {
             seqnum: 0,
             report_due: state.report_due,
             served_report: state.served_report,
+            served_refusal: state.served_refusal,
             report_cut: state.report_cut,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
             announced: None,
+            frontier_at_turn_end: false,
             admitted: None,
+            mark_next_admitted: false,
+            mark_next_relayed: false,
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -798,6 +990,8 @@ impl Leader {
             // frame were lost (task-d33). A vote at this ballot joins it.
             joined: BTreeSet::from([identity.replica]),
             resend_calls: 0,
+            held_back: BTreeSet::new(),
+            first_sends: BTreeMap::new(),
             resent: digest::map(),
             latency: BTreeMap::new(),
             answered: digest::map(),
@@ -807,6 +1001,12 @@ impl Leader {
             early: false,
             early_ready: false,
             early_holders: None,
+            answer_on_release: BTreeSet::new(),
+            relayed: BTreeSet::new(),
+            batch_frames: false,
+            frames: BTreeMap::new(),
+            sent_bytes: SentBytes::default(),
+            release_again: Vec::new(),
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -897,8 +1097,9 @@ impl Leader {
                 last.push(c);
             }
         }
-        // Published in a first batch; the rest go out through the re-send,
-        // oldest first, as votes come back. A new leader after a long
+        // Published in a first batch; the rest go out oldest first as each
+        // voter's adoptions come back (`top_up`), and through the re-send
+        // for what is lost. A new leader after a long
         // history used to put its whole selection on each follower's
         // control lane in one pass, and the lane refused dozens of them
         // (task-d07).
@@ -919,9 +1120,7 @@ impl Leader {
                 continue;
             }
             let deps = entry.deps.clone();
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
         }
         let mut done: BTreeSet<CommandId> = BTreeSet::new();
         for c in &decision.reproposed {
@@ -969,9 +1168,7 @@ impl Leader {
             if !ready.is_empty() {
                 last = ready_tails(decision, &last, &ready);
             }
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
             effects.extend(leader.repropose_entries(decision, &ready, &mut published));
         }
         // What the candidate took in after cutting its own report, which
@@ -989,9 +1186,7 @@ impl Leader {
                 continue;
             }
             let deps = core::mem::replace(&mut last, alloc::vec![*c]);
-            let publish = published < REPROPOSE_BATCH;
-            published += 1;
-            effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_counted(*c, deps, &mut published));
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -1010,12 +1205,47 @@ impl Leader {
     /// forgotten commands, as a follower does (task-d05). A forgotten
     /// command executed long ago: nothing is decided, released or served
     /// for it any more.
-    fn forget_history(&mut self) {
-        if self.ledger.len()
-            <= self
-                .config
+    ///
+    /// Due as a follower's is (task-d110): past a multiple of the table,
+    /// once the records added and the commands executed since the last
+    /// sweep come to more than half of what it kept.
+    ///
+    /// Each execution first drops the history of what the table has
+    /// forgotten since, in the order it executed (task-d111's cut (d)),
+    /// so the sweep below is a backstop, as at a follower.
+    fn forget_history(&mut self, executed: CommandId) {
+        self.ledger.executed(executed);
+        let table = &self.table;
+        let gone = self.ledger.take_forgotten(
+            |c| table.forgotten(c),
+            crate::follower::FORGET_PER_EXECUTION,
+            self.config
                 .capacity
-                .saturating_mul(crate::follower::HISTORY_SWEEP)
+                .saturating_mul(crate::follower::HISTORY_SWEEP),
+        );
+        for c in gone {
+            self.forget_one(c);
+        }
+        #[cfg(debug_assertions)]
+        if self
+            .ledger
+            .executions()
+            .is_multiple_of(crate::follower::FORGET_CHECK_EVERY)
+        {
+            self.check_forgetting();
+        }
+        // Due at the threshold, or once the table forgets the last
+        // command the queue let go unforgotten (#221 review).
+        let owed = self
+            .ledger
+            .owed_sweep()
+            .is_some_and(|c| self.table.forgotten(c));
+        if !owed
+            && !self.ledger.sweep_due(
+                self.config
+                    .capacity
+                    .saturating_mul(crate::follower::HISTORY_SWEEP),
+            )
         {
             return;
         }
@@ -1024,15 +1254,74 @@ impl Leader {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
+        self.answer_on_release.retain(|c| table.record(c).is_some());
+        let marked = &self.answer_on_release;
+        self.relayed.retain(|c| marked.contains(c));
         let proposals = &self.proposals;
         self.unsettled.retain(|(_, c)| proposals.contains_key(c));
         self.durable.retain(|(_, c)| proposals.contains_key(c));
+        self.held_back.retain(|(_, c)| proposals.contains_key(c));
         self.by_barrier.retain(|_, c| proposals.contains_key(c));
         self.votes.retain(|c, _| !table.forgotten(c));
         // A retry of a forgotten command is refused from the table's
         // executed answer (`propose`), so its binding is not needed for
         // that, and kept it grew with every key ever submitted (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
+        self.ledger.swept();
+    }
+
+    /// Drop what this leader keeps about `command`, which the table has
+    /// forgotten, from every map [`Leader::forget_history`]'s sweep walks,
+    /// with the indexes over its proposal (task-d111's cut (d)).
+    fn forget_one(&mut self, command: CommandId) {
+        if let Some(key) = self.ledger.forget(&command)
+            && self.bindings.get(&key) == Some(&command)
+        {
+            self.bindings.remove(&key);
+        }
+        let payload = self.payloads.remove(&command);
+        self.served_payloads.remove(&command);
+        if let Some(proposal) = self.proposals.remove(&command) {
+            self.unsettled.remove(&(proposal.seqnum, command));
+            self.durable.remove(&(proposal.seqnum, command));
+            self.held_back.remove(&(proposal.seqnum, command));
+            if self.by_barrier.get(&proposal.barrier) == Some(&command) {
+                self.by_barrier.remove(&proposal.barrier);
+            }
+        }
+        self.answer_on_release.remove(&command);
+        self.relayed.remove(&command);
+        self.votes.remove(&command);
+        if let Some(payload) = payload
+            && self.bindings.get(&payload.retry_key) == Some(&command)
+        {
+            self.bindings.remove(&payload.retry_key);
+        }
+    }
+
+    /// Debug check of cut (d) against the sweep it replaces, as a
+    /// follower's (`Follower::check_forgetting`).
+    #[cfg(debug_assertions)]
+    fn check_forgetting(&self) {
+        let queued = self.ledger.forget_queued();
+        let kept = |c: &CommandId| {
+            !self.table.forgotten(c) || queued.contains(c) || self.ledger.sweep_owes(c)
+        };
+        debug_assert!(
+            self.ledger.records().all(|(c, _)| kept(c))
+                && self.payloads.keys().all(kept)
+                && self.served_payloads.iter().all(kept)
+                && self.proposals.keys().all(kept)
+                && self.votes.keys().all(kept)
+                && self.bindings.values().all(kept),
+            "a forgotten command's history was kept and is not in the forget queue"
+        );
+        debug_assert!(
+            self.held_back
+                .iter()
+                .all(|(_, c)| self.proposals.contains_key(c)),
+            "a held-back re-proposal outlived its proposal"
+        );
     }
 
     /// Propose a known command under this ballot with `deps`. With
@@ -1053,11 +1342,27 @@ impl Leader {
             if entry.phase >= Phase::Commit && self.table.phase_of(c) == Some(Phase::Executed) {
                 continue;
             }
-            let publish = *published < REPROPOSE_BATCH;
-            *published += 1;
-            effects.extend(self.repropose(*c, entry.deps.clone(), publish));
+            effects.extend(self.repropose_counted(*c, entry.deps.clone(), published));
         }
         effects
+    }
+
+    /// [`Leader::repropose`], published with its batch while fewer than
+    /// `REPROPOSE_BATCH` have been, and counted in `published` only if a
+    /// proposal was made. Counted before, a command this leader executed
+    /// and retired, which `repropose` makes nothing of, used up a place in
+    /// the first batch (the takeover gap on #98).
+    fn repropose_counted(
+        &mut self,
+        command: CommandId,
+        deps: Vec<CommandId>,
+        published: &mut usize,
+    ) -> Vec<Effect> {
+        let made = self.repropose(command, deps, *published < REPROPOSE_BATCH);
+        if !made.is_empty() {
+            *published += 1;
+        }
+        made
     }
 
     fn repropose(
@@ -1137,9 +1442,9 @@ impl Leader {
         };
         if publish {
             let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-            let outbox = self.outbox.as_mut().expect("booted");
             // Encoded once for every voter it goes to (task-d61).
-            let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
+            let frame = self.proposal_message(proposal.clone()).encode();
+            let outbox = self.outbox.as_mut().expect("booted");
             for voter in &self.config.identity.voters {
                 if *voter == self.config.identity.replica {
                     continue;
@@ -1322,6 +1627,13 @@ impl Leader {
                     let p = self.proposals.get_mut(&command).expect("in the order");
                     p.sent.get_or_insert(call);
                     self.counts.deferred += 1;
+                    // Out to the voter now: it counts in the window
+                    // `top_up` keeps, and is not sent it twice.
+                    self.first_sends
+                        .entry(voter)
+                        .or_default()
+                        .out
+                        .insert(command);
                 }
                 Resend::HandedOff => {
                     let r = self.resent.entry((command, voter)).or_insert(Resent {
@@ -1462,7 +1774,7 @@ impl Leader {
 
     /// The proposal frame for `p`, as it was first published.
     fn proposal_frame(&self, p: &Proposal) -> Vec<u8> {
-        ProtocolMessage::Proposal(FastAck {
+        self.proposal_message(FastAck {
             replica: self.config.identity.replica,
             ballot: self.config.quorum.ballot(),
             command: p.command,
@@ -1591,15 +1903,39 @@ impl Leader {
     /// command it adopted is committed. Announced on the re-send timer
     /// alone, a follower's execution trailed the leader's by up to that
     /// interval; announced in the step that moves it, by one message.
+    ///
+    /// While [`Leader::set_frontier_at_turn_end`] is on, the node calls
+    /// it once at the end of its turn instead, so each voter gets one
+    /// `Committed` frame a turn however many batches turned durable in it.
     pub fn announce_advanced(&mut self) -> Vec<Effect> {
-        if self.boot.is_none() || !self.is_leading() {
-            return Vec::new();
-        }
-        let through = self.commit_frontier();
-        if through.is_none() || through <= self.announced {
+        if !self.frontier_owed() {
             return Vec::new();
         }
         self.announce_committed()
+    }
+
+    /// Whether the commit frontier moved since it was last announced.
+    pub fn frontier_owed(&self) -> bool {
+        if self.boot.is_none() || !self.is_leading() {
+            return false;
+        }
+        let through = self.commit_frontier();
+        through.is_some() && through > self.announced
+    }
+
+    /// Hold the frontier a step moves for the end of the node's turn
+    /// (#242 follow-up): the node then calls [`Leader::announce_advanced`]
+    /// once a turn, where it lowers the turn's group.
+    ///
+    /// Announced in every step that moves it, a new leader's backlog sent
+    /// each voter a `Committed` frame for every re-proposal batch that
+    /// turned durable: at 823 behind, 828 frames a voter in a second,
+    /// past what its control lane takes. Once a turn, a voter gets at most
+    /// one a turn, and still in the turn that moved the frontier. The node
+    /// sets it while it lowers in groups, since that is where its turn
+    /// ends; off, the frontier goes out in the step that moves it.
+    pub fn set_frontier_at_turn_end(&mut self, on: bool) {
+        self.frontier_at_turn_end = on;
     }
 
     /// Tell every other voter this ballot's commit frontier (task-d09).
@@ -1637,6 +1973,8 @@ impl Leader {
             if *voter == me {
                 continue;
             }
+            self.sent_bytes.frontiers += 1;
+            self.sent_bytes.frontier_bytes += frame.len() as u64;
             outbox.publish(PendingSend {
                 context,
                 requires: Vec::new(),
@@ -1651,13 +1989,25 @@ impl Leader {
     }
 
     /// Send `from` again the pages of the report this replica sent it
-    /// for `ballot` that it asks for (task-d28), from the same version.
+    /// for `ballot` that it asks for (task-d28), from the same version;
+    /// or the refusal it sent in place of that report (task-d119).
     fn answer_report_pages(
         &mut self,
         from: ReplicaId,
         ballot: Ballot,
         asked: &[u32],
     ) -> Vec<Effect> {
+        if let (Some(refused), Some(boot)) = (self.served_refusal, self.boot)
+            && refused.answers(from, ballot)
+        {
+            let reply = self
+                .ballots
+                .refusal(refused.to, ballot, boot, refused.executed);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let (Some(served), Some(boot)) = (self.served_report.as_ref(), self.boot) else {
             return Vec::new();
         };
@@ -1696,6 +2046,20 @@ impl Leader {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
+        let own = self.learner.executed_through();
+        if let Some(refused) = due.behind(own, self.config.capacity as u64) {
+            self.rejections.push(Rejection::Promise(refused));
+            self.served_refusal = Some(crate::role::ServedRefusal {
+                ballot: due.ballot,
+                to: due.to,
+                executed: own,
+            });
+            let reply = self.ballots.refusal(due.to, due.ballot, boot, own);
+            if let Some(outbox) = self.outbox.as_mut() {
+                outbox.publish(reply);
+            }
+            return self.release();
+        }
         let report = self.report(due.ballot);
         self.report_cut = Some((
             due.ballot,
@@ -1723,6 +2087,22 @@ impl Leader {
     /// The durable ledger (journal-durable records only).
     pub const fn ledger(&self) -> &DurableLedger {
         &self.ledger
+    }
+
+    /// What this leader keeps of its history beside the ledger, map by
+    /// map (#221 review).
+    pub fn history_maps(&self) -> crate::summary::HistoryMaps {
+        crate::summary::HistoryMaps {
+            payloads: self.payloads.len(),
+            served_payloads: self.served_payloads.len(),
+            votes: self.votes.len(),
+            bindings: self.bindings.len(),
+            bare_bindings: self.ledger.bare_bindings(),
+            answer_on_release: self.answer_on_release.len(),
+            relayed: self.relayed.len(),
+            proposals: self.proposals.len(),
+            ..crate::summary::HistoryMaps::default()
+        }
     }
 
     /// Retry keys bound to a command here (task-d26): the commands still
@@ -1765,6 +2145,13 @@ impl Leader {
     pub fn next_executable(&self) -> Option<CommandId> {
         self.learner
             .next_executable(&self.table, |c| self.proposals.get(c).map(|p| p.seqnum))
+    }
+
+    /// The table's size and its oldest unexecuted record's wait, in this
+    /// leader's proposal order (task-d25, #98).
+    pub fn table_waits(&self) -> crate::TableWaits {
+        self.table
+            .waits(|c| self.proposals.get(c).map(|p| p.seqnum))
     }
 
     /// The durable payload of a proposed command.
@@ -1816,7 +2203,7 @@ impl Leader {
             self.missed.note(command, reason, self.config.capacity);
         }
         self.learn();
-        self.forget_history();
+        self.forget_history(command);
         // A command whose result was released speculatively is already
         // disclosed; releasing it again would answer one caller twice.
         // A command whose result was *not* is only disclosed here.
@@ -1845,12 +2232,14 @@ impl Leader {
         }
         self.settle(command);
         let mut effects = alloc::vec![Effect::Established(result.clone())];
-        if self.is_leading() && !released {
-            effects.push(Effect::Released(ReleasedResult::from_gate(
-                result,
-                outcome.response.clone(),
-                false,
-            )));
+        // A marked command's collector answers only on a final release
+        // (task-d100, step A), so it goes out even where the command was
+        // speculated: its speculative release was never sent
+        // ([`Leader::release_ready`]).
+        let marked = self.answer_on_release.contains(&command);
+        if self.is_leading() && (!released || marked) {
+            let release = ReleasedResult::from_gate(result, outcome.response.clone(), false);
+            effects.push(Effect::Released(self.with_admission(release)));
         }
         effects.extend(self.release_ready());
         Ok(effects)
@@ -1888,6 +2277,13 @@ impl Leader {
         self.learned.get_or_insert_with(Vec::new);
     }
 
+    /// The marked commands whose release the daemon publishes again,
+    /// each with its retry key and the decided payload's admission
+    /// digest, since this was last called (task-d100, step A).
+    pub fn take_release_again(&mut self) -> Vec<(CommandId, RetryKey, Digest32)> {
+        core::mem::take(&mut self.release_again)
+    }
+
     /// The commands committed from votes since this was last called,
     /// in commit order (task-d62); empty unless observed.
     pub fn take_learned(&mut self) -> Vec<CommandId> {
@@ -1895,6 +2291,25 @@ impl Leader {
             .as_mut()
             .map(core::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Debug check of the release gate's frontier (task-d111's cut (e))
+    /// against the walk from the first unsettled proposal it replaces:
+    /// every unexecuted proposal before it was released, so the gate
+    /// passes over them as it would have from the start.
+    #[cfg(debug_assertions)]
+    fn check_release_from(&self) {
+        for (seqnum, c) in &self.unsettled {
+            if *seqnum >= self.release_from {
+                break;
+            }
+            let executed =
+                self.proposals[c].executed || self.table.phase_of(c) >= Some(Phase::Executed);
+            debug_assert!(
+                executed || self.speculation.released(c),
+                "an unexecuted proposal below the release frontier was not released"
+            );
+        }
     }
 
     /// Unexecuted proposals in the leader's order.
@@ -1916,9 +2331,11 @@ impl Leader {
     /// them (task-d46).
     fn put_proposal(&mut self, proposal: Proposal) {
         let command = proposal.command;
+        self.release_from = self.release_from.min(proposal.seqnum);
         if let Some(old) = self.proposals.get(&command) {
             self.unsettled.remove(&(old.seqnum, command));
             self.durable.remove(&(old.seqnum, command));
+            self.held_back.remove(&(old.seqnum, command));
             self.by_barrier.remove(&old.barrier);
         }
         if !(proposal.durable && proposal.executed) {
@@ -1926,6 +2343,9 @@ impl Leader {
         }
         if proposal.durable {
             self.durable.insert((proposal.seqnum, command));
+        }
+        if !proposal.published {
+            self.held_back.insert((proposal.seqnum, command));
         }
         self.by_barrier.insert(proposal.barrier, command);
         self.proposals.insert(command, proposal);
@@ -2007,7 +2427,8 @@ impl Leader {
         if !self.is_leading() {
             return Vec::new();
         }
-        let proposals = self.unexecuted_in_order();
+        #[cfg(debug_assertions)]
+        self.check_release_from();
         let table = &self.table;
         let learner = &self.learner;
         let committed = |c: &CommandId| table.phase_of(c) >= Some(Phase::Commit);
@@ -2018,9 +2439,268 @@ impl Leader {
             committed: &committed,
             fast: &fast,
         };
-        match gate.release(&mut self.speculation, &proposals) {
-            Ok(released) => released.into_iter().map(Effect::Released).collect(),
+        // The unexecuted proposals from the frontier on, in order, read
+        // only as far as the gate walks (task-d111's cut (e)). The last
+        // one it took is where the walk stopped, or the last it passed.
+        let proposals = &self.proposals;
+        let last = core::cell::Cell::new(None);
+        let walk = self
+            .unsettled
+            .range((self.release_from, CommandId(Digest32([0; 32])))..)
+            .filter(|(_, c)| !proposals[c].executed && table.phase_of(c) < Some(Phase::Executed))
+            .inspect(|entry| {
+                last.set(Some(**entry));
+                #[cfg(test)]
+                self.release_walked.set(self.release_walked.get() + 1);
+            })
+            .map(|(_, c)| *c);
+        let released = gate.release(&mut self.speculation, walk);
+        // Every unexecuted proposal before the last one taken was
+        // released; the last one too, if the walk went past it.
+        if let Some((seqnum, c)) = last.get() {
+            self.release_from = if self.speculation.released(&c) {
+                seqnum.saturating_add(1)
+            } else {
+                seqnum
+            };
+        }
+        match released {
+            // A marked command's collector holds a speculative release and
+            // answers only on the final one (task-d100, step A), which
+            // goes out whether or not this one did: it is not sent
+            // (#204 review).
+            Ok(released) => released
+                .into_iter()
+                .filter(|r| {
+                    !(r.speculative()
+                        && self.answer_on_release.contains(&r.established().command()))
+                })
+                .map(|r| Effect::Released(self.with_admission(r)))
+                .collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mark `command` as answered by its collector on the release alone
+    /// (task-d100, step A). The voter calls this before stepping each
+    /// submission of a marked command, so the mark is in place for the
+    /// proposal that submission leads to.
+    pub fn mark_answer_on_release(&mut self, command: CommandId) {
+        self.answer_on_release.insert(command);
+    }
+
+    /// Mark the command the next admitted request becomes as answered on
+    /// the release alone, once this replica derives it (task-d100, step
+    /// A). The voter calls this before stepping a marked submission, so
+    /// the mark is in place for the proposal or acknowledgement that
+    /// step leads to, and the command is derived only here (#204
+    /// review). A request refused before its command is held marks
+    /// nothing.
+    pub fn mark_next_admitted(&mut self) {
+        self.mark_next_admitted = true;
+    }
+
+    /// Mark the next admitted request as relayed to this voter alone as
+    /// its ballot's leader (task-d102, task-d100's step B): marked as
+    /// answered on the release too, proposed with its payload, and
+    /// refused with [`SubmissionRefusal::NotLeading`] if this voter
+    /// isn't leading.
+    pub fn mark_next_relayed(&mut self) {
+        self.mark_next_admitted = true;
+        self.mark_next_relayed = true;
+    }
+
+    /// Whether `command`'s proposals carry its payload (task-d102).
+    pub fn relays(&self, command: &CommandId) -> bool {
+        self.relayed.contains(command)
+    }
+
+    /// The proposal message for `proposal`: with the command's payload
+    /// when its submission was relayed to this leader alone (task-d102),
+    /// so a follower that never got the submission adopts it without
+    /// asking for the payload.
+    fn proposal_message(&self, proposal: FastAck) -> ProtocolMessage {
+        let payload = self
+            .relayed
+            .contains(&proposal.command)
+            .then(|| self.payloads.get(&proposal.command))
+            .flatten();
+        match payload {
+            Some(payload) => ProtocolMessage::RelayedProposal {
+                vote: proposal,
+                payload: payload.clone(),
+            },
+            None => ProtocolMessage::Proposal(proposal),
+        }
+    }
+
+    /// Whether a turn's fresh proposals wait for its end, to go to each
+    /// follower in one frame (task-d102). The node sets it while
+    /// `Feature::BatchedRound` is active and it lowers persists in
+    /// groups; turned off, whatever is queued leaves at the next
+    /// [`Leader::cut_frames`].
+    pub fn set_batch_frames(&mut self, on: bool) {
+        self.batch_frames = on;
+    }
+
+    /// Whether proposals wait for [`Leader::cut_frames`].
+    pub fn frames_queued(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    /// What this leader sent of its fresh proposals and its frontier.
+    pub fn sent_bytes(&self) -> SentBytes {
+        self.sent_bytes
+    }
+
+    /// Send each follower the proposals this turn queued for it
+    /// (task-d102): one proposal as the message it is, more in one
+    /// [`ProtocolMessage::ProposalFrame`], split where a frame would pass
+    /// [`MAX_PROPOSAL_FRAME_BYTES`]. Each waits on every batch its
+    /// proposals wait on, which in a turn's group are durable together.
+    /// The node calls it where its loop lowers the turn's persists.
+    pub fn cut_frames(&mut self) -> Vec<Effect> {
+        if self.frames.is_empty() {
+            return Vec::new();
+        }
+        for (voter, queued) in core::mem::take(&mut self.frames) {
+            self.publish_frame(voter, queued);
+        }
+        self.release()
+    }
+
+    fn queue_frame(
+        &mut self,
+        voter: ReplicaId,
+        context: coord_core::effect::EffectContext,
+        ballot: Ballot,
+        requires: Vec<BarrierId>,
+        entry: FramedProposal,
+    ) {
+        // A frame is of one ballot and one context: a change between two
+        // proposals sends what was queued under the first.
+        if let Some(queued) = self.frames.get(&voter)
+            && (queued.context != context || queued.ballot != ballot)
+        {
+            let queued = self.frames.remove(&voter).expect("present");
+            self.publish_frame(voter, queued);
+        }
+        let queued = self.frames.entry(voter).or_insert_with(|| QueuedFrame {
+            context,
+            ballot,
+            requires: Vec::new(),
+            proposals: Vec::new(),
+        });
+        for barrier in requires {
+            if !queued.requires.contains(&barrier) {
+                queued.requires.push(barrier);
+            }
+        }
+        queued.proposals.push(entry);
+    }
+
+    fn publish_frame(&mut self, voter: ReplicaId, queued: QueuedFrame) {
+        let QueuedFrame {
+            context,
+            ballot,
+            requires,
+            proposals,
+        } = queued;
+        let mut chunk: Vec<FramedProposal> = Vec::new();
+        let mut size = 0usize;
+        for entry in proposals {
+            let len = postcard::experimental::serialized_size(&entry).unwrap_or(usize::MAX);
+            if !chunk.is_empty() && size.saturating_add(len) > MAX_PROPOSAL_FRAME_BYTES {
+                self.send_frame(
+                    voter,
+                    context,
+                    ballot,
+                    &requires,
+                    core::mem::take(&mut chunk),
+                );
+                size = 0;
+            }
+            size = size.saturating_add(len);
+            chunk.push(entry);
+        }
+        if !chunk.is_empty() {
+            self.send_frame(voter, context, ballot, &requires, chunk);
+        }
+    }
+
+    fn send_frame(
+        &mut self,
+        voter: ReplicaId,
+        context: coord_core::effect::EffectContext,
+        ballot: Ballot,
+        requires: &[BarrierId],
+        mut chunk: Vec<FramedProposal>,
+    ) {
+        let count = chunk.len() as u64;
+        let message = if chunk.len() == 1 {
+            let entry = chunk.pop().expect("one");
+            let (vote, payload) = entry.into_vote(self.config.identity.replica, ballot);
+            match payload {
+                Some(payload) => ProtocolMessage::RelayedProposal { vote, payload },
+                None => ProtocolMessage::Proposal(vote),
+            }
+        } else {
+            self.sent_bytes.frames += 1;
+            self.sent_bytes.framed += count;
+            ProtocolMessage::ProposalFrame {
+                replica: self.config.identity.replica,
+                ballot,
+                proposals: chunk,
+            }
+        };
+        let payload_bytes = message_payload_bytes(&message);
+        let frame = message.encode();
+        self.sent_bytes.proposals += count;
+        self.sent_bytes.proposal_bytes += (frame.len() - payload_bytes) as u64;
+        self.sent_bytes.payload_bytes += payload_bytes as u64;
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: requires.to_vec(),
+                to: PeerId {
+                    replica: voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame,
+            });
+        }
+    }
+
+    /// Drop `command`'s mark unless this leader's table holds it: the
+    /// submission that marked it was refused before the command was
+    /// initialized (backpressure, a ballot this leader doesn't lead, a
+    /// retired key), and nothing here will ever release it (#204
+    /// review). A later submission marks it again.
+    pub fn keep_mark_if_held(&mut self, command: &CommandId) {
+        if self.table.record(command).is_none() {
+            self.answer_on_release.remove(command);
+            self.relayed.remove(command);
+        }
+    }
+
+    /// Whether `command`'s collector answers it on the release alone.
+    pub fn answers_on_release(&self, command: &CommandId) -> bool {
+        self.answer_on_release.contains(command)
+    }
+
+    /// `released` with the decided payload's admission digest, for a
+    /// command answered on the release alone; unchanged otherwise, and
+    /// unchanged where this leader no longer holds the command's
+    /// record, since a release that names no admission is one its
+    /// collector holds rather than answers (task-d100, step A).
+    fn with_admission(&self, released: ReleasedResult) -> ReleasedResult {
+        let command = released.established().command();
+        if !self.answer_on_release.contains(&command) {
+            return released;
+        }
+        match self.table.record(&command).and_then(|r| r.payload) {
+            Some(admission) => released.with_admission(admission),
+            None => released,
         }
     }
 
@@ -2127,17 +2807,12 @@ impl Leader {
     /// recovered from a durable seal row is fenced from its first step
     /// and a leader whose seal row failed is not (task-55).
     pub fn is_leading(&self) -> bool {
-        let identity = &self.config.identity;
-        let quorum = &self.config.quorum;
+        debug_assert_eq!(self.configured_to_lead, configured_to_lead(&self.config));
         self.fenced.is_none()
             && self.recovery_cycle.is_none()
             && !self.ballots.is_fenced()
-            && identity.role == ReplicaRole::Voter
-            && identity.epoch == quorum.epoch()
-            && identity.voters == *quorum.voters()
-            && quorum.is_voter(&identity.replica)
-            && self.ballots.promised() == quorum.ballot()
-            && quorum.ballot().leader == identity.replica
+            && self.configured_to_lead
+            && self.ballots.promised() == self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
     }
 
@@ -2216,7 +2891,14 @@ impl Leader {
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         self.admitted = None;
-        self.propose(frame, Some(admission))
+        let effects = self.propose(frame, Some(admission));
+        self.mark_next_relayed = false;
+        if core::mem::take(&mut self.mark_next_admitted)
+            && let Some(command) = self.admitted
+        {
+            self.keep_mark_if_held(&command);
+        }
+        effects
     }
 
     /// Whether an admitted request reaches the derivation of its command
@@ -2326,9 +3008,9 @@ impl Leader {
         };
         let barrier = proposal.barrier;
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-        let outbox = self.outbox.as_mut()?;
         // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
+        let frame = self.proposal_message(ack.clone()).encode();
+        let outbox = self.outbox.as_mut()?;
         for voter in &self.config.identity.voters {
             if *voter == self.config.identity.replica {
                 continue;
@@ -2360,29 +3042,52 @@ impl Leader {
             self.rejections.push(Rejection::NotLeading {
                 promised: self.ballots.promised(),
             });
+            // A submission relayed to this voter alone is answered: its
+            // collector re-routes at once rather than at its fallback
+            // (task-d102). The command is not held, so it is not marked.
+            if self.mark_next_relayed
+                && let Some(command) = relayed_command(frame)
+            {
+                return self.refuse(command, SubmissionRefusal::NotLeading);
+            }
             return Vec::new();
         }
-        let request = match decode_stream(frame).as_deref() {
-            Ok([MessageV1::Request(r)]) => r.clone(),
+        // The request is taken out of the decoded stream, not copied: its
+        // logical bytes become the payload record's below.
+        let request = match decode_stream(frame).map(|mut m| (m.len(), m.pop())) {
+            Ok((1, Some(MessageV1::Request(r)))) => r,
             _ => {
                 self.rejections.push(Rejection::MalformedRequest);
                 return Vec::new();
             }
         };
-        let Ok(logical) = request.logical() else {
+        // `logical` checks that the bytes are the canonical encoding of the
+        // request they decode to, so the identity is derived from them as
+        // they are: what `CommandId::derive` would compute from an
+        // encoding made again.
+        if request.logical().is_err() {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
-        };
-        let Ok(command) = CommandId::derive(&request.retry_key, &logical) else {
-            self.rejections.push(Rejection::MalformedRequest);
-            return Vec::new();
-        };
+        }
+        let command = CommandId::from_canonical(&request.retry_key, request.logical.as_slice());
+        let RequestV1 {
+            retry_key,
+            logical,
+            ack_through,
+            ..
+        } = request;
         self.admitted = Some(command);
+        if self.mark_next_admitted {
+            self.answer_on_release.insert(command);
+        }
+        if self.mark_next_relayed {
+            self.relayed.insert(command);
+        }
         let payload = PayloadRecordV1 {
-            retry_key: request.retry_key,
-            logical: request.logical.as_slice().to_vec(),
+            retry_key,
+            logical: logical.into_inner(),
             admission,
-            ack_through: request.ack_through,
+            ack_through,
         };
         // Identity: one retry key binds one payload, first presentation
         // wins. The same identity again is a duplicate only if the facts
@@ -2390,13 +3095,11 @@ impl Leader {
         // -- are the ones this leader proposed it under; and a duplicate
         // is answered rather than ignored, because the submitter
         // presenting it may never have received this leader's reply.
-        match self.bindings.get(&request.retry_key) {
+        match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 let bound = *bound;
-                self.rejections.push(Rejection::RequestIdentityConflict {
-                    retry_key: request.retry_key,
-                    bound,
-                });
+                self.rejections
+                    .push(Rejection::RequestIdentityConflict { retry_key, bound });
                 // Said only once the binding is durable (task-d22).
                 if self.served_payloads.contains(&bound) {
                     return self.refuse(command, SubmissionRefusal::OtherCommand { bound });
@@ -2411,7 +3114,7 @@ impl Leader {
                 return match accepted {
                     Some(accepted) if accepted == payload.admission_digest() => {
                         self.rejections.push(Rejection::Duplicate(command));
-                        self.repair_evidence(command)
+                        self.repair_evidence(command, retry_key)
                     }
                     Some(accepted) => {
                         self.rejections
@@ -2452,9 +3155,12 @@ impl Leader {
             // exact duplicate whose binding was not kept, and
             // `PayloadConflict` is not a duplicate at all.
             Err(InitError::AlreadyInitialized) => {
-                self.bindings.insert(request.retry_key, command);
+                self.bindings.insert(retry_key, command);
+                if !self.payloads.contains_key(&command) {
+                    self.ledger.bound_bare(command, retry_key);
+                }
                 self.rejections.push(Rejection::Duplicate(command));
-                return self.repair_evidence(command);
+                return self.repair_evidence(command, retry_key);
             }
             Err(InitError::PayloadConflict) => {
                 self.rejections.push(Rejection::PayloadConflict(command));
@@ -2466,8 +3172,11 @@ impl Leader {
                 };
             }
         };
-        self.bindings.insert(request.retry_key, command);
-        self.payloads.insert(command, payload.clone());
+        self.bindings.insert(retry_key, command);
+        // The row is encoded before the record moves into the map, which
+        // keeps the only copy.
+        let payload_row = payload_update(&command, &payload).expect("bounded");
+        self.payloads.insert(command, payload);
         let ballot = self.config.quorum.ballot();
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
@@ -2496,7 +3205,7 @@ impl Leader {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates: Vec<StoreUpdate> = alloc::vec![
-            payload_update(&command, &payload).expect("bounded"),
+            payload_row,
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,
@@ -2533,47 +3242,70 @@ impl Leader {
         // reply below always does: it is this leader's fast vote.
         let sends = self.proposal_sends(barrier);
         let early = sends.iter().any(|(_, requires)| requires.is_empty());
+        let message = self.proposal_message(proposal.clone());
+        if self.batch_frames {
+            // Each follower's copy waits for the turn's end, to leave in
+            // one frame with the turn's other proposals (task-d102).
+            let payload = match message {
+                ProtocolMessage::RelayedProposal { payload, .. } => Some(payload),
+                _ => None,
+            };
+            let entry = FramedProposal::of(proposal.clone(), payload).expect("a proposal");
+            for (voter, requires) in sends {
+                self.queue_frame(voter, context, ballot, requires, entry.clone());
+            }
+        } else {
+            // Encoded once for every voter it goes to (task-d61).
+            let payload_bytes = message_payload_bytes(&message);
+            let frame = message.encode();
+            let outbox = self.outbox.as_mut().expect("booted");
+            for (voter, requires) in sends {
+                self.sent_bytes.proposals += 1;
+                self.sent_bytes.proposal_bytes += (frame.len() - payload_bytes) as u64;
+                self.sent_bytes.payload_bytes += payload_bytes as u64;
+                outbox.publish(PendingSend {
+                    context,
+                    requires,
+                    to: PeerId {
+                        replica: voter,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: frame.clone(),
+                });
+            }
+        }
         let outbox = self.outbox.as_mut().expect("booted");
-        // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(proposal.clone()).encode();
-        for (voter, requires) in sends {
+        // A command its collector answers on the release alone gets no
+        // reply: nothing at the collector counts it (task-d100, step A).
+        if !self.answer_on_release.contains(&command) {
+            let reply = ProtocolMessage::LeaderReply {
+                ballot,
+                command,
+                seqnum,
+                deps: init.deps.clone(),
+                path: init.path,
+            }
+            .encode();
             outbox.publish(PendingSend {
                 context,
-                requires,
-                to: PeerId {
-                    replica: voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: frame.clone(),
-            });
-        }
-        let reply = ProtocolMessage::LeaderReply {
-            ballot,
-            command,
-            seqnum,
-            deps: init.deps.clone(),
-            path: init.path,
-        }
-        .encode();
-        outbox.publish(PendingSend {
-            context,
-            requires: alloc::vec![barrier],
-            to: self.config.frontend,
-            frame: reply.clone(),
-        });
-        // The frontend's copy is the one a submission can ask for again
-        // (task-c02).
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
-                ballot,
-                context,
                 requires: alloc::vec![barrier],
-                frame: reply,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: reply.clone(),
+            });
+            // The frontend's copy is the one a submission can ask for
+            // again (task-c02).
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: alloc::vec![barrier],
+                    frame: reply,
+                },
+                &self.table,
+            );
+        }
         // The leader's own acknowledgement counts toward learning later.
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
@@ -2614,6 +3346,14 @@ impl Leader {
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }
+        // A held-back re-proposal became durable: a voter with room in its
+        // window takes it now (`top_up`), rather than at its next
+        // adoption, which may never come if it has adopted everything
+        // sent to it.
+        let mut held_back_durable = false;
+        // The records a failed batch staged, for a proposal presented again
+        // ([`Leader::retry_proposal`]).
+        let mut rejected_rows = Vec::new();
         self.ballots.on_storage(event);
         // Ledger bookkeeping covers every batch this machine staged, not
         // only the proposal batches: an acceptance row carries its own
@@ -2635,7 +3375,7 @@ impl Leader {
                     self.ledger.durable(barrier, *journal_seq);
                 }
                 StorageEvent::Failed { .. } => {
-                    self.ledger.failed(barrier);
+                    rejected_rows = self.ledger.failed_rows(barrier);
                     // An adoption that waited on the failed batch as an
                     // earlier one was dropped with it; its own batch may
                     // still be written, so it is published again over what
@@ -2675,6 +3415,7 @@ impl Leader {
                         }
                         let key = (p.seqnum, command);
                         self.durable.insert(key);
+                        held_back_durable |= self.held_back.contains(&key);
                         // An adoption counted before the proposal was
                         // durable raises the voter's highest now.
                         if let Some(set) = self.votes.get(&command) {
@@ -2697,7 +3438,7 @@ impl Leader {
                     error: StorageError::DefinitelyNotCommitted,
                     ..
                 } => {
-                    let mut effects = self.retry_proposal(command);
+                    let mut effects = self.retry_proposal(command, rejected_rows);
                     effects.extend(self.advance_pending());
                     effects.extend(self.release());
                     return effects;
@@ -2712,16 +3453,144 @@ impl Leader {
             }
         }
         let mut effects = self.advance_pending();
+        if held_back_durable {
+            let me = self.config.identity.replica;
+            let voters: Vec<ReplicaId> = self
+                .config
+                .identity
+                .voters
+                .iter()
+                .copied()
+                .filter(|v| *v != me)
+                .collect();
+            for voter in voters {
+                effects.extend(self.top_up(voter));
+            }
+        }
         self.learn();
         effects.extend(self.deliver_due_report());
         effects.extend(self.release());
         effects
     }
 
+    /// Send `voter` the next held-back re-proposals it has not had, oldest
+    /// first, until [`RESEND_PER_VOTER`] of them are out to it unadopted
+    /// (the takeover gap on #98).
+    ///
+    /// A new leader publishes its first `REPROPOSE_BATCH` re-proposals with
+    /// their batches and holds the rest back, so its first pass does not
+    /// put a long selection on every voter's control lane at once
+    /// (task-d07). Sent from `resend_unvoted` alone, the rest went out 16
+    /// a voter a call, a call every 250 ms: a backlog of N took about
+    /// (N - 32) / 64 seconds after any leader change. Called as each of
+    /// the voter's adoptions arrives, and as a held-back proposal becomes
+    /// durable, this keeps the same bound on what is in flight to a voter
+    /// and sends at the pace of its answers. `resend_unvoted` still sends
+    /// what a lost frame or a voter's silence leaves unanswered.
+    fn top_up(&mut self, voter: ReplicaId) -> Vec<Effect> {
+        if self.held_back.is_empty() || !self.is_leading() {
+            return Vec::new();
+        }
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let mut window = self.first_sends.remove(&voter).unwrap_or_default();
+        {
+            let (proposals, votes) = (&self.proposals, &self.votes);
+            window.out.retain(|c| {
+                proposals.contains_key(c) && !votes.get(c).is_some_and(|v| v.adopted_by(&voter))
+            });
+        }
+        let mut room = RESEND_PER_VOTER.saturating_sub(window.out.len());
+        let mut chosen = Vec::new();
+        let start = match window.through {
+            Some(t) => Bound::Excluded((t, CommandId(Digest32([0xff; 32])))),
+            None => Bound::Unbounded,
+        };
+        for (seqnum, command) in self.held_back.range((start, Bound::Unbounded)) {
+            // Every path that drops a proposal drops it from `held_back`
+            // too; one missing here is passed over, not a panic.
+            let Some(p) = self.proposals.get(command) else {
+                continue;
+            };
+            if room == 0 || !p.durable {
+                break;
+            }
+            window.through = Some(*seqnum);
+            if self.adopted(command, &voter) || window.out.contains(command) {
+                continue;
+            }
+            chosen.push(*command);
+            room -= 1;
+        }
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let to = PeerId {
+            replica: voter,
+            incarnation: ReplicaIncarnation::ZERO,
+        };
+        let call = self.resend_calls;
+        let mut sends = Vec::new();
+        for command in chosen {
+            window.out.insert(command);
+            self.counts.topped_up += 1;
+            let p = self.proposals.get_mut(&command).expect("held back");
+            p.sent.get_or_insert(call);
+            let p = &self.proposals[&command];
+            sends.push(PendingSend {
+                context,
+                requires: alloc::vec![p.barrier],
+                to,
+                frame: self.proposal_frame(p),
+            });
+            sends.extend(self.own_adoption_send(command, to));
+        }
+        self.first_sends.insert(voter, window);
+        // What every voter has had its first send of is held back no
+        // longer: `resend_unvoted` re-sends it as it would any proposal.
+        let me = self.config.identity.replica;
+        let reached = self
+            .config
+            .identity
+            .voters
+            .iter()
+            .filter(|v| **v != me)
+            .map(|v| self.first_sends.get(v).and_then(|w| w.through))
+            .min()
+            .flatten();
+        while let (Some(first), Some(reached)) = (self.held_back.first(), reached) {
+            if first.0 > reached {
+                break;
+            }
+            self.held_back.pop_first();
+        }
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let outbox = self.outbox.as_mut().expect("booted");
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
+    }
+
     /// Present a definitely rejected proposal batch again, unchanged, under
     /// a new barrier, and republish the sends that waited on the old one.
     /// The leader stops leading once the attempts are spent.
-    fn retry_proposal(&mut self, command: CommandId) -> Vec<Effect> {
+    ///
+    /// `rows` are the records the rejected batch staged in the ledger
+    /// ([`DurableLedger::failed_rows`]); the same rows go again, so they
+    /// are staged again under the new barrier (#314 review). Left out, the
+    /// ledger knew no row of a fresh proposal while its batch was in
+    /// flight and none once it was durable: a follower made from this
+    /// leader reported nothing of the command, and its gate
+    /// ([`crate::Follower::next_executable`]) did not hold back a committed
+    /// command whose payload row only that batch wrote.
+    fn retry_proposal(
+        &mut self,
+        command: CommandId,
+        rows: Vec<(CommandId, CommandRecord)>,
+    ) -> Vec<Effect> {
         let Some(proposal) = self.proposals.get(&command) else {
             return Vec::new();
         };
@@ -2733,6 +3602,9 @@ impl Leader {
             return Vec::new();
         };
         let barrier = alloc.allocate();
+        for (c, record) in rows {
+            self.ledger.stage(barrier, c, record);
+        }
         let admission = self
             .table
             .record(&command)
@@ -2747,6 +3619,8 @@ impl Leader {
         // a new leader's first batch has had its first send now, and its
         // re-sends are timed from its batch (task-d49).
         proposal.published = true;
+        let republished = (proposal.seqnum, command);
+        self.held_back.remove(&republished);
         let batch = PersistBatch {
             barrier,
             base: None,
@@ -2770,9 +3644,9 @@ impl Leader {
         // The same proposal, unchanged, under the same rule as its first
         // send (Section 4.8's third condition).
         let sends = self.proposal_sends(barrier);
-        let outbox = self.outbox.as_mut().expect("booted");
         // Encoded once for every voter it goes to (task-d61).
-        let frame = ProtocolMessage::Proposal(ack.clone()).encode();
+        let frame = self.proposal_message(ack.clone()).encode();
+        let outbox = self.outbox.as_mut().expect("booted");
         for (voter, requires) in sends {
             outbox.publish(PendingSend {
                 context,
@@ -2784,31 +3658,33 @@ impl Leader {
                 frame: frame.clone(),
             });
         }
-        let reply = ProtocolMessage::LeaderReply {
-            ballot,
-            command,
-            seqnum,
-            deps,
-            path,
-        }
-        .encode();
-        outbox.publish(PendingSend {
-            context,
-            requires: alloc::vec![barrier],
-            to: self.config.frontend,
-            frame: reply.clone(),
-        });
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
+        if !self.answer_on_release.contains(&command) {
+            let reply = ProtocolMessage::LeaderReply {
                 ballot,
+                command,
+                seqnum,
+                deps,
+                path,
+            }
+            .encode();
+            outbox.publish(PendingSend {
                 context,
                 requires: alloc::vec![barrier],
-                frame: reply,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: reply.clone(),
+            });
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: alloc::vec![barrier],
+                    frame: reply,
+                },
+                &self.table,
+            );
+        }
         // A re-proposal's batch is also its acceptance: the adoption rests
         // on the new batch now, and the one on the rejected batch was
         // dropped with it.
@@ -2879,28 +3755,33 @@ impl Leader {
             .into_iter()
             .collect();
         let frame = ProtocolMessage::SlowAck(ack.clone()).encode();
+        let marked = self.answer_on_release.contains(&command);
         let Some(outbox) = self.outbox.as_mut() else {
             return;
         };
         // To the frontend, which counts it, and to no other voter
-        // (task-d74): a follower learns from the commit frontier.
-        outbox.publish(PendingSend {
-            context,
-            requires: requires.clone(),
-            to: self.config.frontend,
-            frame: frame.clone(),
-        });
-        self.replay.retain(
-            command,
-            crate::replay::RetainedEvidence {
-                barrier,
-                ballot,
+        // (task-d74): a follower learns from the commit frontier. Not
+        // for a command answered on the release alone (task-d100, step
+        // A): its collector counts nothing.
+        if !marked {
+            outbox.publish(PendingSend {
                 context,
                 requires: requires.clone(),
-                frame,
-            },
-            &self.table,
-        );
+                to: self.config.frontend,
+                frame: frame.clone(),
+            });
+            self.replay.retain(
+                command,
+                crate::replay::RetainedEvidence {
+                    barrier,
+                    ballot,
+                    context,
+                    requires: requires.clone(),
+                    frame,
+                },
+                &self.table,
+            );
+        }
         self.own_adoptions.insert(
             barrier,
             OwnAdoption {
@@ -3013,7 +3894,29 @@ impl Leader {
     /// only, through the same outbox and under the same gates, and
     /// released here (task-c02). Not a proposal attempt: nothing is
     /// persisted, and the fence on repeated persistence is not touched.
-    fn repair_evidence(&mut self, command: CommandId) -> Vec<Effect> {
+    fn repair_evidence(&mut self, command: CommandId, retry_key: RetryKey) -> Vec<Effect> {
+        // A command answered on the release alone (task-d100, step A):
+        // what its collector may be missing is the release, which the
+        // evidence store never kept. Once this leader has executed it,
+        // the daemon publishes it again from its records; before then
+        // the release is still coming to the origin the duplicate just
+        // named, and nothing is owed.
+        if self.answer_on_release.contains(&command) {
+            if self.boot.is_some()
+                && self.is_leading()
+                && let Some(record) = self.table.record(&command)
+                && record.phase >= Phase::Executed
+                && let Some(admission) = record.payload
+            {
+                match self.replay.count_release_again(command, &self.table) {
+                    Ok(()) => self.release_again.push((command, retry_key, admission)),
+                    Err(why) => self
+                        .rejections
+                        .push(Rejection::ReplayRefused { command, why }),
+                }
+            }
+            return Vec::new();
+        }
         let why = if self.boot.is_none() || !self.is_leading() {
             crate::replay::ReplayRefusal::Fenced
         } else {
@@ -3089,6 +3992,7 @@ impl Leader {
                             ballot,
                             to: from,
                             requires: effects.reply.requires.clone(),
+                            candidate: Some(executed),
                         });
                         if let Some(outbox) = self.outbox.as_mut() {
                             outbox.publish(effects.reply);
@@ -3171,6 +4075,8 @@ impl Leader {
             ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
+            | ProtocolMessage::RelayedProposal { .. }
+            | ProtocolMessage::ProposalFrame { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
             | ProtocolMessage::FloorReadiness { .. }
@@ -3345,6 +4251,12 @@ impl Leader {
             }
             if from != self.config.identity.replica {
                 self.note_adoption(command, from);
+                // Its adoption is the voter's answer: the next held-back
+                // re-proposal goes now, not on the next timer call.
+                let mut out = self.top_up(from);
+                self.learn();
+                out.extend(self.release_ready());
+                return out;
             }
         }
         self.learn();
@@ -3565,10 +4477,12 @@ impl DeterministicMachine for Leader {
             }
             Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
             // What a durable batch or a vote commits is announced in the
-            // same step (task-d74).
+            // same step (task-d74), or at the end of the node's turn.
             Event::Storage(event) => {
                 let mut effects = self.on_storage(&event);
-                effects.extend(self.announce_advanced());
+                if !self.frontier_at_turn_end {
+                    effects.extend(self.announce_advanced());
+                }
                 effects
             }
             Event::Peer(message) => {
@@ -3579,7 +4493,9 @@ impl DeterministicMachine for Leader {
                     incarnation: message.provenance().incarnation(),
                 };
                 let mut effects = self.on_peer(from, message.frame());
-                effects.extend(self.announce_advanced());
+                if !self.frontier_at_turn_end {
+                    effects.extend(self.announce_advanced());
+                }
                 effects
             }
             Event::Timer(_)
@@ -3598,6 +4514,18 @@ impl Leader {
     pub fn outstanding_barriers(&self) -> Vec<BarrierId> {
         self.outstanding()
     }
+}
+
+/// The command a relayed submission names, for a voter that isn't
+/// leading to refuse it by (task-d102). `None` for a frame that does not
+/// decode to one request.
+pub(crate) fn relayed_command(frame: &[u8]) -> Option<CommandId> {
+    let request = match decode_stream(frame).as_deref() {
+        Ok([MessageV1::Request(r)]) => r.clone(),
+        _ => return None,
+    };
+    let logical = request.logical().ok()?;
+    CommandId::derive(&request.retry_key, &logical).ok()
 }
 
 /// Whether a proposal batch writes the command's payload row (task-d90).
@@ -3768,5 +4696,146 @@ mod tests {
         }));
         assert!(persisted(&after).is_empty(), "{after:?}");
         assert!(leader.votes[&c].adopted_by(&r(0)));
+    }
+
+    /// The leader chooses its next command among the ready records only
+    /// (task-d107): with 2,000 commits blocked behind a command it lacks
+    /// and one ready, a call examines one record.
+    #[test]
+    fn the_next_command_is_chosen_among_the_ready_records_only() {
+        let mut leader = booted();
+        let (rows, ready) = crate::commands::tests::blocked_behind_a_root(2_000);
+        leader.table = CommandTable::restore(None, rows);
+        leader.table.take_examined();
+        assert_eq!(leader.next_executable(), Some(ready));
+        assert_eq!(leader.table.take_examined(), 1);
+    }
+
+    /// task-d111's cut (e): the release gate starts where it last
+    /// stopped. With the table full of proposals unexecuted and none
+    /// committed, each call hands the gate one, not every one, and a
+    /// proposal entered at a lower number than the frontier is walked
+    /// again.
+    #[test]
+    fn the_release_gate_walks_from_where_it_stopped() {
+        let mut leader = booted();
+        let mut commands = Vec::new();
+        for n in 1..=200 {
+            let (frame, c) = request(n);
+            let _ = leader.propose(&frame, None);
+            commands.push(c);
+        }
+        let held = leader.unexecuted_in_order().len();
+        assert!(held > 1, "{held} held");
+        leader.release_walked.set(0);
+        for _ in 0..10 {
+            assert!(leader.release_ready().is_empty());
+        }
+        assert_eq!(leader.release_walked.get(), 10, "one of {held} a call");
+        let first = leader.proposals[&commands[0]].seqnum;
+        assert_eq!(leader.release_from, first);
+        // A proposal entered below the frontier lowers it.
+        leader.release_from = first + 50;
+        let mut again = leader.proposals[&commands[1]].clone();
+        again.seqnum = first + 1;
+        leader.put_proposal(again);
+        assert_eq!(leader.release_from, first + 1);
+    }
+
+    /// task-d110 at the leader: the leader's `forget_history` asks the
+    /// same rule of the same ledger as a follower's (#217 review, point
+    /// 3). A leader that took over a ledger it holds committed and
+    /// unexecuted sweeps once, not again in the nine calls after, and
+    /// again only once half of what it kept has been executed.
+    #[test]
+    fn a_leader_behind_sweeps_once_per_half_of_what_it_keeps() {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+        let genesis = Ballot {
+            epoch,
+            number: 0,
+            leader: r(0),
+        };
+        let config = crate::follower::FollowerConfig {
+            identity: ConfigurationIdentity {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                epoch,
+                voters: voters.clone(),
+                replica: r(1),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+                role: ReplicaRole::Voter,
+            },
+            quorum: BallotConfiguration::c2(epoch, genesis, voters.clone(), [r(0), r(1)].into())
+                .unwrap(),
+            genesis,
+            frontend: FRONTEND,
+            capacity: 8,
+        };
+        let id = |n: u64| {
+            let mut d = [0u8; 32];
+            d[..8].copy_from_slice(&n.to_be_bytes());
+            d[8] = 7;
+            CommandId(Digest32(d))
+        };
+        let behind = 1_000u64;
+        // Committed and waiting for their payloads: nothing executes, so
+        // the table forgets none of it.
+        let rows: Vec<(CommandId, crate::CommandRecord)> = (0..behind)
+            .map(|n| {
+                let key = vec![(n % 5) as u8];
+                (
+                    id(n),
+                    crate::CommandRecord {
+                        phase: Phase::Commit,
+                        deps: Vec::new(),
+                        keys: vec![key.clone()],
+                        payload: Some(Digest32([4; 32])),
+                        paths: vec![(key, Digest32([3; 32]))],
+                        synced_seq: Some(n + 1),
+                        path: Digest32([3; 32]),
+                    },
+                )
+            })
+            .collect();
+        let follower = crate::follower::Follower::recover_with_syncs(
+            config,
+            None,
+            None,
+            rows,
+            [],
+            [],
+            ExecutionPosition::ZERO,
+        );
+        let ballot = Ballot {
+            epoch,
+            number: 1,
+            leader: r(1),
+        };
+        let quorum = BallotConfiguration::c2(epoch, ballot, voters, [r(0), r(1)].into()).unwrap();
+        let decision = SyncDecision {
+            ballot,
+            source_ballot: genesis,
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        };
+        let (mut leader, _) = Leader::from_recovered(follower.into_recovered(), quorum, &decision);
+        assert_eq!(leader.ledger.len(), behind as usize);
+        let before = leader.ledger.sweeps();
+        leader.forget_history(CommandId(Digest32([0xee; 32])));
+        assert_eq!(leader.ledger.sweeps(), before + 1, "swept once at first");
+        for _ in 0..9 {
+            leader.forget_history(CommandId(Digest32([0xee; 32])));
+        }
+        assert_eq!(
+            leader.ledger.sweeps(),
+            before + 1,
+            "not again per execution"
+        );
+        assert_eq!(leader.ledger.len(), behind as usize, "nothing forgotten");
+        for _ in 0..behind / 2 {
+            leader.forget_history(CommandId(Digest32([0xee; 32])));
+        }
+        assert_eq!(leader.ledger.sweeps(), before + 2, "once half was executed");
     }
 }
