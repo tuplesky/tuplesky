@@ -268,7 +268,9 @@ pub enum Congestion {
     /// shortest round trip it has measured, and a loss does not cut it:
     /// while recovering it holds the window to what is in flight. quinn's
     /// pacer spreads the window over the round trip and does not use the
-    /// pacing rate BBR computes.
+    /// pacing rate BBR computes. It runs behind
+    /// [`GuardedBbr`](crate::congestion::GuardedBbr), which hands it only
+    /// a shortest round trip whose receipt stamp was on time.
     Bbr,
     /// NewReno (RFC 9002, Section 7): a loss halves the window, at most
     /// once a round trip.

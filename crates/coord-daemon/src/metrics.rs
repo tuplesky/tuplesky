@@ -546,6 +546,17 @@ pub struct Path {
     pub min_rtt_micros: u64,
     /// The congestion window, in bytes.
     pub cwnd: u64,
+    /// Where the connection runs BBR (`COORDD_CONGESTION=bbr`): the least
+    /// round trip BBR sizes its window from, in microseconds, the one its
+    /// guard adopted from an on-time sample. Below `min_rtt_micros` never;
+    /// above it when quinn's least fell on a late sample. Absent under
+    /// another controller, or before a packet was acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbr_min_rtt_micros: Option<u64>,
+    /// Where the connection runs BBR: how many times quinn's least fell on
+    /// a late sample and was not adopted. Absent under another controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_minimums: Option<u64>,
     /// Congestion events: each one a cut of the window.
     pub congestion_events: u64,
     /// Packets this side sent and judged lost.
@@ -604,6 +615,8 @@ impl Path {
             rtt_micros: micros(reading.rtt),
             min_rtt_micros: micros(reading.min_rtt),
             cwnd: reading.cwnd,
+            bbr_min_rtt_micros: reading.bbr_min_rtt.map(micros),
+            late_minimums: reading.late_minimums,
             congestion_events: reading.congestion_events,
             lost_packets: reading.lost_packets,
             lost_bytes: reading.lost_bytes,

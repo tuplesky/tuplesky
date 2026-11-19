@@ -353,6 +353,8 @@ async fn path_readings_cover_voters_and_collectors_but_not_clients() {
         peer.sent_packets > 0 && peer.rtt > Duration::ZERO && peer.cwnd > 0,
         "{peer:?}"
     );
+    // CUBIC, the default, has no guarded least to read.
+    assert_eq!((peer.bbr_min_rtt, peer.late_minimums), (None, None));
     let collector = &readings[1];
     assert_eq!(
         (
@@ -381,6 +383,44 @@ async fn path_readings_cover_voters_and_collectors_but_not_clients() {
     // What is left out is by the other end's role: a client reads its own
     // link to the voter.
     assert_eq!(client.path_readings().len(), 1);
+}
+
+/// Under BBR a path reads the least round trip BBR sizes its window from,
+/// the one its guard adopted, and how many falls of quinn's least it did
+/// not adopt. The adopted least is a copy of quinn's from an earlier ACK,
+/// and quinn's least never rises, so it is never below quinn's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_under_bbr_reads_the_least_its_window_is_sized_from() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let bbr = Limits {
+        congestion: coord_transport::Congestion::Bbr,
+        ..limits()
+    };
+    let mut a = bind_with(&f, 0, bbr);
+    let mut b = bind_with(&f, 1, bbr);
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    drained(&mut a).await;
+    drained(&mut b).await;
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"vote").unwrap(),
+    )
+    .unwrap();
+    match event(&mut b).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload, b"vote"),
+        other => panic!("{other:?}"),
+    }
+    // The handshake's packets are acknowledged before the frame is
+    // delivered, so BBR has been handed a least by now.
+    let readings = a.path_readings();
+    assert_eq!(readings.len(), 1, "{readings:?}");
+    let peer = &readings[0];
+    let adopted = peer.bbr_min_rtt.expect("BBR was handed a least");
+    assert!(
+        adopted >= peer.min_rtt && peer.late_minimums.is_some(),
+        "{peer:?}"
+    );
 }
 
 /// A raw client endpoint presenting `id`'s certificate, for driving the
