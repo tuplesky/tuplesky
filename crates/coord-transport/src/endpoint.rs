@@ -200,6 +200,7 @@ pub struct Responder {
     link: Arc<Link>,
     node: Arc<Budget>,
     deadline: Duration,
+    received: Instant,
 }
 
 impl core::fmt::Debug for Responder {
@@ -211,6 +212,12 @@ impl core::fmt::Debug for Responder {
 }
 
 impl Responder {
+    /// When the request this answers was read off the stream whole: the
+    /// start of the server's part of a caller's wait (task-d97).
+    pub const fn received(&self) -> Instant {
+        self.received
+    }
+
     /// Write the complete response frame and finish the stream.
     ///
     /// A reply is traffic like any other: it is admitted under the
@@ -2550,6 +2557,7 @@ async fn read_request(
     .await
     {
         Ok(frame) => {
+            let received = Instant::now();
             // Decode here, at the boundary, and accept only what a client
             // may open a request stream with. Emitting an undecodable
             // frame, a server-origin message or a handshake message as an
@@ -2630,6 +2638,7 @@ async fn read_request(
                         link: shared.link(Shared::link_key(&peer)),
                         node: shared.node_budget.clone(),
                         deadline: shared.limits.frame_timeout,
+                        received,
                     },
                 })
                 .await;

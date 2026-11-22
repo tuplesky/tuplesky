@@ -7,10 +7,11 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Cpu, Datagrams, Durability, FastPath, Frontiers, Headroom, Interval, Jobs, JournalGroups,
-    Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits,
-    Reads, Recorder, Release, Resends, Scheduling, ShardIndex, ShardReading, Stage, StageReading,
-    Traffic, Unavailable, UnorderedPreAcceptances, Wait,
+    Answered, Cost, Cpu, Datagrams, Distribution, Durability, FastPath, Frontiers, Headroom,
+    Interval, Jobs, JournalGroups, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure,
+    MetricsSnapshot, PipelineWaits, Reads, Recorder, Release, ReleaseDistributions, Resends,
+    Scheduling, ShardIndex, ShardReading, Stage, StageReading, Traffic, Unavailable,
+    UnorderedPreAcceptances, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -381,6 +382,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 waited_confirm_ms: 450,
                 waited_index_ms: 2700,
                 waited_ms: 2800,
+                waited: distribution(&[2, 3, 3, 40]),
                 snapshots: 280,
                 behind: 12,
             },
@@ -391,6 +393,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     run_queue: Duration::from_secs(3),
                     voluntary: 5200,
                     involuntary: 410,
+                    run_queue_per_pass: distribution(&[0, 0, 1, 9]),
+                    run_queue_per_working_pass: distribution(&[1, 9]),
                 }),
             }),
             waits: Measure::Observed(PipelineWaits {
@@ -407,12 +411,16 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                     queued: Duration::from_millis(30),
                     served: Duration::from_millis(1800),
                     completed: Duration::from_millis(260),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
                 materializer_jobs: Jobs {
                     count: 120,
                     queued: Duration::from_millis(40),
                     served: Duration::from_millis(700),
                     completed: Duration::from_millis(90),
+                    served_each: distribution(&[1, 2, 2, 9]),
+                    ..Jobs::default()
                 },
             }),
             fast_path: FastPath {
@@ -435,6 +443,17 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 predecessors: Duration::from_millis(900),
                 group: Duration::from_millis(300),
                 journal: Duration::from_millis(2100),
+                distributions: ReleaseDistributions {
+                    predecessors: distribution(&[1, 1, 4]),
+                    group: distribution(&[0, 1]),
+                    journal: distribution(&[2, 2, 3]),
+                    whole: distribution(&[3, 4, 9]),
+                    round: distribution(&[1, 2, 6]),
+                },
+            },
+            answered: Answered {
+                writes: distribution(&[2, 3, 3, 14]),
+                reads: distribution(&[1, 2, 5]),
             },
             traffic: Measure::Observed(Traffic {
                 sent_frames: 9000,
@@ -629,4 +648,45 @@ fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
         cpu.domain_scheduling,
         Measure::Unavailable(Unavailable::NotInstrumented)
     );
+}
+
+/// A distribution of the given milliseconds (task-d97).
+fn distribution(millis: &[u64]) -> Distribution {
+    let mut d = Distribution::default();
+    for &ms in millis {
+        d.record(Duration::from_millis(ms));
+    }
+    d
+}
+
+/// A metrics line written before task-d97 still reads: the release
+/// split, the read barrier and the loop's scheduling read with empty
+/// distributions, which say no quantile rather than zero.
+#[test]
+fn a_reading_without_distributions_reads_as_empty() {
+    let release: Release = serde_json::from_str(
+        r#"{"commands":3,"predecessors":{"secs":0,"nanos":3000000},"group":{"secs":0,"nanos":0},"journal":{"secs":0,"nanos":6000000}}"#,
+    )
+    .expect("an older release split parses");
+    assert_eq!(release.commands, 3);
+    assert_eq!(release.distributions, ReleaseDistributions::default());
+    assert_eq!(release.distributions.whole.quantile(0.99), None);
+    let scheduling: Scheduling =
+        serde_json::from_str(r#"{"run_queue":{"secs":3,"nanos":0},"voluntary":5,"involuntary":4}"#)
+            .expect("an older scheduling reading parses");
+    assert_eq!(scheduling.run_queue_per_pass.count(), 0);
+    assert_eq!(scheduling.run_queue_per_working_pass.count(), 0);
+}
+
+/// A recorded distribution goes out on the metrics line and reads back
+/// whole, so a reader can take the difference of two lines' buckets
+/// (task-d97).
+#[test]
+fn a_distribution_survives_the_metrics_line() {
+    let d = distribution(&[1, 2, 2, 3, 250]);
+    let line = serde_json::to_string(&d).expect("serializes");
+    let back: Distribution = serde_json::from_str(&line).expect("parses");
+    assert_eq!(back, d);
+    assert_eq!(back.count(), 5);
+    assert_eq!(back.quantile(1.0), Some(Duration::from_millis(250)));
 }

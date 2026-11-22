@@ -575,6 +575,8 @@ impl<P: Persistence> Voter<P> {
         // went away is not owed anything.
         if let Some(command) = command_of(&admitted.frame) {
             self.origins.remember(command, origin);
+            self.node
+                .stamp_submitted(command, std::time::Instant::now());
         }
         self.node
             .on_event(Event::Admitted(admitted), &self.ballot)
