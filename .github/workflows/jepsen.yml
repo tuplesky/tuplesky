@@ -36,15 +36,19 @@ on:
       jepsen-ref:
         # The default is a commit, not a branch, so a push to the fork
         # never changes what an undispatched run tests: tuplesky/jepsen's
-        # claude/partition-one-follower at 82e5972, 055c0fa (its merge of
-        # the fork's main 3e6f96e: upstream v0.3.15 as 0.3.15-tuplesky,
-        # Elle 0.2.8, and the concurrent generator's update in its group's
-        # context) with the end-of-run barrier and --lag-follower (#313
-        # T4), after a valid wr, append and register kill/partition pass
-        # on it, each with every voter at the barrier, and the no-traffic
-        # cell (44177526755, 44181535957, 44185514770, 44189634131).
+        # claude/partition-one-follower at e2657b7: 82e5972 (055c0fa, its
+        # merge of the fork's main 3e6f96e: upstream v0.3.15 as
+        # 0.3.15-tuplesky, Elle 0.2.8, and the concurrent generator's
+        # update in its group's context; with the end-of-run barrier and
+        # --lag-follower, #313 T4) merged with the fork's main at 3f9cbb6
+        # (tuplesky/jepsen#10: the concurrent generator initializes in
+        # update as well as op, so an update before a thread's first op
+        # no longer throws), after a valid wr, append and register
+        # kill/partition pass on it, each with every voter at the barrier,
+        # and the no-traffic cell (45480058610, 45482504015, 45484606315,
+        # 45486698038).
         description: Branch, tag or commit of tuplesky/jepsen to run
-        default: 82e5972584a7d02a8f301d079d5efffb55283497
+        default: e2657b710def55da9775f2d47ab1197b1249875c
       scenario:
         description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults), wan-throughput, or service (wr at about 80% reads, 1000 uniform keys, 300/s from 4 clients, no faults; etcd at the same rate)"
         type: choice
@@ -162,7 +166,7 @@ env:
   # Scheduled runs have no inputs; these are the dispatch defaults. The
   # load, faults and network come from the scenario, in each job's first
   # step (scripts/ci/jepsen_scenario.sh); a non-empty input overrides it.
-  JEPSEN_REF: ${{ inputs.jepsen-ref || '82e5972584a7d02a8f301d079d5efffb55283497' }}
+  JEPSEN_REF: ${{ inputs.jepsen-ref || 'e2657b710def55da9775f2d47ab1197b1249875c' }}
   SCENARIO: ${{ inputs.scenario || 'faults' }}
   IN_WORKLOAD: ${{ inputs.workload }}
   IN_NEMESIS: ${{ inputs.nemesis }}

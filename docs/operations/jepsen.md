@@ -160,13 +160,16 @@ holds the domain's fixture keys. The containers share the runner's clock,
 so the workflow does not offer the `clock` fault.
 
 `jepsen-ref` defaults to a pinned commit of `tuplesky/jepsen`,
-`82e5972` on `claude/partition-one-follower`: `055c0fa3`, the fork's main
-at `3e6f96e` (upstream v0.3.15 as `0.3.15-tuplesky`, with Elle 0.2.8 and
-the concurrent generator's update in its group's context) merged into the
-branch that carries the harness's later options, with the end-of-run
-barrier and `--lag-follower` (#313 T4) on top. Its passes: `wr`
-(44177526755), `append` (44181535957), register kill/partition
-(44185514770) and the no-traffic cell (44189634131), each `:valid? true`
+`e2657b71` on `claude/partition-one-follower`: `82e5972` merged with the
+fork's main at `3f9cbb6` (tuplesky/jepsen#10, where the concurrent
+generator initializes in `update` as well as `op`, so an `update` before
+a thread's first `op` no longer throws). `82e5972` is `055c0fa3`, the
+fork's main at `3e6f96e` (upstream v0.3.15 as `0.3.15-tuplesky`, with
+Elle 0.2.8 and the concurrent generator's update in its group's context)
+merged into the branch that carries the harness's later options, with
+the end-of-run barrier and `--lag-follower` (#313 T4) on top. Its passes:
+`wr` (45480058610), `append` (45482504015), register kill/partition
+(45484606315) and the no-traffic cell (45486698038), each `:valid? true`
 with every voter at the barrier. A commit rather than a
 branch, so a push to the fork never changes what an undispatched run
 tests; it moves only after a `wr`, an `append` and a register
