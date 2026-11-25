@@ -332,15 +332,16 @@ The section below is the design step; the code step is task-d100's entry in the 
   - **The admission (#202 review).** `Collector::on_evidence` counts every vote under the admission digest this frontend submitted: the leader reply under the collector's own, and every acknowledgement compared with what is already counted (`VoteSet::add`). So the count never learns a command under other admission facts. A command's identity is its retry key, which a retry keeps and a credential rotation doesn't change (`PayloadRecordV1::admission_digest`), so one identity can be submitted under two admissions: a retry through another collector, or one after a rotation. The release carries no admission today (`EstablishedRecord` holds the command, epoch, ballot, position, result digest, revision and fast-path flag).
     - Step A adds it. The release envelope carries the admission digest of the payload the leader decided (its table record's `payload`, which its own votes already carry), beside the epoch and ballot and outside the result's bytes. The collector answers on a release only when that digest equals the one it submitted under (its entry's `admission`).
     - A release under other facts is held, as a release without learning is held today, and the entry ends the way it ends today: settled from this node's record against the held release (`settle_from_record`), which answers by identity as a retry before submission is answered, or by a voter's `OtherFacts` refusal (task-d22). So step A keeps today's comparison and changes no answer a caller gets.
-  - **The record's corroboration (#202 review).** When the release is lost, `settle_from_record` takes the collector's own learning as corroboration of this node's record (the `(None, true) => "votes"` branch, task-c02), and `half_established` lists those entries. Under step A no entry learns, so that branch goes. A lost release then ends by one of three paths, by where the leader is:
+  - **The record's corroboration (#202 review).** When the release is lost, `settle_from_record` takes the collector's own learning as corroboration of this node's record (the `(None, true) => "votes"` branch, task-c02), and `half_established` lists those entries. Under step A a marked entry never learns, so it never reaches that branch. The branch stays for unmarked commands, which still learn and can still lose their release while the two kinds mix, and goes only once no supported build leaves a command unmarked (Codex review on #202). A marked entry whose release is lost ends by one of three paths, by where the leader is:
     - **Still leading, with the command in its table:** the collector's re-sent submission (`due_solicits`) reaches it as an exact duplicate, and its evidence repair (`repair_evidence`, task-c02) publishes the release again instead of its reply. A follower has nothing to repair any more.
+      - **When it is asked (#204 review).** A marked entry holding neither half of a release is submitted again to its ballot's leader alone, once, at one offer ceiling (`SOLICIT_LEADER_AFTER_MILLIS`, 1 s). So a release lost while the leader keeps leading is answered at about 1 s. The all-voter solicit at `SOLICIT_AFTER_MILLIS` (5 s) stays as it is, and the early one doesn't count toward settling from the record, so a collector whose view of the leader is stale ends as it would without it. Sending it once bounds what it costs under overload to one frame an entry.
       - **What the repair re-publishes (#202 review).** Today the repair re-sends frames the leader's `EvidenceStore` kept (`replay.rs`), at most two acknowledgements a command. The release is not one of them: it leaves the machine as `Effect::Released`, so nothing in the machine can send it again. So the daemon rebuilds it: the response, position, revision and result digest from the leader's retry record (`RetryRecordV1`), and the admission digest from its table record. That keeps the store's memory independent of response sizes.
       - **A duplicate that reaches the leader before its projection holds the record** waits for the projection through the command's position, as a retry there does (Section 4.5).
       - **A duplicate that arrives before the release exists** finds nothing to re-publish, though the release is still coming. It waits for the release, as the original submission does; it is never answered with a refusal the collector acts on.
     - **Still leading, past what its table remembers:** it refuses the duplicate as `Forgotten`, which marks the entry for the record (`from_record`, task-d22).
     - **Replaced:** `Collector::reconfigure` marks every entry it voids for the record (task-d22).
 
-    `half_established` then lists the entries marked for the record and those holding a release they can't answer on (speculative, or under other facts).
+    `half_established` then lists the entries marked for the record, those holding a release they can't answer on (speculative, or under other facts), and, as today, unmarked entries that learned and hold no release.
   - **A leader that is wrong.** That is outside the fault model, and the collector's count is no defense against it anyway: the leader also chooses the order the votes are counted over. What compares a leader's result with a voter's execution today is narrower than every command at every voter (#202 and #203 reviews):
     - `LateReleaseAgainstAnswer` (task-d12): a late release, against an answer this collector already gave from its own record;
     - `HeldReleaseAgainstRecord` (task-d06): a held release, against this node's record, for a half-held entry; it stops the node;
@@ -352,7 +353,8 @@ The section below is the design step; the code step is task-d100's entry in the 
   - **The fast-path label.** `EstablishedResult.fast_path` is the leader's, as it is today, and the collector's trace takes it from there.
 
 **A2. What changes on the wire.**
-- **The mark.** A submission is marked as answered on the release, and the leader's proposal carries the mark, so a follower that learned the command from either knows it. For a marked command the leader sends no `LeaderReply`, and every voter sends its fast and slow acknowledgements to the leader only, which drops task-d74's second destination. The release (`ReleasedResult`) is the only frame back, sent as today to the origin the leader learned from the submission (`origins.remember`).
+- **The mark.** A submission is marked as answered on the release by its version (`Submit` version 2, the payload unchanged), and a voter marks the command as its machine derives it from that submission (#204 review). The proposal does not carry the mark under step A: a follower that learned a marked command from the leader's proposal alone sends today's evidence. The collector adds it to the entry's votes as for any entry, and an entry that learns that way is released by the usual rule, its learning together with the leader's release. That is the rarer schedule while the collector fans out to every voter; #204's pair reports how many acknowledgements still reach a frontend for marked commands.
+- **What a marked command is sent.** The leader sends no `LeaderReply` for it, and every voter that holds the mark sends its fast and slow acknowledgements to the leader only, which drops task-d74's second destination. The final release (`ReleasedResult`) is the only frame back, sent as today to the origin the leader learned from the submission (`origins.remember`). Its speculative release is not sent: the collector can't answer on it, and the final release goes out either way (#204 review).
 - **Per command, not per domain.** The collector marks a command while its node reads the feature below active, so marked and unmarked commands mix during activation and no collector waits for evidence nobody sends: an unmarked command gets today's evidence, a marked one its release with the admission.
 - **The frontend's hold.** Evidence that reaches a frontend before the submission told it which collector asked is held (`parked.rs`). A marked command's release follows its submission at the leader, so nothing of it is held. The hold stays for unmarked commands and goes once no supported build leaves a command unmarked.
 
@@ -368,7 +370,7 @@ The section below is the design step; the code step is task-d100's entry in the 
 **Step B: the leader relay while rounds are slow-only.** Built on step A, and its feature is activated only after A's, so every relayed command is also marked and answered on the release alone.
 
 - **Why the hop to the leader costs a slow round nothing.** Section 4.6 rules out a sequential hop to the leader before the fan-out. On a slow round the followers act on the leader's proposal, not on the submission, so the path is collector, leader, followers, leader, collector whether or not the followers also had the submission first. Their direct copy only brought the payload ahead of the order, and the relay brings it with the order. The hop costs something only to a command that would have been fast, which is what the switch below weighs.
-- **What the relay changes on the wire.** A relayed `Submit` is marked as relayed and goes to the leader only, as a read already does (task-d50, `Dispatcher::send_read`). The leader proposes it as today. Its `Proposal` to each follower carries the payload record beside the vote it already carries (`FastAck` holds the command's identity and admission digest, not the payload). A follower that adopts a relayed command sends its slow acknowledgement to the leader only, as under step A.
+- **What the relay changes on the wire.** A relayed `Submit` is marked as relayed and goes to the leader only, as a read already does (task-d50, `Dispatcher::send_read`). The leader proposes it as today. Its `Proposal` to each follower carries the payload record beside the vote it already carries (`FastAck` holds the command's identity and admission digest, not the payload), and step A's mark, since a follower hears of a relayed command from the proposal alone (#204 review). A follower that adopts a relayed command sends its slow acknowledgement to the leader only, as under step A.
 - **What a follower does with a relayed proposal.**
   - **It checks the payload** as it checks a `PayloadResponse` (#202 review): the payload's identity must be the proposal's command, and its admission digest the proposal's vote's (`FastAck.admission`). A payload that fails either is dropped, and the follower fetches the payload as it does today for a proposal that outran its submission. The release's admission (step A) is then the one every adopter adopted under.
   - **It adopts in one batch.** It initializes the command from the payload and adopts the leader's order in one batch: the payload row, the dependency rows and the ACCEPT row. It does not pre-accept the command, so it sends no fast acknowledgement for it, and writes one protocol transition where a pre-accepted command writes two. Its slow acknowledgement leaves once that batch is durable, so the vote rests on a payload row durable at the voter, which Section 4.5's point 4 requires.
@@ -392,7 +394,7 @@ The section below is the design step; the code step is task-d100's entry in the 
 - **No release within a bound.** The collector falls back to today's fan-out: it sends the submission to every voter (`due_solicits`), as a leader read falls back to an ordered submission (`READ_FALLBACK_MILLIS`). The bound is a setting, short against the solicit's 5 s.
 - **Which rule completes it after the fallback (#202 review).** The release alone, as for every marked command under step A. The leader sent no reply for the command and its adopters sent their acknowledgements to the leader only, so a collector that went back to its own count would wait for evidence nobody sends. Step A is why the fallback needs no argument of its own.
 
-**B3. A replicated feature.** The relay changes what a proposal carries, what a release carries (the advice bit) and what a relayed submission asks of the leader and the followers, so every voter has to run a build that knows both before any collector relays. It is a task-60 feature, `LeaderRelay`, activated through task-d99's path after `AnswerOnRelease`, and a collector relays only while its node reads both active. Since step B is built inside task-d102, `LeaderRelay` is that task's `BatchedRound`. Until then the collector fans out as under step A. Unlike task-d98's feature it weakens no voter's counting, so it gates a wire form and a routing, not an argument about votes: a voter of an older build could not decode the proposal's new form.
+**B3. A replicated feature.** The relay changes what a proposal carries, what a release carries (the advice bit) and what a relayed submission asks of the leader and the followers, so every voter has to run a build that knows both before any collector relays. It is a task-60 feature, `BatchedRound` (`batched-round`, with task-d102's proposal frames), activated through task-d99's path after `AnswerOnRelease`, and a collector relays only while its node reads both active. Until then the collector fans out as under step A. Unlike task-d98's feature it weakens no voter's counting, so it gates a wire form and a routing, not an argument about votes: a voter of an older build could not decode the proposal's new form.
 
 **B4. What it moves,** by the runner's figures (#202 review), on top of step A:
 - **In the servers, a command:**
@@ -660,6 +662,8 @@ So a voter merges into its own copy of a Sync, before its marker and row are wri
 **A candidate whose own report names what nobody can supply stops campaigning (task-d79).** A selection needs a payload for every command a report names at ACCEPT or above. A report other than the candidate's own that names one nobody holds is set aside while a majority remains without it, and the candidate's own is never set aside. So a voter that missed every Sync that released an acceptance, whose payload is gone everywhere, fails every campaign on its own report. Each one raised its ballot and fenced the other voters' campaigns, and nobody led (protocol_sim row 10, five voters, seed 540, with every acknowledgement to a follower lost and catch-up on). Once every voter has answered, it gives the campaign up, and does not campaign again until it installs a Sync, as a candidate behind stops (task-d05). Not campaigning is safe by construction. The other voters' campaigns select without the acceptance, and installing their Sync releases it here. Dropping the acceptance from the candidate's own report instead would change what a selection may release, and would need its own safety argument for a liveness gain this already gives.
 
 **What that liveness needs: another voter that can lead.** The candidate gives up only once every voter has answered, and a selection sets a report aside only while more than a majority of reports remain without it. With three voters and one of them down, the voter still up campaigns from its own report and the stuck voter's, which is exactly a majority, so it cannot set the stuck report aside. Not every voter has answered either, so neither campaign fails: both wait, and the domain has no leader until the third voter returns, as it had none before task-d79. Once the third voter answers, the stuck voter gives up, and the other voter's campaign sets the stuck report aside and wins. This is a limit, not a regression: a leaderless stretch in a run with a voter down and one voter stuck on an acceptance nobody can supply is this case. Closing it would take the other option, dropping the unbacked acceptance from the candidate's own report. That needs the argument the campaign's own documentation half makes, that an acceptance no reporter has a payload for was never decided, or was decided by voters that have since executed it, together with the rule that a candidate never leads while missing a decided command (from the review of task-d79).
+
+**A command whose payload no report holds is undecided (task-d121, a feature).** With every voter that held something a selection must carry gone for good, the domain never leads again. Either an entry names a dependency `D` that no report holds, so every selection gives up as `Behind` (task-d05), or `D` is an acceptance whose payload only the lost voters held, so every selection fails as `HalfInitialized` and waits for a voter that never answers (task-d79's limit, above). Where task-d121 is on, a selection decides such a `D` as nothing at the new ballot. The rule reads the copy of `D` the selection takes, an acceptance at the source ballot or a commit: where that copy is a nothing, the selection carries it. Otherwise it decides `D` as nothing only once task-d120's wait for the other reports has passed, no report of its quorum holds `D`'s payload under the facts that copy names (under any facts where there is no copy) or holds `D` decided, and the candidate neither holds the payload nor committed or executed `D`, reading its executions as task-d77 does and waiting for rows it hasn't read. It never does so in a selection whose order check dropped a possible-fast candidate whose dependencies reach a command no report holds and the candidate doesn't hold decided (that selection's own `SelectionCounts::unreported_undecided` is above zero). Such a candidate may have been decided fast under dependencies the check couldn't read, and binding the selection would re-propose it under others. That selection is the one it is without the rule: the campaign gives up as `Behind`, waits as `HalfInitialized` after the set-aside, or waits in `selection_missing`, as today. A payload row at any phase under those facts supplies `D` instead. The new leader then proposes nothing for `D`'s instance, and `D` is decided once a slow quorum of that ballot accepts it, as every re-proposal is. A `D` that was an entry stays one, with the record a report holds, so the selection orders as it would with the payload supplied; a `D` that was a re-proposal, or that no report holds, is re-proposed as nothing. Only its effect is nothing, and its submitter learns a definite refusal once it is decided. A quorum that decided `D` at a lower ballot shares a member with the selection's quorum. That member voted with `D`'s payload row durable (task-d90) before it promised the new ballot. Every selection bound since kept `D`, so no Sync released that row, by the retention every selection already rests on. So its report holds the payload or `D` decided, or it refuses the candidate as more than a table ahead (task-d119's cut). So no ballot below the new one decided `D`, and every member of the quorum now refuses those ballots, so none of them can. No voter executed `D`, since executing needs a commit. A nothing is a value: a record whose admission is a marker, initialized as any record is. Reports carry it, a Sync install demotes it as any acceptance it doesn't carry, and a later selection carries it at the source ballot as it carries any acceptance there. So a holder that comes back cannot decide `D` again. The new leader proposes the value the selection gives, and a voter that installs or accepts a nothing replaces a record of `D` below COMMIT with it. Today's set-aside of a half-initialized report goes first where it alone gives a selection, without the rule; otherwise the campaign waits, and the rule reads every report it has read. The set-aside and task-d79's give-up stay as the fallback. The rule rests on the premise `leave_out_unheld` already rests on, that a decided command has its payload at some reporter, and on Section 5.4: a voter whose storage is lost never votes again under its identity. This task builds the check that premise needs: `init` writes a random store identity, the peer handshake, every promise and every report carry it, and each voter refuses a peer back under another one until membership names a new generation. A copy of a voter's own store carries its identity, so restoring one voter alone from an older copy stays an operator's premise (Section 5.4, task-42) that no check detects. A voter that holds `D` at COMMIT, or executed, under a digest and meets a nothing for it stops, as on any second decision, and so does one that holds `D`'s nothing at COMMIT, or executed as a refusal, and meets `D` under a digest. A selection that would carry a nothing for a `D` its candidate executed under a digest stops too. The rule is on from genesis (Section 10.2), with `release-at-execution`, which it requires, since a feature needs every voter and cannot be switched on after the loss. The argument, with the fast path's counts, is under task-d121 in the plan.
 
 **A voter ahead serves at any ballot of its epoch (task-d81).** A candidate's `NewLeader` names what it executed, and a voter that has executed less refuses to campaign until it has executed that far (task-d10). So a candidate that alone executed the newest positions and cannot lead holds every other voter back: it can't lead when it lacks a command it would have to select (`Behind`), and the others won't campaign. Only it can serve those positions. A donor used to serve only while synchronized at the asker's ballot or a later one (task-d33). A candidate that missed the ballot the others installed then served none of them, and the domain never healed (protocol_sim row 12, five voters, seed 148, at nine in ten acknowledgements to a follower lost; row 2, three voters, seed 281, at three in four; both with catch-up). A donor now serves at any ballot of its epoch (`Machine::serves_catch_up_at`). This is safe because a page is a prefix of what its donor executed:
 - every command in it is decided, and a decision is the same at every voter;
@@ -930,6 +934,10 @@ Only irrevocable application produces events. Preserve complete revisions and de
 Bound buffers and close slow consumers with a resumption requirement. Do not silently skip changes or expose half a transaction/lease revocation. Admission limits ensure each logical revision fits the supported atomic-event budget even when transport chunks are needed.
 
 **The retained strict authorization profile authorizes each selected output batch against an ordered authorization barrier.** Share a barrier only among batches already selected for that check, not as an indefinite lease. This prevents isolated frontends/observers from making new permission decisions from stale policy. Previously authorized bytes may arrive after revocation because the network cannot recall them. Observer policy/session replay and subscription admission are additional safeguards, not a replacement for this per-output requirement.
+
+**A voter's barrier is bounded in staleness (#312, #320).** A voter's frontend reads the barrier from that voter's own store, and a voter cut off from the domain, or behind it, has not applied everything the domain decided, revocations among them. So its policy answers only while it has confirmed, within an allowance (`[limits] max_policy_staleness_millis`, 5 s by default), that its store holds everything the domain had committed. The voter asks the leader of the ballot it follows every half allowance. The leader answers as it answers a current read (task-d50): once a round started after the ask arrived has confirmed its ballot and everything it proposed below its read index has executed, it answers with the position it has executed through. Everything the domain committed before the ask reached the leader is at or below that position, in the one execution order every voter shares (task-d06). Once the voter's committed projection has reached that position, the ask's send time is its stamp, and the policy answers while the stamp is within the allowance. Where the voter's journal already holds that position and only a projection commit held for a larger one (task-d86) stands between, the voter asks for that commit, as a read held at the barrier does. Both ends are the voter's own clock; no clock is compared across nodes. A leader with nothing proposed in its ballot has no read index, so it takes its lease authority again to propose. Past the allowance the barrier is stale. That is neither a grant nor a denial, and nothing is disclosed on it: a bind is refused as unavailable, output is held as pending, and a watch closes as source-lost at the last revision it gave. Nothing is revoked: the caller may present its credential again, to this voter later or to another. A barrier the store cannot read still denies. The rule is the same after a heal or a restart: a voter that has no stamp since it started, or whose store has not reached its latest answer, answers nothing from its policy. A process with no voter follows no ballot, has no one to ask, and is never fresh: it refuses every bind.
+
+**What the bound leaves (#320).** The allowance is measured on the voter's monotonic clock, which does not advance while its host is suspended or its VM frozen. A voter resumed after a freeze of any length answers from its policy for what was left of one allowance when it froze, at most the allowance (5 s by default), and then answers nothing until a new ask is confirmed. Alpha accepts that residual; there is no clock that counts suspended time. A leader holds an ask at most 1 s (the read barrier's wait) and then refuses it as expired. It holds at most 256 asks at once, and at most 4 from one connection or from its own voter. Only about three of a voter's asks can still make it fresh at any time (the ones sent now, half an allowance ago and an allowance ago), so 4 leaves each voter room of its own: a connection that floods asks fills only its own four places, and it takes 64 such connections, not one, to push other voters to `Busy`. Past either cap, and after any refusal or lost ask, the voter asks again at an eighth of the allowance. A stale bind is refused before the credential is read, and the connection closes as `Rejected` with the reason "bind unavailable", which says nothing about the credential: a client keeps it and binds again later or elsewhere. Every other refused bind closes with "bind refused", and a client drops its credential. The bound holds only once every voter runs a build that has it. A build without it does not know the ask's frame kind, so a leader on that build closes the link the ask came on, and a voter that has the bound under such a leader never stamps: it stays stale and refuses every bind, which fails closed. A voter without the bound answers from its own store as before, without a bound. So voters move to a build with the bound together, not in a rolling upgrade.
 
 <a id="s6-5"></a>
 ### 6.5 Retries and ambiguous outcomes
@@ -1259,16 +1267,16 @@ Use injected clock-health/uncertainty intervals for conservative admission valid
 <a id="s10-1"></a>
 ### 10.1 Credential issuance is not voting admission
 
-Provision independently available WIF-capable node issuance, either existing integration or the separately deployable reference issuer sharing verifier code. It is an explicit deployment/M4 deliverable, operational before quorum exists. Verify workload identity and possession of a generated node key; issue short-lived cluster/role-bound certificates.
+Provision independently available WIF-capable node issuance, either existing integration or the separately deployable reference issuer sharing verifier code. It is an explicit deployment/M4 deliverable, operational before quorum exists. Verify workload identity and possession of a generated node key; issue short-lived cluster/domain/role-bound certificates. An enrollment rule names the one domain its certificates reach. A workload that serves two domains holds a rule for each and names the domain it asks for; a request that names none is refused when its rules reach more than one, so the domain a certificate reaches never depends on the order the rules are listed in.
 
-QUIC peer voting requires normal client/server TLS checks plus matching node ID, key/generation and committed membership. A WIF JWT is not a TLS handshake; an eligible certificate does not enroll a voter. Client exchange and node enrollment have separate audiences/policies. A common service account cannot authorize arbitrary processes for one voter slot.
+QUIC peer voting requires normal client/server TLS checks plus matching node ID, key/generation and committed membership. A WIF JWT is not a TLS handshake; an eligible certificate does not enroll a voter. Client exchange and node enrollment have separate audiences/policies. A common service account cannot authorize arbitrary processes for one voter slot. Peer access is not a voter's name either: an observer's or learner's certificate whose node is a committed voter's is refused at any generation, because a voter's link and the provenance of every peer frame are keyed by the node's replica identity. The rule holds until a prepared transition names that incarnation: a successor staged as a learner under the voter's own name (task-d39) is the one exception, and the link key and the provenance role keep it from speaking as the voter. Provenance carries the role the handshake bound, and only a voter's frames reach consensus, catch-up, reads, floors and features, or count as a collector's evidence.
 
 Intact-storage restart can rotate credentials without resetting history. Lost storage/new generation uses learner admission and handoff. Key changes require proof of possession. Orchestration/storage fencing prevent cloned independent processes from voting under one identity; WIF alone cannot.
 
 <a id="s10-2"></a>
 ### 10.2 Genesis
 
-Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping and protocol/version policy. Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
+Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping, protocol/version policy and the replicated features active from genesis (task-d121). Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
 
 Provisioning signer authorization may use existing OIDC/cloud identity instead of a static API root token, but protected trust anchors and signing authority remain necessary.
 
@@ -1634,7 +1642,7 @@ Every resource a node holds for a domain has a stated limit, and the limit belon
 | Memory | Sync being installed | the Sync's entries, at most 5 × `max_report_entries(capacity)`; installation examines an entry once per change to what it waits on, so it costs time linear in entries and edges |
 | Memory | Candidate reports | per reporter, `ceil(2 × capacity / 256) + 1` pages of 256 entries; the complete reports are assembled, a copy of every entry, only once a majority could be complete, so at most `voters - majority + 1` times per campaign |
 | Memory | Sync binding | the selection and one encoding of it; the frame size is counted from that encoding |
-| Memory | Catch-up window | one page: 64 commands and 1 MiB |
+| Memory | Catch-up window | one page: 125 commands and 1 MiB, or one larger command; the next page is asked ahead only while one page is in hand, and waits outside the table, so a voter holds at most two pages beside it: 250 commands and 2 MiB, or two of its largest commands (task-d25). Both bounds are checked where a page is taken, whatever the donor sent |
 | Memory | Collector | `limits.max_outstanding_per_session` entries per session, and undelivered bytes of that many requests of `limits.max_request_bytes` plus 128 KiB each |
 | Memory | Transport send | 16 MiB in flight per destination and 64 MiB per node, 2 MiB of each reserved for the control lane |
 | Memory | Transport receive | 64 MiB of frames being received per node, the same control reserve; a frame takes its whole length once its header is in and waits for room before its payload is read |
@@ -1650,7 +1658,9 @@ Every resource a node holds for a domain has a stated limit, and the limit belon
 | Temporary files | Checkpoint images | one image being written beside the published one, under a pending name; a crash's leftovers and every superseded image are removed at the next reclaim |
 | Rate | Admission | `limits.max_admitted_per_second` new requests per frontend, a second's worth as a burst; a retry of an outstanding request takes nothing |
 
-The admission rate is meant to stay below the rate at which a voter catching up executes: a window of up to 64 commands per durable batch (task-d25). A voter returning behind a domain gains on it by the difference, so the time it needs is bounded by its gap divided by that difference; admitted faster than it executes, it never closes the gap. The default of 1,000 a second is a design target and a ceiling, not a proved bound: the catch-up rate it is set under (64 commands per 10 ms batch) has not been measured, and task-d33's budget oracle is its check. It gates only client requests in the dispatcher; resolves, watches and held retries bypass it, and one bucket per frontend is shared by every session. The bound is per frontend, and a domain served by several admits their sum.
+The recovery reserve is sized for one catch-up window with no slack at the largest table: 875 admitted, 125 recovering and 1,000 retired are the report bound of 2,000, twice the table. That is meant. 125 is the page chosen as the largest the reserve holds, and the bound is inclusive. It is safe because it is a bound on liveness, not on what is decided: a report past it is set aside while a majority remains without it, never selected over, and a candidate's own is refused by name (task-d20). Other work past the capacity, a Sync's entries or the record of a held proposal whose turn has come, can already take a voter past it, and costs that voter's report for a campaign. What the reserve keeps is that a voter admitted to its limit and holding a window still reports. So a window is one page whatever a voter holds, and a test fails if two pages ever install as one (task-d25).
+
+The admission rate is meant to stay below the rate at which a voter catching up executes: a window of up to 125 commands per durable batch, with the next page asked ahead while a window executes (task-d25). A voter returning behind a domain gains on it by the difference, so the time it needs is bounded by its gap divided by that difference; admitted faster than it executes, it never closes the gap. The default of 1,000 a second is a design target and a ceiling, not a proved bound. The catch-up rate it is set under was once given as 64 commands per 10 ms batch, about 6,400 a second, and never measured. Measured, it is far lower, and it differs by host. On the CI runner it was about 320 commands a second while every page a voter executed past on its way broke the chain of asks until the pacer's next one; with the chain unbroken (task-d25), a follower cut off under load there pulled 460 to 1,300 commands a second sustained, with bursts near 2,000, and was back in step within 10 to 12 s of the heal. On a local four-core host running five voters, with the chain unbroken, it was 1,200 to 1,600 a second: a voter stopped for 9 s while the domain ran at 1,000 commands a second was back within 600 commands of the others 9 s after it resumed, and with the domain at 1,500 to 1,600 a second, the most that host carries, it executed 1,200 to 1,300 a second, one page in hand at a time, and did not close its gap. A single frontend at the default can therefore admit about what a catching-up voter executes on the local host, and more than the runner's slowest sustained pace. task-d33's budget oracle is its check. It gates only client requests in the dispatcher; resolves, watches and held retries bypass it, and one bucket per frontend is shared by every session. The bound is per frontend, and a domain served by several admits their sum. That stays so for now, by the owner's decision of 2026-11-11 (task-d26): on the defaults, three frontends admit up to 3,000 a second and five up to 5,000, more than a voter catches up under load, so for such a domain the rule above holds only at a lower setting. The question is revisited against the measured catch-up rate.
 
 Not yet bounded, and owned: the executed-history set (one identity per command executed, which recovery asks about) and its execution ordinals (one per command executed, which the possible-fast rule reads, task-d71), the tombstones kept for keys no longer written, and every durable row of an executed command grow with history until quorum-safe forgetting trims below its floor (task-d27), whose trim drops the identities and the ordinals together, the ordinals then numbered from a counter of their own rather than from how many are kept; disk headroom before a checkpoint is task-d27's too.
 
@@ -1818,6 +1828,241 @@ Common schema owns stable logical collection IDs, canonical values and reviewed 
 
 Protocol state cannot be reduced to a Raft-like last_applied: application snapshots do not recreate unresolved dependency/vote obligations. Physical placement is adapter-private; logical schema/index maintenance is common.
 
+*Proposed by task-d117's design step ([Section 17.17](#s17-17)), not built:* the per-command protocol rows (`protocol_v1`'s dependency and proposal rows, `pending_payload_v1`), the retry rows (`retry_v1`, `retry_floor_v1`) and executed history (`execution_v1`, `payload_v1`, `decided_v1`) leave the projection. Its first code step is built: `meta_v1` is written once a commit (point 5). Each of its code steps amends this table as it lands.
+
+*Amended by task-d113's design step: the payload, dependency and executed rows keyed by order.* This is a design step; nothing below is built. The table above keeps today's keys until the code step lands.
+
+**Why: the materializer's profile** (#185, [6810986014](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6810986014); local, the carry at `413fd66a`, five voters, `replay`, tmpfs, 30 and 120 callers).
+- **Measured:**
+  - A follower writes 10.7 to 10.9 rows a command and the leader 11.6 to 11.8, about 2.3 KB.
+  - Yet the materializer writes 38 KB a command to the file at a follower and 46 KB at the leader: about 9.4 and 11.3 fresh 4 KiB pages, the same at both loads.
+  - A commit holds 4.3 and 11.3 commands locally, and 3.25 and 7.55 at the runner's leader.
+  - The thread is 116 to 138 µs a command at the leader and 100 to 120 at a follower.
+- **Why a row costs a page, and the digest-keyed rows two** (review on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)):
+  - The payload, dependency and executed rows are keyed by the command's digest, so each lands on a leaf no other command in the commit touches.
+  - Their tables are large: after 100,000 operations a follower's `payload_v1` has 25,597 leaves under 533 branch pages, `protocol_v1` 6,988 under 153, and `executed_v1` 2,988 under 65. So a commit's commands share neither a leaf nor the branch page above it, and each row copies both.
+  - History and current rows are keyed by key, so they share a leaf only where a commit's commands write nearby keys.
+  - The retry and retry-floor tables are small (14 leaves and 2 in that run, whatever its length), so their rows cost a fraction of a page. Every commit copies those leaves anyway.
+  - redb copies a page on write, rebuilds it, checksums it at the working commit and writes it at the next durable commit.
+- **The thread's split:** copy-on-write allocation 17 to 19%, the leaf's rebuild 16 to 17%, page lookups 11 to 14%, working-commit checksums 11 to 12%, durable-commit `pwrite` 12 to 15%, freed pages 7 to 9% in all. That is 74 to 86% that follows pages. Reopening the table for every row is another 5 to 6.5%, and it follows rows, not pages.
+
+**What is keyed by what today:**
+
+| Row | Collection and key | Written | Common hash |
+| --- | --- | --- | --- |
+| Executed | `executed_v1`, the command identity (`codecs::executed_key`) | at execution (`retry::executed_update`) | yes |
+| Payload | `payload_v1`, the command identity (`rows::payload_key`) | at intake: a vote, an adoption, the leader's proposal batch, a Sync's installation, a fetched payload, a catch-up install | the executed ones only (`export.rs` keeps a payload only if `executed_v1` holds its command) |
+| Dependency | `protocol_v1`, epoch, tag and command identity (`rows::dependency_key`) | at intake, and again where ACCEPT follows in a later batch | no: `protocol_v1` is node-private |
+
+`execution_v1` (0x0005) is registered and specified in the table above as keyed by established position, and nothing writes it. Two readers already name it as their fix. `executed_order` (`coord-storage/src/protocol.rs`) and `ExecutedOrder` (`coord-daemon/src/catch_up.rs`) each read the whole of `executed_v1` to recover the order of execution, "and a durable position index is what would make it less".
+
+**The layout:**
+
+| Row | Key | Written | Common hash |
+| --- | --- | --- | --- |
+| Executed | `execution_v1`: the execution position, big-endian. The value gains the command identity | at execution | yes, in place of `executed_v1`, which is no longer written |
+| An executed command's payload | `payload_v1`: the execution position | at execution, moved from the pending row in the same transaction | yes |
+| A payload not yet executed | `pending_payload_v1`, a new node-private collection: intake order | at intake; deleted when it moves, or at a Sync's release (task-d24) | no |
+| Dependency, and the leader's proposal row while it is written | `protocol_v1`: epoch, tag and intake order, with the command identity as the key's suffix: `epoch (8) \| tag (1) \| seq (8) \| ordinal (4) \| command (32)`, 53 bytes against 41 by command. The value is unchanged (step 1, #237) | at intake; a rewrite stays in place | no, as today |
+
+- **Intake order is the journal position of the record that brings the row,** `LocalJournalSeq`, the order replay applies (Section 17.16.4), and the row's ordinal within that record.
+  - It is unique for a projection's life: a missing or empty journal is not permission to create (above), and a voter that starts fresh installs a shared image, which holds no node-private rows.
+  - The sequence doesn't restart under a live projection: `project` refuses a record that isn't the successor, attach refuses a lost journal prefix, and the strict worker numbers each group in one stamp. The key carries no generation prefix, and needs none, since a projection that starts over holds no node-private rows (step 1, #237).
+  - The command identity is the key's suffix, not part of the value (step 1, #237, against the design step's "the value gains the command identity"). The value's format is unchanged, so every reader of it still decodes it, and the 53-byte key describes itself to trim's classification and to the layout check. It costs 32 bytes a key, on node-private rows only.
+- **The store's lowering assigns the keys, not the machine.** The journal's records keep naming these rows by command: the `StoreUpdate`s built in `coord-consensus/src/rows.rs`, used at more than twenty sites, and `retry::executed_update`. So neither the journal's format nor the consensus crate changes.
+  - `lower_update` (`coord-storage/src/lowering.rs`) runs record by record from `project` (`journaled.rs`) and from the worker.
+  - It maps a put or delete by command onto its intake key through the index below. It keys an application outcome's executed row by the record's own position.
+  - Replay lowers the same records at the same journal positions, so it writes the same keys.
+- **The move at execution.** When the lowering lowers an executed row, it moves the command's pending payload to `payload_v1` under that position. A pending row that is written and moved within one commit is never written.
+  - A catch-up install brings its payload and executes in the same turn, so its pending row usually isn't written at all.
+- **A commit's rows share leaves.** A commit's execution positions are consecutive, and so are its records' journal positions. Each ordered region then dirties its right-hand leaf once a commit, plus fresh pages for its bytes. The regions are `execution_v1`, `payload_v1`, the pending table's two ends and the dependency rows.
+
+**1. The index by command.** Under this layout, these readers need it:
+
+| Reader | Today | Under order keys | Index by command? |
+| --- | --- | --- | --- |
+| Boot (`read_protocol`, `read_history`, `coord-storage/src/protocol.rs`) | scans the epoch's dependency rows; reads `payload_v1` and `executed_v1` once per row; scans all of `executed_v1` and sorts it | scans the dependency rows and the pending payloads; scans `execution_v1` in key order, with no sort; reads an executed record's payload at its position | no: it reads every row it joins, and builds the index from them |
+| Catch-up served (`ExecutedOrder`, `page`, `catch_up_entry`, `coord-daemon/src/catch_up.rs`) | all of `executed_v1` into memory at the first ask, then three point reads a command | one range of `execution_v1` and one of `payload_v1` from the requester's frontier | only for the decided record, the dependency row |
+| A campaign's executed rows (`catch_up::executed_rows`, task-d77) | `catch_up_entry` by command | the dependency row through the index | yes |
+| Resolve (`retained_answer`'s `requested()`, `bins/coordd/src/serve.rs`) | `payload_v1` by command | the retry row, read by retry key as now, names the position (`RetryRecordV1::position`); the payload is `payload_v1` at that position | no. A resolve is answered with a result only from a retry row, and only then is the request needed |
+| Settling from the record (`records_for`, `coord-daemon/src/settle.rs`) | retry rows | unchanged | no |
+| Trim (`plan_trim`, `classify`, `executed_within`, `coord-checkpoint/src/trim.rs`; `coordd` doesn't run it yet, task-d27) | scans the protocol rows; reads `executed_v1` by command for each dependency row | scans them in intake order; takes the position from the index's executed part | yes |
+| The trim fence (`TrimFence::command`, `coord-checkpoint/src/trim.rs`; a library reader whose only callers are tests today, for task-d27's wiring) | `executed_v1` by command, after trim has removed the command's protocol rows; no row means `Admit` | the index's executed part gives the position, and `execution_v1` at that position confirms the command; no entry means `Admit`, as today | yes, and it must outlive the protocol rows (Codex on #233) |
+| A divergence stop (`catch_up::mismatch`'s `executed_record`; `settle::executed_near`, which scans all of `executed_v1`) | by command; a whole-table scan | a range of `execution_v1` around the two positions; the command's own row through the index's executed part | once, at a stop |
+| The store's own writes: ACCEPT's rewrite, a pulled command's `dependency_delete` (task-d08), `payload_delete` (task-d24), the move | by key | through the index | yes |
+
+So boot, catch-up served and resolve need no index by command here. Boot reads every row it joins, and catch-up and resolve read by position. What does need it is the campaign, trim and its fence, a stop and the store's own writes.
+
+**The table is complete** (review on #233 went through every use outside tests of the three collections and of `executed_key`, `payload_key`, `dependency_key` and `proposal_key`). Outside it, the code step also touches:
+- **The two emptiness checks:** `check_target` in `coord-checkpoint`'s `install.rs`, and `restore.rs`. They test the common-hash collections and `protocol_v1`, so they must test the new pending collection too, or a target holding pending payloads passes as empty.
+- **`executed_v1` as a name.** The records keep it (`0x0006`, keyed by command), and the table goes. The registry says so, or `in_common_hash` and the image's walk still count an empty collection.
+- **Unchanged:** `ADMISSION_COLLECTIONS` in `worker.rs` reads a batch's updates, not the tables, so it stays as it is.
+- **Smaller:** `coord-store-bench`'s executed-row count, the divergence report's text in `bins/coordd/src/serve.rs`, and the fjall engine's collection list.
+
+**The index lives in memory, in the store, in two parts with their own lifetimes** (the second from Codex's review on #233). Each maps an 8-byte prefix of a command identity, and the row named carries the whole identity, so a prefix collision is settled by reading the row. A prefix held by two commands keeps both entries.
+- **The intake part:** each live intake-keyed row, a pending payload or a dependency row, to its intake order. An entry lives as long as its row: it goes at the move, at a Sync's release, at a pulled command's `dependency_delete` and at trim.
+- **The executed part:** each retained `execution_v1` row to its position. An entry lives as long as the executed row, not the intake rows. After trim has removed a command's protocol rows, or on a voter that installed a shared image and never held them, the fence, a stop and trim still find the command's position.
+- **Pages: none.** No durable row is written for either part, so neither puts the random leaf back.
+  - **This is the step's condition, not a choice among equals** (review on #185, 6812429771). A durable table keyed by command identity would put back one random page a command of the three this step removes. In review's redb measurement, at 50,000 commands retained, three rows a command cost 32.2 µs and 24.9 KB written under digest keys against 7.4 µs and 2.4 KB in key order. The digest-keyed cost grows with the table (24.9, 32.2 and 47.7 µs at 2,000, 50,000 and 300,000), and the ordered cost stays near 6 to 7.
+  - **So every reader in the table above gets a command's position from memory or from an ordered scan, never from a durable row keyed by command.** Boot, catch-up served and resolve need no index (boot builds it from the rows it reads, catch-up reads by position, and resolve finds the position in the retry row). The campaign's executed rows, trim, the fence, a stop and the store's own writes take it from the in-memory index, which is rebuilt at open from scans boot already makes. The journal is not read for it.
+- **Built at open:**
+  - the intake part from a scan of `protocol_v1` of its own, at attach and at the worker's open, not from boot's read (step 1, #237): review read about 0.9 s to build it at 10⁶ rows. Step 2 adds one scan of the pending payloads, which hold only what is not executed;
+  - the executed part from the scan of `execution_v1` that boot makes anyway. Today `read_history` reads all of `executed_v1`, so the open reads no more pages than it does now.
+  - A shared image's install builds the executed part from the image's `execution_v1` rows, whose values carry the command.
+- **The open's cost (inferred):** an insert for each executed row read, about 0.1 µs, so about 0.1 s at 10⁶ retained executions, beside the read boot already makes of them: about 90 bytes a row, some 22,000 pages at 10⁶.
+- **Kept by the lowering.** Each commit's changes are published with the commit. A reader pins its snapshot first and then asks the index:
+  - a row added after the snapshot reads as absent, which is that snapshot's answer;
+  - a row deleted after the snapshot reads as absent too, which is a later snapshot's answer and what its reader would get next.
+  - A third case, a row deleted and written again under a new key after the snapshot, is ruled out for snapshot readers by rule (c) below. A commit whose outcome isn't known is rule (d), and a recovery cut's overlay is rule (e).
+- **Memory (inferred):**
+  - The intake part takes 39 to 46 bytes a live row, as review measured it on #237 (the design step inferred 24 to 32): a 24-byte slot in an ordered set, and the set's nodes. It holds the pending payloads and every dependency row the store keeps, and at the leader the proposal row too, so two entries a command there. In `coordd` today that is every row, since nothing trims (task-d27): about 46 MB a million commands at a follower, without bound. Its entries go on the metrics line, and what bounds it before task-d27 is in task-d113's plan entry.
+  - The executed part takes about 16 to 24 bytes for each executed command retained, an 8-byte prefix and an 8-byte position with the map's overhead. That is every executed command until a floor forgets a prefix of `execution_v1`, about 24 MB at 10⁶.
+  - Both are the same order as what boot already loads, every dependency row and every executed identity at 32 bytes each.
+  - `ExecutedOrder`'s 32 bytes an executed command goes.
+- **CPU (inferred):** a map insert or removal for each row lowered, one more insert for each command executed: under a microsecond a command a voter, below 0.001 ms an operation. The sizes below are unchanged by the executed part.
+- **Not taken:**
+  - a durable index keyed by command, which is the random leaf again;
+  - a durable index batched by order (one row a commit listing its commands). It would let the open read about 40 bytes a command instead of dependency rows, but the open reads those anyway.
+
+**The lowering's rules:** (a) to (d) from review on #233 ([6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752)), and (e) from reading for the code step. None changes the layout. Each has a test in the code step.
+- **(a) A payload put for a command already executed is dropped.**
+  - Today such a put overwrites the same row with the same bytes, so none of the `payload_update` sites (thirteen in `coord-consensus` and one in `serve.rs`) has had to rule it out: a late fetch, a vote or an adoption that arrives after the command executed.
+  - Under this layout it would write a pending row that nothing moves or deletes. So the lowering writes nothing for it when the index's executed part holds the command.
+  - The test delivers one after execution and checks that the pending table stays empty.
+- **(b) An executed row with no pending payload is refused.**
+  - The move needs the payload in the pending table, or earlier in the same commit. A command executes only after its payload is in hand (a vote, the proposal batch, a Sync's installation, a fetch or a catch-up install), and each of those puts the payload first. So an executed row with no payload to move is a broken invariant, not a case with a rule.
+  - The projection refuses it, as it refuses a base that doesn't extend it. Otherwise `payload_v1` would have a hole at that position, and a donor's range read and the shared image would be short a row.
+  - The code step checks each executing path against the rule. A negative control lowers an execution with no payload and sees the refusal.
+- **(c) Through the index, a snapshot reader looks up executed commands only.**
+  - A row deleted after a reader's snapshot and written again under a new intake key would give an answer neither snapshot holds. That is a command a Sync released and the next leader proposed again. The index then names the new key, and the reader, finding no row there in its snapshot, sees "absent" for a row both snapshots hold.
+  - An executed command's rows are never deleted and rewritten under a new key: its execution and payload rows are keyed by position, its dependency row's rewrite stays in place, and a Sync releases only commands that aren't executed. So the lookups the readers' table makes are safe: catch-up, the campaign, trim, the fence and a stop all ask about executed commands.
+  - The store's own writes read the intake part inside the write transaction, which holds the latest state. The code step keeps any snapshot reader that asks about a command not executed out of the intake part. If one is ever needed, each entry gains the sequence that wrote it, so a reader can tell an entry newer than its snapshot.
+- **(d) The index follows the commit's outcome.**
+  - A commit that returns an error publishes nothing.
+  - A commit whose outcome isn't known already puts the store in `MaterializationUncertain` with the meta it wrote (`pending_meta`), and the store settles it by reading the meta back. The index's changes for that commit are held with `pending_meta`. They are published if the meta shows the commit landed, and dropped if it didn't.
+  - A store that quarantines drops the index with it, and the next open rebuilds it from the store.
+- **(e) An overlay lowers its rows with the same key assignment** (found reading for the code step, after review). Two readers lay rows the projection doesn't hold yet over a pinned snapshot, and both hold the journal's updates as they are, keyed by command:
+  - **the recovery cut** (`RecoveryCut`, `cut.rs`): built in `journaled.rs` from the records between the snapshot's stamp and the durable head. `read_protocol` and the campaign's report run over it under `replay`;
+  - **the planning view** (`apply.rs`): an execution group's own writes, laid over the projection while the group is open.
+
+  Laid over a projection keyed by intake order and position, a by-command row would not replace the row it rewrites. A dependency row rewritten at ACCEPT but not yet materialized would then read twice, once under each key, and a delete wouldn't hide its row.
+  - So the key assignment is one function, used by the lowering and by each overlay's `extend`.
+  - It takes a record's updates, its journal position and the index, and gives the lowered rows.
+  - An overlay keeps the index's changes for its own records, over the index at its snapshot's stamp. The cut then reads the keys materialization will write, as it now reads its rows ("the overlay replays the same `StoreUpdate` rows the materializer would write").
+  - **The timing, as built (step 1, #237).** The index moves as a commit returns, together with the read gate, before the store takes the engine back: a commit's changes are published when it returns OK, ahead of `set_completed`. A recovery cut takes the index only when the index's stamp equals its snapshot's, so its overlay assigns keys from the index as of that snapshot, never a later one. If the two differ, it pins again, up to 64 times, then returns `Busy` ("the projection moved on under every attempt at a cut").
+  - The planning view's group holds application rows, so step 1's dependency rows don't reach it. Step 2's executed and payload rows do.
+
+**2. Which order: the execution position for executed rows, and intake order before execution.**
+- **Executed rows and executed payloads take the execution position:**
+  - it is replicated: every voter executes the same command at a position, so these rows stay in the common hash and the shared image;
+  - it is known when they are written;
+  - every row lands at the right-hand end: a voter never executes out of position order.
+- **Why nothing executes out of position order.**
+  - The store refuses an application whose base isn't its queued frontier, or whose position isn't above it (`JournaledStore::submit`: `StaleBase`, `PositionNotAfterBase`).
+  - The projection refuses one that doesn't extend it (`project`: "durable record's base does not extend the projection").
+  - Catch-up installs are contiguous from the requester's frontier (`ExecutedOrder::between`, `catch_up::page`), and a Sync's commands execute through the same path.
+  - So the case of a command executed out of position order doesn't arise at a voter. What does differ is the order of intake from the order of execution.
+- **Payload and dependency rows before execution take intake order.** They are written before the command has a position, and each voter writes them at its own journal position, so these keys are node-private. The leader's sequence number isn't used: it is ballot-scoped, and a vote before the proposal, a Sync's installation and a catch-up install have none.
+- **What intake out of execution order does.** A command held across a leader change, installed by a Sync or fetched late executes after commands taken in after it.
+  - Its move then deletes from an older leaf: a page for that command alone.
+  - Its dependency row's rewrite, at ACCEPT after recovery, lands on its old leaf, as every rewrite does today.
+  - So recovery and a late fetch pay a page a command where they are out of order, which is what every command pays today.
+
+**3. The durable format, and how an existing projection moves.**
+- **What changes:**
+  - the projection's layout: four rows' keys and one new node-private collection;
+  - the common hash's membership: `execution_v1` in place of `executed_v1`, and pending payloads out;
+  - the shared image: `payload_v1` and `execution_v1` by position. So `SharedCheckpointV1`'s version is raised, and the scrub reads the new layout (task-d37).
+- **What doesn't change:** the journal's records, the wire, the consensus crate and what a vote rests on.
+- **A domain runs one layout,** as task-d105's design step sets for its own (#208).
+  - Two voters on different layouts would export different roots, and their floors (task-d27) wouldn't count together.
+  - The layout is recorded at initialization and compared at every open. Step 1 (#237) built it: `STORE_FORMAT_VERSION` is 2 (`coord_store_api::registry`), recorded under `meta_fields::FORMAT_VERSION` when redb or fjall initializes a store. Building the index refuses a store that records another format, or holds a 41-byte dependency or proposal key, with the reason, class `Unsupported`. A local checkpoint's identity list carries the field.
+  - A live store or image of the other layout is refused with the reason (Section 17.7: an unsupported format fails before admission).
+  - This task doesn't wait to share task-d105's layout change. Nothing is deployed, so a second layout change costs a test domain nothing.
+- **An existing projection doesn't move in this step.** Nothing is deployed in production, so a store of the old layout is refused and a test domain starts fresh.
+- **The conversion is a release condition** (review on #233), carried in the plan the way the catch-up page size is. The first release that promises an upgrade in place needs the conversion below built.
+- **`replay` rebuilds from the journal only above its selected local checkpoint** (correcting the order's premise). The journal's prefix is retired at each publication under both profiles (Section 17.16.3, step 4), so below C the rows are only in the local image, in the old layout (Section 17.16.4). Under both profiles a move needs the image converted. They differ in which artifact:
+  - **`replay`:** convert the selected local image offline into a new generation, then replay `(C, J]` onto it. The suffix replays as it is, since its records name rows by command and the new lowering keys them.
+  - **`strict`:** the projection is the durable state at every commit, and a restart replays only above its stamp. So the live projection itself is converted offline as a new generation, selected only once durable, with the old kept until then (Section 17.7's generation replacement).
+  - **The conversion is lossless and mechanical.** It joins `executed_v1` with `payload_v1` by command into `execution_v1` and `payload_v1` by position, and gives every other payload and dependency row an intake order in key order. It is linear in the projection. It isn't built: a local image implies no conversion command (Section 17.16.1), and one is built only if a deployment needs it.
+
+**4. What forgetting, the history sweeps and the checkpoint image read.**
+- **task-d110's sweep and task-d111's forgetting by order** (its cut (d), #221) **read no rows** (correcting the order's premise).
+  - `forget_history`, `forget_in_order`, `forget_one` and `sweep_history` (`coord-consensus/src/follower.rs`, and the leader's `forget_history` in `leader.rs`) drop entries from the machine's maps in memory, and write no row either.
+  - The layout doesn't touch them.
+- **Durable forgetting is task-d27's trim, and `coordd` doesn't run it yet.** No payload, executed, dependency or proposal row is reclaimed today.
+  - Its plan scans the protocol rows through the floor's epoch, and for each dependency row reads `executed_v1` by command to see whether it executed at or below the boundary (`executed_within`).
+  - Under order keys it scans the same range in intake order and takes the position from the index's executed part. Its deletes fall in runs of intake order, not one leaf each.
+- **Once a floor forgets executed history,** the prefix of `execution_v1` and `payload_v1` below it is one range delete. Today nothing deletes either, and `executed_v1` is read whole at boot (`read_history`) and at a donor's first catch-up ask.
+- **The shared image** (`export.rs`'s `traverse`, inline on the domain's loop every `FLOOR_INTERVAL`, 4,096 positions, `coord-daemon/src/floor.rs`).
+  - Today it reads `executed_v1` once for every `payload_v1` row, to keep the executed ones.
+  - Under order keys `execution_v1` and `payload_v1` are ranges to the boundary, with no read a row, and pending payloads are in another collection. That is less read work on the loop, not sized here.
+- **The local image** (Section 17.16.1) carries every collection, node-private ones included, so its shape doesn't change. The index is rebuilt at open from it.
+- **KV compaction** (`coord-storage/src/compaction.rs`) reads history and events, which this task doesn't touch.
+
+**5. The history, current, retry and retry-floor rows:**
+
+| Row | Key today | Can it share a leaf? | Whose |
+| --- | --- | --- | --- |
+| Event (`events_v1`) | revision, ordinal | it does already: revisions rise with execution | |
+| History (`kv_history_v1`) | namespace, key, revision | keyed by revision it is the event row, which holds the same entry. task-d105's step (#208) drops the history row for it, with an index by key in memory | task-d105 |
+| Current (`kv_current_v1`) | namespace, key | not by order without an index by key, since reads and guards find it by key. task-d105's second part drops it once that index exists, after its list read's pair | task-d105 |
+| Retry (`retry_v1`) | session, client, sequence | not as a row of its own: admission looks it up by retry key for every command (`retry::admit`), and a commit's commands come from many clients. See the note after the table | task-d104 |
+| Retry deletes | the same | task-d104's window that overwrites in place removes them | task-d104 |
+| Retry floor (`retry_floor_v1`) | session, client | no: one row a client, found by client. task-d104 writes it once every K commands | task-d104 |
+
+**The retry rows are small already** (review on #233). In review's model, at 8 commands a commit, the retry rows, the retry floor and the three meta rows a commit together write 0.40 pages a command, 4.5 µs a voter: under −0.02 ms an operation for all of them. The retry and floor tables stay a few leaves wide whatever the run's length, and every commit copies those leaves anyway. So folding the retry row into the execution row isn't worth a page a command, as this step first had it. It would save a fraction of 0.40 pages, and task-d104 stays small.
+
+**6. The sizes** (review's model on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752), replacing this step's first estimate), converted by the profile's rule: a local µs a command over five voters is 0.00079 ms an operation at 120 callers and 0.00066 at 30, on the EPYC 9V74.
+- **The model:**
+  - **Setup.** redb 4.2.0, opened as the adapter opens it, on tmpfs. It uses a real follower's table shapes after 100,000 operations (five voters, `replay`, 120 callers, the carry at `5ffa09e6`).
+  - **What each command writes:** a follower's rows, each into a table of its own. The payload and dependency rows come at intake. Twelve commands later come the executed, event, history, current and retry rows, a retry delete and the floor. There are three meta rows a commit.
+  - **The run:** 50,000 commands are in the tables first, then 30,000 are measured.
+  - **Its total matches the profile's:** 9.0 pages and 36.8 KB a command at 8 a commit, where the profile has 9.4 and 38.
+  - **What it isn't:** it is redb alone. It reads no journal and encodes no row, and its µs are its host's.
+- **By table at 8 commands a commit:** the three rows 5.7 pages, history 1.8, current 1.25, events 0.30, and the retry rows, floor and meta rows 0.40 together.
+
+| Commands a commit | Today: µs and pages a command | By order, move included: µs and pages a command | The three rows alone: today, then by order |
+| ---: | --- | --- | --- |
+| 3 | 77.6, 11.1 | 51.9, 5.8 | 44.1 µs and 6.6 pages, then 18.8 and 1.0 |
+| 8 | 67.4, 9.0 | 35.5, 3.9 | 37.9 and 5.7, then 7.7 and 0.57 |
+| 30 | 61.2, 10.0 | 29.8, 4.5 | 31.7 and 6.0, then 4.6 and 0.60 |
+
+- **The three rows don't depend on the mix.** With every write on 16 keys, history is 0.8 pages and current 0.13, and the total goes from 7.0 to 1.9 by order. With 100,000 commands in the tables, the three rows are 6.2 pages today and 0.60 by order.
+- **In ms an operation, two ways:**
+  - **By the model's µs and the conversion:** 30 to 35 µs a voter at 8 a commit is −0.12 to −0.14 at 120 callers, and 22 to 26 µs at 3 a commit is −0.07 to −0.085 at 30.
+  - **As a share of the thread:** the model's thread falls 47% at 8 a commit, 33% at 3 and about half at 30. Applied to the 74 to 86% of the real thread that follows pages, that is −0.14 to −0.17 at 120 callers and −0.10 to −0.12 at 30.
+
+| Part | ms an operation, 120 callers | ms an operation, 30 callers | Basis |
+| --- | --- | --- | --- |
+| **The three rows by order, the move included** | **−0.12 to −0.17** | **−0.07 to −0.12** | review's model, converted both ways above |
+| Inside that: the move at execution, against leaving the payload in place behind a node-private locator by position | +0.009 (2.4 µs a voter at 8 a commit) | +0.008 to +0.013 (2.3 to 3.9 µs at 3) | review's model |
+| The leader's proposal row | −0.006 to −0.007 | −0.006 to −0.007 | counted under task-d103, which stops writing it (#206), not here |
+| The index | under 0.001, CPU | under 0.001 | inferred |
+
+**What the first estimate had, and why it was low.** It had three pages a command gross, −0.09 to −0.11 ms an operation, and −0.05 to −0.08 net at 120 callers and −0.03 to −0.045 at 30.
+- **Its residual terms hold.** The model's ordered rows cost about 47 µs a commit, which fits their five right-hand leaves.
+- **Its gross was low.** A digest-keyed row in a table that large copies its leaf and the branch page above it, so the three rows are 5.7 to 6.6 pages, not 3.
+
+**What the sizes say:**
+- **This is the largest lever on record at any commit size.** It is about half to three quarters of the gap to 2.0× at 30 callers (−0.156 ms an operation), and a third to a half of it at 120 (−0.362).
+- **It doesn't need task-d86's cadence.** By order the model's thread is 35.5 µs at 8 a commit and 29.8 at 30, so the cadence adds to this task and isn't needed for it.
+- **The move at execution costs about 0.01 ms an operation.** It buys three things:
+  - executed history read by position with no index (resolve, catch-up, the image);
+  - a pending table bounded by what is unexecuted;
+  - a common hash with no node-private key in it.
+- **What the pair reads.** A follower's fresh pages should fall from 9.4 to about 4 a command at 8 to 11 commands a commit, and to about 6 at 3. The first estimate had 7.0 to 7.4, so the pair's reading tells the two apart at once.
+- **The counting build splits the file's bytes by table,** so that each row's size is read rather than inferred, here and for task-d104 and task-d105.
+- **Not touched here:** the table reopened every row (5 to 6.5% of the thread) is lever 3 on #185, and the commit's fixed cost is task-d86's.
+
+**The order (the lead's, on review's word):** the top code priority, needing neither task-d86 nor task-d105 first. The code goes in two steps:
+1. **The dependency rows alone.**
+   - They are node-private, so this step changes no image and no common hash.
+   - Their readers are boot, catch-up, the campaign and trim, and the store's own rewrites and deletes.
+   - It builds the index's intake part, the lowering's key assignment, rules (c) and (d), and the layout check.
+   - By the table's shape it is about a third of the gain; review didn't measure it apart. Its evidence splits the counting build's file bytes by table.
+2. **The payload and executed rows.** This step brings the pending collection, the move, the index's executed part, and rules (a) and (b). It also raises the shared image's version and changes the common hash's membership.
+
 <a id="s17-2"></a>
 ### 17.2 Ordered keys and views
 
@@ -1906,6 +2151,7 @@ Immediate and local two-phase hardening are selected from the reviewed redb cont
   - the collector answers a resolve from the projection (`retained_answer` and `settle_from_records` in `coordd`, `settle_from_record` in the collector), so a command the journal holds is never answered `Unknown` or `Forgotten`; the projection must have replayed the journal before the node answers;
   - the divergence tooling reads `executed_v1` from the projection;
   - an engine not under the journal (the strict single-store reference, a restore's fill, a checkpoint's install target) keeps two-phase commit.
+  - *Under task-d117's design step ([Section 17.17](#s17-17)), not built:* a resolve is answered from the retry window in memory, which boot rebuilds from the image and the journal before the node answers; the divergence tooling reads executed history from the buffer and the segments; and the reference store keeps its rows.
 
 Optional `journaled-replay`: after task-j06 qualification, atomic working-state updates need not fsync each transaction because durable redo plus a published durable checkpoint reconstruct acknowledged state. Discard or validate working generations after crash; never depend on an unsynced live database as the only source. Provide a separate internal atomic-working-state capability and durable checkpoint method; do not weaken commit_durable or expose an unsafe actor/operator switch. Keep strict mode until the full composed matrix and measured benefit justify enabling replay mode.
 
@@ -2330,6 +2576,8 @@ Bound backlog, retained bytes, per-domain transitions, memory indexes, rewrite a
 | SharedCheckpointV1 | Agreed common state/floor and catch-up lineage, not unrelated local promises/obligations |
 | Observer snapshot | Declared capability's common state/history and finalized cursor; may not even be full MVCC |
 
+*Under task-d117's design step ([Section 17.17](#s17-17)), not built:* the local image carries the recovery map, the retry window and the history tail beside the application state, and names the history segments below its boundary; the shared image carries the retry window and the history digest in place of `payload_v1` and `execution_v1`.
+
 Local checkpoints are same-engine lifecycle artifacts, not migration interfaces. Restoring a common/observer image cannot reset an existing voter's obligations. Logical encodings aid verification but imply no conversion command.
 
 <a id="s17-16-2"></a>
@@ -2382,6 +2630,252 @@ Physical redo reclamation preserves unresolved obligations inside complete local
 | Sync panic or shard corruption | Stop publication, recover/quarantine explicitly |
 
 Previously durable-prefix damage is not normal torn tail. Pin/test engine recovery mode; permissive mode cannot silently discard acknowledged state.
+
+<a id="s17-17"></a>
+### 17.17 Protocol state in the journal only
+
+*Added by task-d117's design step: proposal 2 of [the batching rule](tuplesky-batching-rule.md#41-proposal-2-protocol-state-in-the-journal-only-lever-7).* This is a design step; nothing below is built. Sections 17.1, 17.3.4 and 17.16 keep today's text until each code step lands, and each step amends them as it lands.
+
+**Why.** The owner's rule: "Journal and store are for recovery. Storing command state individually, paying a storage round trip per command, is not batching." The audit against it (#185, [6835865051](https://github.com/tuplesky/tuplesky/pull/185#issuecomment-6835865051)) counted about 14 rows a command at a follower, 2 of them application rows. Every other row is a copy of what the journal already holds, written so that a restart, a donor or a resolve can read it.
+
+**What this step decides.**
+- **The projection keeps what reads need:** the application collections, the identity and configuration rows, `checkpoint_v1`, and `meta_v1` once a commit.
+- **The rest leaves it,** for three places:
+  - **live protocol state** (promises, Syncs, seals, dependency and proposal rows, payloads not yet executed): an in-memory recovery map kept by the store's lowering, carried by the local image, and rebuilt from the journal above the image;
+  - **the retry window** (`retry_v1`, `retry_floor_v1`): in memory, versioned for views, carried by both images, rebuilt from the journal above the image;
+  - **executed history** (`execution_v1`, `payload_v1`, `decided_v1`): an in-memory buffer above the last segment, and below it immutable history segments, one every `FLOOR_INTERVAL` (4,096) positions, written off the loop.
+- **The journal's retention still ends at the published image (`C`).** No reader of history reads the journal, so no voter's frontier pins it.
+
+**The collections, by where they go.** Rows a command at a follower are the audit's.
+
+| Collection | Rows a command, follower | Under this step | Durable in | Code step |
+| --- | ---: | --- | --- | --- |
+| `meta_v1` | 1 | `kv_revision`, `retention_floor` and `lease_authority` once a commit (point 5) | the projection | 1 |
+| `protocol_v1`: dependency, proposal | 2.2 | the recovery map (point 2) | the local image and the journal above it | 2 |
+| `protocol_v1`: promise, Sync, seal | under 0.01 | the recovery map | the local image and the journal above it | 2 |
+| `pending_payload_v1` | 2.2 | the recovery map | the local image and the journal above it | 2 |
+| `retry_v1`, `retry_floor_v1` | 2.5 and 1 | the retry window (point 4) | both images and the journal above them | 3 |
+| `payload_v1`, `execution_v1`, `decided_v1` | 1 each | the history buffer, then segments (point 3) | segments, the local image's tail, and the journal above it | 4 |
+| `kv_current_v1`, `events_v1`, sessions, leases, policy, grants | 2 | unchanged | the projection | |
+| `config_v1`, `checkpoint_v1` | 0 | unchanged | the projection | |
+
+About 11.8 of a follower's 13.9 rows a command leave, 85%. What stays is 2 application rows a command and a tenth of a meta row.
+
+**1. The store's layout, and its conversion.**
+- **Each code step raises `STORE_FORMAT_VERSION`** (4 today) and removes its collections' tables from the projection. A domain runs one layout, recorded at initialization and checked at every open (Section 17.1, point 3). A store of another layout is refused with the reason.
+- **The images' versions are raised with the steps that change them:**
+  - the local image (`LocalRecoveryCheckpointV1`, format 2) gains the recovery section at step 2, the retry window at step 3, and the history tail at step 4;
+  - the shared image (`SharedCheckpointV1`, format 2) carries the retry window at step 3, and the history digest in place of `payload_v1` and `execution_v1` at step 4.
+- **The journal's records don't change.** The machine keeps writing the same `StoreUpdate`s to the same collections by command, through more than twenty sites in `coord-consensus`. Only the store's lowering decides where each lands. So the consensus crate, the wire and what a vote rests on don't change.
+- **The reference store (`StoreWorker`) keeps today's rows.** It has no journal to recover from, so its protocol rows stay in its store. Under task-j08's comparison, the two are compared on application state and on the machine each recovers (`read_protocol`), not on the tables.
+- **No existing store moves.** Nothing is deployed, so a store or image of the old layout is refused and a test domain starts fresh, as for task-d113 and task-d105.
+- **The conversion is a release condition,** carried in the plan like task-d113's. It is offline, mechanical and lossless:
+  - the protocol rows and pending payloads become the local image's recovery section;
+  - `execution_v1`, `payload_v1` and `decided_v1` become segments by position, and the history digest is computed over them in order;
+  - `retry_v1` and `retry_floor_v1` become the retry window, each retained result with its request read from `payload_v1` at its position.
+
+  It isn't built: it is built only if a deployment needs it.
+
+**2. The recovery map: live protocol state in memory.**
+- **What it is.** An ordered map in the store, keyed exactly as the rows are today: intake keys for dependency and proposal rows (Section 17.1's layout), the pending key for payloads, the epoch keys for promises, Syncs and seals. The lowering applies each protocol update to it instead of to a redb table. So `read_protocol` (`coord-storage/src/protocol.rs`), the recovery cut (`cut.rs`) and the `Assigner` read it as they read rows today, through the same `OrderedRead`.
+- **Why the store keeps it, not the machine.** The machine's state on the loop is ahead of the projection and mixes durable state with what isn't journaled yet. The image must hold the state the journal implies at exactly `C`. The lowering already folds the journal in order into rows. Folding it into memory instead keeps that state, at every commit's stamp, with no change to the machine.
+- **Kept as the intake index is (Section 17.1, rules (d) and (e)).**
+  - It is a persistent ordered map: each version shares what didn't change with the one before. So publishing a version a commit costs the commit's updates, not a copy. That is a new dependency (a crate such as `im`), or a B-tree of shared nodes of our own; the code step picks one.
+  - A commit's changes are staged with the commit, and published when it returns OK, together with the read gate and the index.
+  - An uncertain commit holds them with `pending_meta`, and they are published or dropped as the meta read back says.
+  - A quarantine drops the map, and the next open rebuilds it (point 7).
+  - A pipelined commit in flight is lowered over the staged changes of the commits before it, as the index's are.
+- **What it holds, and its bound.**
+  - Commands not yet executed: their dependency rows (the leader's proposal row too) and pending payloads. At most the table's capacity (`MAX_TABLE_CAPACITY`, 1,000), its reserve and a Sync's placeholders: about 2,000 commands at about 1 KB each (a dependency row and an 805-byte payload), so about 2 MB.
+  - **Promises and seals:** the promise, and a seal a configuration epoch, as today.
+  - **Syncs: at most two** (Codex on #258).
+    - Today the lowering keeps a Sync row for every ballot (`sync_key` names it), and trim never drops one (`coord-checkpoint/src/trim.rs`, `classify`). Each is up to about 2 MB (task-d20's cap). Moved into memory as they are, they would grow with every leader change.
+    - Boot reads two of them. One is the synchronized ballot's, whose installation resumes (`Follower::recover_with_syncs`). The other is the promised ballot's when this voter leads it, whose campaign resumes rather than reselects (`RecoveredProtocol::resumable_sync`).
+    - So the map keeps those two, and drops any other once it is neither: when a later Sync is bound here, or a later ballot's synchronization is durable. Nothing reads a dropped one.
+    - The image carries the same two. A store of today's layout is refused (point 1), so none has to be dropped from one.
+    - At most about 4 MB.
+  - At execution the lowering moves the command's payload and dependency row out, as it does today (`assign_executed`, `move_decided`): to the history buffer (point 3), and the payload to the retry window too (point 4). A released command's rows go at the Sync's release, and a pulled command's at its install, as today.
+  - **Each key's latest decided command stays as well** (task-d116, point 3; Codex on #260).
+    - A key keeps naming its latest command after that command executes, and the key's chain needs that record and its paths. Neither the key index nor the intake index leads from a key to it (task-d116).
+    - So the map also keeps, under each key, the decided record of the key's latest command: one copy however many keys name it.
+    - The record goes once every key it names has a later command. A later change to it (point 3) is written there.
+    - The image carries it with the rest of the map, and boot reads it there.
+    - It costs about one more map update a key a command names.
+    - **This part grows with the keys the domain has named, not with history,** as task-d105's key index does. A dependency row is about 200 bytes, the 1 KB above less the payload, so this part is about 200 bytes a key at most, less where one command is the latest for several keys. A domain whose commands have named a million distinct keys holds up to about 200 MB here; today `decided_v1` holds a record for every command.
+  - So the map is bounded by the table, two Syncs and the domain's keys, not by history or leader changes. That is about 2 MB of commands, 4 MB of Syncs and the decided overlay (point 3), about 6 MB, plus about 200 bytes a key named. Today's rows are bounded by nothing, since nothing trims them.
+  - **Not taken: a key's latest command kept as a position, its record read back from history.**
+    - It would be about 40 bytes a key.
+    - But trim (task-d27) would then have to keep every segment holding some key's latest record, which is the history the floor exists to drop.
+- **Who reads it.**
+  - The lowering, on the materializer's thread, for the store's own writes and the move.
+  - Boot's `read_protocol`, after the attach, when nothing else runs.
+  - The export, which takes the version published with the commit it pins (point 6).
+  - Nothing on the loop reads it while the domain runs: a campaign's report comes from the machine's ledger, which reads no rows (task-d77).
+- **CPU (inferred):** an insert or removal in a persistent map for each protocol update, about 0.3 to 0.5 µs, at about 8 updates a command: 2 to 4 µs a command a voter, against the redb rows' share of the materializer.
+- **Not taken:** a plain map copied at each pin. It would cost a copy of the whole map, 6 MB and up, a publication on the materializer's thread, and the pin would have to wait for the materializer to reach a commit boundary.
+
+**3. Executed history: a buffer, then segments.**
+- **What executed history is:** for each position, the execution record (command, revision, result digest), the payload, and this node's decided record (the dependency row moved at execution, node-private, with its epoch). Today they are `execution_v1`, `payload_v1` and `decided_v1`.
+- **Who reads it, and how far back:**
+  - a donor (task-d08's catch-up): from the asker's frontier;
+  - a campaign's executed rows (task-d77): commands executed above the slowest reporting voter's frontier;
+  - a divergence stop: around two positions;
+  - boot: the current epoch's decided records, and the executed index's command list (point 7);
+  - trim (task-d27, not run by `coordd`): below the floor.
+  - Resolve no longer does: the retry window carries the request (point 4).
+- **The buffer.** The lowering appends each executed position's three parts to an in-memory buffer as it lowers the executed row, published with the commit. An entry's execution record and payload never change, so a view reads the positions at or below its frontier under a short read lock. Its decided record can change, below.
+- **A decided record can change after execution** (Codex on #258).
+  - A later ballot's re-proposal or Sync can name a command this voter already executed. Its dependency update still reaches the decided record: `Assigner::after_execution` (`coord-storage/src/intake.rs`) writes it over the record at the command's position when it is of the same or a later configuration epoch, and deletes it in its own epoch.
+  - **So the change goes to the recovery map,** under the position's decided key: an overlay over the buffer and the segments, versioned with the rest of the map. `after_execution` writes there in place of `decided_v1`, and a deletion is a tombstone.
+  - **Every reader of a decided record reads the overlay first:** boot's decided records, a donor's page, a campaign's executed rows, and the fence.
+  - **The image carries it** as part of the recovery map at `C`. A journal prefix retired below `C` therefore loses none of it.
+  - **It is folded at the next boundary.** When the checkpoint thread writes a segment, it first writes again each earlier segment the overlay touches, with the overlay's versions in place. That is a new file under the same rule as a segment's first write (temporary name, sync, rename, directory sync). Once the rewrite is durable, the map drops those entries. Until then the overlay stays the first read.
+  - **Its bound:** an executed command is named by a later protocol update only while a recovery's selection or a leader's re-proposal holds it. So the overlay holds at most a table's worth of entries for each leader change between two boundaries, about 0.2 MB each. A rewrite is a segment's write, about 4.5 MB, and happens only after a leader change that named executed commands.
+- **Segments.** When the buffer passes a multiple of `FLOOR_INTERVAL` (4,096 positions), the checkpoint thread writes the 4,096 positions below it as one segment:
+  - one file, written once: to a temporary name, synced, renamed, and its directory synced;
+  - by position: a header (origin, first and last position, format), the entries, and a footer holding each command's 8-byte prefix and position (the executed index's part, point 7), the history digest through the last position, and a checksum;
+  - the buffer drops a segment's positions once the segment is durable;
+  - a segment is never changed in place: the decided overlay is folded into a new file (above).
+  - So the buffer holds at most about two segments' worth: about 9 MB at 1.1 KB a position.
+- **One storage write a segment** is the rule's batch taken to its limit: at the bar's load, a 4.5 MB sequential write every two seconds or so, off the loop, against today's three rows a command in the materializer's commits.
+- **The history digest.** The lowering keeps a running digest over each executed position's replicated part: `blake3(previous ‖ position ‖ command ‖ admission ‖ revision ‖ result_digest)`, where `admission` is the payload's `PayloadRecordV1::admission_digest()`.
+  - **Why the admission is named** (Codex on #260). The command identity covers only the retry key and the logical request (`CommandId::derive`, `coord-types/src/identity.rs`). The payload also binds what the admitting verifier attested and `ack_through`, and `admission_digest()` (`coord-consensus/src/rows.rs`) is what replicas compare for those. Two payloads under one identity can differ there without changing the revision or the result digest. With the admission in the chain, the digest covers the whole payload, as today's export of its bytes does.
+  - It is node-local state, not a journal or wire field. task-d35's execution chain would replace it if built, provided it covers the admission too.
+- **The common hash and the floor.** `payload_v1` and `execution_v1` leave the common hash. The shared image at a floor boundary carries the history digest through the boundary in their place. Segments end on the floor's boundaries, so the digest through a boundary is the segment's footer, or the buffer's when the segment isn't written yet. Two voters with different executed histories below a boundary still export different roots. The floor's export no longer reads history: today `export.rs` reads `payload_v1` and `execution_v1` up to the boundary, inline on the loop every 4,096 positions.
+- **Not taken:**
+  - **History from the journal by position**, as the batching rule first had it. A command's history is in up to three records at different positions (its intake, its decision, its execution), so the index would cost about 36 bytes a command. Retention would then follow the slowest voter's frontier, and boot reads every retained record at open (`open_existing` walks and verifies them all). The reach would still end somewhere, and the same question would return below it.
+  - **One row a commit in the projection holding the commit's history.** It meets "one write a batch", but it is a second copy written on the hot path: about 0.3 pages a command on the materializer, against segments written off the loop.
+  - **History in memory:** about 1.1 KB a command, without bound until task-d27.
+
+**4. The retry window in memory.**
+- **What it holds:** each retained result (`RetryRecordV1`) and each client's floor and width, as `retry_v1` and `retry_floor_v1` do today. Each retained result also holds its command's request, the payload's logical request, moved there at execution (point 2).
+- **Why the request.** A resolve authorizes a retained result against its request (`requested`, `bins/coordd/src/serve.rs`), which today reads `payload_v1` at the retry row's position. With the request beside the result, a resolve reads no history. A retained result can outlive any history a voter keeps, since an idle client keeps its last results until its session ends. A restored domain's resolves then work too.
+- **Versioned for views,** as task-d105's key index is. Each entry keeps its versions by execution position. A view reads the newest at or below its frontier, and versions behind the oldest pinned view are dropped. The planning view's overlay (the group's own writes) is unchanged.
+- **Its readers:** planning (`retry::admit`, `lookup`, `floor`, `retirement`), resolve (`resolve_retained`, `requested`), settlement from the record (`records_for`, `conflicts_for`), release-again (`voter.rs`), and the shared and local exports. Each reads memory instead of a redb get, which is proposal 1's gain, not counted here.
+- **Its bound is task-d26's.** At most the width plus task-d104's `K` retained results a client, each up to the request and response limits. In steady state a client acknowledges each request, so it holds one or two. The bench's 120 clients hold about 240 results, about 0.3 MB. A domain of many clients that never acknowledge reaches the contract's bound, which is memory now, not disk, so task-d26's contract has to state it as memory.
+- **It agrees with task-d104 (#207):** its batched retirement and its window that overwrites in place both still apply, to memory.
+
+**5. `meta_v1` once a commit.**
+- Today application batches put `kv_revision`, `retention_floor` and `lease_authority` as ordinary updates (`materialize.rs`): about one meta row a command in the audit. The stamp and the execution frontier are already written once a commit (`DurableMeta::write`).
+- The lowering keeps the last put of each `meta_v1` key in a commit and writes it once. Nothing reads the values in between from the projection: the planning view's overlay holds the group's own, and the recovery cut lays the journal's updates over its snapshot as they are.
+- It needs no format change, and it is its own small PR, first.
+- **Built** by the first code step. `Lowered::keep` (`lowering.rs`) gives a `meta_v1` key the commit has already written the later value in its row's place, so the commit writes each key once. The key index still sees every update, as it is assigned and before the row is kept.
+
+**6. The images, and what journal retention depends on.**
+- **The local image at `C`** holds:
+  - the projection's application collections at `C`, as today;
+  - the recovery section: the recovery map at `C`;
+  - the retry window at `C`;
+  - its history boundary: the end of the last segment durable at the pin;
+  - the history tail: every executed position above the boundary, through `C`'s execution position. That is at most about two segments' worth, when a segment's write is still in flight at the pin.
+- **The pin.** `pin_local` takes the recovery map's version, the retry window's versions and the buffer's entries as published with the commit it pins, so all three are at the projection's snapshot's stamp.
+- **A publication's order (Section 17.16.3, step 2, extended).** An image names only segments already durable, and carries every executed position above them. So once the image is durable, the pointer may be appended, as today. A segment that becomes durable after the pin is above the image's boundary, which is harmless (boot, step 4).
+- **What journal retention depends on.** The prefix through `C` is retired once the pointer is durable, as today. Nothing else pins the journal:
+  - the recovery map and the retry window are in the image at `C`;
+  - executed history at or below `C` is in segments or the image's tail;
+  - no reader of history reads the journal.
+
+  So the journal's length stays bounded by the publication's cadence (4,096 records under `strict`; 65,536 records and 30 s under `replay`) and the tolerance of `J − C` (Section 17.16.3), as today.
+- **Under `strict` the projection no longer recovers alone.** Its application rows are durable at every commit, as now. The recovery state is in the image at `C` and the journal above it. So under both profiles boot reads the image and replays `(C, J]` into memory.
+- **The image is smaller.** Today `export_local` copies every collection, executed history included, at every publication. After step 4 it copies the application state, the recovery section, the retry window and at most about two segments of history. That saves checkpoint-thread work that grows with history; it isn't sized here.
+- **Segments are reclaimed at the floor** (task-d27): a segment wholly below the forgetting floor goes whole. Until `coordd` runs task-d27, nothing reclaims them, as nothing trims executed rows today.
+
+**7. What each reader reads, its cost and its bound.**
+
+| Reader | Today | Under this step | Cost | Bound |
+| --- | --- | --- | --- | --- |
+| Boot (`read_protocol`, `restore_execution`, `restore_payloads`) | the epoch's protocol rows, all of `execution_v1`, the epoch's `decided_v1`, the pending payloads, `payload_v1` for executed records | the recovery map (image at `C`, then `(C, J]`); the executed index from the segments' footers and the buffer; the epoch's decided records from the segments and the buffer | the recovery replay below; the footers at about 16 bytes a command, against today's scan of `execution_v1` | the recovery replay by the publication's cadence; the footers by history, as today, until task-d27 |
+| Catch-up served (`catch_up::page`, task-d08) | a range of `execution_v1`, then `payload_v1` and `decided_v1` by position | the buffer above the last segment; one segment's range below | one sequential read a page, against three point reads a command | what segments keep, as today's rows: everything until task-d27 |
+| A campaign's report | the machine's ledger, no rows | unchanged | none | the table |
+| A campaign's executed rows (task-d77, `catch_up::executed_rows`) | the index's executed part, then three rows | the index's executed part, then the buffer or a segment | a point read in a segment | as catch-up |
+| Resolve (`retained_answer`, `requested`) | `retry_v1`, then `payload_v1` at its position | the retry window, with the request | a lookup in memory | task-d26's retained results |
+| Settlement from the record (`records_for`, `conflicts_for`) and release-again | `retry_v1` | the retry window | a lookup in memory | the same |
+| Planning (`retry::admit`, `retirement`) | `retry_v1`, `retry_floor_v1` through the planning view | the retry window at the view's frontier, with the group's overlay | a lookup in memory | the same |
+| A divergence stop (`mismatch`, `executed_near`) | `execution_v1` around two positions | the buffer or a segment around them | once, at a stop | as catch-up |
+| Trim and its fence (task-d27; no production caller) | `protocol_v1` and `decided_v1` surveyed; `execution_v1` by the index | segments below the floor go whole; the recovery map holds no executed command, so there are no protocol rows to plan | a file delete a segment | the floor |
+| The floor's shared image | `payload_v1` and `execution_v1` to the boundary, inline on the loop | the history digest at the boundary, and the retry window | none for history | none |
+| The local image | every collection | point 6 | O(application state + 2 segments) | the publication |
+
+- **The decided overlay** (point 3) is read first by every reader above that reads a decided record.
+- **The executed index** (Section 17.1, point 1: command prefix to position) stays in memory. It is rebuilt at open from the segments' footers and the buffer, instead of from a scan of `execution_v1`. A campaign's rows, a stop and the fence use it as today.
+- **The intake part of the index** stays as it is: the recovery map keeps intake keys, so the store's own writes find a command's row through it.
+- **`plan_trim`, `TrimFence::command`, `retire_updates` and `executed_order`** have no production caller today. They are rewritten against segments when task-d27 wires trim. Whether the fence's command lists outlive the segments' bodies is task-d27's to settle.
+
+**Boot, step by step.**
+1. The journal opens, walking its retained records, as today: at most `J − C`.
+2. The projection opens. It is smaller: no protocol or history tables.
+3. The baseline is read (`recovery_baseline`), and the image at `C` is loaded, as today. Its recovery section, retry window and history tail load into memory. Under `replay`, an invalid projection is reinstalled from the image's application part, as today.
+4. The segments' footers are read for the executed index. A segment above the image's history boundary is checked against what the replay below rebuilds: equal, it is kept; torn or different, it is written again.
+5. **The recovery replay:** `(C, J]` is lowered into the recovery map, the retry window and the buffer. `(M, J]` is lowered into the projection's application rows too, as today, where `M` is the projection's stamp. The records `(C, M]` are lowered into memory only, since their application rows are already in the projection.
+6. `read_protocol` reads the recovery map, the buffer and the segments, and the voter starts.
+
+**Its cost (inferred):** the recovery replay lowers into memory, a few µs a record. Under `strict` that is at most 4,096 records, about 10 to 30 ms. Under `replay` it is at most 65,536 records, about 0.2 to 0.4 s, or what `J − C` reached after a failed publication. Against that, the open no longer scans `protocol_v1` (task-d113's intake index: about 0.9 s at 10⁶ rows) or `execution_v1`. The boot line gains the phases: `recovery_section`, `recovery_replay` and `segments`. Acceptance reads them at 10⁵ and 10⁶ commands. The owner accepts "(reasonable) recovery time for maximum throughput"; this is a bounded addition, not one that grows with history.
+
+**8. The crash matrix and fault runs it re-earns.**
+
+**The crash cuts, each a test at every cut under `strict` and `replay`:**
+- **Every operation of the journal and the projection,** task-j05's composed matrix (#212, not yet on the carry; the code steps wait for it). The recovered machine (`read_protocol` over the recovery map) and the retry window equal what a replay of the whole journal into an empty store gives. Today's checks of the protocol and executed rows become checks of the map, the window and the history.
+- **Every step of a publication with its segment:**
+  - a segment durable and the image not: the prior image and its history boundary hold, and the segment above the boundary is checked at boot (boot, step 4);
+  - the image durable and its pointer not: the prior image holds, and the new files aren't selected;
+  - the pointer durable and retirement not: the new image and the overlap replay without double effects;
+  - **negative control:** an image that names a segment not yet durable, then a crash, is caught: the retired prefix holds history that neither a segment nor the image has.
+- **Every step of a segment's write** (temporary file, sync, rename, directory sync): a crash leaves no segment or a whole one.
+- **The decided overlay:**
+  - a decided record changed after its segment is durable, then a crash before the fold: boot reads the change from the image's recovery map and `(C, J]`, not the segment's older version;
+  - a crash at each step of the fold's rewrite: the old segment or the new one, and the overlay until the new one is durable;
+  - **negative control:** a fold that drops the overlay's entries before the rewrite is durable, then a crash, is caught: boot reads the older decided record.
+- **Syncs superseded:** a crash between binding a later Sync and dropping an earlier one keeps the two boot reads; a boot after many leader changes holds at most two.
+- **A damaged segment:**
+  - below the image's history boundary, its positions are in no journal, so the node quarantines, as for a damaged image (`coord-checkpoint/tests/local.rs`);
+  - above it, boot writes it again from the replay.
+- **The recovery replay stopped part way and restarted:** it writes only memory, so it starts again.
+- **An uncertain commit, settled both ways:** the recovery map, the retry window and the buffer are left as the store has them (rule (d)).
+- **A pipelined commit taken back by `settle`:** its staged changes go with it.
+- **Under `strict`:** a projection at `M` with the recovery state from the image at `C` and `(C, J]`.
+
+**The tests today that rest on the rows, each rewritten to the same claim:**
+- `coord-storage`:
+  - `journaled_real.rs`: the matrices at every projection write and sync, under `strict`, under `replay` with a cadence, and around a publication;
+  - `replay_profile.rs`: lost working commits replayed, the cadence, a publication that syncs before it retires, a projection behind the baseline;
+  - `journaled.rs`: the recovery cut behind materialization, replay restoring exact state, the seal recovered through the cut, a replaced node;
+  - `composed.rs`: boot between the record and the projection, a promise recovered before materialization, a group's boot;
+  - `pipelined.rs` and `appender.rs`: a boot with a commit or an append out;
+  - `intake.rs`: boot rebuilding the same machine, the cut over a rewrite or a delete not yet materialized, a replay writing the same keys.
+- `coord-checkpoint`: `cycle.rs` (a retired prefix recovered from the image and the suffix), `local.rs` (the image is the whole recovery state, a crash at each publication step, a damaged image, an installed image equal to the pinned state), `off_thread.rs` and `pointer_job.rs`.
+- `coordd`: `cli.rs`'s restart, a restarted replica recovering what it owed, a baseline published and come back on, answers kept across a restart, a killed and restarted leader, a late restart catching up; `store.rs`'s reinstall cases; and `coord-daemon/tests/node.rs`'s resolve after a pipelined boot.
+- **Unchanged:** `recovery.rs` (the reference store keeps its rows), and the simulators. `protocol_sim.rs` and `catch_up.rs` restart from a model of the durable rows, which stands for the logical state recovery gives back, not for the layout.
+
+**The fault runs** (testing's, on the runner, after each step):
+- a follower killed under load and restarted: its boot line, and catch-up served from the donors' buffers;
+- a follower down longer than a segment and longer than a publication interval: catch-up served from segments;
+- the leader killed: the campaign, and task-d77's executed rows from history;
+- a kill during a publication, between the segment and the pointer;
+- under `replay`, a lost projection reinstalled from the image;
+- a retry after a kill, answered from the rebuilt retry window, and a resolve after a restore from backup.
+
+**9. Sizes.** On the batching rule's terms (Sections 3 and 7): local µs a command over five voters, then ms an operation at 0.66 commands an operation, and the 7763 scaled at the materializers' 1.37.
+- **Gross:** −185 µs a command at the materializers (the batching rule's Section 4.1, range −175 to −195).
+- **What this design adds back (inferred):** the recovery map's updates, 2 to 4 µs a command a voter; the buffer and the digest, about 1; the retry window's versions, about 1; the segments' write, about 0.3 a command off the loop. That is 4 to 6 µs a voter, +20 to +30 µs five voters.
+- **Net:** about −155 to −165 µs a command: **−0.10 to −0.11 ms an operation locally, −0.14 to −0.15 on the 7763.**
+- **By code step,** split by each step's share of the rows that leave (the pair reads each):
+
+| Step | Rows a command, follower | Gross µs | Added µs | Net, ms an operation locally |
+| --- | ---: | ---: | ---: | ---: |
+| 1. `meta_v1` once a commit | −0.9 | −10 (its leaf is copied anyway) | 0 | −0.007 |
+| 2. Live protocol state in the recovery map | −4.4 | −69 | +10 to +20 | −0.032 to −0.039 |
+| 3. The retry window | −3.5 | −55 | +5 | −0.033 |
+| 4. Executed history in segments | −3.0 | −47 | +5 | −0.028 |
+
+- **Not counted:** the retry and planning reads served from memory (proposal 1's), the image's smaller export, and the floor's export reading no history. None of them shows in a 25 s pair.
+
+**10. The order of the code steps.** One PR each, each with its own pair (the counting build's bytes by table, and the materializer's µs a command at each voter) and its crash tests:
+1. **`meta_v1` once a commit.** No format change. Built.
+2. **Live protocol state in the recovery map,** with the image's recovery section and the recovery replay. Node-private only: no image shared, no common hash changed. It needs task-j05's composed matrix on the carry first.
+3. **The retry window,** with the request beside each result. It changes the common hash's `retry_v1` and both images. It goes before step 4, so that step 4 owes resolve nothing.
+4. **Executed history in segments,** with the history digest in the floor's root.
+
+**What it supersedes:** task-d103's proposal row (the row leaves with step 2), task-d104's retry rows (its rules apply to the window in memory), lever 6's part 2 (the retry window in memory), and, for the rows that leave, task-d113's keying by order. task-d113's intake keys and its index stay, in memory.
 
 <a id="s18"></a>
 ## 18. Deterministic core and production execution
@@ -2520,9 +3014,9 @@ Use keyring-core with Apple store on macOS and zbus Secret Service on supported 
 
 Reference issuer has protected mounted PKCS#8 CA key, restrictive permissions, encrypted storage and narrow signer port, deployable before quorum. WIF does not remove root secrets. A KMS/HSM signer can substitute without membership changes but is not a missing v1 dependency.
 
-Use rcgen to verify CSR proof-of-possession. Independently check configured CA/key match and CA/key-usage constraints at startup; signing alone does not validate those. Build SAN/subject/EKU/constraints from verified role policy, never blindly copy CSR extensions. Reject CA requests, bad algorithms/critical extensions, overlong lifetime and unauthorized names. x509-parser extracts; rustls validates paths/handshake. [I6, I14]
+Use rcgen to verify CSR proof-of-possession. Independently check configured CA/key match and CA/key-usage constraints at startup; signing alone does not validate those. Build SAN/subject/EKU/constraints from verified role policy, never blindly copy CSR extensions. The certificate's cluster, domain and role are the rule's, never the request's: a request only chooses among its workload's rules, by role and domain, and must name the domain when those rules reach more than one. Reject CA requests, bad algorithms/critical extensions, overlong lifetime and unauthorized names. x509-parser extracts; rustls validates paths/handshake. [I6, I14]
 
-Bind cluster/node/generation/role SANs plus normal endpoint DNS. Current committed key/incarnation authorizes votes, not merely certificate validity. Keep normal rustls validation; no permissive URI workaround. Same-key/generation renewal is not membership; voting-key/generation replacement is a committed lifecycle transition. Expiry affects warm sessions. Cloned identity cannot count twice and requires orchestration/storage fencing.
+Bind cluster/domain/node/generation/role SANs plus normal endpoint DNS. A certificate reaches only the domain it names: a cluster's domains share its issuer, so the binder takes the domain from the certificate and refuses a `Hello` naming another. Current committed key/incarnation authorizes votes, not merely certificate validity. A non-voter peer role does not bind to a committed voter's node, at any generation, until a prepared transition names that incarnation (a successor staged as a learner, task-d39); the transport keys a link by replica only for a connection bound as a voter, and the role travels in each frame's provenance, so the rule holds at three places rather than one. That refusal has its own reason and a count on the accepting node, since no issuer following its policy signs such a certificate, and `inspect` names it on the node that holds it, which refuses to start. Keep normal rustls validation; no permissive URI workaround. Same-key/generation renewal is not membership; voting-key/generation replacement is a committed lifecycle transition. Expiry affects warm sessions. Cloned identity cannot count twice and requires orchestration/storage fencing.
 
 One rule classifies a presented credential against committed membership: the committed generation presenting the committed key is a renewal and binds; a new key at the committed generation, a generation nothing committed, a generation the configuration has moved past, and a node that is not a voter of this epoch do not. A refused peer learns only that it was refused; the distinctions are reported on the node itself, where a replacement is actually performed, and must be readable precisely when the node cannot serve.
 

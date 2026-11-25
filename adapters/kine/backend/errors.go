@@ -62,6 +62,9 @@ func mapClientError(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, client.ErrBindRejected):
 		return status.Error(codes.Unauthenticated, err.Error())
+	case errors.Is(err, client.ErrBindUnavailable):
+		// Not the credential: this frontend can't bind now. Retried.
+		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, client.ErrProtocol):
 		return status.Error(codes.Internal, err.Error())
 	default:

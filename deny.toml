@@ -41,6 +41,15 @@ ignore = [
     # which raft-engine 0.4.2 (the journal's engine) pins; no workspace
     # crate uses it. The fix is a raft-engine release on a newer nix.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils is pulled in by raft-engine's nix 0.26; no workspace crate uses it, and the advisory is unmaintained-only with no safe upgrade" },
+    # chrono 0.4.45: unmaintained (all versions), with no safe upgrade and
+    # no known vulnerability. It reaches the build graph solely through
+    # oauth2 5.0.0 (coordctl, coord-login) and openidconnect 4.0.1
+    # (coord-login), which use it for token timestamps (exp, iat,
+    # auth_time); no workspace crate uses it. The latest releases,
+    # oauth2 5.0.0 and openidconnect 4.1.0, still require it. Expires at the
+    # first oauth2 and openidconnect releases off chrono (onto jiff or time),
+    # and is re-checked by 2027-02-17 at the latest.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is pulled in by oauth2 and openidconnect for token timestamps; no workspace crate uses it, and the advisory is unmaintained-only with no safe upgrade" },
 ]
 
 [licenses]

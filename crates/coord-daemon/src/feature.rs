@@ -141,6 +141,25 @@ pub enum ActivateRefusal {
     },
     /// Another activation is in progress.
     Busy(Feature),
+    /// A feature that is activated only after another, which isn't
+    /// active yet (`BatchedRound` after `AnswerOnRelease`, task-d102).
+    Requires {
+        /// The feature asked for.
+        feature: Feature,
+        /// The feature that has to be active first.
+        before: Feature,
+    },
+}
+
+/// The feature that has to be active before `feature` is activated, if
+/// any. A relayed command is marked and answered on the leader's release
+/// alone, so the relay (`BatchedRound`) comes after `AnswerOnRelease`
+/// (task-d100's step B, design Section 4.3's B3).
+pub const fn requires(feature: Feature) -> Option<Feature> {
+    match feature {
+        Feature::BatchedRound => Some(Feature::AnswerOnRelease),
+        _ => None,
+    }
 }
 
 impl core::fmt::Display for ActivateRefusal {
@@ -168,6 +187,14 @@ impl core::fmt::Display for ActivateRefusal {
             }
             ActivateRefusal::Busy(feature) => {
                 write!(f, "{} is being activated", feature.name())
+            }
+            ActivateRefusal::Requires { feature, before } => {
+                write!(
+                    f,
+                    "{} is activated only once {} is active",
+                    feature.name(),
+                    before.name()
+                )
             }
         }
     }
@@ -324,10 +351,18 @@ impl Features {
             .map(|row| (row.voter, Row { row, durable: true }))
             .collect();
         let record = published_activation(view).map_err(|e| format!("the activation: {e:?}"))?;
-        if let Some(record) = &record
-            && (record.cluster != self.cluster || record.domain != self.domain)
-        {
-            return Err("the activation record is another cluster's or domain's".into());
+        if let Some(record) = &record {
+            if record.cluster != self.cluster || record.domain != self.domain {
+                return Err("the activation record is another cluster's or domain's".into());
+            }
+            // A record this build cannot run is refused, not read as
+            // nothing active (Codex on #98): `active` would turn one whose
+            // features do not parse into an empty set, and the node would
+            // vote without what the cluster activated. The store's start
+            // already refuses it; this holds for any other way a view
+            // reaches here.
+            coord_checkpoint::feature::admit_record(record)
+                .map_err(|e| format!("the activation record: {e}"))?;
         }
         self.record = record.clone();
         self.durable_record = record;
@@ -822,6 +857,11 @@ impl Features {
         }
         if self.active().contains(&feature) {
             return Ok((Activation::AlreadyActive, self.resend()));
+        }
+        if let Some(before) = requires(feature)
+            && !self.active().contains(&before)
+        {
+            return Err(ActivateRefusal::Requires { feature, before });
         }
         if let Some(busy) = self.activating
             && busy != feature

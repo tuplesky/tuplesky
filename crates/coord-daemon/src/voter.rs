@@ -35,8 +35,8 @@
 //! from looking like a quorum.
 
 use coord_collector::{
-    IngressError, MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, admitted_from_submit,
-    decode_read, read_answer_frame,
+    FreshnessAnswerV1, IngressError, MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal,
+    admitted_from_submit, decode_freshness, decode_read, freshness_answer_frame, read_answer_frame,
 };
 use coord_core::effect::{BootId, PeerId};
 use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
@@ -136,11 +136,39 @@ pub struct Voter<P: Persistence> {
     fenced_at: Option<Ballot>,
     /// The reads this voter holds as a leader (task-d50).
     reads: ReadBarrier,
-    /// The completed frontier read just before the last snapshot pinned
-    /// for due reads, when that snapshot was behind one of them
-    /// (task-d58). While the frontier still reads exactly this, a new
-    /// snapshot would show what that one did.
-    reads_behind_at: Option<u64>,
+    /// The projection's completed frontier and the journaled position
+    /// read just before the last view taken for due reads, when that view
+    /// was behind one of them (task-d58; #185, lead 17:43). While both
+    /// still read exactly this, a new view would show what that one did.
+    reads_behind_at: Option<(u64, Option<coord_types::ids::ExecutionPosition>)>,
+    /// Marked commands whose release this voter, as their leader,
+    /// publishes again once its projection holds their retry record
+    /// (task-d100, step A). Bounded by [`ORIGINS`], oldest first: a
+    /// collector that is still waiting asks again.
+    release_again: std::collections::BTreeMap<CommandId, ReleaseAgain>,
+    /// The projection's completed frontier when the waiting releases
+    /// were last looked up and some still waited: until a commit moves
+    /// it, a new snapshot would show the same (#204 review).
+    release_again_seen_at: Option<u64>,
+    /// How many snapshots the waiting releases were looked up in
+    /// (diagnostic).
+    release_again_lookups: u64,
+}
+
+/// A marked command's release waiting to be published again (task-d100,
+/// step A).
+#[derive(Clone, Copy, Debug)]
+struct ReleaseAgain {
+    /// The command's retry key, where its record is.
+    key: coord_types::RetryKey,
+    /// The decided payload's admission digest.
+    admission: coord_types::identity::Digest32,
+    /// What this leader had executed through when it was asked: the
+    /// command executed at or below it. A projection applied that far
+    /// with no record for the key never will hold one: the command was
+    /// refused at admission, which records nothing under the key
+    /// (#204 review).
+    executed_by: coord_types::ids::ExecutionPosition,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -176,6 +204,9 @@ impl<P: Persistence> Voter<P> {
             fenced_at: None,
             reads: ReadBarrier::new(),
             reads_behind_at: None,
+            release_again: std::collections::BTreeMap::new(),
+            release_again_seen_at: None,
+            release_again_lookups: 0,
         }
     }
 
@@ -450,13 +481,33 @@ impl<P: Persistence> Voter<P> {
     /// recorded under a ballot this voter was leaving, which the fence at
     /// the new ballot refuses. If the machine does not promise after all
     /// -- a guard it applies and this does not -- the ballot goes back.
+    ///
+    /// Only a voter's frames get that far (design Section 10.1). An
+    /// observer's or learner's link is peer access, never a vote, and its
+    /// provenance still names a replica: everything below -- the ballot
+    /// raised for a higher `NewLeader`, a promise answered with the won
+    /// selection, a catch-up ask served, a floor or feature promise
+    /// heard, the machines' own counting -- would take it for the voter
+    /// that replica is. So a frame on any other role's provenance is
+    /// dropped first, before it is even decoded.
     pub fn on_peer(
         &mut self,
         provenance: PeerProvenance,
         frame: Vec<u8>,
     ) -> Result<Outbound, DriveError> {
+        if !provenance.is_voter() {
+            return Ok(Outbound::default());
+        }
         let before = self.ballot;
-        let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+        // What this voter acts on itself is below, and a leader's proposal
+        // frame is none of it: the frame goes to the machine undecoded,
+        // and the follower decodes it once (cost pass row 11). It is the
+        // largest message a follower takes, one a turn of its leader's.
+        let message = if coord_consensus::ProtocolMessage::is_proposal_frame(&frame) {
+            None
+        } else {
+            coord_consensus::ProtocolMessage::decode(&frame).ok()
+        };
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
@@ -632,6 +683,21 @@ impl<P: Persistence> Voter<P> {
         } else {
             command_of(&admitted.frame)
         };
+        // A submission sent as answered on the release alone (task-d100,
+        // step A) marks its command as the machine derives it, so the
+        // proposal or acknowledgement this step leads to already knows
+        // not to send the frontend anything, and the command is derived
+        // once, by the machine (#204 review). One refused before its
+        // command is held leaves no mark.
+        if frame.version == coord_collector::VERSION_ANSWER_ON_RELEASE {
+            self.node.mark_next_admitted();
+        }
+        // Relayed to this voter alone as the leader (task-d102, step B):
+        // marked the same way, proposed with its payload if this voter
+        // leads, and refused as `NotLeading` if it doesn't.
+        if frame.version == coord_collector::VERSION_RELAYED {
+            self.node.mark_next_relayed();
+        }
         let out = self.node.on_event(Event::Admitted(admitted), &self.ballot);
         let command = early.or_else(|| self.node.machine().admitted());
         #[cfg(debug_assertions)]
@@ -641,7 +707,126 @@ impl<P: Persistence> Voter<P> {
             self.node
                 .stamp_submitted(command, std::time::Instant::now());
         }
-        out.map(Ok)
+        let mut out = out?;
+        let asked = self.node.take_release_again();
+        if !asked.is_empty() {
+            let executed_by = self.node.machine().executed_through();
+            for (command, key, admission) in asked {
+                if self.release_again.len() >= ORIGINS {
+                    self.release_again.pop_first();
+                }
+                self.release_again.insert(
+                    command,
+                    ReleaseAgain {
+                        key,
+                        admission,
+                        executed_by,
+                    },
+                );
+            }
+            // A new entry may already be answerable.
+            self.release_again_seen_at = None;
+        }
+        out.absorb(self.publish_releases_again());
+        Ok(Ok(out))
+    }
+
+    /// Publish again the releases of marked commands a collector sent
+    /// again (task-d100, step A), rebuilt from this node's retry record
+    /// of each: the response, position, revision and result digest from
+    /// the record, the epoch and ballot this voter leads at, and the
+    /// admission digest the leader's table held. One whose record the
+    /// projection does not hold yet waits for it, as a retry there does,
+    /// until the projection has applied past where the command executed:
+    /// a command refused at admission records nothing under its key, so
+    /// its entry goes then (#204 review). None goes out once this voter
+    /// no longer leads, and the collector then settles from its own
+    /// node's record (task-d22).
+    ///
+    /// Called after every step that can move the projection; it pins a
+    /// snapshot only when something waits and a projection commit has
+    /// completed since it last looked. The
+    /// fast-path label of a rebuilt release is `false`: nothing kept
+    /// says which path decided it, and the collector compares only the
+    /// position, revision, digest and bytes.
+    pub fn publish_releases_again(&mut self) -> Outbound {
+        let mut out = Outbound::default();
+        if self.release_again.is_empty() {
+            return out;
+        }
+        let Some(leading) = self.leading() else {
+            self.release_again.clear();
+            self.release_again_seen_at = None;
+            return out;
+        };
+        // Only a projection commit changes what a snapshot shows, so one
+        // is pinned again only once the completed frontier has moved
+        // (#204 review), as the read barrier does (task-d58).
+        let reader = self.node.applier().store().reader();
+        let completed = reader.completed();
+        if self.release_again_seen_at == Some(completed) {
+            return out;
+        }
+        let Ok(gated) = reader.snapshot() else {
+            return out;
+        };
+        self.release_again_lookups += 1;
+        let applied = coord_storage::lowering::DurableMeta::read(gated.view())
+            .map(|meta| meta.frontier.execution_position)
+            .ok();
+        let mut found = Vec::new();
+        self.release_again.retain(|&command, waiting| {
+            match coord_storage::retry::lookup(gated.view(), &waiting.key) {
+                Ok(Some(record)) if record.command_id == command => {
+                    found.push((command, waiting.admission, record));
+                    false
+                }
+                // Applied past where it executed with no record of it:
+                // refused at admission, and nothing here will release it
+                // (#204 review). Its collector settles from its own
+                // node, or is answered by its solicit's next step.
+                Ok(None) => applied.is_none_or(|applied| applied < waiting.executed_by),
+                // The key bound to another command: the domain executed
+                // that one under it, and this one has nothing to release.
+                Ok(Some(_)) => false,
+                Err(_) => true,
+            }
+        });
+        drop(gated);
+        for (command, admission, record) in found {
+            let Ok(established) = coord_core::capability::EstablishedResult::restore(
+                coord_core::capability::EstablishedRecord {
+                    command,
+                    epoch: leading.ballot.epoch,
+                    ballot: leading.ballot,
+                    position: record.position,
+                    result_digest: record.result_digest,
+                    revision: record.revision,
+                    fast_path: false,
+                },
+            ) else {
+                continue;
+            };
+            let released = coord_core::capability::ReleasedResult::from_gate(
+                established,
+                record.response,
+                false,
+            )
+            .with_admission(admission);
+            if let Ok(frame) = coord_collector::release_frame(&released) {
+                out.frontend.push(frame);
+            }
+        }
+        self.release_again_seen_at = (!self.release_again.is_empty()).then_some(completed);
+        // A release still waiting looks for its record in the next
+        // commit, which is not held for a larger one (task-d86).
+        if !self.release_again.is_empty() {
+            self.node
+                .applier_mut()
+                .store_mut()
+                .request_projection_commit();
+        }
+        out
     }
 
     /// What this voter leads, for the read barrier: `None` unless its
@@ -658,6 +843,16 @@ impl<P: Persistence> Voter<P> {
             }
             _ => None,
         }
+    }
+
+    /// Whether this voter leads a ballot in which it has proposed
+    /// nothing yet (#320). Such a leader has no read index, so it refuses
+    /// every read and every freshness ask (`ReadRefusal::NothingProposed`)
+    /// until something is proposed. A read is ordered instead, which
+    /// proposes; an ask is not, so the serve loop has the leader propose
+    /// (it takes lease authority again).
+    pub fn leads_with_nothing_proposed(&self) -> bool {
+        self.leading().is_some_and(|l| l.index.is_none())
     }
 
     /// A current read a collector sent this voter as the leader it
@@ -687,6 +882,42 @@ impl<P: Persistence> Voter<P> {
         out
     }
 
+    /// A freshness ask a voter's frontend sent this voter as the leader
+    /// it follows, from `origin` (#320).
+    ///
+    /// Held at the read barrier as a read is, and answered on a read's
+    /// two conditions with the position this leader had executed
+    /// through then; or refused at once. Either way the answer goes back
+    /// in [`Outbound::reads`]. A frame that does not decode as an ask is
+    /// dropped: the frontend that sent it asks again.
+    pub fn on_freshness_ask(
+        &mut self,
+        frame: &coord_types::wire_v1::Frame,
+        origin: Origin,
+        now: MonotonicMillis,
+    ) -> Outbound {
+        let mut out = Outbound::default();
+        let Ok(ask) = decode_freshness(frame) else {
+            return out;
+        };
+        let leading = self.leading();
+        if let Err((origin, answer)) = self.reads.admit_ask(origin, ask, leading, now) {
+            push_freshness(&mut out, origin, &answer);
+            return out;
+        }
+        out.absorb(self.pump_reads(now));
+        out
+    }
+
+    /// When the round a read this leader holds waits for may start, if it
+    /// waits on [`crate::reads::ROUND_SPACING_MILLIS`]: the serve loop
+    /// wakes then, since on an idle domain nothing else arrives to pump
+    /// the reads.
+    pub fn next_read_round_at(&self) -> Option<MonotonicMillis> {
+        self.leading()
+            .and_then(|l| self.reads.next_round_at(l.ballot))
+    }
+
     /// Move the reads this voter holds along (task-d50): start the
     /// confirmation round a newly arrived read needs, answer every read
     /// whose round confirmed, whose index executed and whose snapshot
@@ -695,8 +926,10 @@ impl<P: Persistence> Voter<P> {
     /// Called after anything that can move one of those: a read, a
     /// confirmation, an execution, a materialization, a turn.
     pub fn pump_reads(&mut self, now: MonotonicMillis) -> Outbound {
-        let mut out = Outbound::default();
-        if self.reads.held() == 0 {
+        // A materialization may also be what a release published again
+        // waited for (task-d100, step A).
+        let mut out = self.publish_releases_again();
+        if !self.reads.holds_any() {
             self.reads_behind_at = None;
             return out;
         }
@@ -724,6 +957,25 @@ impl<P: Persistence> Voter<P> {
                 }
             }
         }
+        // The freshness asks first (#320): they share the reads' rounds,
+        // and `take_due` drops the rounds that have aged out.
+        let answers = match self.node.machine() {
+            Machine::Leader(leader) => self.reads.take_due_asks(
+                leading,
+                now,
+                |index| leader.executed_below(index),
+                leader.executed_through(),
+            ),
+            Machine::Follower(_) => self.reads.take_due_asks(
+                None,
+                now,
+                |_| false,
+                coord_types::ids::ExecutionPosition::ZERO,
+            ),
+        };
+        for (origin, answer) in answers {
+            push_freshness(&mut out, origin, &answer);
+        }
         let (due, refused) = match self.node.machine() {
             Machine::Leader(leader) => self.reads.take_due(
                 leading,
@@ -741,28 +993,38 @@ impl<P: Persistence> Voter<P> {
         for (origin, answer) in refused {
             push_answer(&mut out, origin, &answer);
         }
-        // One snapshot for every read due in this pump (task-d58): each is
-        // due because everything below its index executed, so a snapshot
-        // pinned now covers all of them, and pinning one per read was a
-        // read transaction and a metadata read each. No snapshot (the
+        // One view for every read due in this pump (task-d58): each is
+        // due because everything below its index executed, so a view
+        // taken now covers all of them, and pinning one per read was a
+        // read transaction and a metadata read each. No view (the
         // projection is mid-commit, or quarantined) holds them all again,
-        // as a snapshot behind their position does.
+        // as a view behind their position does.
         //
-        // A read is due once its index has executed, and answerable once
-        // the projection has committed that far, which is later. Between
-        // the two every pump would pin a snapshot only to find it behind:
-        // ten per read served in the five-voter run. So once one was
-        // behind, none is pinned again until the completed frontier has
-        // moved from what it read before that one: a projection commit
-        // moves it, and nothing else changes what a snapshot shows.
-        // Moved either way, as a reattached projection's could, a new
-        // snapshot is pinned.
-        let reader = self.node.applier().store().reader();
-        let completed = reader.completed();
-        let gated = if due.is_empty() || self.reads_behind_at == Some(completed) {
+        // The view is the projection's snapshot with the journaled groups
+        // in flight laid over it (`Applier::read_view`; #185, lead 17:43):
+        // what a command planned there reads, and what a release has
+        // already disclosed. So a read is answerable once its index is in
+        // the journal, not once the projection has committed that far,
+        // and it asks for no commit: the reads' asks were what cut the
+        // leader's held commits short, 71% of them at 120 callers and 98%
+        // at 30.
+        //
+        // A read can still be due before it is answerable: its index in
+        // the group still open, or in one whose append is still out.
+        // Between the two every pump would take a view only to find it
+        // behind. So once one was behind, none is taken again until the
+        // projection's completed frontier or the journaled position has
+        // moved from what it read before that one: nothing else changes
+        // what the view shows. Moved either way, as a reattached
+        // projection's could, a new view is taken.
+        let reaches = (
+            self.node.applier().store().reader().completed(),
+            self.node.applier().journaled_through(),
+        );
+        let gated = if due.is_empty() || self.reads_behind_at == Some(reaches) {
             None
         } else {
-            reader.snapshot().ok()
+            self.node.applier().read_view().ok()
         };
         let mut again = Vec::new();
         for held in due {
@@ -797,7 +1059,7 @@ impl<P: Persistence> Voter<P> {
         }
         if gated.is_some() {
             self.reads.pinned(again.len());
-            self.reads_behind_at = (!again.is_empty()).then_some(completed);
+            self.reads_behind_at = (!again.is_empty()).then_some(reaches);
         }
         for held in again.into_iter().rev() {
             self.reads.hold_again(held);
@@ -808,6 +1070,19 @@ impl<P: Persistence> Voter<P> {
     /// What the read barrier has done since boot (task-d50).
     pub fn read_counts(&self) -> crate::reads::ReadCounts {
         self.reads.counts
+    }
+
+    /// Marked commands whose release waits to be published again
+    /// (task-d100, step A; diagnostic).
+    pub fn releases_waiting(&self) -> usize {
+        self.release_again.len()
+    }
+
+    /// How many projection snapshots the waiting releases have been
+    /// looked up in (diagnostic): one per completed projection commit
+    /// at most, while anything waits.
+    pub fn release_lookups(&self) -> u64 {
+        self.release_again_lookups
     }
 
     /// Where this command's evidence is owed, if this voter admitted it.
@@ -874,7 +1149,7 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// How many commands this replica knows by identity and not by
-    /// content.
+    /// content, counted to the most one ask is for (task-d109).
     pub fn missing_payloads(&self) -> usize {
         self.node.missing_payloads()
     }
@@ -883,6 +1158,12 @@ impl<P: Persistence> Voter<P> {
     /// with.
     pub fn payloads_answered(&self) -> u64 {
         self.node.payloads_answered()
+    }
+
+    /// How many payload requests this voter's machine sent, the ones it
+    /// made by itself included (a campaign's next batch).
+    pub fn payload_asks(&self) -> u64 {
+        self.node.payload_asks()
     }
 
     /// What this voter's re-sends did since boot (task-d49).
@@ -920,8 +1201,10 @@ impl<P: Persistence> Voter<P> {
         let standing = crate::catch_up::Standing {
             executed: machine.executed_through(),
             holds: machine.holds_unexecuted(),
-            backlog: || machine.unexecuted_held(),
+            backlog: || machine.decided_unexecuted_held(),
             busy: machine.catching_up(),
+            chain: machine.catch_up_chain_open(),
+            pages: machine.catch_up_counts().0,
             leads: machine.leads(),
         };
         let voters: Vec<ReplicaId> = machine.identity().voters.iter().copied().collect();
@@ -970,8 +1253,10 @@ impl<P: Persistence> Voter<P> {
         self.node.settle(&self.ballot)
     }
 
-    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
-    /// command to apply.
+    /// Whether [`Voter::flush`] has anything to do: batches queued, a
+    /// command to apply, a leader's proposals waiting for the turn's
+    /// frame (task-d102), or a leader's commit frontier waiting for the
+    /// turn's end (#242 follow-up).
     ///
     /// Batches queued behind a journal append that is out are not owed a
     /// flush (task-d54): nothing can be journaled until the append is
@@ -979,7 +1264,10 @@ impl<P: Persistence> Voter<P> {
     /// then. Owed one, the runtime would flush in a loop that moves
     /// nothing.
     pub fn owes_flush(&self) -> bool {
-        (self.queued() > 0 && !self.appending()) || self.node.can_execute()
+        (self.queued() > 0 && !self.appending())
+            || self.node.can_execute()
+            || self.node.machine().frames_queued()
+            || self.node.machine().frontier_owed()
     }
 
     /// Whether a journal append is out on the appender's thread, its
@@ -1086,6 +1374,14 @@ fn highest(a: Ballot, b: Ballot) -> Ballot {
 /// Queue `answer` for `origin`'s collector.
 fn push_answer(out: &mut Outbound, origin: Origin, answer: &ReadAnswerV1) {
     if let Ok(frame) = read_answer_frame(answer) {
+        out.reads.push((origin, frame));
+    }
+}
+
+/// Queue a freshness ask's answer for `origin`'s frontend (#320), on
+/// the way a read's answer goes.
+fn push_freshness(out: &mut Outbound, origin: Origin, answer: &FreshnessAnswerV1) {
+    if let Ok(frame) = freshness_answer_frame(answer) {
         out.reads.push((origin, frame));
     }
 }

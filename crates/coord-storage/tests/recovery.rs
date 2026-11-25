@@ -574,7 +574,12 @@ impl Cluster {
                 };
                 let (from, frame) = self.nodes[pick].inbox.remove(idx).unwrap();
                 let event = Event::Peer(AuthenticatedPeerMessage::new(
-                    PeerProvenance::from_transport(from, inc(), 1),
+                    PeerProvenance::from_transport(
+                        from,
+                        inc(),
+                        coord_types::wire_v1::PeerRole::Voter,
+                        1,
+                    ),
                     frame,
                 ));
                 let effects = self.nodes[pick].step(event);

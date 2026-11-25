@@ -4,6 +4,8 @@
 //! trust rule was disabled, cannot read protected cached retry outcomes;
 //! sessions and policy advance execution without a KV revision.
 
+mod support;
+
 use coord_core::effect::BootId;
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan};
@@ -165,6 +167,7 @@ impl<E: LocalEngine> Domain<E> {
             build_authorized_view(&gated, NS, &session, request, ViewBudget::default()).unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),

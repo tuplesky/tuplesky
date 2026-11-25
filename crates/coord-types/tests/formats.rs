@@ -39,13 +39,17 @@ fn a_version_outside_the_window_is_refused_and_says_which_way() {
     for format in Format::ALL {
         let window = format.window();
         assert!(
-            window.oldest >= 1 && window.oldest <= window.current,
+            window.oldest >= 1
+                && window.oldest <= window.current
+                && window.current <= window.newest,
             "{} has an impossible window {window:?}",
             format.name()
         );
         assert!(format.supports(window.oldest));
         assert!(format.supports(window.current));
+        assert!(format.supports(window.newest));
         assert_eq!(admit(format, window.current), Ok(()));
+        assert_eq!(admit(format, window.newest), Ok(()));
 
         // Below: a format that has been retired.
         if window.oldest > 1 {
@@ -63,14 +67,14 @@ fn a_version_outside_the_window_is_refused_and_says_which_way() {
         // Above: something else wrote it. Never guessed at, because
         // guessing is how a store gets written by a build that did not
         // understand it.
-        let newer = window.current + 1;
+        let newer = window.newest + 1;
         assert!(!format.supports(newer));
         assert_eq!(
             admit(format, newer),
             Err(FormatError::Newer {
                 format,
                 found: newer,
-                current: window.current,
+                newest: window.newest,
             })
         );
         assert!(admit(format, 0).is_err(), "zero is never a version");
