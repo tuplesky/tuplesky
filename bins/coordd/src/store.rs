@@ -32,7 +32,7 @@ use coord_journal_raft_engine::journal::{
 };
 use coord_storage::JournaledDomain;
 use coord_storage::journaled::{
-    DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
+    CommitHold, DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
 };
 use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::{
@@ -270,6 +270,28 @@ pub struct Storage {
     /// them at start (task-60): each one this build supports, or the
     /// store was refused.
     pub active: std::collections::BTreeSet<coord_types::formats::Feature>,
+    /// How long opening and attaching took, step by step.
+    pub phases: BootPhases,
+}
+
+/// How long each step of opening the storage took before the runtime
+/// starts, for the startup report's `boot` line (#245; the lead on #185
+/// asked what grows with history there). The index builds and the replay
+/// inside the attach are on the store's [`coord_storage::Replayed`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BootPhases {
+    /// Opening the journal: raft-engine reads its files, and every
+    /// retained record is decoded and checked.
+    pub journal_open: std::time::Duration,
+    /// Opening the projection's generation.
+    pub projection_open: std::time::Duration,
+    /// Reading the recovery baseline from the journal's retained records
+    /// and loading the image it names.
+    pub baseline: std::time::Duration,
+    /// The activation guard's scan of what the attach will replay.
+    pub guard_scan: std::time::Duration,
+    /// The attach in all: the index builds, the replay and the checks.
+    pub attach: std::time::Duration,
 }
 
 /// The journal and the projection, open and not yet attached.
@@ -297,6 +319,8 @@ pub struct Opened {
     /// How the projection's generation is opened, for a reinstall
     /// (task-j06).
     options: OpenOptions,
+    /// The open's steps, timed so far.
+    phases: BootPhases,
 }
 
 /// An authorized replacement this start comes back on (task-58), found
@@ -381,6 +405,7 @@ pub fn open_storage_with(
     };
 
     let mut before_attach = Some(before_attach);
+    let mut phases = BootPhases::default();
     let (found, journal) = match intent {
         Intent::Initialize => {
             // Refused before anything is written if the journal is already
@@ -441,8 +466,11 @@ pub fn open_storage_with(
             (Found::Opened(generation, None), journal)
         }
         Intent::Serve => {
+            let opening = std::time::Instant::now();
             let journal = RaftEngineJournal::open_existing(&journal_root, identity, &options)
                 .map_err(journal_error)?;
+            phases.journal_open = opening.elapsed();
+            let opening = std::time::Instant::now();
             let found = find_serving(
                 &config.state.root_path(&config.state_directory),
                 StoreIdentity {
@@ -455,6 +483,7 @@ pub fn open_storage_with(
                     cache_bytes: config.state.cache_bytes,
                 },
             )?;
+            phases.projection_open = opening.elapsed();
             (found, journal)
         }
     };
@@ -491,6 +520,19 @@ pub fn open_storage_with(
                 root: show(&journal_root),
                 reason: format!("{e}"),
             })?;
+        // Larger projection commits, held for a bound of records and
+        // time or until something reading the projection asks (task-d86).
+        if let Some((records, wait)) = config.journal.projection_commit_hold() {
+            store
+                .hold_projection_commits(CommitHold {
+                    records: NonZeroU32::new(records).expect("checked nonzero"),
+                    wait,
+                })
+                .map_err(|e| StoreError::Refused {
+                    root: show(&journal_root),
+                    reason: format!("{e}"),
+                })?;
+        }
     }
 
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
@@ -588,6 +630,7 @@ pub fn open_storage_with(
         options: OpenOptions {
             cache_bytes: config.state.cache_bytes,
         },
+        phases,
     })
 }
 
@@ -620,8 +663,10 @@ impl Opened {
             checkpoint_root,
             adoption,
             options,
+            mut phases,
         } = self;
         let mut generation = generation;
+        let active;
         // The rollback guard (task-60). A build started against a cluster
         // that has activated something it cannot do refuses here, before
         // anything is adopted or the domain is attached, and long before
@@ -633,7 +678,8 @@ impl Opened {
         // replay, below.
         {
             let directory = generation.directory().to_path_buf();
-            rollback_guard(generation.engine(), &directory)?;
+            active = rollback_guard(generation.engine(), &directory)?;
+            let scanning = std::time::Instant::now();
             // The same guard over what the attach would replay, before
             // anything is adopted (#212 review). The stream is the one the
             // root is stamped with, which an adoption still to come has
@@ -648,6 +694,7 @@ impl Opened {
                 &journal_root,
                 &directory,
             )?;
+            phases.guard_scan = scanning.elapsed();
         }
         let generation = match adoption {
             None => generation,
@@ -665,6 +712,7 @@ impl Opened {
         // baseline is a fact of the stream, not of the projection, and an
         // image that no longer loads has to stop the node here rather than
         // when a recovery needs it.
+        let reading = std::time::Instant::now();
         let checkpoints =
             coord_checkpoint::LocalCheckpointStore::open(&checkpoint_root).map_err(|e| {
                 StoreError::Refused {
@@ -686,6 +734,7 @@ impl Opened {
             None => None,
         };
         let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
+        phases.baseline = reading.elapsed();
         let generation = if store.projection_profile() == ProjectionProfile::Strict {
             refuse_if_invalid(&store, domain_id, generation, represented)?
         } else {
@@ -709,25 +758,37 @@ impl Opened {
         // would count the whole retained stream as unreclaimed, and the
         // housekeeping that watches that number would publish a full image
         // on every restart of a node that had once crossed its threshold.
+        let attaching = std::time::Instant::now();
         store
             .attach_with_baseline(domain_id, shard, engine, represented)
             .map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("the projection could not be attached to the journal: {e:?}"),
             })?;
+        phases.attach = attaching.elapsed();
         // The guard again, over what the attach's replay applied: the
-        // features the store now has active, which the scan above has
-        // already admitted. Nothing is served before this.
+        // features the store has active now, which the scan above has
+        // admitted record by record. This is the set the node runs with,
+        // not the one read before the replay. Nothing is served before
+        // this.
         let active = {
             let reader = store.reader(domain_id).expect("just attached");
             let view = reader.snapshot().map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("the activation record could not be read after the replay: {e:?}"),
             })?;
-            coord_checkpoint::feature::admit(view.view()).map_err(|e| StoreError::Refused {
-                root: show(&directory),
-                reason: format!("{e}"),
-            })?
+            let after =
+                coord_checkpoint::feature::admit(view.view()).map_err(|e| StoreError::Refused {
+                    root: show(&directory),
+                    reason: format!("{e}"),
+                })?;
+            if after != active {
+                eprintln!(
+                    "the replay changed the active features from {active:?} to {after:?}; \
+                     running with {after:?}"
+                );
+            }
+            after
         };
 
         // A transition's ballot is in the epoch of the configuration its base
@@ -750,6 +811,7 @@ impl Opened {
             generation: directory,
             boot,
             active,
+            phases,
         })
     }
 }
@@ -865,19 +927,40 @@ fn reinstall_if_invalid(
     let staged = generation
         .stage_reinstall(identity, options)
         .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
+    let represented = pointer.represented;
     let mut staged = install_baseline(staged, pointer, image, refused)?;
     // The guards on what would be selected, before it is: the image's
-    // own activation, and any the attach would replay onto it.
+    // own activation (#227 review on the carry), and any the attach would
+    // replay onto it. A refusal removes the staging, which nothing selects
+    // (#231 review on the carry), so a start that keeps refusing leaves
+    // nothing behind.
     let staged_directory = staged.directory().to_path_buf();
-    rollback_guard(staged.engine(), &staged_directory)?;
-    refuse_unapplied_activation(
-        store,
-        domain_id,
-        identity.incarnation,
-        staged.engine(),
-        journal_root,
-        &staged_directory,
-    )?;
+    let in_the_image = |refusal: StoreError| match refusal {
+        StoreError::Refused { root, reason } => StoreError::Refused {
+            root,
+            reason: format!(
+                "{reason}: in the local checkpoint at {}; nothing was reinstalled",
+                represented.get()
+            ),
+        },
+        other => other,
+    };
+    let checked = rollback_guard(staged.engine(), &staged_directory)
+        .map_err(in_the_image)
+        .and_then(|_| {
+            refuse_unapplied_activation(
+                store,
+                domain_id,
+                identity.incarnation,
+                staged.engine(),
+                journal_root,
+                &staged_directory,
+            )
+        });
+    if let Err(refusal) = checked {
+        abandon(staged);
+        return Err(refusal);
+    }
     let discarded = staged.previous().map(|m| m.generation);
     let generation = staged
         .activate()
@@ -1260,6 +1343,215 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         ReplicaIncarnation::new(n).expect("incarnation")
     }
 
+    /// The selected generation's directory.
+    fn selected_generation(config: &Config) -> PathBuf {
+        let root = config.state.root_path(&config.state_directory);
+        let current = std::fs::read_to_string(root.join("CURRENT")).expect("CURRENT");
+        root.join(current.trim())
+    }
+
+    /// Every regular file under `root`, by path relative to it, with its
+    /// bytes.
+    fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).expect("under root").to_path_buf();
+                    out.push((rel, std::fs::read(&path).expect("read")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A table's rows, by key.
+    type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// Every row of every table of the generation's database, by table:
+    /// the projection's logical content. Its bytes are no measure, since
+    /// redb rewrites its header and trims the file on any open and close.
+    fn rows_of(generation: &Path) -> Vec<(String, Rows)> {
+        use redb::{ReadableDatabase, ReadableTable, TableHandle};
+        let db = redb::Database::open(generation.join("domain.redb")).expect("open");
+        let read = db.begin_read().expect("read");
+        let mut out = Vec::new();
+        for handle in read.list_tables().expect("tables") {
+            let name = handle.name().to_owned();
+            let def: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new(&name);
+            let table = read.open_table(def).expect("table");
+            let rows = table
+                .iter()
+                .expect("iter")
+                .map(|row| {
+                    let (k, v) = row.expect("row");
+                    (k.value().to_vec(), v.value().to_vec())
+                })
+                .collect();
+            out.push((name, rows));
+        }
+        out.sort();
+        out
+    }
+
+    /// A node initialized with its genesis policy, and a copy of its
+    /// projection from then, at `dir/projection-before`.
+    fn a_node_and_its_projection(config: &Config, dir: &Path) -> (PathBuf, PathBuf) {
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        let generation = selected_generation(config);
+        let before = dir.join("projection-before");
+        copy_tree(&generation, &before);
+        (generation, before)
+    }
+
+    /// Journal, through a boot at `at`, an activation record of
+    /// `features` (ids), and a record after it, both applied to the
+    /// projection.
+    fn journal_an_activation(config: &Config, at: u64, features: Vec<u16>) {
+        let mut storage = serve(config, at).expect("serve").attach().expect("attach");
+        submit_an_activation(&mut storage, at, features);
+        drop(storage);
+    }
+
+    /// Submit and materialize an activation record of `features` (ids),
+    /// and a record after it, on a node attached at `at`.
+    fn submit_an_activation(storage: &mut Storage, at: u64, features: Vec<u16>) {
+        use coord_storage::Persistence;
+        let record = coord_checkpoint::feature::ActiveFeaturesV1 {
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            configuration: coord_types::ids::ConfigurationEpoch::new(1).expect("epoch"),
+            features,
+            reporters: vec![REPLICA],
+        };
+        let mut barriers = coord_core::outbox::BarrierAllocator::new(incarnation(at), storage.boot);
+        let after = coord_core::effect::StoreUpdate {
+            collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+            key: b"after-the-activation".to_vec(),
+            value: Some(vec![1]),
+        };
+        for update in [record.update().expect("update"), after] {
+            storage
+                .domain
+                .submit(
+                    coord_core::effect::PersistBatch {
+                        barrier: barriers.allocate(),
+                        base: None,
+                        updates: vec![update],
+                    },
+                    coord_storage::journaled::TransitionKind::Protocol,
+                )
+                .expect("submit");
+            for _ in 0..8 {
+                if storage.domain.queued() == 0 && storage.domain.unmaterialized() == 0 {
+                    break;
+                }
+                storage.domain.lower().expect("lower");
+            }
+        }
+        assert_eq!(storage.domain.unmaterialized(), 0);
+    }
+
+    /// An activation is a journaled transition, and the attach's replay
+    /// applies it without asking whether this build can do the feature:
+    /// one journaled after the projection's stamp is not in the projection
+    /// the first rollback guard reads (Codex on #98; #212 has the same).
+    /// The start reads what the replay would apply first, and refuses at
+    /// the activation record, under either profile, before a row is
+    /// replayed or a boot record appended: the projection's rows and the
+    /// journal are as they were, on two starts.
+    #[test]
+    fn an_activation_only_the_journal_holds_is_refused_before_the_replay() {
+        for replay in [false, true] {
+            let dir = workspace(&format!("activation-in-journal-{replay}"));
+            let mut config = config(&dir);
+            if replay {
+                config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+            }
+            let (generation, before) = a_node_and_its_projection(&config, &dir);
+
+            // The cluster activates a feature this build has never heard
+            // of, through the journal, and a record follows it.
+            journal_an_activation(&config, 1, vec![0x7fff]);
+
+            // The projection from before both: it continues the journal,
+            // so it is kept, and the attach would replay them onto it.
+            std::fs::remove_dir_all(&generation).expect("remove");
+            copy_tree(&before, &generation);
+            let journal = root_path(&config.state_directory, &config.journal.root);
+            let (projection_was, journal_was) = (rows_of(&generation), tree_bytes(&journal));
+            for start in 0..2 {
+                match serve(&config, 1).and_then(Opened::attach) {
+                    Err(StoreError::Refused { reason, .. }) => {
+                        assert!(
+                            reason.contains("too old")
+                                && reason.contains("0x7fff")
+                                && reason.contains("nothing was replayed"),
+                            "replay={replay}, start {start}: {reason}"
+                        );
+                    }
+                    Err(other) => panic!("replay={replay}: refused for another reason: {other}"),
+                    Ok(_) => panic!("replay={replay}: served a store it cannot fully read"),
+                }
+                assert!(
+                    rows_of(&generation) == projection_was,
+                    "replay={replay}, start {start}: the projection's rows changed"
+                );
+                assert!(
+                    tree_bytes(&journal) == journal_was,
+                    "replay={replay}, start {start}: the journal changed"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The control: an activation of a feature this build supports, in
+    /// the same place, is admitted, replayed, and is what the node runs
+    /// with. The set is the one read after the replay; before this fix
+    /// the start kept the one read before it, which here is empty.
+    #[test]
+    fn an_activation_only_the_journal_holds_that_this_build_supports_is_replayed_and_active() {
+        use coord_types::formats::Feature;
+        for replay in [false, true] {
+            let dir = workspace(&format!("supported-activation-in-journal-{replay}"));
+            let mut config = config(&dir);
+            if replay {
+                config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+            }
+            let (generation, before) = a_node_and_its_projection(&config, &dir);
+            journal_an_activation(&config, 1, vec![Feature::EarlyProposal.id()]);
+            std::fs::remove_dir_all(&generation).expect("remove");
+            copy_tree(&before, &generation);
+            let storage = serve(&config, 2)
+                .and_then(Opened::attach)
+                .unwrap_or_else(|e| panic!("replay={replay}: refused: {e}"));
+            assert_eq!(
+                storage.active,
+                std::collections::BTreeSet::from([Feature::EarlyProposal]),
+                "replay={replay}"
+            );
+            drop(storage);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     fn serve(config: &Config, at: u64) -> Result<Opened, StoreError> {
         open_storage(
             config,
@@ -1451,6 +1743,19 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     /// the baseline a later boot published. Returns the journal's durable
     /// head and the baseline's represented sequence.
     fn a_projection_behind_its_baseline(config: &Config, dir: &Path, at: u64) -> (u64, u64) {
+        a_projection_behind_a_baseline_holding(config, dir, at, None)
+    }
+
+    /// [`a_projection_behind_its_baseline`], with an activation of
+    /// `activation` (feature ids) journaled and materialized before the
+    /// baseline is published, so the baseline's image holds it.
+    fn a_projection_behind_a_baseline_holding(
+        config: &Config,
+        dir: &Path,
+        at: u64,
+        activation: Option<Vec<u16>>,
+    ) -> (u64, u64) {
+        use coord_checkpoint::LocalBaseline;
         let opened = open_storage(
             config,
             Intent::Initialize,
@@ -1473,6 +1778,9 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         // The next boot appends its lifecycle record, materializes it
         // and publishes a baseline that represents it.
         let mut storage = serve(config, at).expect("serve").attach().expect("attach");
+        if let Some(features) = activation {
+            submit_an_activation(&mut storage, at, features);
+        }
         let published = storage
             .domain
             .publish_local(
@@ -1536,6 +1844,89 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             .expect("serve")
             .attach()
             .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An activation inside the baseline image itself (#227 review): the
+    /// scan before the attach starts at the image's stamp, so only the
+    /// guard after the attach saw it, and by then the reinstalled
+    /// generation was selected and the replay written. The reinstall now
+    /// checks the image it installed before selecting it: the start
+    /// refuses as too old, and the selected generation and its rows are as
+    /// they were, on two starts.
+    #[test]
+    fn an_activation_inside_the_baseline_image_is_refused_before_the_reinstall_is_selected() {
+        let dir = workspace("reinstall-activation");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (_, represented) =
+            a_projection_behind_a_baseline_holding(&config, &dir, 1, Some(vec![0x7fff]));
+        assert!(represented > 0);
+        let selected = selected_generation(&config);
+        let rows_were = rows_of(&selected);
+        let root = config.state.root_path(&config.state_directory);
+        let entries = |root: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(root)
+                .expect("the state root")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let entries_were = entries(&root);
+        for start in 0..2 {
+            match serve(&config, 1).and_then(Opened::attach) {
+                Err(StoreError::Refused { reason, .. }) => assert!(
+                    reason.contains("too old")
+                        && reason.contains("0x7fff")
+                        && reason.contains("nothing was reinstalled"),
+                    "start {start}: {reason}"
+                ),
+                Err(other) => panic!("start {start}: refused for another reason: {other}"),
+                Ok(_) => panic!("start {start}: served an image it cannot run"),
+            }
+            assert_eq!(
+                selected_generation(&config),
+                selected,
+                "start {start}: the reinstalled generation was selected"
+            );
+            assert!(
+                rows_of(&selected) == rows_were,
+                "start {start}: the selected projection's rows changed"
+            );
+            // The staged generation is removed, not left for each start
+            // to add another (#231 review).
+            assert_eq!(
+                entries(&root),
+                entries_were,
+                "start {start}: the refused reinstall left something in the state root"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control: the same image holding an activation this build
+    /// supports is reinstalled, and the node runs with it.
+    #[test]
+    fn a_supported_activation_inside_the_baseline_image_is_reinstalled_and_active() {
+        use coord_types::formats::Feature;
+        let dir = workspace("reinstall-supported-activation");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_projection_behind_a_baseline_holding(
+            &config,
+            &dir,
+            1,
+            Some(vec![Feature::EarlyProposal.id()]),
+        );
+        let storage = serve(&config, 1)
+            .and_then(Opened::attach)
+            .unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!(
+            storage.active,
+            std::collections::BTreeSet::from([Feature::EarlyProposal])
+        );
+        drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2000,182 +2391,6 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every regular file under `root`, by path relative to it, with its
-    /// bytes.
-    fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("read dir") {
-                let path = entry.expect("entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let rel = path.strip_prefix(root).expect("under root").to_path_buf();
-                    out.push((rel, std::fs::read(&path).expect("read")));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    /// A table's rows, by key.
-    type Rows = Vec<(Vec<u8>, Vec<u8>)>;
-
-    /// Every row of every table of the generation's database, by table:
-    /// the projection's logical content. Its bytes are no measure, since
-    /// redb rewrites its header and trims the file on any open and close.
-    fn rows_of(generation: &Path) -> Vec<(String, Rows)> {
-        use redb::{ReadableDatabase, ReadableTable, TableHandle};
-        let db = redb::Database::open(generation.join("domain.redb")).expect("open");
-        let read = db.begin_read().expect("read");
-        let mut out = Vec::new();
-        for handle in read.list_tables().expect("tables") {
-            let name = handle.name().to_owned();
-            let def: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new(&name);
-            let table = read.open_table(def).expect("table");
-            let rows = table
-                .iter()
-                .expect("iter")
-                .map(|row| {
-                    let (k, v) = row.expect("row");
-                    (k.value().to_vec(), v.value().to_vec())
-                })
-                .collect();
-            out.push((name, rows));
-        }
-        out.sort();
-        out
-    }
-
-    /// An activation is a journaled transition, and the attach's replay
-    /// applies it without asking whether this build can do the feature:
-    /// one journaled after the projection's stamp is not in the projection
-    /// the first rollback guard reads. The start reads what the replay
-    /// would apply first, and refuses at the activation record, under
-    /// either profile, before a row is replayed or a boot record appended:
-    /// the generation and the journal are byte for byte as they were
-    /// (#212 reviews).
-    #[test]
-    fn an_activation_only_the_journal_holds_is_refused_before_the_replay() {
-        for replay in [false, true] {
-            let dir = workspace(&format!("activation-in-journal-{replay}"));
-            let mut config = config(&dir);
-            if replay {
-                config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
-            }
-            let opened = open_storage(
-                &config,
-                Intent::Initialize,
-                CLUSTER,
-                DOMAIN,
-                REPLICA,
-                incarnation(1),
-            )
-            .expect("init");
-            let mut storage = opened.attach().expect("attach");
-            crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
-            drop(storage);
-            let generation = selected_database(&config)
-                .parent()
-                .expect("generation")
-                .to_path_buf();
-            let before = dir.join("projection-before");
-            copy_tree(&generation, &before);
-
-            // The cluster activates a feature this build has never heard
-            // of, through the journal, and a record follows it.
-            journal_an_unknown_activation(&config, 1);
-
-            // The projection from before both: it continues the journal,
-            // so it is kept, and the attach would replay them onto it.
-            std::fs::remove_dir_all(&generation).expect("remove");
-            copy_tree(&before, &generation);
-            let journal = root_path(&config.state_directory, &config.journal.root);
-            let (projection_was, journal_was) = (rows_of(&generation), tree_bytes(&journal));
-            for start in 0..2 {
-                match serve(&config, 1).and_then(Opened::attach) {
-                    Err(StoreError::Refused { reason, .. }) => {
-                        assert!(
-                            reason.contains("unknown active feature")
-                                && reason.contains("nothing was replayed"),
-                            "replay={replay}, start {start}: {reason}"
-                        );
-                    }
-                    Err(other) => panic!("replay={replay}: refused for another reason: {other}"),
-                    Ok(_) => panic!("replay={replay}: served a store it cannot fully read"),
-                }
-                assert!(
-                    rows_of(&generation) == projection_was,
-                    "replay={replay}, start {start}: the projection's rows changed"
-                );
-                assert!(
-                    tree_bytes(&journal) == journal_was,
-                    "replay={replay}, start {start}: the journal changed"
-                );
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Journal, through a boot at `at`, the activation of a feature this
-    /// build has never heard of, and a record after it, both applied to
-    /// the projection.
-    fn journal_an_unknown_activation(config: &Config, at: u64) {
-        use coord_storage::Persistence;
-        let mut storage = serve(config, at).expect("serve").attach().expect("attach");
-        let record = coord_checkpoint::feature::ActiveFeaturesV1 {
-            cluster: CLUSTER,
-            domain: DOMAIN,
-            configuration: coord_types::ids::ConfigurationEpoch::new(1).expect("epoch"),
-            features: vec![0x7fff],
-            reporters: vec![REPLICA],
-        };
-        let mut barriers = coord_core::outbox::BarrierAllocator::new(incarnation(at), storage.boot);
-        storage
-            .domain
-            .submit(
-                coord_core::effect::PersistBatch {
-                    barrier: barriers.allocate(),
-                    base: None,
-                    updates: vec![record.update().expect("update")],
-                },
-                coord_storage::journaled::TransitionKind::Protocol,
-            )
-            .expect("submit");
-        for _ in 0..8 {
-            if storage.domain.queued() == 0 && storage.domain.unmaterialized() == 0 {
-                break;
-            }
-            storage.domain.lower().expect("lower");
-        }
-        // And a record after it, which the replay would apply too.
-        storage
-            .domain
-            .submit(
-                coord_core::effect::PersistBatch {
-                    barrier: barriers.allocate(),
-                    base: None,
-                    updates: vec![coord_core::effect::StoreUpdate {
-                        collection: coord_store_api::registry::Collection::ProtocolV1.id(),
-                        key: b"after-the-activation".to_vec(),
-                        value: Some(vec![1]),
-                    }],
-                },
-                coord_storage::journaled::TransitionKind::Protocol,
-            )
-            .expect("submit");
-        for _ in 0..8 {
-            if storage.domain.queued() == 0 && storage.domain.unmaterialized() == 0 {
-                break;
-            }
-            storage.domain.lower().expect("lower");
-        }
-        assert_eq!(storage.domain.unmaterialized(), 0);
-        drop(storage);
-    }
-
     /// The same guard on a reinstall (#212 re-review 6760013204): a
     /// replay-backed node that lost its projection, in each of the ways
     /// `Loss` names, with an unknown activation journaled after its
@@ -2205,7 +2420,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             // continues the journal, so only the scan stands between the
             // activation and the replay.
             copy_tree(&dir.join("state"), &dir.join("state-baseline"));
-            journal_an_unknown_activation(&config, 1);
+            journal_an_activation(&config, 1, vec![0x7fff]);
             std::fs::remove_dir_all(dir.join("state")).expect("remove");
             std::fs::rename(dir.join("state-baseline"), dir.join("state")).expect("put back");
             if let Some(loss) = loss {
@@ -2219,7 +2434,8 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
                 let case = format!("{loss:?} at {at}, start {start}");
                 match serve(&config, at).and_then(Opened::attach) {
                     Err(StoreError::Refused { reason, .. }) => assert!(
-                        reason.contains("unknown active feature")
+                        reason.contains("too old")
+                            && reason.contains("0x7fff")
                             && reason.contains("nothing was replayed"),
                         "{case}: {reason}"
                     ),

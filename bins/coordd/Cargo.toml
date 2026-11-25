@@ -63,13 +63,14 @@ mimalloc.workspace = true
 coord-sdk.workspace = true
 coord-state.workspace = true
 postcard.workspace = true
-redb.workspace = true
 jsonwebtoken.workspace = true
 coord-node-issuer.workspace = true
 coord-membership.workspace = true
 coord-session.workspace = true
 coord-store-api.workspace = true
 coord-store-testkit.workspace = true
+# Reading and damaging a projection's database in the tests.
+redb.workspace = true
 coord-sts.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

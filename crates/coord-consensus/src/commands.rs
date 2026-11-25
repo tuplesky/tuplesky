@@ -134,12 +134,27 @@ struct KeyState {
 /// Recovery work does not respect the bound at all; it enters beyond
 /// capacity. What the reserve is sized for is that a voter admitted to
 /// seven eighths can hold one catch-up window (`MAX_CATCH_UP_COMMANDS`,
-/// 64) or its placeholders and still report within twice the table: at
+/// 125) or its placeholders and still report within twice the table: at
 /// the largest table, 875 admitted, 125 recovering and 1,000 retired is
-/// 2,000. Below a table of 512 the reserve is smaller than a window and
+/// 2,000. A window is at most one page whatever a voter has in hand: the
+/// page it asks ahead waits outside the table (task-d25), and
+/// `a_window_is_one_page_when_the_first_ends_early` fails without that
+/// limit. Below a table of 1,000 the reserve is smaller than a window and
 /// the beyond-capacity path carries the rest; at the smallest table, 32,
 /// it is 4. A Sync's entries are made to fit by the release rule and the
 /// Sync's cap, not by the reserve.
+///
+/// The sum leaves no slack at the largest table, and that is meant: 125
+/// is the page chosen as the largest the reserve holds (task-d25). It is
+/// safe because the report bound is inclusive (2,000 entries are taken)
+/// and is a bound on liveness, not on what is decided: a report past it
+/// is set aside, never selected over, while a majority remains without it
+/// (task-d20), and a candidate's own is refused by name. Other work past
+/// the capacity -- a Sync's entries, the record of a held proposal whose
+/// turn has come (task-d71) -- can already take a voter past it, which
+/// costs that voter's report for a campaign. What the reserve keeps is
+/// that a voter admitted to its limit and holding one window still
+/// reports; a window of two pages would not.
 pub const RECOVERY_RESERVE_PARTS: usize = 8;
 
 /// How far an initialization may fill the table.
@@ -156,6 +171,58 @@ enum Room {
     /// the next synchronization's digest covers; appended, it stayed in the
     /// suffix after it retired.
     Installed,
+    /// A relayed command (task-d102, task-d100's step B): bounded as
+    /// `room` says, and not appended to the path logs. It is never
+    /// pre-accepted here, so its place is not in this replica's suffix:
+    /// its adoption is a synchronization of a command outside the suffix
+    /// (design Section 4.1).
+    Relayed(RelayRoom),
+}
+
+/// How much of the table a relayed command may take (task-d102): the
+/// same rule a submission's initialization follows, which the follower
+/// decides ([`CommandTable::initialize_relayed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayRoom {
+    /// New admission: up to the capacity less the recovery reserve.
+    Admission,
+    /// A command whose turn has come: the reserve too, and one past it.
+    Reserve,
+    /// Recovery work, which the largest Sync bounds.
+    Unbounded,
+}
+
+/// What holds back a table's oldest unexecuted record
+/// ([`CommandTable::waits`], task-d25).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableWait {
+    /// Its payload has not arrived: a placeholder.
+    Payload,
+    /// Not committed: at this phase.
+    Uncommitted(Phase),
+    /// Committed, behind its first dependency not executed: at this
+    /// phase here, or `None` for one this table has no payload of and
+    /// does not remember executing.
+    Dependency(Option<Phase>),
+    /// Ready: nothing in the table holds it. What does is its owner's (a
+    /// catch-up window in hand, a row written again, the next pass).
+    Ready,
+}
+
+/// A table's size and its oldest unexecuted record's wait
+/// ([`CommandTable::waits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableWaits {
+    /// Records, placeholders included.
+    pub records: usize,
+    /// The bound, if any.
+    pub capacity: Option<usize>,
+    /// Records holding their payload below EXECUTED.
+    pub unexecuted: usize,
+    /// Of those, the ones ready to execute.
+    pub ready: usize,
+    /// The oldest unexecuted record, and what it waits on.
+    pub oldest: Option<(CommandId, TableWait)>,
 }
 
 /// The command table of one replica in one domain.
@@ -218,12 +285,36 @@ pub struct CommandTable {
     /// [`CommandTable::restore`]); left lazily, by
     /// [`CommandTable::in_accept`].
     accepted: BTreeSet<CommandId>,
-    /// Every command whose record is at COMMIT (task-d46): what the next
-    /// command to execute is chosen from, instead of every record.
-    /// Entered by [`CommandTable::commit`] and [`CommandTable::restore`],
-    /// left by [`CommandTable::execute`] and
-    /// [`CommandTable::restore_executed`], the only ways out of COMMIT.
-    committed: BTreeSet<CommandId>,
+    /// Every command whose record is at COMMIT with its payload and every
+    /// dependency executed: what the next command to execute is chosen
+    /// from (task-d107). Exact: entered only when a record is examined
+    /// and found ready, left by [`CommandTable::execute`] and
+    /// [`CommandTable::restore_executed`], the only ways out of COMMIT
+    /// for a record with its payload.
+    ///
+    /// It replaced a set of every record at COMMIT (task-d46), each of
+    /// which a call checked the dependencies of. A replica behind holds
+    /// thousands of those blocked on one command it lacks, and asked
+    /// every pass, that check was most of its loop (task-d106).
+    ready: BTreeSet<CommandId>,
+    /// The records at COMMIT with their payload that are not ready, by
+    /// the one dependency each was found waiting on (task-d107): the
+    /// first of its dependencies not executed when it was examined.
+    /// Keyed by identity, so a record can wait on a command this table
+    /// has no record of yet. When that command executes, or is restored
+    /// executed, its waiters are examined again, each then ready or
+    /// waiting on its next dependency not executed; nothing else looks at
+    /// them. Left lazily: a waiter restored executed meanwhile is dropped
+    /// when its dependency wakes it.
+    waiting: BTreeMap<CommandId, Vec<CommandId>>,
+    /// How many records hold their payload below EXECUTED (task-d107):
+    /// whether this replica holds work it has not executed, without a
+    /// walk of the table, whose executed records stay until reclaimed.
+    unexecuted: usize,
+    /// Records the next command's choice examined (task-d107), for the
+    /// tests that bound it.
+    #[cfg(test)]
+    examined: core::cell::Cell<u64>,
     /// The order this replica executed commands in, as ordinals: one per
     /// command, retired ones included, the cost `history` already pays
     /// (task-d71). Execution is one order at every voter, so a candidate
@@ -263,7 +354,11 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         }
@@ -285,7 +380,11 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         }
@@ -314,18 +413,32 @@ impl CommandTable {
             raised: None,
             moved: None,
             accepted: BTreeSet::new(),
-            committed: BTreeSet::new(),
+            ready: BTreeSet::new(),
+            waiting: BTreeMap::new(),
+            unexecuted: 0,
+            #[cfg(test)]
+            examined: core::cell::Cell::new(0),
             execution_order: BTreeMap::new(),
             durable_executions: None,
         };
+        let mut committed = Vec::new();
         for (c, r) in records {
             if r.phase == Phase::Accept {
                 table.accepted.insert(c);
             }
             if r.phase == Phase::Commit {
-                table.committed.insert(c);
+                committed.push(c);
+            }
+            if r.payload.is_some() && r.phase < Phase::Executed {
+                table.unexecuted += 1;
             }
             table.records.insert(c, r);
+        }
+        // Once every record is in, so each is found ready or waiting on
+        // its first dependency not executed. The executed identities the
+        // boot restores next wake what waits on them.
+        for c in committed {
+            table.examine(c);
         }
         let mut per_key: BTreeMap<Vec<u8>, Vec<CommandId>> = BTreeMap::new();
         for (c, r) in &table.records {
@@ -460,6 +573,9 @@ impl CommandTable {
         }
         let record = self.records.remove(command).expect("checked");
         self.accepted.remove(command);
+        if record.payload.is_some() {
+            self.unexecuted -= 1;
+        }
         for key in &record.keys {
             let Some(state) = self.keys.get_mut(key) else {
                 continue;
@@ -655,6 +771,24 @@ impl CommandTable {
         self.initialize_bounded(command, payload, keys, Room::Installed)
     }
 
+    /// [`CommandTable::initialize`] for a relayed command (task-d102,
+    /// task-d100's step B): its payload arrived with the leader's
+    /// proposal, and the follower adopts the leader's order at once, so
+    /// the command is never pre-accepted here. Its key's latest moves to
+    /// it, so the next command this replica pre-accepts on the key
+    /// follows it, and its path logs don't take it: its adoption
+    /// synchronizes it from outside the suffix. The record is at
+    /// PRE-ACCEPT in memory only until that adoption, which writes it.
+    pub fn initialize_relayed(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+        room: RelayRoom,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, Room::Relayed(room))
+    }
+
     fn initialize_bounded(
         &mut self,
         command: CommandId,
@@ -673,9 +807,15 @@ impl CommandTable {
             Some(_) => {}
             None => {
                 let refused = match room {
-                    Room::Admission => self.full_after_reclaim(),
-                    Room::Reserve => self.at_capacity_after_reclaim(),
-                    Room::Unbounded | Room::Installed => false,
+                    Room::Admission | Room::Relayed(RelayRoom::Admission) => {
+                        self.full_after_reclaim()
+                    }
+                    Room::Reserve | Room::Relayed(RelayRoom::Reserve) => {
+                        self.at_capacity_after_reclaim()
+                    }
+                    Room::Unbounded | Room::Installed | Room::Relayed(RelayRoom::Unbounded) => {
+                        false
+                    }
                 };
                 if refused {
                     return Err(InitError::Backpressure);
@@ -692,7 +832,7 @@ impl CommandTable {
                 }
             }
             state.last = Some(command);
-            let digest = if room == Room::Installed {
+            let digest = if matches!(room, Room::Installed | Room::Relayed(_)) {
                 state.log.install(command)
             } else {
                 state.log.append(command)
@@ -701,6 +841,11 @@ impl CommandTable {
         }
         let path = combined_path(&paths);
         self.raise(command);
+        // A record with its payload here was refused above: this one is
+        // new, or a placeholder taking its payload. A placeholder at
+        // COMMIT, which only a restore holds, starts again at PRE-ACCEPT
+        // like any other, so its payload never makes it ready here.
+        self.unexecuted += 1;
         self.records.insert(
             command,
             CommandRecord {
@@ -944,20 +1089,137 @@ impl CommandTable {
         Ok(())
     }
 
-    /// The records at COMMIT, in identity order (task-d46): those the
-    /// next command to execute is among.
-    pub fn in_commit(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
+    /// The commands ready to execute, in identity order (task-d107): at
+    /// COMMIT with their payload, every dependency executed. The next
+    /// command to execute is among them. Costs the ready records, not
+    /// the ones blocked behind a dependency.
+    pub fn ready(&self) -> impl Iterator<Item = &CommandId> {
         debug_assert!(
             self.records
                 .iter()
-                .filter(|(_, r)| r.phase == Phase::Commit)
-                .all(|(c, _)| self.committed.contains(c)),
-            "a record at COMMIT is missing from the executable set"
+                .filter(|(_, r)| r.phase == Phase::Commit && r.payload.is_some())
+                .filter(|(_, r)| guard_execute(&r.deps, |d| self.phase_of(d)).is_ok())
+                .map(|(c, _)| c)
+                .eq(self.ready.iter()),
+            "the ready set is not exactly the records the full walk finds ready"
         );
-        self.committed
+        self.ready.iter().inspect(|_| {
+            #[cfg(test)]
+            self.examined.set(self.examined.get() + 1);
+        })
+    }
+
+    /// How many records are at COMMIT, placeholders included: decided
+    /// here and not executed (#236 review). One walk of the records.
+    pub fn committed_records(&self) -> usize {
+        self.records
+            .values()
+            .filter(|r| r.phase == Phase::Commit)
+            .count()
+    }
+
+    /// Whether any record holds its payload below EXECUTED (task-d107).
+    pub fn holds_unexecuted(&self) -> bool {
+        self.unexecuted_records() > 0
+    }
+
+    /// How many records hold their payload below EXECUTED (task-d107).
+    pub fn unexecuted_records(&self) -> usize {
+        debug_assert_eq!(
+            self.records
+                .values()
+                .filter(|r| r.payload.is_some() && r.phase < Phase::Executed)
+                .count(),
+            self.unexecuted,
+            "the unexecuted count is not the records below EXECUTED"
+        );
+        self.unexecuted
+    }
+
+    /// The table's size and what holds back its oldest unexecuted record
+    /// (task-d25, #98): read once a metrics line, at the cost of one walk
+    /// of the records.
+    ///
+    /// The oldest is the record below EXECUTED, its payload held or not,
+    /// that is first in `order` (a leader's proposal sequence number, a
+    /// follower's adoption), then by identity among those it has none for.
+    /// A table full of commands that cannot execute names, here, the one
+    /// they are all behind.
+    pub fn waits(&self, order: impl Fn(&CommandId) -> Option<u64>) -> TableWaits {
+        let oldest = self
+            .records
             .iter()
-            .filter_map(|c| self.records.get_key_value(c))
-            .filter(|(_, r)| r.phase == Phase::Commit && r.payload.is_some())
+            .filter(|(_, r)| r.phase < Phase::Executed)
+            .min_by_key(|(c, _)| (order(c).map_or((1, 0), |s| (0, s)), **c))
+            .map(|(command, record)| {
+                let wait = if record.payload.is_none() {
+                    TableWait::Payload
+                } else if record.phase < Phase::Commit {
+                    TableWait::Uncommitted(record.phase)
+                } else if self.ready.contains(command) {
+                    TableWait::Ready
+                } else {
+                    match record
+                        .deps
+                        .iter()
+                        .map(|d| self.phase_of(d))
+                        .find(|p| *p != Some(Phase::Executed))
+                    {
+                        Some(phase) => TableWait::Dependency(phase),
+                        None => TableWait::Ready,
+                    }
+                };
+                (*command, wait)
+            });
+        TableWaits {
+            records: self.records.len(),
+            capacity: self.capacity,
+            unexecuted: self.unexecuted,
+            ready: self.ready.len(),
+            oldest,
+        }
+    }
+
+    /// Records the next command's choice has examined, since the last
+    /// call (task-d107).
+    #[cfg(test)]
+    pub(crate) fn take_examined(&self) -> u64 {
+        self.examined.replace(0)
+    }
+
+    /// Find `command` ready, or waiting on its first dependency not
+    /// executed (task-d107). Nothing for a record not at COMMIT with its
+    /// payload: a record reaches COMMIT through [`CommandTable::commit`]
+    /// or [`CommandTable::restore`], which examine it.
+    fn examine(&mut self, command: CommandId) {
+        let Some(record) = self.records.get(&command) else {
+            return;
+        };
+        if record.phase != Phase::Commit || record.payload.is_none() {
+            return;
+        }
+        let blocker = record
+            .deps
+            .iter()
+            .find(|d| self.phase_of(d) != Some(Phase::Executed))
+            .copied();
+        match blocker {
+            Some(dep) => self.waiting.entry(dep).or_default().push(command),
+            None => {
+                self.ready.insert(command);
+            }
+        }
+    }
+
+    /// `command` executed: it is no longer ready, and what waited on it
+    /// is examined again (task-d107).
+    fn executed_now(&mut self, command: &CommandId) {
+        self.ready.remove(command);
+        if let Some(waiters) = self.waiting.remove(command) {
+            for waiter in waiters {
+                self.examine(waiter);
+            }
+        }
     }
 
     /// The commands at ACCEPT, in identity order (task-d46): those the
@@ -1045,7 +1307,7 @@ impl CommandTable {
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
         self.accepted.remove(&command);
-        self.committed.insert(command);
+        self.examine(command);
         self.raise(command);
         Ok(())
     }
@@ -1077,7 +1339,8 @@ impl CommandTable {
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.accepted.remove(&command);
-        self.committed.remove(&command);
+        self.unexecuted -= 1;
+        self.executed_now(&command);
         self.last_executed = Some(command);
         self.note_execution(command);
         self.unretired.push_back(command);
@@ -1166,9 +1429,15 @@ impl CommandTable {
     ///
     /// A command with no record here is one whose rows are gone (a trimmed
     /// prefix): it is remembered as executed, which is all there is left
-    /// to say about it.
+    /// to say about it. So is one the table holds only a placeholder of:
+    /// a durable Sync row names it and no row of its own is left. A
+    /// catch-up window that ran a command with no decided record made one
+    /// (#303), and no window does now (seed 73), but the execution row is
+    /// the evidence whatever made the placeholder. Kept, the placeholder
+    /// hid the execution -- `phase_of` answered none -- and a selection
+    /// that named the command asked its payload for ever, since taking the
+    /// payload of a command executed here initializes nothing.
     pub fn restore_executed(&mut self, command: &CommandId) {
-        self.committed.remove(command);
         self.last_executed = Some(*command);
         self.note_execution(*command);
         self.raise(*command);
@@ -1177,14 +1446,20 @@ impl CommandTable {
                 if r.phase != Phase::Executed {
                     r.phase = Phase::Executed;
                     self.accepted.remove(command);
+                    self.unexecuted -= 1;
                     self.unretired.push_back(*command);
                 }
+            }
+            Some(r) if r.phase == Phase::Start => {
+                self.records.remove(command);
+                self.history.insert(*command);
             }
             Some(_) => {}
             None => {
                 self.history.insert(*command);
             }
         }
+        self.executed_now(command);
     }
 
     /// Forget an executed command. Unresolved acceptance is never deleted
@@ -1445,5 +1720,249 @@ impl CommandTable {
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    //! The ready set (task-d107): what the next command's choice looks at,
+    //! counted rather than timed, with N records blocked and one ready.
+
+    use alloc::vec;
+
+    use coord_types::ids::ExecutionPosition;
+
+    use super::*;
+    use crate::learner::Learner;
+
+    fn id(n: u32) -> CommandId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        bytes[31] = 1;
+        CommandId(Digest32(bytes))
+    }
+
+    fn record(phase: Phase, deps: Vec<CommandId>, payload: bool) -> CommandRecord {
+        CommandRecord {
+            phase,
+            deps,
+            keys: Vec::new(),
+            payload: payload.then_some(Digest32([7; 32])),
+            paths: Vec::new(),
+            synced_seq: None,
+            path: crate::graph::empty_path(),
+        }
+    }
+
+    /// `blocked` records at COMMIT behind a root no row names, and one
+    /// with nothing to wait on, which is returned with them.
+    /// `in_flight` records at ACCEPT, undecided, beside
+    /// [`blocked_behind_a_root`]'s `decided` (#236 review): what a
+    /// follower at full load holds, most of it not yet committed.
+    pub(crate) fn in_flight_beside_decided(
+        in_flight: u32,
+        decided: u32,
+    ) -> Vec<(CommandId, CommandRecord)> {
+        let (mut rows, _) = blocked_behind_a_root(decided - 1);
+        let base = decided + 1;
+        rows.extend(
+            (base..base + in_flight).map(|n| (id(n), record(Phase::Accept, Vec::new(), true))),
+        );
+        rows
+    }
+
+    pub(crate) fn blocked_behind_a_root(
+        blocked: u32,
+    ) -> (Vec<(CommandId, CommandRecord)>, CommandId) {
+        let root = id(0);
+        let ready = id(1);
+        let rows = (2..2 + blocked)
+            .map(|n| (id(n), record(Phase::Commit, vec![root], true)))
+            .chain([(ready, record(Phase::Commit, Vec::new(), true))])
+            .collect();
+        (rows, ready)
+    }
+
+    fn next(table: &CommandTable) -> Option<CommandId> {
+        Learner::new(ExecutionPosition::ZERO).next_executable(table, |_| None)
+    }
+
+    /// N records restored at COMMIT behind a root this table has no record
+    /// of, and one with nothing to wait on: a call looks at that one only,
+    /// whatever N is. The full walk it replaced looked at N + 1.
+    #[test]
+    fn a_call_examines_the_ready_record_only_however_many_are_blocked() {
+        for blocked in [10u32, 1_000, 5_000] {
+            let (rows, ready) = blocked_behind_a_root(blocked);
+            let table = CommandTable::restore(None, rows);
+            table.take_examined();
+            assert_eq!(next(&table), Some(ready));
+            assert_eq!(table.take_examined(), 1, "{blocked} blocked");
+            assert_eq!(table.unexecuted_records(), blocked as usize + 1);
+        }
+    }
+
+    /// A placeholder restored as executed is history, not a placeholder:
+    /// the execution row says the command ran here, whatever left a Sync
+    /// row naming it and no row of its own (#303).
+    #[test]
+    fn a_placeholder_restored_as_executed_is_history() {
+        let mut table = CommandTable::restore(Some(64), Vec::new());
+        table.expect(id(3)).unwrap();
+        // A placeholder has no phase to answer: it has bound nothing.
+        assert_eq!(table.phase_of(&id(3)), None);
+        assert!(table.record(&id(3)).is_some());
+        table.restore_executed(&id(3));
+        assert_eq!(table.phase_of(&id(3)), Some(Phase::Executed));
+        assert!(table.record(&id(3)).is_none(), "the placeholder stayed");
+        assert_eq!(table.undecided().count(), 0);
+    }
+
+    /// The oldest unexecuted record is the first in its owner's order,
+    /// and what holds it is named: a dependency this table has no record
+    /// of, then, once that is restored executed, nothing in the table.
+    #[test]
+    fn the_oldest_unexecuted_record_names_what_it_waits_on() {
+        let (rows, ready) = blocked_behind_a_root(3);
+        let mut table = CommandTable::restore(Some(64), rows);
+        // The owner's order puts the blocked records first, `ready` last.
+        let order = |c: &CommandId| (2..5).position(|n| id(n) == *c).map(|p| p as u64);
+        let waits = table.waits(order);
+        assert_eq!(
+            (waits.records, waits.capacity, waits.unexecuted, waits.ready),
+            (4, Some(64), 4, 1)
+        );
+        assert_eq!(waits.oldest, Some((id(2), TableWait::Dependency(None))));
+        table.restore_executed(&id(0));
+        let waits = table.waits(order);
+        assert_eq!(
+            (waits.ready, waits.oldest),
+            (4, Some((id(2), TableWait::Ready)))
+        );
+        for n in 2..5 {
+            table.execute(id(n)).unwrap();
+        }
+        // Unordered, the one left is still found.
+        assert_eq!(table.waits(order).oldest, Some((ready, TableWait::Ready)));
+        table.execute(ready).unwrap();
+        let waits = table.waits(order);
+        assert_eq!((waits.unexecuted, waits.oldest), (0, None));
+    }
+
+    /// A record not committed waits at its phase, and a placeholder on
+    /// its payload; a committed record behind one waits at that phase.
+    #[test]
+    fn the_oldest_waits_on_its_payload_its_commit_or_a_dependency_held_here() {
+        let mut table = CommandTable::new();
+        let key = || vec![b"k".to_vec()];
+        let (a, b, c) = (id(1), id(2), id(3));
+        table.initialize(a, Digest32([1; 32]), key()).unwrap();
+        table.initialize(b, Digest32([2; 32]), key()).unwrap();
+        table.expect(c).unwrap();
+        let first = |first: CommandId| move |x: &CommandId| (*x == first).then_some(0);
+        assert_eq!(
+            table.waits(first(a)).oldest,
+            Some((a, TableWait::Uncommitted(Phase::PreAccept)))
+        );
+        assert_eq!(table.waits(first(c)).oldest, Some((c, TableWait::Payload)));
+        table.accept(a, Vec::new()).unwrap();
+        table.accept(b, vec![a]).unwrap();
+        table.commit(a).unwrap();
+        table.commit(b).unwrap();
+        assert_eq!(
+            table.waits(first(b)).oldest,
+            Some((b, TableWait::Dependency(Some(Phase::Commit))))
+        );
+    }
+
+    /// A blocked record is looked at again when the one dependency it
+    /// waits on executes, and not before: executing the ready record wakes
+    /// nothing, and the root, restored executed, makes every waiter ready.
+    #[test]
+    fn the_dependency_a_record_waits_on_wakes_it() {
+        let root = id(0);
+        let ready = id(1);
+        let rows = (2..12)
+            .map(|n| (id(n), record(Phase::Commit, vec![ready, root], true)))
+            .chain([(ready, record(Phase::Commit, Vec::new(), true))]);
+        let mut table = CommandTable::restore(None, rows);
+        assert_eq!(next(&table), Some(ready));
+        table.execute(ready).unwrap();
+        table.take_examined();
+        // Each waiter moved on to its next dependency not executed, the
+        // root, which no record here names yet.
+        assert_eq!(next(&table), None);
+        assert_eq!(table.take_examined(), 0);
+        assert_eq!(table.waiting.get(&root).map(Vec::len), Some(10));
+        table.restore_executed(&root);
+        assert_eq!(table.ready().count(), 10);
+        assert!(table.waiting.is_empty());
+        assert_eq!(next(&table), Some(id(2)));
+    }
+
+    /// A record committed with every dependency executed is ready at its
+    /// commit; one committed behind a dependency is ready once that
+    /// executes.
+    #[test]
+    fn a_commit_is_ready_with_its_dependencies_executed() {
+        let mut table = CommandTable::new();
+        let key = || vec![b"k".to_vec()];
+        let a = id(1);
+        let b = id(2);
+        table.initialize(a, Digest32([1; 32]), key()).unwrap();
+        let deps = table.initialize(b, Digest32([2; 32]), key()).unwrap().deps;
+        assert_eq!(deps, vec![a]);
+        table.accept(a, Vec::new()).unwrap();
+        table.accept(b, vec![a]).unwrap();
+        table.commit(a).unwrap();
+        table.commit(b).unwrap();
+        assert_eq!(next(&table), Some(a));
+        assert_eq!(table.unexecuted_records(), 2);
+        table.execute(a).unwrap();
+        assert_eq!(next(&table), Some(b));
+        table.execute(b).unwrap();
+        assert_eq!(next(&table), None);
+        assert!(!table.holds_unexecuted());
+        // Retired, the records leave no waiter or ready entry behind.
+        assert_eq!(table.reclaim(), 2);
+        assert!(table.ready.is_empty() && table.waiting.is_empty());
+    }
+
+    /// A record restored at COMMIT without its payload is not ready, and
+    /// its payload starts it again at PRE-ACCEPT: it is ready only once
+    /// committed again.
+    #[test]
+    fn a_payload_reaching_a_restored_commit_starts_it_again() {
+        let a = id(1);
+        let mut table =
+            CommandTable::restore(None, [(a, record(Phase::Commit, Vec::new(), false))]);
+        assert_eq!(next(&table), None);
+        assert!(!table.holds_unexecuted());
+        table
+            .initialize_beyond_capacity(a, Digest32([1; 32]), Vec::new())
+            .unwrap();
+        assert_eq!(table.phase_of(&a), Some(Phase::PreAccept));
+        assert_eq!(next(&table), None);
+        assert!(table.holds_unexecuted());
+        table.accept(a, Vec::new()).unwrap();
+        table.commit(a).unwrap();
+        assert_eq!(next(&table), Some(a));
+    }
+
+    /// The unexecuted count follows a released record and a record
+    /// restored executed.
+    #[test]
+    fn the_unexecuted_count_follows_release_and_restored_execution() {
+        let mut table = CommandTable::new();
+        let a = id(1);
+        let b = id(2);
+        table.initialize(a, Digest32([1; 32]), Vec::new()).unwrap();
+        table.initialize(b, Digest32([2; 32]), Vec::new()).unwrap();
+        table.expect(id(3)).unwrap();
+        assert_eq!(table.unexecuted_records(), 2);
+        assert!(table.release(&a));
+        assert_eq!(table.unexecuted_records(), 1);
+        table.restore_executed(&b);
+        assert_eq!(table.unexecuted_records(), 0);
     }
 }

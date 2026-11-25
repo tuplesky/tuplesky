@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use coord_collector::{Collector, CollectorConfig, MonotonicMillis, Submitted};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
-    LearningMode, ReplicaRole,
+    LearningMode, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, PeerId};
@@ -34,8 +34,9 @@ use coord_storage::{Applier, GroupLimits, StoreWorker};
 use coord_store_testkit::model::ModelEngine;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
-    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, PolicyRuleId,
-    PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
+    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition,
+    NamespaceId, PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence,
+    SessionId,
 };
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole, RequestV1};
@@ -227,12 +228,12 @@ fn retry_key(sequence: u64) -> RetryKey {
     }
 }
 
-fn logical(sequence: u64) -> LogicalRequest {
+fn logical(sequence: u64, value_len: usize) -> LogicalRequest {
     let mut logical = LogicalRequest::new(
         NS,
         CanonicalOperation::Put(PutOp {
             key: format!("k{sequence}").into_bytes(),
-            value: b"v".to_vec(),
+            value: vec![b'v'; value_len],
             lease: None,
             prev_kv: false,
         }),
@@ -243,8 +244,8 @@ fn logical(sequence: u64) -> LogicalRequest {
 
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
-fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+fn admitted(sequence: u64, value_len: usize) -> AdmittedRequest {
+    let request = RequestV1::new(retry_key(sequence), &logical(sequence, value_len), 0, 0).unwrap();
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -284,7 +285,21 @@ struct Cluster {
     pacers: Vec<Pacer>,
     now: Instant,
     sequence: u64,
+    /// The length of each put's value: 1 unless a test says otherwise.
+    value_len: usize,
     backpressure: Vec<usize>,
+    /// The next catch-up ask voter `.0` sends to voter `.1` is lost, or
+    /// with `.2`, the next catch-up page.
+    lose: Option<(usize, usize, bool)>,
+    /// How many of those to let through before the one lost.
+    lose_after: usize,
+    /// Every frame voter `.0` sends to voter `.1` but catch-up's is lost:
+    /// a leader with nothing for that voter to adopt.
+    mute: Option<(usize, usize)>,
+    /// Every catch-up ask from voter `.0` and every page to it is lost,
+    /// once `.1` more of them have gone through: a voter cut off from
+    /// every donor's catch-up for a while.
+    cut: Option<(usize, usize)>,
 }
 
 impl Cluster {
@@ -302,7 +317,12 @@ impl Cluster {
             pacers: vec![Pacer::default(), Pacer::default(), Pacer::default()],
             now: Instant::now(),
             sequence: 0,
+            value_len: 1,
             backpressure: vec![0; 3],
+            lose: None,
+            lose_after: 0,
+            mute: None,
+            cut: None,
         }
     }
 
@@ -310,9 +330,51 @@ impl Cluster {
         // The collector is not what this is about: what the voters tell
         // it is dropped.
         for (to, frame) in out.peer {
+            let to = usize::from(to.replica.0[0]);
+            if let Some((lose_from, lose_to, page)) = self.lose
+                && lose_from == from
+                && lose_to == to
+                && matches!(
+                    (page, coord_consensus::ProtocolMessage::decode(&frame)),
+                    (
+                        false,
+                        Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. })
+                    ) | (
+                        true,
+                        Ok(coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                    )
+                )
+            {
+                if self.lose_after == 0 {
+                    self.lose = None;
+                    continue;
+                }
+                self.lose_after -= 1;
+            }
+            if let Some((cut, through)) = self.cut.as_mut()
+                && (*cut == from || *cut == to)
+                && matches!(
+                    coord_consensus::ProtocolMessage::decode(&frame),
+                    Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. }
+                        | coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                )
+            {
+                if *through == 0 {
+                    continue;
+                }
+                *through -= 1;
+            }
+            if self.mute == Some((from, to))
+                && !matches!(
+                    coord_consensus::ProtocolMessage::decode(&frame),
+                    Ok(coord_consensus::ProtocolMessage::CatchUpRequest { .. }
+                        | coord_consensus::ProtocolMessage::CatchUpPage { .. })
+                )
+            {
+                continue;
+            }
             let prov = self.voters[from].provenance();
-            self.peers
-                .push_back((usize::from(to.replica.0[0]), prov, frame));
+            self.peers.push_back((to, prov, frame));
         }
     }
 
@@ -321,7 +383,10 @@ impl Cluster {
         self.sequence += 1;
         let Submitted::FanOut(fan_out) = self
             .collector
-            .submit(MonotonicMillis::ZERO, &admitted(self.sequence))
+            .submit(
+                MonotonicMillis::ZERO,
+                &admitted(self.sequence, self.value_len),
+            )
             .expect("submitted")
         else {
             panic!("not new work")
@@ -424,10 +489,9 @@ impl Cluster {
         order
             .into_iter()
             .map(|(position, command)| {
-                let entry =
-                    coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &command)
-                        .expect("read")
-                        .expect("executed and held");
+                let entry = coord_storage::protocol::catch_up_entry(&gated, epoch(), &command)
+                    .expect("read")
+                    .expect("executed and held");
                 (position.get(), command, entry.result_digest)
             })
             .collect()
@@ -475,6 +539,43 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
         "{pages} pages, {pulled} pulled"
     );
     assert!(cluster.voters[0].node().pages_served > 0);
+    // Each page answered an ask r2 published (task-d106 step 0).
+    let paths = cluster.voters[2].node().machine().catch_up_paths();
+    assert!(paths.asked >= pages, "{paths:?}");
+    // A donor counts what it answers with nothing, by why: of itself or
+    // a stranger, at another epoch's ballot, and past its own frontier.
+    let donor = cluster.voters[0].node_mut();
+    let through = donor.machine().executed_through();
+    let other = Ballot {
+        epoch: ConfigurationEpoch::new(2).unwrap(),
+        ..ballot()
+    };
+    let before = donor.unserved;
+    for (from, at) in [(r(0), ballot()), (r(9), ballot()), (r(2), other)] {
+        let out = donor.serve_catch_up(from, at, ExecutionPosition::ZERO);
+        assert!(out.peer.is_empty(), "{from:?} {at:?}");
+    }
+    assert!(
+        donor
+            .serve_catch_up(r(2), ballot(), through)
+            .peer
+            .is_empty()
+    );
+    let after = donor.unserved;
+    assert_eq!(
+        (
+            after.sender - before.sender,
+            after.ballot - before.ballot,
+            after.nothing_after - before.nothing_after,
+            after.stopped - before.stopped,
+            after.no_order - before.no_order,
+            after.order_above - before.order_above,
+            after.no_snapshot - before.no_snapshot,
+            after.first_row - before.first_row,
+        ),
+        (2, 1, 1, 0, 0, 0, 0, 0),
+        "{before:?} {after:?}"
+    );
     // Serving: executed as far as the leader, table drained, and new work
     // taken without backpressure once caught up.
     let refused_before = cluster.backpressure[2];
@@ -489,9 +590,226 @@ fn a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal() {
     // Its history is the leader's, row for row: the same commands at the
     // same positions with the same results.
     assert_eq!(cluster.executed_rows(2), cluster.executed_rows(0));
+
+    // A role change keeps what the metrics line counts (#98, 6807495802,
+    // a voter's line read 0 after a heal): r2 campaigns and leads, and its
+    // node still counts the pages it took as a follower.
+    let before = cluster.voters[2].node().catch_up_since_start();
+    assert!(before.0 > 0, "r2 took no pages: the test shows nothing");
+    let (_, out) = cluster.voters[2]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    cluster.carry(2, out);
+    cluster.settle();
+    assert!(cluster.voters[2].leads(), "r2 did not win its campaign");
+    assert_eq!(
+        cluster.voters[2].node().machine().catch_up_counts(),
+        (0, 0),
+        "a leader's machine counts no catch-up: the test shows nothing"
+    );
+    assert_eq!(cluster.voters[2].node().catch_up_since_start(), before);
 }
 
-/// task-d77 (#169 review): a candidate's campaign waits on the dependency
+/// A voter that restarts behind holding nothing asks, whatever it holds,
+/// since nothing else would make it ask (task-d08). When that ask, or
+/// the page that answers it, is lost in a quiet cluster, it asks again
+/// until a page arrives; with nothing past it at any donor, it stops once
+/// every voter has been asked (#98, Codex on the carry's `catch_up.rs`).
+///
+/// Two cases each. With the leader's traffic, the leader re-sends what
+/// the voter has not adopted, which gives it work to ask for. Muted, the
+/// leader has nothing for it, as one holding nothing the voter has not
+/// adopted: there the probe is the only ask. Before, the probe counted as
+/// made the moment it went, and a muted voter whose probe was lost never
+/// asked again.
+#[test]
+fn a_voter_restarted_behind_whose_first_ask_is_lost_still_catches_up_in_a_quiet_cluster() {
+    for muted in [false, true] {
+        for (lose_from, lose_to, page, what) in [(2, 0, false, "the ask"), (0, 2, true, "its page")]
+        {
+            let what = format!("{what}, muted {muted}");
+            let mut cluster = Cluster::new();
+            for _ in 0..2 {
+                cluster.second();
+            }
+            cluster.down = vec![2];
+            for _ in 0..5 {
+                cluster.second();
+            }
+            // The load stops; r2 comes back holding nothing, with the
+            // pacer a restart gives it, and the first catch-up ask it
+            // sends the leader, or the first page the leader sends it, is
+            // lost.
+            cluster.down.clear();
+            cluster.pacers[2] = Pacer::default();
+            assert!(
+                !cluster.voters[2].node().machine().holds_unexecuted(),
+                "r2 holds work: this is not the quiet case"
+            );
+            let behind = cluster.executed_through(0) - cluster.executed_through(2);
+            assert!(behind >= 5 * RATE, "r2 is only {behind} behind");
+            cluster.lose = Some((lose_from, lose_to, page));
+            cluster.mute = muted.then_some((0, 2));
+            for _ in 0..10 {
+                cluster.tick();
+            }
+            assert!(cluster.lose.is_none(), "{what}: nothing was lost");
+            assert_eq!(
+                cluster.executed_through(2),
+                cluster.executed_through(0),
+                "{what} lost: r2 never asked again ({:?})",
+                cluster.voters[2].node().machine().catch_up_paths()
+            );
+            // Level now, with nothing past it anywhere: it stops asking
+            // once every voter has been asked, and the loop has no
+            // deadline for it.
+            let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+            for _ in 0..10 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.voters[2].node().machine().catch_up_paths().asked,
+                asked,
+                "{what}: a level voter kept asking"
+            );
+            assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+        }
+    }
+}
+
+/// A chain's later ask or page lost in a quiet domain (#226 review): the
+/// probe used to end at the first page, after which the asks were the
+/// chain's alone, so a voter holding nothing whose second ask or page was
+/// lost never asked again (review's case: r2 at 105 of 141 for 30 ticks).
+/// Each ask and each page of a chain of several pages is lost in turn,
+/// with the leader muted and with its traffic: r2 must end level, and then
+/// stop asking.
+#[test]
+fn a_voter_whose_chain_loses_any_ask_or_page_still_catches_up_in_a_quiet_cluster() {
+    for muted in [true, false] {
+        for nth in 0..4 {
+            for (lose_from, lose_to, page, what) in [(2, 0, false, "ask"), (0, 2, true, "page")] {
+                let what = format!("{what} {nth}, muted {muted}");
+                let mut cluster = Cluster::new();
+                for _ in 0..2 {
+                    cluster.second();
+                }
+                cluster.down = vec![2];
+                for _ in 0..25 {
+                    cluster.second();
+                }
+                cluster.down.clear();
+                cluster.pacers[2] = Pacer::default();
+                assert!(
+                    !cluster.voters[2].node().machine().holds_unexecuted(),
+                    "{what}: r2 holds work, so this is not the quiet case"
+                );
+                let behind = cluster.executed_through(0) - cluster.executed_through(2);
+                assert!(
+                    behind > 3 * MAX_CATCH_UP_COMMANDS as u64,
+                    "{what}: r2 is only {behind} behind, a chain of under four pages"
+                );
+                cluster.lose = Some((lose_from, lose_to, page));
+                cluster.lose_after = nth;
+                cluster.mute = muted.then_some((0, 2));
+                for _ in 0..30 {
+                    cluster.tick();
+                }
+                assert!(cluster.lose.is_none(), "{what}: nothing was lost");
+                assert_eq!(
+                    cluster.executed_through(2),
+                    cluster.executed_through(0),
+                    "{what} lost: r2 stopped short ({:?})",
+                    cluster.voters[2].node().machine().catch_up_paths()
+                );
+                let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+                for _ in 0..10 {
+                    cluster.tick();
+                }
+                assert_eq!(
+                    cluster.voters[2].node().machine().catch_up_paths().asked,
+                    asked,
+                    "{what}: a level voter kept asking"
+                );
+                assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+            }
+        }
+    }
+}
+
+/// An open chain whose every ask and page is lost for a round of every
+/// voter, in a quiet domain (task-d25 review): r2 takes its first page,
+/// and then no catch-up frame reaches it or leaves it for longer than a
+/// round, four asks with three voters. A donor with nothing past an ask
+/// answers nothing, so the round read as nobody having more, and the voter
+/// gave its chain up: muted, it stayed at 166 of 541 with no ask and no
+/// deadline. Now it asks on every `CHAIN_RETRY` while its chain is open,
+/// so once the frames flow again it ends level, and then stops asking.
+#[test]
+fn a_voter_whose_chain_loses_every_answer_for_a_round_still_catches_up_in_a_quiet_cluster() {
+    for muted in [true, false] {
+        for lost_for in [8, 16] {
+            let what = format!("lost for {lost_for} ticks, muted {muted}");
+            let mut cluster = Cluster::new();
+            for _ in 0..2 {
+                cluster.second();
+            }
+            cluster.down = vec![2];
+            for _ in 0..25 {
+                cluster.second();
+            }
+            cluster.down.clear();
+            cluster.pacers[2] = Pacer::default();
+            assert!(
+                !cluster.voters[2].node().machine().holds_unexecuted(),
+                "{what}: r2 holds work, so this is not the quiet case"
+            );
+            // The probe and its page go through; nothing else does.
+            cluster.cut = Some((2, 2));
+            cluster.mute = muted.then_some((0, 2));
+            for _ in 0..lost_for {
+                cluster.tick();
+            }
+            let paths = cluster.voters[2].node().machine().catch_up_paths();
+            assert!(
+                cluster.executed_through(2) < cluster.executed_through(0),
+                "{what}: r2 caught up while cut off ({paths:?})"
+            );
+            assert!(
+                cluster.voters[2].node().machine().catch_up_counts().0 >= 1,
+                "{what}: r2 never took its first page ({paths:?})"
+            );
+            assert!(
+                paths.asked >= 6,
+                "{what}: fewer asks than a round lost ({paths:?})"
+            );
+            cluster.cut = None;
+            for _ in 0..30 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.executed_through(2),
+                cluster.executed_through(0),
+                "{what}: r2 stopped short ({:?}, deadline {:?})",
+                cluster.voters[2].node().machine().catch_up_paths(),
+                cluster.pacers[2].next_deadline()
+            );
+            let asked = cluster.voters[2].node().machine().catch_up_paths().asked;
+            for _ in 0..20 {
+                cluster.tick();
+            }
+            assert_eq!(
+                cluster.voters[2].node().machine().catch_up_paths().asked,
+                asked,
+                "{what}: a level voter kept asking"
+            );
+            assert_eq!(cluster.pacers[2].next_deadline(), None, "{what}");
+        }
+    }
+}
+
+/// task-d77 (#169 review): a campaign waits on the dependency
 /// rows of commands it executed and forgot, and the runtime reads them as
 /// a donor reads a page. A command whose rows are still held is answered
 /// with its row, the record catch-up serves; one with no dependency row
@@ -515,7 +833,7 @@ fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
     let applier = cluster.voters[2].node().applier();
     let held = {
         let gated = applier.store().reader().snapshot().expect("snapshot");
-        coord_storage::protocol::catch_up_entry(gated.view(), epoch(), &forgotten)
+        coord_storage::protocol::catch_up_entry(&gated, epoch(), &forgotten)
             .expect("read")
             .expect("executed and held")
             .decided
@@ -531,4 +849,319 @@ fn a_campaign_is_answered_a_forgotten_commands_row_from_the_store() {
         coord_daemon::catch_up::executed_rows(applier, other, vec![forgotten]),
         vec![(forgotten, None)]
     );
+}
+
+/// The donor's side of a command past a page's byte bound by itself
+/// (#236 review): a put at the value limit is larger than
+/// `MAX_CATCH_UP_BYTES` on its own, and the donor's one-command exemption
+/// is what puts it in a page at all. Without it, the donor has no page
+/// for it (`FirstRow`), and the voter behind it never gets past it.
+#[test]
+fn a_donor_serves_a_command_past_the_byte_bound_by_itself() {
+    let mut cluster = Cluster::new();
+    cluster.second();
+    cluster.down = vec![2];
+    // Three puts at the value limit, then enough small ones that the
+    // leader's table no longer holds them: r2 can get them only from a
+    // page.
+    cluster.value_len = MAX_CATCH_UP_BYTES;
+    for _ in 0..3 {
+        cluster.submit();
+        cluster.settle();
+    }
+    cluster.value_len = 1;
+    for _ in 0..3 {
+        cluster.second();
+    }
+    let behind = cluster.executed_through(0) - cluster.executed_through(2);
+    assert!(
+        behind > 2 * CAPACITY as u64,
+        "r2 is only {behind} behind: the test shows nothing"
+    );
+    cluster.down.clear();
+    let (pages, _) = cluster.voters[2].node().machine().catch_up_counts();
+    for _ in 0..20 {
+        cluster.tick();
+    }
+    assert_eq!(
+        cluster.executed_through(2),
+        cluster.executed_through(0),
+        "r2 stopped short ({:?})",
+        cluster.voters[2].node().machine().catch_up_paths()
+    );
+    let (taken, _) = cluster.voters[2].node().machine().catch_up_counts();
+    assert!(
+        taken - pages >= 4,
+        "three commands past the bound and the rest: {} pages",
+        taken - pages
+    );
+}
+
+/// The journal-first store coordd runs (task-d52).
+type Journaled =
+    coord_storage::JournaledDomain<coord_store_testkit::journal::ModelJournal, ModelEngine>;
+
+/// Follower `me` over the journal-first store, booted and lowering in
+/// groups, its projection commits lent to a manual materializer under the
+/// replay profile with a commit hold no test reaches (task-d86): what it
+/// journals is held until something asks for the commit.
+fn held_follower(me: u8) -> (Voter<Journaled>, coord_storage::ManualHandle<ModelEngine>) {
+    use coord_storage::Persistence as _;
+    use coord_storage::journaled::{
+        CommitHold, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
+    };
+    let boot = BootId([me + 1; 16]);
+    let mut store = JournaledStore::open(
+        coord_store_testkit::journal::ModelJournal::new(),
+        CLUSTER,
+        r(me),
+        inc(),
+        boot,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .attach(
+            DOMAIN,
+            coord_journal_api::stream::ShardId::new(0).unwrap(),
+            ModelEngine::new(),
+        )
+        .unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = store.application_base(DOMAIN).unwrap();
+    let genesis = Ballot {
+        epoch: base.configuration,
+        number: 0,
+        leader: r(0),
+    };
+    store
+        .submit(Submission {
+            domain: DOMAIN,
+            ballot: genesis,
+            kind: TransitionKind::Application {
+                position: base.execution_position.checked_next().unwrap(),
+                revision: None,
+                result_digest: Digest32([0; 32]),
+            },
+            batch: coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: Some(base),
+                updates: bootstrap_updates(),
+            },
+        })
+        .unwrap();
+    store.flush().unwrap();
+    store
+        .replay_projection(DurableCadence {
+            commits: std::num::NonZeroU32::MAX,
+            records: std::num::NonZeroU32::MAX,
+        })
+        .expect("the model engine has working state");
+    store
+        .hold_projection_commits(CommitHold {
+            records: std::num::NonZeroU32::MAX,
+            wait: Duration::from_secs(3600),
+        })
+        .expect("the replay profile");
+    let (materializer, handle) = coord_storage::ManualMaterializer::new();
+    store
+        .pipeline(Box::new(materializer))
+        .expect("nothing out yet");
+    let domain = coord_storage::JournaledDomain::new(store, DOMAIN, genesis).expect("attached");
+    let applier = Applier::new(domain, alloc).unwrap();
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Follower::new(FollowerConfig {
+        identity: identity(me),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: CAPACITY,
+    })
+    .restore_execution(bootstrapped, []);
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND);
+    node.lower_in_groups();
+    let ingress = Ingress::new(
+        &membership(),
+        r(me),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("a committed voter");
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+    voter.boot(boot, inc()).expect("boot");
+    (voter, handle)
+}
+
+/// Two voters over the reference store and a third, `lagging`, whose
+/// projection commits are held (task-d86).
+struct Held {
+    voters: Vec<Voter<StoreWorker<ModelEngine>>>,
+    lagging: Voter<Journaled>,
+    collector: Collector,
+    peers: std::collections::VecDeque<(usize, PeerProvenance, Vec<u8>)>,
+    sequence: u64,
+    /// Whether `lagging` is cut off: nothing reaches it and nothing it
+    /// sends leaves.
+    cut: bool,
+}
+
+impl Held {
+    fn carry(&mut self, from: PeerProvenance, out: Outbound) {
+        for (to, frame) in out.peer {
+            self.peers
+                .push_back((usize::from(to.replica.0[0]), from, frame));
+        }
+    }
+
+    /// One client request, submitted to every voter not cut off.
+    fn submit(&mut self) {
+        self.sequence += 1;
+        let Submitted::FanOut(fan_out) = self
+            .collector
+            .submit(MonotonicMillis::ZERO, &admitted(self.sequence, 1))
+            .expect("submitted")
+        else {
+            panic!("not new work")
+        };
+        let submit = frame(&fan_out.frame);
+        for to in 0..2 {
+            let out = self.voters[to]
+                .on_submission(PeerRole::Frontend, &submit, Origin::Connection(7))
+                .expect("driven")
+                .expect("admitted");
+            self.carry(self.voters[to].provenance(), out);
+        }
+        if !self.cut {
+            let out = self
+                .lagging
+                .on_submission(PeerRole::Frontend, &submit, Origin::Connection(7))
+                .expect("driven")
+                .expect("admitted");
+            self.carry(self.lagging.provenance(), out);
+        }
+    }
+
+    /// The peer plane and execution until nothing moves; `lagging`
+    /// journals, executes and hands off as coordd's loop does, and its
+    /// commits are never run here.
+    fn settle(&mut self) {
+        loop {
+            let mut moved = false;
+            while let Some((to, prov, bytes)) = self.peers.pop_front() {
+                if self.cut && (to == 2 || prov.from() == r(2)) {
+                    continue;
+                }
+                moved = true;
+                let out = if to == 2 {
+                    self.lagging.on_peer(prov, bytes)
+                } else {
+                    self.voters[to].on_peer(prov, bytes)
+                }
+                .expect("driven");
+                let from = if to == 2 {
+                    self.lagging.provenance()
+                } else {
+                    self.voters[to].provenance()
+                };
+                self.carry(from, out);
+            }
+            for i in 0..2 {
+                let out = self.voters[i].execute().expect("executed");
+                moved |= !out.is_empty();
+                self.carry(self.voters[i].provenance(), out);
+            }
+            if !self.cut {
+                let executed = self.lagging.node().executed;
+                let mut out = self.lagging.flush().expect("journaled");
+                out.absorb(self.lagging.finish().expect("handed off"));
+                out.absorb(self.lagging.settle().expect("settled"));
+                moved |= !out.peer.is_empty()
+                    || self.lagging.node().executed > executed
+                    || self.lagging.owes_flush();
+                self.carry(self.lagging.provenance(), out);
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+}
+
+/// A group whose execution led to more than its results asks for its
+/// commit, since what it led to goes out only once that commit is back
+/// (task-d86): here the batch installing the next catch-up window, which
+/// a window's last pulled command leads to (the next page was asked for
+/// and taken while the first window ran). The lagging voter's commits
+/// are held for an hour and nothing else asks: without the group's ask
+/// the next window would wait that long.
+#[test]
+fn a_group_that_leads_to_the_next_catch_up_window_is_not_held() {
+    let (lagging, handle) = held_follower(2);
+    let mut w = Held {
+        voters: (0..2).map(|me| voter(me, CAPACITY)).collect(),
+        lagging,
+        collector: Collector::new(CollectorConfig {
+            quorum: quorum(),
+            max_pending: 1 << 16,
+            max_resolved: 16,
+            max_undelivered_bytes: usize::MAX,
+        }),
+        peers: std::collections::VecDeque::new(),
+        sequence: 0,
+        cut: false,
+    };
+    w.submit();
+    w.settle();
+    let through = |w: &Held| w.lagging.node().machine().executed_through().get();
+    let start = through(&w);
+    assert_eq!(
+        start,
+        w.voters[0].node().machine().executed_through().get(),
+        "the lagging voter executed the first command with the others"
+    );
+    // Cut off for more than a page.
+    w.cut = true;
+    let behind = MAX_CATCH_UP_COMMANDS as u64 + 5;
+    for _ in 0..behind {
+        w.submit();
+        w.settle();
+    }
+    let leader = w.voters[0].node().machine().executed_through().get();
+    assert_eq!(leader, start + behind);
+    assert_eq!(through(&w), start);
+    w.cut = false;
+    assert_eq!(
+        handle.waiting(),
+        0,
+        "every commit of the lagging voter is held"
+    );
+
+    // It asks the leader; the first page fills a window, the second is
+    // asked for and taken while the window runs, and the window's last
+    // command leads to the batch installing it, which waits for its
+    // group's commit.
+    let out = w
+        .lagging
+        .node_mut()
+        .request_catch_up(r(0), &ballot())
+        .expect("asked");
+    w.carry(w.lagging.provenance(), out);
+    w.settle();
+    assert_eq!(
+        through(&w),
+        start + MAX_CATCH_UP_COMMANDS as u64,
+        "one window executed"
+    );
+    assert_eq!(
+        handle.waiting(),
+        1,
+        "the group that led to the next window asked for its commit"
+    );
+    // The commit comes back, the window is installed, and the rest is
+    // executed.
+    while handle.run() {
+        w.settle();
+    }
+    assert_eq!(through(&w), leader);
 }

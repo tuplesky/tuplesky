@@ -216,8 +216,11 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
     );
     let ticks: Vec<u64> = from_frontend.iter().map(|(_, t, _, _)| *t).collect();
     let (min, max) = (ticks.iter().min().unwrap(), ticks.iter().max().unwrap());
-    assert!(
-        *max - *min <= 1,
+    // Exactly the same tick: a link's delay bounds are inclusive, so
+    // equal bounds are a constant delay (before task-32's draw was fixed
+    // it ran a tick past the bound, which this allowed for).
+    assert_eq!(
+        min, max,
         "arrivals in the same tick over symmetric paths: {ticks:?}"
     );
     assert!(*min >= sent_at + 10, "no arrival before the path's delay");

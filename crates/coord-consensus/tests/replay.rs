@@ -147,7 +147,12 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
 
 fn peer(from: u8, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            r(from),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }

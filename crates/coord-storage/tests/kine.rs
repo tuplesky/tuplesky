@@ -4,6 +4,8 @@
 //! trip), retries preserve the binding, a recovering scheduler sees private
 //! bindings, and a replaced binding's expiration is stale on redb.
 
+mod support;
+
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan};
@@ -162,6 +164,7 @@ impl<E: LocalEngine> Domain<E> {
                 .unwrap()
                 .to_owned(),
         );
+        support::stage_bound(&mut self.worker, Some(&b), request);
         match apply_plan(
             &mut self.worker,
             self.alloc.allocate(),

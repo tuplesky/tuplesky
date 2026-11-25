@@ -199,9 +199,35 @@ impl Dispatcher {
         self.leader_reads = on;
     }
 
+    /// Mark the commands submitted from now on as answered on the
+    /// leader's release alone, or stop (task-d100, step A; see
+    /// [`crate::Collector::set_answer_on_release`]).
+    pub fn set_answer_on_release(&mut self, on: bool) {
+        self.collector.set_answer_on_release(on);
+    }
+
+    /// Relay marked submissions to the ballot's leader alone, or stop
+    /// (task-d102; [`crate::Collector::set_relay`]).
+    pub fn set_relay(&mut self, on: bool) {
+        self.collector.set_relay(on);
+    }
+
     /// Reads waiting on their leader's answer.
     pub fn reads_waiting(&self) -> usize {
         self.reads.len()
+    }
+
+    /// Whether a result for `key` can still come from here: a read
+    /// waiting on its leader, a command being collected, or one whose
+    /// result is retained for resolution. Each is bounded by this
+    /// dispatcher's own limits.
+    pub fn holds(&self, key: &RetryKey) -> bool {
+        self.reads.contains_key(key) || self.collector.is_bound(key)
+    }
+
+    /// How many keys [`Dispatcher::holds`] is true for.
+    pub fn held(&self) -> usize {
+        self.reads.len() + self.collector.bound()
     }
 
     /// The collector.
@@ -433,22 +459,32 @@ impl Dispatcher {
     /// complete-revision batches chunked with `complete` on the last
     /// chunk, progress, and the close. `authorize` is the output
     /// authorization of each selected batch (task-37 binds it to one
-    /// fresh policy barrier per bounded pump).
+    /// fresh policy barrier per bounded pump). A batch it denies closes
+    /// the watch as unauthorized; one it cannot decide closes it as
+    /// source-lost, at the same last complete revision.
     pub fn pump_watch(
         &mut self,
         hub: &WatchHub,
         connection: u64,
         watch_id: u64,
         max_items: usize,
-        mut authorize: impl FnMut(&WatchBatch) -> bool,
+        mut authorize: impl FnMut(&WatchBatch) -> BatchVerdict,
     ) -> Vec<Vec<u8>> {
         let Some(id) = self.watches.get(&(connection, watch_id)).copied() else {
             return Vec::new();
         };
         let mut out = Vec::new();
         let mut taken = 0;
+        let mut undecided = false;
         while taken < max_items
-            && let Some(item) = hub.next(id, &mut authorize)
+            && let Some(item) = hub.next(id, |batch| match authorize(batch) {
+                BatchVerdict::Permit => true,
+                BatchVerdict::Deny => false,
+                BatchVerdict::Undecided => {
+                    undecided = true;
+                    false
+                }
+            })
         {
             taken += 1;
             match item {
@@ -485,9 +521,18 @@ impl Dispatcher {
                     last_complete_revision,
                 } => {
                     self.watches.remove(&(connection, watch_id));
+                    // The hub closes a batch that was not permitted as
+                    // unauthorized. One that could not be decided is not
+                    // a refusal: the caller is told the source is lost,
+                    // and resumes from the same revision.
+                    let reason = if undecided && matches!(reason, CloseReason::Unauthorized) {
+                        WatchCloseReasonV1::SourceLost
+                    } else {
+                        close_reason(reason)
+                    };
                     out.push(close_frame(
                         watch_id,
-                        close_reason(reason),
+                        reason,
                         (last_complete_revision.get() > 0).then_some(last_complete_revision),
                     ));
                     break;
@@ -776,6 +821,7 @@ impl Dispatcher {
                         "retry key bound to another payload",
                     ),
                     SubmitRefusal::Backpressure { .. } => {
+                        self.admission.refused_at_collection_bound();
                         (codes::BACKPRESSURE, "domain at its collection bound")
                     }
                 };
@@ -853,17 +899,25 @@ impl Dispatcher {
         })
     }
 
-    /// The leader `from`'s answer to a read (task-d50).
+    /// The leader's answer to a read (task-d50), by the provenance the
+    /// transport bound its link to.
     ///
-    /// Only the voter the read was sent to answers it. A served result is
-    /// the caller's, still to pass the frontend's output gate; a refusal
-    /// orders the read instead.
+    /// Only the voter the read was sent to answers it, and only on a
+    /// voter's link: an observer's or learner's, bound under the leader's
+    /// replica, answers nothing, and the read keeps waiting for the
+    /// leader (design Section 10.1). A served result is the caller's,
+    /// still to pass the frontend's output gate; a refusal orders the
+    /// read instead.
     pub fn on_read_answer(
         &mut self,
         now: MonotonicMillis,
-        from: ReplicaId,
+        from: PeerProvenance,
         answer: ReadAnswerV1,
     ) -> Option<ReadResolution> {
+        if !from.is_voter() {
+            return None;
+        }
+        let from = from.from();
         let key = answer.retry_key;
         if self.reads.get(&key)?.leader != from {
             return None;
@@ -1031,6 +1085,21 @@ fn close_frame(watch_id: u64, reason: WatchCloseReasonV1, last: Option<KvRevisio
     })
     .encode()
     .expect("bounded")
+}
+
+/// What a watch's output authorization decided for one selected batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchVerdict {
+    /// The batch may be delivered.
+    Permit,
+    /// Current policy does not permit it: the watch closes as
+    /// unauthorized.
+    Deny,
+    /// This node cannot decide now (its policy may be behind the
+    /// domain's, #312): nothing is delivered, and the watch closes as
+    /// source-lost at its last complete revision, which the caller
+    /// resumes from.
+    Undecided,
 }
 
 const fn close_reason(reason: CloseReason) -> WatchCloseReasonV1 {

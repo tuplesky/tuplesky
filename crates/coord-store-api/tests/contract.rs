@@ -14,7 +14,7 @@ use coord_store_api::engine::{
     ScanRequest, SnapshotSource, WriteTxn,
 };
 use coord_store_api::envelope::{
-    AppliedStamp, STAMP_RECORD_KIND, STAMP_SCHEMA_VERSION, StoreEnvelopeV1,
+    AppliedStamp, MAX_ENVELOPE_PAYLOAD, STAMP_RECORD_KIND, STAMP_SCHEMA_VERSION, StoreEnvelopeV1,
 };
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_api::seq::StoreSeq;
@@ -274,6 +274,56 @@ fn store_seq_is_not_a_public_counter() {
     assert_eq!(stamp.journal_seq(), seq);
     assert_eq!(StoreSeq::INITIAL.journal_seq(), LocalJournalSeq::ZERO);
     assert_eq!(format!("{stamp:?}"), "StoreSeq(41)");
+}
+
+/// Lengths either side of each varint step a payload's length takes.
+const ENVELOPE_LENGTHS: [usize; 9] = [0, 1, 127, 128, 300, 16_383, 16_384, 70_000, 2_097_152];
+
+/// `encode` writes the header and copies the payload after it rather than
+/// letting postcard push the payload a byte at a time; the bytes are the
+/// same at every varint step of the length and of the two `u16`s.
+#[test]
+fn encode_is_postcards_encoding() {
+    for len in ENVELOPE_LENGTHS {
+        for (record_kind, schema_version) in [(0, 0), (1, 1), (0x7f, 0x80), (0xffff, 0x3fff)] {
+            let env = StoreEnvelopeV1 {
+                record_kind,
+                schema_version,
+                payload: (0..len).map(|i| (i * 31 % 251) as u8).collect(),
+            };
+            assert_eq!(
+                env.encode().unwrap(),
+                postcard::to_allocvec(&env).unwrap(),
+                "{len} {record_kind} {schema_version}"
+            );
+        }
+    }
+}
+
+/// `encode_value` encodes a value in place after the header: the bytes are
+/// the envelope of the value's own encoding, and a value over the payload
+/// limit is refused as the envelope would be.
+#[test]
+fn encode_value_is_the_envelope_of_the_values_encoding() {
+    let lengths = ENVELOPE_LENGTHS.into_iter().chain([MAX_ENVELOPE_PAYLOAD]);
+    for len in lengths {
+        let value: (u64, Vec<u8>, [u8; 32]) = (len as u64, vec![7; len], [9; 32]);
+        let payload = postcard::to_allocvec(&value).unwrap();
+        let over = payload.len() > MAX_ENVELOPE_PAYLOAD;
+        let envelope = StoreEnvelopeV1 {
+            record_kind: 0x0102,
+            schema_version: 3,
+            payload,
+        }
+        .encode();
+        let in_place = StoreEnvelopeV1::encode_value(0x0102, 3, &value, "test value");
+        if over {
+            assert_eq!(envelope.unwrap_err().class, ErrorClass::Limit, "{len}");
+            assert_eq!(in_place.unwrap_err().class, ErrorClass::Limit, "{len}");
+        } else {
+            assert_eq!(in_place.unwrap(), envelope.unwrap(), "{len}");
+        }
+    }
 }
 
 #[test]

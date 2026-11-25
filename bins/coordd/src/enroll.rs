@@ -315,6 +315,10 @@ impl Enroller {
             // issuer is told which of its rules for that workload
             // answers. It grants nothing a rule does not.
             "role": coord_node_issuer::role_str(current.identity.role),
+            // The domain this leaf already reaches, for the same reason:
+            // a workload that runs a node in each of two domains holds a
+            // rule for each, and the renewal is of this one.
+            "domain": hex(&current.identity.domain.0),
         });
         let mut response = self
             .client
@@ -387,6 +391,11 @@ pub fn accept(
     if now.cluster != was.cluster || now.node != was.node {
         return Err(refused("it names another node"));
     }
+    if now.domain != was.domain {
+        return Err(refused(
+            "it names another domain, and a renewal does not change where a node may serve",
+        ));
+    }
     if now.incarnation != was.incarnation {
         return Err(refused(
             "it names another incarnation, which is a committed replacement and not a renewal",
@@ -453,8 +462,8 @@ pub fn accept(
 }
 
 /// Check that `credential` is this node's collector: issued by the trust
-/// bundle, held under its own key, naming this node at this incarnation,
-/// in a role that may submit on a caller's behalf.
+/// bundle, held under its own key, naming this node at this incarnation
+/// in this domain, in a role that may submit on a caller's behalf.
 ///
 /// The node's own leaf gets the chain check at startup and is what the
 /// node's identity is read from; the collector's leaf was only read. A
@@ -465,6 +474,7 @@ pub fn accept(
 pub fn collector_for(
     credential: &Credential,
     cluster: coord_types::ids::ClusterId,
+    domain: coord_types::ids::DomainId,
     node: coord_types::ids::ReplicaId,
     incarnation: coord_types::ids::ReplicaIncarnation,
 ) -> Result<(), String> {
@@ -473,6 +483,9 @@ pub fn collector_for(
     let named = &credential.identity;
     if named.cluster != cluster || named.node != node {
         return Err("it names another node".into());
+    }
+    if named.domain != domain {
+        return Err("it names another domain".into());
     }
     if named.incarnation != incarnation {
         return Err(format!(
@@ -704,6 +717,8 @@ mod tests {
     use rustls_pki_types::pem::PemObject;
 
     const CLUSTER: [u8; 16] = [0x11; 16];
+    /// The domain the test genesis names (`[0x22; 16]`), which the fixtures' leaves reach.
+    const DOMAIN: [u8; 16] = [0x22; 16];
 
     struct Ca {
         issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
@@ -764,8 +779,25 @@ mod tests {
             names: &[&str],
             usages: Vec<rcgen::ExtendedKeyUsagePurpose>,
         ) -> CertificateDer<'static> {
+            self.issue_in(DOMAIN, key, incarnation, role, secs, names, usages)
+        }
+
+        /// The same, for `domain`: a sibling domain's leaf under the
+        /// same authority, where `domain` is not the test genesis's.
+        #[allow(clippy::too_many_arguments)]
+        fn issue_in(
+            &self,
+            domain: [u8; 16],
+            key: &rcgen::KeyPair,
+            incarnation: u64,
+            role: PeerRole,
+            secs: i64,
+            names: &[&str],
+            usages: Vec<rcgen::ExtendedKeyUsagePurpose>,
+        ) -> CertificateDer<'static> {
             let identity = NodeIdentity {
                 cluster: coord_types::ids::ClusterId(CLUSTER),
+                domain: coord_types::ids::DomainId(domain),
                 node: coord_types::ids::ReplicaId([1; 16]),
                 incarnation: coord_types::ids::ReplicaIncarnation::new(incarnation).unwrap(),
                 role,
@@ -826,18 +858,21 @@ mod tests {
     /// in a submitting role; anything else is refused for what it is.
     #[test]
     fn a_collector_leaf_must_be_this_nodes() {
-        use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+        use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
         let ca = new_ca();
         let f = fixture(&ca);
         let cluster = ClusterId(CLUSTER);
+        let domain = DomainId(DOMAIN);
         let node = ReplicaId([1; 16]);
         let first = ReplicaIncarnation::new(1).unwrap();
         for role in [PeerRole::Frontend, PeerRole::KineCollector] {
-            collector_for(&f.current(role), cluster, node, first).expect("this node's collector");
+            collector_for(&f.current(role), cluster, domain, node, first)
+                .expect("this node's collector");
         }
         let why = collector_for(
             &f.current(PeerRole::Frontend),
             cluster,
+            domain,
             ReplicaId([2; 16]),
             first,
         )
@@ -846,20 +881,33 @@ mod tests {
         let why = collector_for(
             &f.current(PeerRole::Frontend),
             ClusterId([0x22; 16]),
+            domain,
             node,
             first,
         )
         .unwrap_err();
         assert!(why.contains("another node"), "{why}");
+        // A collector of a sibling domain under the same issuer.
         let why = collector_for(
             &f.current(PeerRole::Frontend),
             cluster,
+            DomainId([0x33; 16]),
+            node,
+            first,
+        )
+        .unwrap_err();
+        assert!(why.contains("another domain"), "{why}");
+        let why = collector_for(
+            &f.current(PeerRole::Frontend),
+            cluster,
+            domain,
             node,
             ReplicaIncarnation::new(2).unwrap(),
         )
         .unwrap_err();
         assert!(why.contains("incarnation 1"), "{why}");
-        let why = collector_for(&f.current(PeerRole::Voter), cluster, node, first).unwrap_err();
+        let why =
+            collector_for(&f.current(PeerRole::Voter), cluster, domain, node, first).unwrap_err();
         assert!(why.contains("role voter"), "{why}");
         // Issued by another authority: the leaf names this node, and
         // nothing this domain trusts said so.
@@ -868,7 +916,7 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(ca.der.clone()).unwrap();
         foreign.roots = Arc::new(roots);
-        let why = collector_for(&foreign, cluster, node, first).unwrap_err();
+        let why = collector_for(&foreign, cluster, domain, node, first).unwrap_err();
         assert!(why.contains("not issued by the trust bundle"), "{why}");
         // Held under a key that is not the leaf's.
         let mut unheld = f.current(PeerRole::Frontend);
@@ -877,7 +925,7 @@ mod tests {
             PrivateKeyDer::from_pem_slice(pem("PRIVATE KEY", &other.serialize_der()).as_bytes())
                 .unwrap(),
         );
-        let why = collector_for(&unheld, cluster, node, first).unwrap_err();
+        let why = collector_for(&unheld, cluster, domain, node, first).unwrap_err();
         assert!(why.contains("not the leaf's"), "{why}");
     }
 
@@ -912,6 +960,25 @@ mod tests {
             None,
         ));
         assert!(why.contains("another incarnation"), "{why}");
+        // A leaf for a sibling domain, under the same authority and key,
+        // is not a renewal of this one's: it would move the node.
+        let why = refused(accept(
+            &current,
+            f.issue_in(
+                [0x33; 16],
+                &f.key,
+                1,
+                PeerRole::Observer,
+                600,
+                &["node.test"],
+                vec![
+                    rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                    rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                ],
+            ),
+            None,
+        ));
+        assert!(why.contains("another domain"), "{why}");
         // An observer or collector does not acquire a voter's entitlement
         // by being handed a voter's certificate.
         let why = refused(accept(
@@ -951,7 +1018,7 @@ mod tests {
             serde_json::from_value::<coord_membership::genesis::GenesisManifest>(
                 serde_json::json!({
                     "cluster": hex(&CLUSTER),
-                    "domain": hex(&[0x22; 16]),
+                    "domain": hex(&DOMAIN),
                     "epoch": 1,
                     "voters": [{
                         "node": hex(&[1; 16]),

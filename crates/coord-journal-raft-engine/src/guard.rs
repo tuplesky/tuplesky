@@ -18,12 +18,15 @@
 //! * **Only the last file of its queue.** Rotation closes, and so syncs, a
 //!   file before it creates the next, so nothing in a file with a later
 //!   one after it is torn.
-//! * **A file header only if it was never written.** Any sync of a file
-//!   persists its header, so a file header that does not decode is
-//!   truncated only if it is all zeros and no whole batch follows it
-//!   (tried signed and unsigned, since a zeroed header no longer says the
-//!   file's version). A torn first write whose first sector never landed
-//!   leaves exactly that: a zero header, and part of one batch.
+//! * **A file header only if nothing follows it.** A file's header is
+//!   synced before anything in the file is acknowledged: a rotated file's
+//!   by `rotate_imp` before its first batch, the first file's by `create`
+//!   with the identity record, and a header the engine's open rewrites by
+//!   the adapter's sync once the open returns. So a truncation at offset
+//!   0 is let through only where the file holds nothing but zeros, and a
+//!   header that does not decode, zeros or not, with any data after it is
+//!   refused: only a creation never acknowledged could leave that, and
+//!   refusing it loses nothing.
 //! * **Only one batch, the last.** Recycling is off and the adapter writes
 //!   every group with `sync`, so after the last synced batch there are only
 //!   the engine's preallocated zeros, or the remains of the one batch in

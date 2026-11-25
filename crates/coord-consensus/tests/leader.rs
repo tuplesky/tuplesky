@@ -24,7 +24,7 @@ use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
-use coord_types::wire_v1::{MessageV1, RequestV1};
+use coord_types::wire_v1::{BoundedBytes, MessageV1, RequestV1};
 use coord_types::{CommandId, RetryKey};
 use serde::Serialize;
 
@@ -133,7 +133,12 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
 
 fn peer(from: u8, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            r(from),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }
@@ -461,6 +466,60 @@ fn reordered_and_duplicate_requests_cannot_bind_conflicting_payload() {
     assert!(small.step(admitted(2, 2, 2).0).is_empty());
     assert_eq!(small.take_rejections(), vec![Rejection::Backpressure]);
     assert!(small.proposal(&admitted(1, 1, 1).1).is_some());
+}
+
+/// `event` with its frame replaced by `frame`.
+fn with_frame(event: Event, frame: Vec<u8>) -> Event {
+    let Event::Admitted(mut admitted) = event else {
+        unreachable!("an admitted request")
+    };
+    admitted.frame = frame;
+    Event::Admitted(admitted)
+}
+
+/// The leader proposes a frame only as exactly one request whose logical
+/// bytes are the canonical encoding of the request they decode to (row
+/// (c), #274). It derives the identity from those bytes as they are, so
+/// without the canonical check a frame whose bytes decode to the same
+/// request would be proposed under another identity, and without the
+/// one-message check a frame of two requests would be proposed as its
+/// last. Either is refused, with nothing proposed, bound or numbered.
+#[test]
+fn a_request_frame_is_proposed_only_as_one_canonical_request() {
+    let mut leader = booted();
+    let request =
+        |seq: u64, key: u8| RequestV1::new(retry_key(seq), &logical(key, key), 0, 0).unwrap();
+    let frame_of = |requests: Vec<RequestV1>| -> Vec<u8> {
+        requests
+            .into_iter()
+            .flat_map(|r| MessageV1::Request(r).encode().unwrap())
+            .collect()
+    };
+    let (event, command) = admitted(1, 1, 1);
+
+    // Two requests in one frame.
+    let two = with_frame(event.clone(), frame_of(vec![request(1, 1), request(2, 2)]));
+    assert!(leader.step(two).is_empty());
+    assert_eq!(leader.take_rejections(), vec![Rejection::MalformedRequest]);
+
+    // One request, its logical bytes the canonical encoding and one byte
+    // more: they decode to the same request, but they are not its
+    // canonical encoding.
+    let mut trailing = request(1, 1);
+    let mut bytes = trailing.logical.as_slice().to_vec();
+    bytes.push(0);
+    trailing.logical = BoundedBytes::new(bytes).unwrap();
+    assert!(trailing.logical().is_err(), "the bytes are not canonical");
+    let non_canonical = with_frame(event.clone(), frame_of(vec![trailing]));
+    assert!(leader.step(non_canonical).is_empty());
+    assert_eq!(leader.take_rejections(), vec![Rejection::MalformedRequest]);
+
+    // Neither bound the retry key or took a sequence number: the request
+    // itself, alone and canonical, is proposed first.
+    assert_eq!(leader.step(event).len(), 1);
+    assert!(leader.take_rejections().is_empty());
+    assert_eq!(leader.proposal(&command).unwrap().seqnum, 0);
+    assert!(leader.proposal(&admitted(2, 2, 2).1).is_none());
 }
 
 #[test]
@@ -1163,4 +1222,109 @@ fn a_service_command_presented_again_is_proposed_to_the_voters_again() {
         );
         assert_eq!(leader.proposal(&command).unwrap().seqnum, 0);
     }
+}
+
+/// task-d102: with frames on, a turn's fresh proposals wait for
+/// `cut_frames` and leave in one `ProposalFrame` to each follower, once
+/// every batch they wait on is durable; a relayed command's entry carries
+/// its payload. A turn of one proposal sends it as the message it is.
+#[test]
+fn a_turns_proposals_leave_in_one_frame_to_each_follower() {
+    let mut leader = booted();
+    leader.set_batch_frames(true);
+    let (first, c1) = admitted(1, 1, 1);
+    let (second, c2) = admitted(2, 2, 2);
+    let mut persisted = leader.step(first);
+    leader.mark_next_relayed();
+    persisted.extend(leader.step(second));
+    assert!(leader.relays(&c2));
+    assert!(leader.frames_queued(), "both proposals wait for the cut");
+    assert!(
+        sends_of(&persisted)
+            .iter()
+            .all(|m| !matches!(m, ProtocolMessage::Proposal(_))),
+        "no proposal left before the cut: {persisted:?}"
+    );
+    let cut = leader.cut_frames();
+    assert!(!leader.frames_queued());
+    assert!(
+        sends_of(&cut).is_empty(),
+        "the frames wait on their batches: {cut:?}"
+    );
+    let mut released = Vec::new();
+    for event in durable(&persisted, 1) {
+        released.extend(leader.step(event));
+    }
+    let mut to: Vec<ReplicaId> = Vec::new();
+    for e in &released {
+        let Effect::SendWhenDurable {
+            to: peer, frame, ..
+        } = e
+        else {
+            continue;
+        };
+        let Ok(ProtocolMessage::ProposalFrame {
+            replica,
+            ballot: b,
+            proposals,
+        }) = ProtocolMessage::decode(frame)
+        else {
+            continue;
+        };
+        assert_eq!(replica, r(0));
+        assert_eq!(b, ballot(0, 0));
+        let commands: Vec<CommandId> = proposals.iter().map(|p| p.command).collect();
+        assert_eq!(commands, vec![c1, c2], "in sequence-number order");
+        assert_eq!(proposals[0].seqnum, 0);
+        assert_eq!(proposals[1].seqnum, 1);
+        assert!(proposals[0].payload.is_none());
+        assert!(proposals[1].payload.is_some(), "the relayed one carries it");
+        to.push(peer.replica);
+    }
+    to.sort();
+    assert_eq!(to, vec![r(1), r(2)], "one frame to each follower");
+    let sent = leader.sent_bytes();
+    assert_eq!(sent.frames, 2);
+    assert_eq!(sent.framed, 4);
+    assert_eq!(sent.proposals, 4);
+    assert!(sent.payload_bytes > 0 && sent.proposal_bytes > 0);
+
+    // A turn of one proposal sends it as it is.
+    let (third, c3) = admitted(3, 3, 3);
+    let persisted = leader.step(third);
+    assert!(leader.frames_queued());
+    leader.cut_frames();
+    let mut released = Vec::new();
+    for event in durable(&persisted, 2) {
+        released.extend(leader.step(event));
+    }
+    let proposals: Vec<_> = sends_of(&released)
+        .into_iter()
+        .filter(|m| matches!(m, ProtocolMessage::Proposal(p) if p.command == c3))
+        .collect();
+    assert_eq!(proposals.len(), 2, "{released:?}");
+    assert_eq!(leader.sent_bytes().frames, 2, "no frame for one proposal");
+    assert!(leader.cut_frames().is_empty(), "nothing left to cut");
+}
+
+/// task-d102: with frames off, nothing waits for a cut: each proposal
+/// leaves as it is made, counted by kind.
+#[test]
+fn without_frames_a_proposal_leaves_as_it_is_made() {
+    let mut leader = booted();
+    let (first, c1) = admitted(1, 1, 1);
+    let persisted = leader.step(first);
+    assert!(!leader.frames_queued());
+    assert!(leader.cut_frames().is_empty());
+    let mut released = Vec::new();
+    for event in durable(&persisted, 1) {
+        released.extend(leader.step(event));
+    }
+    let proposals = sends_of(&released)
+        .into_iter()
+        .filter(|m| matches!(m, ProtocolMessage::Proposal(p) if p.command == c1))
+        .count();
+    assert_eq!(proposals, 2);
+    let sent = leader.sent_bytes();
+    assert_eq!((sent.proposals, sent.frames, sent.payload_bytes), (2, 0, 0));
 }

@@ -151,7 +151,12 @@ fn acking(receipt: u8, ticks: u64, ack_through: u64) -> Event {
 
 fn peer(from: u8, message: ProtocolMessage) -> Event {
     Event::Peer(AuthenticatedPeerMessage::new(
-        PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
+        PeerProvenance::from_transport(
+            r(from),
+            ReplicaIncarnation::new(1).unwrap(),
+            coord_types::wire_v1::PeerRole::Voter,
+            1,
+        ),
         message.encode(),
     ))
 }

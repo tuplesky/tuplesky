@@ -133,9 +133,30 @@ pub const SESSION_BIND_VERSION: u16 = 1;
 /// different number, and a second registry is how they would come to.
 pub const KIND_COLLECTOR_SUBMIT: u16 = 0x0103;
 
-/// The only schema version of a collector submission this build
-/// understands.
+/// The schema version of a collector submission answered as it always
+/// was, on the collector's own count of the evidence.
 pub const COLLECTOR_SUBMIT_VERSION: u16 = 1;
+
+/// The schema version of a collector submission marked as answered on
+/// the leader's release alone (task-d100, step A): the same payload as
+/// [`COLLECTOR_SUBMIT_VERSION`], and the voters send its frontend no
+/// evidence.
+pub const COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION: u16 = 2;
+
+/// Schema version of a collector submission relayed to its ballot's
+/// leader alone (task-d102, task-d100's step B): the same payload as
+/// [`COLLECTOR_SUBMIT_VERSION`], answered on the leader's release alone
+/// as version 2 is, and proposed with its payload. A voter that isn't
+/// leading refuses it rather than voting on it.
+pub const COLLECTOR_SUBMIT_RELAYED_VERSION: u16 = 3;
+
+/// Every schema version of a collector submission this build
+/// understands.
+pub const COLLECTOR_SUBMIT_VERSIONS: [u16; 3] = [
+    COLLECTOR_SUBMIT_VERSION,
+    COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION,
+    COLLECTOR_SUBMIT_RELAYED_VERSION,
+];
 
 /// A trusted collector's current read, sent to the leader it follows
 /// only (`spec/wire-v1.md`, "Collector frames"; task-d50, design Section
@@ -147,6 +168,17 @@ pub const KIND_COLLECTOR_READ: u16 = 0x0107;
 
 /// The only schema version of a collector read this build understands.
 pub const COLLECTOR_READ_VERSION: u16 = 1;
+
+/// A voter's freshness ask, sent by the frontend beside it to the leader
+/// of the ballot the voter follows (#320): has that leader, confirmed by
+/// a quorum after the ask arrived, executed everything committed before
+/// it, and through which execution position? A raw kind of the API
+/// range like [`KIND_COLLECTOR_READ`], admitted on the same terms. Its
+/// payload is `coord_collector::wire::FreshnessAskV1`.
+pub const KIND_COLLECTOR_FRESHNESS: u16 = 0x0108;
+
+/// The only schema version of a freshness ask this build understands.
+pub const COLLECTOR_FRESHNESS_VERSION: u16 = 1;
 
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

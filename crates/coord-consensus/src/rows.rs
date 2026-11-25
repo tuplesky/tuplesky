@@ -65,14 +65,7 @@ pub fn promise_key(epoch: ConfigurationEpoch) -> Vec<u8> {
 
 /// Encode the promise row.
 pub fn encode_promise(record: &PromiseRecordV1) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(record)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "promise encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: PROMISE_KIND,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    envelope(PROMISE_KIND, record, "promise encode")
 }
 
 /// Decode the promise row.
@@ -113,14 +106,7 @@ pub fn dependency_key(epoch: ConfigurationEpoch, command: &CommandId) -> Vec<u8>
 /// Encode a command's required dependency state (phase, dependencies,
 /// payload binding and path evidence).
 pub fn encode_dependency(record: &CommandRecord) -> Result<Vec<u8>, EngineError> {
-    let payload = postcard::to_allocvec(record)
-        .map_err(|_| EngineError::new(ErrorClass::Limit, "dependency encode"))?;
-    StoreEnvelopeV1 {
-        record_kind: DEPENDENCY_KIND,
-        schema_version: 1,
-        payload,
-    }
-    .encode()
+    envelope(DEPENDENCY_KIND, record, "dependency encode")
 }
 
 /// Decode a dependency row.
@@ -170,6 +156,7 @@ pub struct PayloadRecordV1 {
     /// Stable invocation identity.
     pub retry_key: RetryKey,
     /// Canonical `LogicalRequest` encoding.
+    #[serde(with = "coord_core::byte_string")]
     pub logical: Vec<u8>,
     /// What the admitting verifier attested, as part of what this
     /// command durably *is*.
@@ -233,20 +220,17 @@ pub fn payload_key(command: &CommandId) -> Vec<u8> {
     command.as_bytes().to_vec()
 }
 
+/// `StoreEnvelopeV1 { record_kind, schema_version, payload }` with
+/// `value` as its payload, in one allocation
+/// ([`StoreEnvelopeV1::encode_value`]). The bytes are the envelope's
+/// (`envelope_is_the_envelopes_encoding`).
 fn envelope_at<T: Serialize>(
     kind: u16,
     schema_version: u16,
     value: &T,
     what: &'static str,
 ) -> Result<Vec<u8>, EngineError> {
-    let payload =
-        postcard::to_allocvec(value).map_err(|_| EngineError::new(ErrorClass::Limit, what))?;
-    StoreEnvelopeV1 {
-        record_kind: kind,
-        schema_version,
-        payload,
-    }
-    .encode()
+    StoreEnvelopeV1::encode_value(kind, schema_version, value, what)
 }
 
 fn envelope<T: Serialize>(
@@ -543,4 +527,162 @@ pub fn sync_update(
         key: sync_key(epoch, &record.decision.ballot),
         value: Some(encode_sync(record)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD;
+    use coord_types::ids::{
+        ClientInstanceId, ClusterId, DomainId, ReplicaId, RequestSequence, SessionId,
+    };
+
+    fn retry_key(seq: u64) -> RetryKey {
+        RetryKey {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            session_id: SessionId([3; 16]),
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(seq).unwrap(),
+        }
+    }
+
+    /// Lengths either side of each varint width a byte string's length
+    /// takes, and the bench's request size.
+    const LENGTHS: [usize; 9] = [0, 1, 127, 128, 2500, 16_383, 16_384, 70_000, 2_097_151];
+
+    fn payload(len: usize) -> PayloadRecordV1 {
+        PayloadRecordV1 {
+            retry_key: retry_key(len as u64 + 1),
+            logical: (0..len).map(|i| (i % 251) as u8).collect(),
+            admission: None,
+            ack_through: len as u64,
+        }
+    }
+
+    /// The payload record as it was before its logical bytes were a byte
+    /// string: a `Vec<u8>` serde takes as a sequence.
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct PayloadAsItWas {
+        retry_key: RetryKey,
+        logical: Vec<u8>,
+        #[serde(default)]
+        admission: Option<AdmissionFacts>,
+        #[serde(default)]
+        ack_through: u64,
+    }
+
+    impl From<&PayloadRecordV1> for PayloadAsItWas {
+        fn from(p: &PayloadRecordV1) -> Self {
+            PayloadAsItWas {
+                retry_key: p.retry_key,
+                logical: p.logical.clone(),
+                admission: p.admission,
+                ack_through: p.ack_through,
+            }
+        }
+    }
+
+    /// What `envelope_at` replaced: the value encoded on its own, then
+    /// the envelope around it.
+    fn as_it_was<T: Serialize>(kind: u16, schema_version: u16, value: &T) -> Vec<u8> {
+        StoreEnvelopeV1 {
+            record_kind: kind,
+            schema_version,
+            payload: postcard::to_allocvec(value).unwrap(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_byte_string_is_encoded_as_the_sequence_was() {
+        for len in LENGTHS {
+            let record = payload(len);
+            let before = PayloadAsItWas::from(&record);
+            let bytes = postcard::to_allocvec(&record).unwrap();
+            assert_eq!(bytes, postcard::to_allocvec(&before).unwrap(), "{len}");
+            // A row written before reads as it did, and one written now
+            // reads with the record as it was.
+            assert_eq!(
+                postcard::from_bytes::<PayloadRecordV1>(&bytes).unwrap(),
+                record
+            );
+            assert_eq!(
+                postcard::from_bytes::<PayloadAsItWas>(&bytes).unwrap(),
+                before
+            );
+            // A format without byte strings (JSON, a sequence of numbers)
+            // reads the field as it always did.
+            if len <= 2500 {
+                let json = serde_json::to_string(&before).unwrap();
+                assert_eq!(serde_json::to_string(&record).unwrap(), json);
+                assert_eq!(
+                    serde_json::from_str::<PayloadRecordV1>(&json).unwrap(),
+                    record
+                );
+            }
+        }
+        // The length is still checked against the bytes there are.
+        let mut short = postcard::to_allocvec(&payload(2500)).unwrap();
+        short.truncate(short.len() - 9);
+        assert!(postcard::from_bytes::<PayloadRecordV1>(&short).is_err());
+    }
+
+    #[test]
+    fn envelope_is_the_envelopes_encoding() {
+        for len in LENGTHS {
+            let record = payload(len);
+            let row = encode_payload(&record).unwrap();
+            assert_eq!(row, as_it_was(PAYLOAD_KIND, 1, &record), "{len}");
+            assert_eq!(decode_payload(&row).unwrap(), record);
+        }
+        let ballot = Ballot {
+            epoch: ConfigurationEpoch::new(7).unwrap(),
+            number: 300,
+            leader: ReplicaId([9; 16]),
+        };
+        let promise = PromiseRecordV1 {
+            promised: ballot,
+            synced: ballot,
+        };
+        assert_eq!(
+            encode_promise(&promise).unwrap(),
+            as_it_was(PROMISE_KIND, 1, &promise)
+        );
+        assert_eq!(
+            decode_promise(&encode_promise(&promise).unwrap()).unwrap(),
+            promise
+        );
+        for deps in [0, 1, 200] {
+            let proposal = ProposalRecordV1 {
+                ballot,
+                seqnum: 1 << 40,
+                deps: (0..deps)
+                    .map(|i| CommandId::from_canonical(&retry_key(i + 1), &[i as u8]))
+                    .collect(),
+                path: Digest32([3; 32]),
+            };
+            assert_eq!(
+                encode_proposal(&proposal).unwrap(),
+                as_it_was(PROPOSAL_KIND, 1, &proposal)
+            );
+        }
+        // An envelope over the limit is refused as it was.
+        let over = PayloadRecordV1 {
+            logical: alloc::vec![0; MAX_ENVELOPE_PAYLOAD],
+            ..payload(0)
+        };
+        let refused = encode_payload(&over).unwrap_err();
+        assert_eq!(refused.class, ErrorClass::Limit);
+        assert!(
+            StoreEnvelopeV1 {
+                record_kind: PAYLOAD_KIND,
+                schema_version: 1,
+                payload: postcard::to_allocvec(&over).unwrap(),
+            }
+            .encode()
+            .is_err()
+        );
+    }
 }

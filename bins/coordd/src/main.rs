@@ -326,6 +326,18 @@ fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
 }
 
 /// The first eight bytes of a digest, for a line an operator reads.
+/// A format's versions for the build line: the one it reads and writes,
+/// when its window is one version wide, or else `oldest..newest`, the
+/// versions it reads.
+fn versions(f: coord_types::formats::Format) -> String {
+    let w = f.window();
+    if w.oldest == w.newest {
+        w.current.to_string()
+    } else {
+        format!("{}..{}", w.oldest, w.newest)
+    }
+}
+
 fn hex16(bytes: &[u8; 32]) -> String {
     bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -567,6 +579,11 @@ fn report_metrics(
         } else {
             Measure::Unavailable(Unavailable::NotThisRole)
         },
+        // No connection is open before the first turn, and the frontend
+        // has offered nothing.
+        paths: Vec::new(),
+        paths_unreported: 0,
+        offers: coord_daemon::metrics::Offers::default(),
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),
@@ -633,7 +650,13 @@ fn main() -> ExitCode {
                     short(&report.replica.0),
                     report.incarnation.get(),
                     report.role,
-                    credential_state(&report.credential),
+                    // A non-voter naming a voter is refused for its role,
+                    // whatever its generation and key say.
+                    if report.names_a_voter {
+                        "names-a-committed-voter".to_owned()
+                    } else {
+                        credential_state(&report.credential)
+                    },
                 );
                 println!(
                     "leaf issued_at={} expires_at={} renewal={} driver={}",
@@ -680,14 +703,21 @@ fn main() -> ExitCode {
     // What this build is, before it opens anything (task-60). Formats
     // are what it reads and writes; features are what the cluster may
     // have turned on. An operator reconciling a mixed fleet reads this
-    // line on every node and compares it.
+    // line on every node and compares it. A format whose window is wider
+    // than one version prints the versions it reads, `oldest..newest`:
+    // the journal's `1..2` says this build reads what its successor
+    // writes, so a voter can go back to it (the batching-rule doc's
+    // 10.7, step 1a). The journal's written version is given beside it,
+    // since a build and its successor read the same window and differ in
+    // what they write.
     println!(
-        "build schema={} journal={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
-        coord_types::formats::Format::StoreSchema.current(),
+        "build schema={} journal={} journal_writes={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
+        versions(coord_types::formats::Format::StoreSchema),
+        versions(coord_types::formats::Format::JournalRecord),
         coord_types::formats::Format::JournalRecord.current(),
-        coord_types::formats::Format::SharedCheckpoint.current(),
-        coord_types::formats::Format::LocalCheckpoint.current(),
-        coord_types::formats::Format::Backup.current(),
+        versions(coord_types::formats::Format::SharedCheckpoint),
+        versions(coord_types::formats::Format::LocalCheckpoint),
+        versions(coord_types::formats::Format::Backup),
         coord_types::formats::Supported::features()
             .iter()
             .map(|f| f.name())
@@ -937,6 +967,7 @@ fn main() -> ExitCode {
             && let Err(why) = enroll::collector_for(
                 &credential,
                 placed.membership.cluster(),
+                placed.membership.domain(),
                 placed.replica,
                 placed.incarnation,
             )
@@ -988,6 +1019,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
+    let booting = std::time::Instant::now();
     // The store is this node's only under the manifest it was
     // initialized with. Anything else -- another set of voters, another
     // policy, under the same cluster and domain -- is a genesis
@@ -1097,6 +1129,7 @@ fn main() -> ExitCode {
     // problem and is the most expensive kind of misconfiguration to
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
+    let phases = storage.phases;
     let checkpoints = storage.checkpoints;
     let early_proposal = early_proposal(&storage.active);
     let applier = match coord_storage::Applier::new(
@@ -1120,6 +1153,7 @@ fn main() -> ExitCode {
     let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
     // Where the loop's waits on those two threads are counted.
     let mut waits = None;
+    let building = std::time::Instant::now();
     let backing = if roles.votes() {
         match voter(
             &placed,
@@ -1140,6 +1174,15 @@ fn main() -> ExitCode {
     } else {
         serve::Backing::Serving(Box::new(applier))
     };
+    println!(
+        "{}",
+        boot_line(
+            &phases,
+            replayed.as_ref(),
+            building.elapsed(),
+            booting.elapsed()
+        )
+    );
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
     // `None` and reaches every voter over the wire.
@@ -1205,7 +1248,10 @@ fn main() -> ExitCode {
         Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
-        .wake_on_materialized(materialized);
+        .wake_on_materialized(materialized)
+        .policy_staleness(std::time::Duration::from_millis(
+            config.limits.max_policy_staleness_millis,
+        ));
     if let Some(replayed) = replayed {
         domain = domain.recovered_in(replayed.took);
     }
@@ -1411,11 +1457,14 @@ fn main() -> ExitCode {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
         }
+        if let Some(line) = domain.catch_up_line() {
+            eprintln!("{line}");
+        }
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
 saturated={} unavailable={} refused={} released={} returned={} unreturnable={} \
-watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
+returned_sends={} watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
 crowded_out={}",
             counts.queued_local,
             counts.queued_remote,
@@ -1426,6 +1475,7 @@ crowded_out={}",
             counts.released,
             counts.returned,
             counts.unreturnable,
+            counts.returned_sends,
             counts.watches,
             counts.watch_frames,
             counts.watches_lost,
@@ -1885,4 +1935,39 @@ fn now_seconds() -> u64 {
 /// an identity, not a secret, and the full value is in the certificate.
 fn short(bytes: &[u8; 16]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The startup report's `boot` line: how long each step before the
+/// runtime starts took, in milliseconds, with the sizes of what the
+/// attach indexed (#245; the lead on #185 asked what grows with history
+/// there). `voter_ms` is building the voter over the attached store;
+/// `total_ms` runs from the journal's open to the voter built.
+fn boot_line(
+    phases: &store::BootPhases,
+    replayed: Option<&coord_storage::Replayed>,
+    voter: std::time::Duration,
+    total: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (intake, entries, keys, versions, replay) = replayed.map_or((0.0, 0, 0.0, 0, 0.0), |r| {
+        (
+            ms(r.intake_index),
+            r.intake_entries,
+            ms(r.key_index),
+            r.key_versions,
+            ms(r.took),
+        )
+    });
+    format!(
+        "boot journal_open_ms={:.1} projection_open_ms={:.1} baseline_ms={:.1} guard_scan_ms={:.1} \
+attach_ms={:.1} intake_index_ms={intake:.1} intake_entries={entries} key_index_ms={keys:.1} \
+key_versions={versions} replay_ms={replay:.1} voter_ms={:.1} total_ms={:.1}",
+        ms(phases.journal_open),
+        ms(phases.projection_open),
+        ms(phases.baseline),
+        ms(phases.guard_scan),
+        ms(phases.attach),
+        ms(voter),
+        ms(total),
+    )
 }

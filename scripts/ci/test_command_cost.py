@@ -120,6 +120,27 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reads["mean_served_ms"], 4.0)
         self.assertNotIn("reads", cost.per_command("n1", snapshot()))
 
+    def test_the_output_gate_is_read_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["gate"] = {"holds": 40, "deferred": 3, "denied": 1}
+        gate = cost.per_command("n1", snap)["gate"]
+        self.assertEqual(gate, {"holds": 40, "deferred": 3, "denied": 1})
+        quiet = snapshot()
+        quiet["cost"]["Observed"]["gate"] = {"holds": 0, "deferred": 0, "denied": 0}
+        self.assertNotIn("gate", cost.per_command("n1", quiet))
+        self.assertNotIn("gate", cost.per_command("n1", snapshot()))
+        # A binary from before the hold reports no holds, and the records
+        # the gate keeps are a gauge, not something it did.
+        older = snapshot()
+        older["cost"]["Observed"]["gate"] = {"denied": 2, "deferred": 1, "remembered": 40}
+        gate = cost.per_command("n1", older)["gate"]
+        self.assertEqual(gate, {"holds": 0, "deferred": 1, "denied": 2})
+        keeping = snapshot()
+        keeping["cost"]["Observed"]["gate"] = {
+            "denied": 0, "deferred": 0, "remembered": 40, "holds": 0,
+        }
+        self.assertNotIn("gate", cost.per_command("n1", keeping))
+
     def test_the_read_waits_are_taken_apart_into_three(self):
         snap = snapshot()
         snap["cost"]["Observed"]["reads"] = {
@@ -203,6 +224,32 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("5.00/4.50 (4.80, 2.00)", table)
         self.assertNotIn("traffic_per_command", cost.per_command("n1", snapshot()))
 
+    def test_what_a_leader_sent_is_read_per_command_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["proposals"] = {
+            "proposals": 400, "proposal_bytes": 48000, "payload_bytes": 120000,
+            "frames": 50, "framed": 300, "frontiers": 74, "frontier_bytes": 2960,
+        }
+        reading = cost.per_command("n1", snap)
+        sent = reading["proposals_per_command"]
+        self.assertAlmostEqual(sent["proposals"], 4.0)
+        self.assertAlmostEqual(sent["frames"], 0.5)
+        self.assertAlmostEqual(sent["frontiers"], 0.74)
+        self.assertAlmostEqual(sent["frontier_bytes"], 29.6)
+        table = cost.paths_table({"runs": [{"callers": 1, "voters": [reading]}]})
+        self.assertIn("| 4.00/0.50/0.74 |", table)
+        # A follower sent nothing as leader, and an older binary has no
+        # counts: neither reads as zero.
+        follower = snapshot()
+        follower["cost"]["Observed"]["proposals"] = dict.fromkeys(
+            snap["cost"]["Observed"]["proposals"], 0)
+        self.assertNotIn("proposals_per_command", cost.per_command("n2", follower))
+        self.assertNotIn("proposals_per_command", cost.per_command("n1", snapshot()))
+        row = cost.paths_table({"runs": [{"callers": 1, "voters": [
+            cost.per_command("n2", follower)]}]}).splitlines()[-1]
+        self.assertEqual(row.count("|"), cost.paths_table(
+            {"runs": []}).splitlines()[0].count("|"))
+
     def test_journal_groups_are_read_per_command_when_reported(self):
         snap = snapshot(executed=100, appends=180, syncs=190)
         snap["cost"]["Observed"]["journal_groups"] = {
@@ -221,6 +268,20 @@ class ReduceTests(unittest.TestCase):
         self.assertIn("| 1 | n1 | 1.900 | 0.900 | 0.600 | 0.200 | 0.100 | 0.100 "
                       "| 3.30 (1.00) | 3.00 | 1.25 |", table)
         self.assertNotIn("groups_per_command", cost.per_command("n1", snapshot()))
+
+    def test_flush_causes_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=100, appends=50)
+        snap["cost"]["Observed"]["flush_causes"] = {
+            "idle": 80, "events": 5, "queued": 1, "appending": 30,
+        }
+        reading = cost.per_command("n1", snap)
+        flushes = reading["flush_causes_per_command"]
+        self.assertAlmostEqual(flushes["idle"], 0.8)
+        self.assertAlmostEqual(flushes["events"], 0.05)
+        self.assertAlmostEqual(flushes["appending"], 0.3)
+        table = cost.flush_causes_table({"runs": [{"callers": 10, "voters": [reading]}]})
+        self.assertIn("| 10 | n1 | 0.800 | 0.050 | 0.010 | 0.300 | 2.00 |", table)
+        self.assertNotIn("flush_causes_per_command", cost.per_command("n1", snapshot()))
 
     def test_a_run_with_no_fast_decision_is_a_finding(self):
         def voter(fast):

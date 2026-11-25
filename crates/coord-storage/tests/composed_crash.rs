@@ -13,8 +13,9 @@
 //! - **every acknowledged step, by an independent check:** a step whose
 //!   journal group the device synced before the crash (read from the
 //!   journal kit's own log, not from what `flush` returned) has its
-//!   protocol row and its application rows (the key, the event, the
-//!   executed row) in the recovered projection, and no step past the last
+//!   protocol row and its application rows (the key, the event, and the
+//!   execution row its executed row lowers to, with the payload it moves:
+//!   task-d113) in the recovered projection, and no step past the last
 //!   one submitted has any. That is the release rule's acknowledgement
 //!   (`JournalDurable`), whether or not the flush got to return.
 //!
@@ -59,6 +60,7 @@ use coord_storage::journaled::{
 use coord_storage_redb::RedbEngine;
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
+use coord_types::CommandId;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 
@@ -96,12 +98,42 @@ fn kv_key(step: u64) -> Vec<u8> {
     format!("key-{step}").into_bytes()
 }
 
+/// The key of step `step`'s event row: its revision, ordinal 0. The key
+/// index reads every event row when the projection attaches (task-d105),
+/// so the rows are real events.
 fn event_key(step: u64) -> Vec<u8> {
-    step.to_be_bytes().to_vec()
+    coord_storage::codecs::event_key(KvRevision::new(step).unwrap(), 0)
 }
 
-fn executed_key(step: u64) -> Vec<u8> {
-    vec![step as u8; 32]
+/// Step `step`'s event: the put of `kv_key(step)` at its revision.
+fn event_value(step: u64) -> Vec<u8> {
+    let at = KvRevision::new(step).unwrap();
+    coord_storage::codecs::encode_event(&coord_storage::codecs::EventRecordV1 {
+        kind: coord_state::KvEventKind::Put,
+        namespace: NamespaceId([0; 16]),
+        key: kv_key(step),
+        entry: Some(coord_state::KvEntry {
+            value: b"value".to_vec(),
+            create_revision: at,
+            mod_revision: at,
+            version: 1,
+            lease: None,
+            lease_generation: None,
+        }),
+        prev: None,
+    })
+    .unwrap()
+}
+
+/// Step `step`'s command.
+fn command(step: u64) -> CommandId {
+    CommandId(Digest32([step as u8; 32]))
+}
+
+/// The key of step `step`'s execution row: its executed row is lowered
+/// there, by position, with the payload it moves (task-d113, step 2).
+fn execution_key(step: u64) -> Vec<u8> {
+    coord_storage::codecs::position_key(ExecutionPosition::new(step).unwrap()).to_vec()
 }
 
 fn update(collection: Collection, key: Vec<u8>, value: Vec<u8>) -> StoreUpdate {
@@ -343,12 +375,21 @@ fn submit_step(
             base: Some(base),
             updates: vec![
                 update(Collection::KvCurrentV1, kv_key(step), b"value".to_vec()),
-                update(Collection::EventsV1, event_key(step), vec![step as u8; 12]),
+                update(Collection::EventsV1, event_key(step), event_value(step)),
+                // Its payload, then its executed row, which moves the
+                // payload to the position (task-d113, step 2).
                 update(
-                    Collection::ExecutedV1,
-                    executed_key(step),
-                    step.to_be_bytes().to_vec(),
+                    Collection::PayloadV1,
+                    command(step).as_bytes().to_vec(),
+                    vec![step as u8; 16],
                 ),
+                coord_storage::retry::executed_update(
+                    &command(step),
+                    ExecutionPosition::new(step).unwrap(),
+                    None,
+                    Digest32([step as u8; 32]),
+                )
+                .unwrap(),
             ],
         },
     });
@@ -402,7 +443,7 @@ fn check_steps(rows: &Rows, boot: &Boot, case: &str) {
             (Collection::ProtocolV1, protocol_key(step)),
             (Collection::KvCurrentV1, kv_key(step)),
             (Collection::EventsV1, event_key(step)),
-            (Collection::ExecutedV1, executed_key(step)),
+            (Collection::ExecutionV1, execution_key(step)),
         ] {
             assert!(
                 has(collection, &key),
@@ -479,7 +520,7 @@ fn composed_matrix(replay: Option<DurableCadence>) {
                 }
                 if recovered
                     .iter()
-                    .any(|(c, ..)| *c == Collection::ExecutedV1.id().0)
+                    .any(|(c, ..)| *c == Collection::ExecutionV1.id().0)
                 {
                     with_executed += 1;
                 }

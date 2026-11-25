@@ -3,6 +3,8 @@
 //! revision reaches the watch hub exactly once and in order, including one
 //! established by reconciliation after an indeterminate acknowledgement.
 
+mod support;
+
 use coord_consensus::PayloadRecordV1;
 use coord_core::effect::PersistBatch;
 use coord_core::outbox::BarrierAllocator;
@@ -17,6 +19,7 @@ use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 use coord_types::{CommandId, RetryKey};
+use support::Staged;
 
 const NS: NamespaceId = NamespaceId([5; 16]);
 const SESSION: SessionId = SessionId([3; 16]);
@@ -112,12 +115,12 @@ fn a_terminal_semantic_rejection_is_a_result_and_never_blocks_successors() {
         prev_kv: false,
     }));
     let (command, record) = payload(1, &doomed);
-    let outcome = applier.apply(command, &record).unwrap();
+    let outcome = applier.apply_staged(command, &record).unwrap();
     assert_eq!(outcome.revision, None, "nothing was written");
     assert_eq!(applier.kv_revision().unwrap(), before);
     // It is retry-resolvable: the same identity returns the same result at
     // the same position, and does not execute again.
-    let again = applier.apply(command, &record).unwrap();
+    let again = applier.apply_staged(command, &record).unwrap();
     assert_eq!(again.position, outcome.position);
     assert_eq!(again.result_digest, outcome.result_digest);
     // The recorded result names the rejection.
@@ -135,7 +138,7 @@ fn a_terminal_semantic_rejection_is_a_result_and_never_blocks_successors() {
     );
     // A valid write after it proceeds: nothing is wedged.
     let (command, record) = payload(2, &put(b"after", b"1"));
-    let outcome = applier.apply(command, &record).unwrap();
+    let outcome = applier.apply_staged(command, &record).unwrap();
     assert!(outcome.revision.is_some());
     assert_eq!(
         outcome.position.get(),
@@ -207,11 +210,11 @@ fn a_commit_established_by_reconciliation_still_reaches_open_watches() {
         .engine_mut()
         .script_commit(CommitScript::Indeterminate { applied: true });
     let (command, record) = payload(1, &put(b"a", b"1"));
-    let first = applier.apply(command, &record).unwrap();
+    let first = applier.apply_staged(command, &record).unwrap();
     let r1 = first.revision.expect("the commit took effect");
     // A following ordinary write.
     let (command, record) = payload(2, &put(b"b", b"2"));
-    let second = applier.apply(command, &record).unwrap();
+    let second = applier.apply_staged(command, &record).unwrap();
     let r2 = second.revision.expect("applied");
     assert_eq!(r2.get(), r1.get() + 1);
     // The watch saw both revisions, in order and once each: the hub never
@@ -250,12 +253,12 @@ fn a_view_too_large_to_build_is_a_rejection_and_never_blocks_successors() {
     }));
     let (command, record) = payload(1, &doomed);
     let outcome = applier
-        .apply(command, &record)
+        .apply_staged(command, &record)
         .expect("a result, not an error");
     assert_eq!(outcome.revision, None, "a read writes nothing");
     assert_eq!(applier.kv_revision().unwrap(), before);
     // Retry-resolvable at the same position, with the same result.
-    let again = applier.apply(command, &record).unwrap();
+    let again = applier.apply_staged(command, &record).unwrap();
     assert_eq!(again.position, outcome.position);
     assert_eq!(again.result_digest, outcome.result_digest);
     let gated = applier.store().reader().snapshot().unwrap();
@@ -272,7 +275,7 @@ fn a_view_too_large_to_build_is_a_rejection_and_never_blocks_successors() {
     );
     // The write behind it proceeds.
     let (command, record) = payload(2, &put(b"after", b"1"));
-    let outcome = applier.apply(command, &record).unwrap();
+    let outcome = applier.apply_staged(command, &record).unwrap();
     assert!(outcome.revision.is_some());
     assert_eq!(
         outcome.position.get(),
@@ -454,7 +457,7 @@ fn local_garbage_collection_progress_never_changes_a_replicated_outcome() {
     for a in [&mut churned, &mut collected] {
         set_kv_revision(a, start);
         let (command, record) = payload(1, &put(b"hot", b"final"));
-        a.apply(command, &record).unwrap();
+        a.apply_staged(command, &record).unwrap();
     }
     let revision = churned.kv_revision().unwrap();
     assert_eq!(revision, collected.kv_revision().unwrap());
@@ -472,9 +475,9 @@ fn local_garbage_collection_progress_never_changes_a_replicated_outcome() {
     }));
     let (command, record) = payload(2, &historical);
     let churned_outcome = churned
-        .apply(command, &record)
+        .apply_staged(command, &record)
         .expect("a result, not a local failure");
-    let collected_outcome = collected.apply(command, &record).expect("a result");
+    let collected_outcome = collected.apply_staged(command, &record).expect("a result");
 
     let stored_response = |a: &mut Applier<StoreWorker<ModelEngine>>| {
         let gated = a.store().reader().snapshot().unwrap();
@@ -519,7 +522,7 @@ fn an_admission_refusal_finishes_the_command_it_refuses() {
     let beyond = 1u64 << 40;
     let (command, record) = payload(beyond, &put(b"k", b"v"));
     let outcome = applier
-        .apply(command, &record)
+        .apply_staged(command, &record)
         .expect("a result, not an error");
     assert_eq!(outcome.revision, None, "a refusal writes nothing");
     let gated = applier.store().reader().snapshot().unwrap();
@@ -534,7 +537,7 @@ fn an_admission_refusal_finishes_the_command_it_refuses() {
     drop(gated);
     // The command behind it proceeds at the next position.
     let (next, next_record) = payload(1, &put(b"after", b"1"));
-    let after = applier.apply(next, &next_record).unwrap();
+    let after = applier.apply_staged(next, &next_record).unwrap();
     assert!(after.revision.is_some());
     assert_eq!(
         after.position.get(),
@@ -552,28 +555,31 @@ fn a_refused_command_is_recorded_as_executed() {
     // d12-11 divergence, task-d12).
     let mut applier = applier(ModelEngine::new());
     let (first, first_record) = payload(1, &put(b"before", b"1"));
-    applier.apply(first, &first_record).unwrap();
+    applier.apply_staged(first, &first_record).unwrap();
     // An out-of-window sequence: refused at admission.
     let beyond = 1u64 << 40;
     let (window, window_record) = payload(beyond, &put(b"k", b"v"));
-    let refused_window = applier.apply(window, &window_record).unwrap();
+    let refused_window = applier.apply_staged(window, &window_record).unwrap();
     // The establishing operation with no admission: refused before any
     // admission is consulted.
     let (mismatch, mut mismatch_record) = payload(2, &req(CanonicalOperation::ConsumeAdmission));
     mismatch_record.admission = None;
-    let refused_mismatch = applier.apply(mismatch, &mismatch_record).unwrap();
+    let refused_mismatch = applier.apply_staged(mismatch, &mismatch_record).unwrap();
     let gated = applier.store().reader().snapshot().unwrap();
     use coord_store_api::engine::OrderedRead as _;
     for (command, outcome) in [(window, &refused_window), (mismatch, &refused_mismatch)] {
+        // Keyed by its position, naming the command (task-d113, step 2).
         let bytes = gated
             .view()
             .get(
-                coord_store_api::registry::Collection::ExecutedV1.id(),
-                &coord_storage::codecs::executed_key(&command),
+                coord_store_api::registry::Collection::ExecutionV1.id(),
+                &coord_storage::codecs::position_key(outcome.position),
             )
             .unwrap()
             .expect("a refused command executed");
-        let row = coord_storage::codecs::decode_executed(&bytes).unwrap();
+        let execution = coord_storage::codecs::decode_execution(&bytes).unwrap();
+        assert_eq!(execution.command, command);
+        let row = execution.executed;
         assert_eq!(row.position, outcome.position);
         assert_eq!(row.revision, None);
         assert_eq!(row.result_digest, outcome.result_digest);
@@ -607,11 +613,11 @@ fn a_planner_valid_response_always_fits_its_retry_record() {
     let value = vec![b'x'; 768 * 1024];
     for (i, key) in [b"big-1", b"big-2", b"big-3"].iter().enumerate() {
         let (command, record) = payload(i as u64 + 1, &put(key.as_slice(), &value));
-        applier.apply(command, &record).unwrap();
+        applier.apply_staged(command, &record).unwrap();
     }
     let (command, record) = payload(10, &range_all());
     let outcome = applier
-        .apply(command, &record)
+        .apply_staged(command, &record)
         .expect("a result, not a storage error");
     let gated = applier.store().reader().snapshot().unwrap();
     let stored = coord_storage::retry::lookup(gated.view(), &retry_key(10))
@@ -630,6 +636,6 @@ fn a_planner_valid_response_always_fits_its_retry_record() {
     }
     // And the command behind it proceeds.
     let (next, next_record) = payload(11, &put(b"after", b"1"));
-    let after = applier.apply(next, &next_record).unwrap();
+    let after = applier.apply_staged(next, &next_record).unwrap();
     assert_eq!(after.position.get(), outcome.position.get() + 1);
 }
