@@ -1135,9 +1135,14 @@ struct Stats {
     /// off (its C0 measurement).
     behind_undecided: u32,
     behind_unexecuted_undecided: u32,
-    /// Selections that failed as `HalfInitialized`: an entry at ACCEPT
-    /// whose payload no reporter holds (task-d121's payload shape). Every
-    /// campaign that fails so is counted.
+    /// Campaigns a follower rejected as `HalfInitialized`: an entry at
+    /// ACCEPT whose payload no reporter holds (task-d121's payload shape).
+    /// Only the rejections are counted. A selection that fails so while its
+    /// campaign sets a report aside or waits for more
+    /// (`Campaign::try_select_decided`) is not, and neither is whether it
+    /// dropped a candidate behind an undecided command: `select_counted`
+    /// returns before `possible_fast_decisions` runs, so task-d121's C0
+    /// read those with a scratch probe.
     half_initialized: u32,
     /// Possible-fast candidates selections dropped whose dependencies
     /// reach a command no report holds and the candidate doesn't hold
@@ -5547,10 +5552,11 @@ fn one_seed_from_the_environment() {
 /// leader holds decided (one it doesn't hold decided fails the run).
 /// For task-d121's C0 it also says which `Behind` give-ups had a
 /// selection that dropped a candidate behind such a command
-/// (`behind_undecided`), how many selections failed as
+/// (`behind_undecided`), how many campaigns followers rejected as
 /// `HalfInitialized`, and, with `PROTOCOL_SIM_HOLDERS_GONE`, the runs
 /// that reached the mark, never led after it, and had every give-up
-/// after it kept off the rule by condition 5.
+/// after it kept off the rule by condition 5. A seed that fails adds
+/// nothing to any of these: it is listed with the failures instead.
 /// The loss of acknowledgements to followers and catch-up are the
 /// environment's, as in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
 /// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
