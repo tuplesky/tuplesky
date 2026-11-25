@@ -122,7 +122,6 @@ fn each_sector_subset_on_every_dirty_file_at_every_crash_point_keeps_every_group
 #[test]
 fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
-    let mut refused = 0;
     for (i, op) in ops.iter().enumerate() {
         if !matches!(op, Op::Write { .. }) {
             continue;
@@ -146,22 +145,41 @@ fn a_failed_write_never_acknowledges_and_loses_nothing_acknowledged() {
                 // `Ok`: with the crash at the same ordinal, recovery is
                 // checked only against earlier acknowledgements, which
                 // would pass an engine that swallowed the error (#210
-                // review).
-                if let Some(c) = acked.call_at(n) {
-                    assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
-                    refused += 1;
-                }
+                // review). Every write of the census is a call's, so each
+                // is checked, not a floor over the matrix.
+                let c = acked
+                    .call_at(n)
+                    .unwrap_or_else(|| panic!("{case}: write {n} fell inside no call"));
+                assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
             }
         }
     }
-    assert!(refused > 0, "no failed write fell inside a call");
 }
 
+/// ENOSPC at every write, truncation and allocation, over two windows.
+///
+/// The pinned engine answers a log write's ENOSPC by truncating the file,
+/// rotating to a new one and retrying the write once (`pipe.rs`'s
+/// `append`, `engine.rs`'s `write`; the kit's message is spelt so the
+/// engine recognises it, [`coord_journal_faultkit::ENOSPC_MESSAGE`]):
+///
+/// * a **one-operation** window is gone by the retry, so the call may
+///   return `Ok`, and then what it acknowledged must survive the reopen
+///   (`run`'s check holds the journal to every acknowledgement);
+/// * a **never-closing** window fails the truncation or the new file's
+///   header too, so the call whose write it refused must not return `Ok`.
+///
+/// Then a crash at every operation of each rotation the one-operation
+/// windows reached, under every tail policy: the rotation is the one path
+/// the fault-free census never takes.
 #[test]
 fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
     let ops = census();
-    let mut refused = 0;
     let total = ops.len() as u64;
+    // One-operation windows the engine rotated past and retried, with the
+    // ordinals the rotation and the retry took (after `n`, to the call's
+    // end).
+    let mut rotations: Vec<(u64, u64, u64)> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         if !matches!(
             op,
@@ -170,31 +188,75 @@ fn enospc_never_acknowledges_and_loses_nothing_acknowledged() {
             continue;
         }
         let n = i as u64 + 1;
-        // A one-operation window, and one that never closes.
-        for window in [(n, n), (n, u64::MAX)] {
-            for tail in [None, Some(Tail::None)] {
-                let plan = FaultPlan {
-                    enospc: Some(window),
-                    crash_after: tail.map(|_| n),
-                    ..FaultPlan::default()
-                };
-                let case = format!("ENOSPC over {window:?} of {total}, then {tail:?}");
-                let (_, acked) = run(plan, tail, &case);
-                // Nor the call whose write ENOSPC refused (#210 review). A
-                // refused length change is raft-engine's preallocation,
-                // which it logs and writes past (`LogFileWriter::write`),
-                // so that call may still return `Ok`: what it
-                // acknowledged is what recovery is checked against.
-                if matches!(op, Op::Write { .. })
-                    && let Some(c) = acked.call_at(n)
-                {
-                    assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
-                    refused += 1;
-                }
+        for tail in [None, Some(Tail::None)] {
+            let crash_after = tail.map(|_| n);
+
+            let plan = FaultPlan {
+                enospc: Some((n, n)),
+                crash_after,
+                ..FaultPlan::default()
+            };
+            let case = format!("ENOSPC at {n} of {total} only, then {tail:?}");
+            let (shared, acked) = run(plan, tail, &case);
+            if tail.is_none()
+                && matches!(op, Op::Write { .. })
+                && let Some(c) = acked.call_at(n)
+                && c.ok
+            {
+                // Acknowledged past the refused write: only by rotating.
+                let after = &shared.log()[n as usize..c.to as usize];
+                assert!(
+                    after
+                        .iter()
+                        .any(|o| matches!(o, Op::Dir { what } if what.starts_with("create"))),
+                    "{case}: the {} call returned Ok without a new file: {after:?}",
+                    c.what
+                );
+                rotations.push((n, n + 1, c.to));
+            }
+
+            let plan = FaultPlan {
+                enospc: Some((n, u64::MAX)),
+                crash_after,
+                ..FaultPlan::default()
+            };
+            let case = format!("ENOSPC from {n} of {total} on, then {tail:?}");
+            let (_, acked) = run(plan, tail, &case);
+            if matches!(op, Op::Write { .. }) {
+                // Every write of the census is a call's (#210 review: a
+                // floor over the whole matrix would pass one that skipped
+                // most of them).
+                let c = acked
+                    .call_at(n)
+                    .unwrap_or_else(|| panic!("{case}: write {n} fell inside no call"));
+                assert!(!c.ok, "{case}: the {} call returned Ok", c.what);
             }
         }
     }
-    assert!(refused > 0, "no refused write fell inside a call");
+    eprintln!("ENOSPC rotations (window, ordinals): {rotations:?}");
+    assert!(
+        !rotations.is_empty(),
+        "no ENOSPC reached the engine's rotate-and-retry"
+    );
+    let tails = [Tail::None, Tail::All, Tail::Seeded(1), Tail::Seeded(2)];
+    for &(n, from, to) in &rotations {
+        for k in from..=to {
+            for tail in tails {
+                let plan = FaultPlan {
+                    enospc: Some((n, n)),
+                    crash_after: Some(k),
+                    ..FaultPlan::default()
+                };
+                run(
+                    plan,
+                    Some(tail),
+                    &format!(
+                        "ENOSPC at {n}, rotation crashed after {k} of {from}..={to}, {tail:?}"
+                    ),
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -532,6 +594,8 @@ fn a_crash_scripted_at_a_rejected_operation_still_halts() {
     let mut writer = fs.new_writer(handle).unwrap();
     let err = writer.write(b"x").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+    // Spelt as the pinned engine's `is_no_space_err` recognises it.
+    assert!(err.to_string().contains("nospace"), "{err}");
     assert!(shared.is_frozen());
 }
 
