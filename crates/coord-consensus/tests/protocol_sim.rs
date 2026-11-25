@@ -924,9 +924,14 @@ struct Sim {
     /// campaign up as `Behind` on, once counted: a machine that gave up
     /// refuses every later campaign of its boot on the same command.
     behind_counted: Vec<Option<CommandId>>,
+    /// Each node's current follower machine's count of campaigns given
+    /// up as `Behind` whose selection dropped a candidate behind an
+    /// unreported dependency it doesn't hold decided, as last read.
+    behind_undecided_seen: Vec<u64>,
     /// The commands campaigns were given up as `Behind` on, counted in
-    /// this check and not yet read by `Knobs::holders_gone`.
-    gave_up: Vec<CommandId>,
+    /// this check and not yet read by `Knobs::holders_gone`, and whether
+    /// each one's selection counted such a drop.
+    gave_up: Vec<(CommandId, bool)>,
     /// The voters `Knobs::holders_gone` destroyed: they never restart.
     destroyed: BTreeSet<u8>,
     /// The command `Knobs::holders_gone` marked its moment on.
@@ -1124,6 +1129,21 @@ struct Stats {
     /// (task-d119).
     behind: u32,
     behind_unexecuted: u32,
+    /// Of those, the ones whose selection dropped a possible-fast
+    /// candidate behind a command no report holds and the candidate
+    /// doesn't hold decided: where task-d121's condition 5 keeps its rule
+    /// off (its C0 measurement).
+    behind_undecided: u32,
+    behind_unexecuted_undecided: u32,
+    /// Campaigns a follower rejected as `HalfInitialized`: an entry at
+    /// ACCEPT whose payload no reporter holds (task-d121's payload shape).
+    /// Only the rejections are counted. A selection that fails so while its
+    /// campaign sets a report aside or waits for more
+    /// (`Campaign::try_select_decided`) is not, and neither is whether it
+    /// dropped a candidate behind an undecided command: `select_counted`
+    /// returns before `possible_fast_decisions` runs, so task-d121's C0
+    /// read those with a scratch probe.
+    half_initialized: u32,
     /// Possible-fast candidates selections dropped whose dependencies
     /// reach a command no report holds and the candidate doesn't hold
     /// decided, every selection made counted, summed over every follower
@@ -1146,6 +1166,10 @@ struct Stats {
     behind_after_gone: u32,
     behind_after_gone_on_it: u32,
     boots_after_gone: u32,
+    /// Of the campaigns given up as `Behind` from the mark, the ones
+    /// whose selection counted a drop as `behind_undecided` does: a stall
+    /// where every one did is one task-d121's condition 5 keeps.
+    behind_after_gone_undecided: u32,
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`.
@@ -1237,6 +1261,7 @@ impl Sim {
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
             behind_counted: vec![None; usize::from(n)],
+            behind_undecided_seen: vec![0; usize::from(n)],
             gave_up: Vec::new(),
             destroyed: BTreeSet::new(),
             gone_mark: None,
@@ -1662,6 +1687,7 @@ impl Sim {
                 node.role = Some(Role::Follower(f));
                 self.window[usize::from(i)] = false;
                 self.behind_counted[usize::from(i)] = None;
+                self.behind_undecided_seen[usize::from(i)] = 0;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
                 }
@@ -2829,16 +2855,30 @@ impl Sim {
             let why = match node.role.as_mut() {
                 Some(Role::Follower(f)) => {
                     let rejections = f.take_rejections();
+                    // A machine gives a campaign up as `Behind` once, so a
+                    // rise in its count is this give-up's (task-d121's C0).
+                    let seen = &mut self.behind_undecided_seen[usize::from(i)];
+                    let now = f.unreported_drops().behind_undecided;
+                    let undecided = now > *seen;
+                    *seen = now;
                     for r in &rejections {
                         if let FollowerRejection::Behind { missing } = r
                             && self.behind_counted[usize::from(i)] != Some(*missing)
                         {
                             self.behind_counted[usize::from(i)] = Some(*missing);
                             self.stats.behind += 1;
+                            self.stats.behind_undecided += u32::from(undecided);
                             if !self.executed_anywhere.contains(missing) {
                                 self.stats.behind_unexecuted += 1;
+                                self.stats.behind_unexecuted_undecided += u32::from(undecided);
                             }
-                            self.gave_up.push(*missing);
+                            self.gave_up.push((*missing, undecided));
+                        }
+                        if let FollowerRejection::Campaign(RecoveryError::HalfInitialized {
+                            ..
+                        }) = r
+                        {
+                            self.stats.half_initialized += 1;
                         }
                     }
                     if let Some(t) = self.trace.as_mut() {
@@ -2878,8 +2918,8 @@ impl Sim {
                 self.fail(&format!("node {i} stopped: {why}"));
             }
         }
-        for missing in core::mem::take(&mut self.gave_up) {
-            self.holders_gone(missing);
+        for (missing, undecided) in core::mem::take(&mut self.gave_up) {
+            self.holders_gone(missing, undecided);
         }
         if self.gone_mark.is_some() && self.leader_index().is_some() {
             self.stats.led_after_gone = true;
@@ -2887,14 +2927,16 @@ impl Sim {
     }
 
     /// `Knobs::holders_gone`, at a campaign given up as `Behind` on
-    /// `missing`.
-    fn holders_gone(&mut self, missing: CommandId) {
+    /// `missing`, `undecided` when its selection dropped a candidate
+    /// behind an unreported dependency it doesn't hold decided.
+    fn holders_gone(&mut self, missing: CommandId, undecided: bool) {
         let Some(destroy) = self.knobs.holders_gone else {
             return;
         };
         if let Some(on) = self.gone_mark {
             self.stats.behind_after_gone += 1;
             self.stats.behind_after_gone_on_it += u32::from(on == missing);
+            self.stats.behind_after_gone_undecided += u32::from(undecided);
             return;
         }
         if self.executed_anywhere.contains(&missing) || self.leader_index().is_some() {
@@ -3048,6 +3090,7 @@ impl Sim {
         let boot = node.boot;
         node.role = Some(Role::Follower(f));
         self.behind_counted[usize::from(i)] = None;
+        self.behind_undecided_seen[usize::from(i)] = 0;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
     }
@@ -4671,6 +4714,9 @@ fn run_row(row: u8) {
                         totals.stopped_undecided += s.stopped_undecided;
                         totals.behind += s.behind;
                         totals.behind_unexecuted += s.behind_unexecuted;
+                        totals.behind_undecided += s.behind_undecided;
+                        totals.behind_unexecuted_undecided += s.behind_unexecuted_undecided;
+                        totals.half_initialized += s.half_initialized;
                         totals.unreported_drops += s.unreported_drops;
                         totals.unreported_drop_runs += s.unreported_drop_runs;
                         totals.bound_unreported += s.bound_unreported;
@@ -5071,6 +5117,13 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
         gone.behind_after_gone_on_it > 0,
         "no campaign given up as `Behind` on {} after the mark",
         short(&on)
+    );
+    // Task-d121's condition 5 doesn't keep the rule off it: no campaign
+    // given up after the mark had a selection that dropped a candidate
+    // behind a command no report holds (its C0).
+    assert_eq!(
+        gone.behind_after_gone_undecided, 0,
+        "a selection after the mark dropped a candidate behind an unreported command"
     );
     assert!(
         gone.boots_after_gone >= 2 * GONE_BOOTS,
@@ -5497,6 +5550,13 @@ fn one_seed_from_the_environment() {
 /// hold decided, and the runs with any; and selections bound with a
 /// candidate dropped behind a command no report holds and the new
 /// leader holds decided (one it doesn't hold decided fails the run).
+/// For task-d121's C0 it also says which `Behind` give-ups had a
+/// selection that dropped a candidate behind such a command
+/// (`behind_undecided`), how many campaigns followers rejected as
+/// `HalfInitialized`, and, with `PROTOCOL_SIM_HOLDERS_GONE`, the runs
+/// that reached the mark, never led after it, and had every give-up
+/// after it kept off the rule by condition 5. A seed that fails adds
+/// nothing to any of these: it is listed with the failures instead.
 /// The loss of acknowledgements to followers and catch-up are the
 /// environment's, as in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
 /// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
@@ -5527,23 +5587,40 @@ fn seeds_from_the_environment() {
     }
     let mut totals = Stats::default();
     let mut failures = Vec::new();
+    // Task-d121's C0: runs that reached the mark, the ones that never led
+    // after it (a permanent stall where the holders were destroyed), and
+    // of those the ones where every campaign given up as `Behind` after
+    // it had a selection condition 5 keeps the rule off.
+    let (mut marked, mut stalled, mut kept) = (0u32, 0u32, 0u32);
     for seed in v[2]..v[3] {
         match run_knobs(n, knobs, seed, None) {
             Ok(s) => {
                 if let Some(on) = s.gone_on {
+                    marked += 1;
+                    let stall = !s.led_after_gone;
+                    let keeps = stall
+                        && s.behind_after_gone > 0
+                        && s.behind_after_gone_undecided == s.behind_after_gone;
+                    stalled += u32::from(stall);
+                    kept += u32::from(keeps);
                     println!(
                         "seed {seed}: holders of {} gone (mask {:b}), led after {}, \
-                         behind after {} ({} on it), boots after {}",
+                         behind after {} ({} on it, {} with an undecided drop), \
+                         boots after {}",
                         short(&on),
                         s.gone,
                         s.led_after_gone,
                         s.behind_after_gone,
                         s.behind_after_gone_on_it,
+                        s.behind_after_gone_undecided,
                         s.boots_after_gone
                     );
                 }
                 totals.behind += s.behind;
                 totals.behind_unexecuted += s.behind_unexecuted;
+                totals.behind_undecided += s.behind_undecided;
+                totals.behind_unexecuted_undecided += s.behind_unexecuted_undecided;
+                totals.half_initialized += s.half_initialized;
                 totals.unreported_drops += s.unreported_drops;
                 totals.unreported_drop_runs += s.unreported_drop_runs;
                 totals.bound_unreported += s.bound_unreported;
@@ -5553,19 +5630,30 @@ fn seeds_from_the_environment() {
         }
     }
     println!(
-        "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}), \
+        "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}; \
+         with an undecided drop {}, of those on a command no voter executed {}), \
+         half-initialized {}, \
          unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
          fenced {}, failed {}",
         v[2],
         v[3],
         totals.behind,
         totals.behind_unexecuted,
+        totals.behind_undecided,
+        totals.behind_unexecuted_undecided,
+        totals.half_initialized,
         totals.unreported_drops,
         totals.unreported_drop_runs,
         totals.bound_unreported,
         totals.fenced,
         failures.len()
     );
+    if knobs.holders_gone.is_some() {
+        println!(
+            "row {row} at {n} voters: marked {marked}, never led after the mark {stalled}, \
+             of those every `Behind` after it with an undecided drop {kept}"
+        );
+    }
     assert_none_failed(&failures);
 }
 
