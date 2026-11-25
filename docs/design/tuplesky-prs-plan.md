@@ -5296,15 +5296,17 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - catch-up windows carry a decided record with its payload; they carry the marker instead.
 - **Execution and `D`'s submitter.**
   - `D` executes as a refusal, its executed row with no effect, once it is decided. A frontend waiting on `D` learns the same.
-  - A submission of `D` that meets the nothing record is answered as refused, not as a presentation under other facts (task-d14), and never admitted.
-  - Unlike an admission refusal (task-d12), the nothing decision also keeps `D`'s identity as refused once the table retires it: a tombstone beside the retired set, which `on_request` checks with `table.retired`.
+  - A submission of `D` that meets the nothing record is never admitted. It is answered as refused, not as a presentation under other facts (task-d14), only on evidence that the nothing is decided: the voter holds it at COMMIT (its leader counted a slow quorum of its acceptances, or the voter learned the commit from the commit frontier, a Sync entry or a catch-up window), or executed it (#315 review).
+    - Against a nothing the voter holds below COMMIT, the submission waits, as a duplicate of an undecided command waits for its release (task-d100). A lone acceptance of the nothing, even a durable one, decides nothing: a later ballot whose selection holds `D`'s payload re-proposes `D` with it (the returning-holder test below), and a refusal sent before then would be one the commit contradicts.
+    - The waiting submission isn't admitted under its digest, and its payload isn't written: the voter's record is the nothing, and a proposal under the digest, not a retry, is what replaces it ("Accepting a nothing", above).
+  - Unlike an admission refusal (task-d12), the nothing decision also keeps `D`'s identity as refused once the table retires it: a tombstone beside the retired set, which `on_request` checks with `table.retired`. The tombstone is written only for a nothing the voter executed, so it too rests on a decision.
     - A voter that decided nothing from a marker holds no payload, so it can't know `D`'s retry key. A retry of `D` carries the same identity, since `CommandId` is derived from the retry key and the request.
     - The tombstone is kept for task-d117's retry window in memory, which superseded task-d104's retry rows.
   - So a retry after the table forgets `D` is answered as refused and never admitted again. That is the first of the two fixes task-d100 left open for a refused command whose release is lost ("keep the refusal for the key"), taken here for this case, by identity rather than by key.
 - **The floor: what "committed or executed" reads there.**
   - The candidate reads its table, its ledger and its executed rows (`OwnDecisions`). Within an epoch with trimming off, those are complete.
   - Once task-d27's floor trims executed rows, a dependency below the floor that the candidate executed would read as never executed.
-  - So the rule doesn't fire on a candidate whose floor is above genesis, and keeps today's wait, until task-d27's floor keeps the identity of every executed command a retained record names.
+  - So the rule doesn't decide a new nothing on a candidate whose floor is above genesis, and keeps today's wait, until task-d27's floor keeps the identity of every executed command a retained record names. Carrying a nothing the selection's copy already holds is a separate case and is unaffected: a quorum may have decided it, so it is carried above any floor. The design states the guard beside condition 5 (Section 4.9, #315 review).
   - Today nothing trims (`plan_trim` has no caller), so alpha's floor stays at genesis and the rule fires there.
   - The code step adds a debug assertion that the rule never fires above a floor.
 
@@ -5394,10 +5396,11 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - A voter holding `D` at ACCEPT under a digest, with the nothing entry's dependencies, replaces it when it installs the Sync, and votes.
   - A leader holding its own nothing below the source re-proposes `D` with its payload where another report holds one.
 - **Storage.** A voter restarts holding a nothing record, which boot accepts. It executes the record under rule (b), and serves it in a catch-up window to a voter behind, which commits it as nothing. A follower writes a committed nothing's commit row and executes it as a refusal.
-- **The refusal.** A retry of `D` after the table forgets it is answered as refused, at the voter that decided the nothing and at one that learned it from a marker.
+- **The refusal.** A retry of `D` after the table forgets it is answered as refused, at the voter that decided the nothing and at one that learned it from a marker. A retry that meets the nothing at a voter holding it only at ACCEPT waits, is not admitted, and is answered once `D` is decided (the returning-holder test below).
 - **The vote.** A nothing acceptance counts only once its rows are durable: a failed batch holds the vote back.
 - **A held nothing meets a digest.** A follower holding `D`'s nothing at ACCEPT, demoted below the source, receives a proposal of `D` under its digest. It replaces the nothing, fetches and writes the payload row, and votes once that row is durable. Holding the nothing at COMMIT, it stops.
 - **A holder that installed `b'`'s Sync keeps its payload.** `D`'s only holder comes back, installs `b'`'s Sync, which lists `D` among its nothing re-proposals, and misses the proposal, which no quorum accepts. At `b''` the selection re-proposes `D` with the holder's payload, and `D` commits with it.
+  - **A retry before the ballot changes.** While `b'`'s leader holds the nothing at ACCEPT and no quorum has accepted it, a retry of `D` reaches that leader. It is neither refused nor admitted, and its caller is answered with `D`'s result once `D` commits at `b''`. **Control:** with the retry answered as refused there, as the plan read before #315's review, the test fails: its caller holds a refusal the commit contradicts.
 - **The store identity.**
   - A voter initialized again on an empty store under its identity is refused by every peer that saw its identity before, and the review's wiped schedule stalls instead of deciding `D` as nothing.
   - **Control:** with the check off, the oracle reports the lost write.
