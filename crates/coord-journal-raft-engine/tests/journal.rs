@@ -73,6 +73,8 @@ impl Handle for FaultHandle {
     }
 }
 
+impl coord_journal_raft_engine::DirSync for FaultFs {}
+
 impl FileSystem for FaultFs {
     type Handle = FaultHandle;
     type Reader = <DefaultFileSystem as FileSystem>::Reader;
@@ -248,7 +250,7 @@ impl Stream {
 }
 
 /// Create a journal with durable mappings for the given domains.
-fn create<F: FileSystem>(
+fn create<F: FileSystem + coord_journal_raft_engine::DirSync>(
     dir: &Path,
     fs: Arc<F>,
     domains: &[u8],
