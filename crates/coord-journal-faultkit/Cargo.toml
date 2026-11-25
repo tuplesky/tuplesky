@@ -1,0 +1,26 @@
+[package]
+name = "coord-journal-faultkit"
+description = "Fault-injecting raft-engine FileSystem with volatile/durable images for journal crash qualification (test-only, task-j05)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Qualification harness; never linked into production artifacts.
+role = "test-only"
+
+[dependencies]
+coord-journal-raft-engine.workspace = true
+raft-engine.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-journal-api.workspace = true
+coord-store-api.workspace = true
+tempfile.workspace = true

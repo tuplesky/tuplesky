@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 210 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d100`, `task-d106` through `task-d110`, `task-d112`, `task-d113`, `task-d115` through `task-d121` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, `task-d113` from a profile of the materializer, `task-d115` from the owner's batching rule, `task-d116` from a restarted voter's boot in a fault run, `task-d117` from its proposal 2, `task-d118` from a security review of a replicated limit's change, `task-d119` from the protocol simulator's sweep on #269, `task-d120` from task-d119's give-ups, `task-d121` from the cases task-d120 leaves open, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 215 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d110`, `task-d112`, `task-d113`, `task-d115` through `task-d121` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, `task-d62` through `task-d65` from a consolidated review against the reference SwiftPaxos, `task-d66` from the Jepsen runs of task-d51, `task-d67` from a Jepsen run on #98 that made no fast decision, `task-d68` from task-d62's counts after a leader change, `task-d69` from a profile of a follower's loop, `task-d70` from the Jepsen runner's profile of the transport's workers, `task-d71` from the protocol simulator's first 1,000-seed sweep, `task-d72` through `task-d75` from comparing a command's cost with etcd's on one host, `task-d76` from a Jepsen run that killed the leader, `task-d77` through `task-d81` from the protocol simulator with acknowledgements between followers lost, `task-d82` through `task-d84` from the Jepsen runs of the #173 carry, `task-d85` from the protocol simulator on task-d74's routing, `task-d86` through `task-d92` from planning the whole gap to etcd on #174, `task-d106` and `task-d107` from the task-d72 batch's register-kill run, `task-d108` and `task-d109` from the runs after it, `task-d110` from an audit of the walks a turn makes over history, `task-d113` from a profile of the materializer, `task-d115` from the owner's batching rule, `task-d116` from a restarted voter's boot in a fault run, `task-d117` from its proposal 2, `task-d118` from a security review of a replicated limit's change, `task-d119` from the protocol simulator's sweep on #269, `task-d120` from task-d119's give-ups, `task-d121` from the cases task-d120 leaves open, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -61,6 +61,11 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d98 | From the next step on the gap (#185 review): a slow-path write pays two syncs in series before it is learned, the leader's and then a follower's, since the leader sends its proposal only once its batch is durable; about 95% of the register row's writes take the slow path, and two runner syncs are about 4.6 ms against etcd's `service` p99 of 3 | Before the next batch, or the batch revises the `service` target with this as the reason |
 | task-d99 | From task-d98's design step (#192 review): task-60's activation rule and rows exist, but nothing in a running `coordd` records a voter's support or activates a feature, so a feature-gated change ships unreachable, and Section 23 rules out an operator flag around a correctness gate | Before the batch that carries task-d98 |
 | task-d100 | From the batch's sweep and its two runner jobs (#98, #185 review): with the disk's tail off the head is core-bound from 30 callers, and a slow-path command still costs the collector's frontend about 11 api frames, about 13 datagrams, and every follower a submission's admission for an order it only adopts | After task-d98 and task-d99, which its relayed proposal and its features rest on; step A first, step B sized on the runner after it (#202 review) |
+| task-d101 | From the two local profiles and the row count on #185, read against the runner's tmpfs job (#185 review): the four followers' executions and projections cost about 0.75 ms an operation, a fifth of the servers, and none of it is on a write's path | A design step now, beside task-d100's code step; its option 1 is task-d86's follower half |
+| task-d102 | From #185's next steps (#185 review): at 120 callers a command costs about 16.8 datagrams and a journal group holds about 4.9 commands, since every message and group of a slow round is per command | A design step now, after task-d100's step A; it builds step B, and reads task-d84's parts 2 and 3, task-d86 and task-d101's option 1 together |
+| task-d103 | The first of task-d101's option 2 cuts, its own design step (#185 review): the protocol rows can't move to the journal, whose readers look them up by command past its retention, but the leader's proposal row is written in every proposal batch and read by nothing | A design step now; a row at the leader |
+| task-d104 | The second of task-d101's option 2 cuts (#185 review): a client acknowledges on every request, so each command retires one sequence and rewrites its client's floor | A design step now; about a row a command at every voter |
+| task-d105 | The third of task-d101's option 2 cuts (#185 review): a put writes a history row and an event row holding the same version, keyed two ways | A design step now; about a row a mutated key at every voter, and a checkpoint format version |
 | task-d106 | From the task-d72 batch's register-kill run on the head (#98): a voter restarted behind the others held more commands committed and not executed than one Sync row takes, so the Sync it carried them into (task-d80) never fitted, it refused every new ballot's Sync, and catch-up, which serves only a synchronized voter, never brought it forward | Liveness; before the next fault run |
 | task-d107 | From the task-d72 batch's register-kill run on the head (#98, #213 review): the restarted voter's loop was busy 97 to 100% of the time, and the next command to execute was found by checking every committed record's dependencies, every pass, with thousands of them blocked on one command | Before the run after the register-kill baseline |
 | task-d108 | From the register-kill run on task-d107's head (#98, run 42929336912): a voter that won its promise quorum stalled before it led, and at most elections one loop pass computed for seconds. Selection, which a takeover runs in one loop pass, read each member's record of a command by scanning its report, and walked the selection's dependencies again for every adopted command and candidate: over three reports of 2,000 commits and 30 pre-acceptances it took 1.4 s, and about four times that over twice the commits (#98 review) | Liveness; before the next fault run |
@@ -299,6 +304,11 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d98](#task-d98) | Send the leader's proposal before its batch is durable | task-d30, task-d74, task-d89, task-d99 |
 | [task-d99](#task-d99) | Activate a replicated feature in a running domain | task-60 |
 | [task-d100](#task-d100) | Answer on the release, then relay a write through the leader while rounds are slow-only | task-d74, task-d90, task-d98, task-d99 |
+| [task-d101](#task-d101) | Let followers do less: what reads a follower's projection, and what each option saves | task-d12, task-d86, task-d90 |
+| [task-d102](#task-d102) | A contended round is a batch: one frame, one group and one acknowledgement a turn | task-d61, task-d84, task-d86, task-d99, task-d100, task-d101 |
+| [task-d103](#task-d103) | Stop writing the leader's proposal row, which nothing reads | task-d89, task-d101 |
+| [task-d104](#task-d104) | Retire the retry window in batches | task-c02, task-d26, task-d99, task-d101 |
+| [task-d105](#task-d105) | One version row a revision, with the key index in memory | task-d26, task-d37, task-d101 |
 | [task-d106](#task-d106) | Keep carried commits out of the Sync row | task-d20, task-d80 |
 | [task-d107](#task-d107) | Choose the next command to execute among the ready records only | task-d46, task-d106 |
 | [task-d108](#task-d108) | Select a takeover's Sync in time linear in what the reports hold | task-d33, task-d71 |
@@ -1316,9 +1326,111 @@ On the serving path: a running daemon publishes its own baseline, retires the pr
 
 **Implement:** Pinned filesystem injection with audited unhooked/background operations; combine actual raft-engine/redb faults, subprocess death, ENOSPC/sync errors and recovery modes. Keep independent protocol/application/retry oracles.
 
-**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix.
+**The matrix, in steps, with `replay`'s case in it from the start** (#185 review). `replay` (task-j06) is the profile that may become the default, and task-j06 makes task-j05's whole matrix its gate, so every step runs under `strict` and under `replay`. Each step is its own PR.
 
-**Review boundary:** Clean close or process kill alone does not prove power-loss behavior.
+What exists today:
+- **redb.** Its faults are covered by `coord-redb-faultkit`: two images, torn, seeded and reordered tails, sync failures, ENOSPC, crash-freeze, and subprocess `abort()`. `journaled_real.rs` runs that matrix under both profiles over a real raft-engine journal.
+- **The journal** is never faulted there: it is closed cleanly and copied. Its only fault test fails `Handle::sync`.
+- **Recovery modes.** Neither recovery mode is tested against a damaged file.
+- **Oracles.** No crash test of the journal-first path runs an independent oracle; they compare rows with a reference replay.
+
+The steps:
+1. **A journal fault kit.** A raft-engine `FileSystem` adapter with a volatile image and a durable one, as the redb kit has. It faults:
+   - writes and short writes, ENOSPC and EIO on write, sync failures;
+   - **ENOSPC as the pin recognises it** (#210 review). The pin knows no-space by the error's text alone (`is_no_space_err`, `contains("nospace")`), and only then truncates, rotates to a new file and retries the write once. So the kit's ENOSPC carries that text. A one-operation window may then be acknowledged after the retry, and what it acknowledged must survive; a window that never closes must not be acknowledged. Every operation of each rotation it reaches is crashed under every tail policy, since the fault-free workload never rotates;
+   - a crash that freezes the files and keeps none, all, or a seeded subset of what wasn't synced, torn at byte level and reordered.
+
+   **The audit:** the operations that bypass the adapter, each named in the report as uncontrolled or, where the adapter can reach it, brought under it. These are:
+   - the directory sync in raft-engine's `pipe.rs`, which panics on failure. In the pin (`097c499`) its one caller is `rotate_imp`, so it runs only at rotation. The first log file, created by `SinglePipe::open`, got no directory sync (#210 review);
+   - `pipe_builder`'s directory creation, listing and lock;
+   - the adapter's own `std::fs` calls, including `create_dir_all`, which synced no parent;
+   - raft-engine's background threads, if any.
+
+   **Directory entries** (#210 review).
+   - **The model:** a created or renamed file's entry survives a crash only once a directory sync covers it. Until then a crash loses the created file, or leaves the renamed one under its old name.
+   - **The adapter's fix:** it now syncs the journal's directory and every directory `create_dir_all` made, up to the one that existed, through a `DirSync` trait the kit implements. This happens after the engine creates its first file and before `create` returns.
+   - **raft-engine's own rotation sync** is inferred from the pin's order, since it bypasses the kit.
+   - **What's named, not modelled:** a delete is modelled as standing, and a directory's own entry isn't modelled.
+   - **The controls:** with the adapter's sync removed, the matrix fails, because the created journal is lost. A directory sync the kit lies about is caught.
+
+   **Not in this step:**
+   - After a failed `fsync`, Linux can mark the pages clean, so a later `fsync` reports success without persisting them. The engine panics on a failed sync, so that case belongs to step 5's fail-stop.
+   - Steps 1 and 2 test the journal alone, so they are profile-independent: `strict` and `replay` don't differ there.
+2. **The recovery modes** against the kit: a torn or partial tail, and damage inside the durable prefix, under `TolerateTailCorruption` (the default) and `AbsoluteConsistency`. A mode may drop an unsynced tail. Neither may drop, or open past, a record that was synced and reported durable; damage there is refused with its position.
+
+   **Found and fixed here (#211).** The pinned engine, under `TolerateTailCorruption`, truncated the last log file at its first broken batch whatever followed it (a broken file header emptied it, and the open then read as uninitialized), and truncated the last batch of any file on a broken entries block. One damaged byte dropped every acknowledged group after it. The adapter now runs the engine over a tail guard (`coord_journal_raft_engine::guard`) that checks each truncation against the file's bytes before it reaches the file:
+   - **Only the last file of its queue,** since rotation syncs a file before creating the next.
+   - **Only an unfinished write:** nothing but zeros past the end the broken batch's header claims, and the batch either cut short (its checksum zero, or running past the end of the file) or holding an unwritten sector part. Inside the claimed end nothing is searched, since a payload can hold anything a batch looks like. Where the header doesn't decode, a whole batch (one whose item block's checksum matches) anywhere after it is refused.
+   - **A file header only if it is all zeros and nothing follows it.** A header is synced before anything in its file is acknowledged: `rotate_imp` syncs a rotated file's, `create` syncs the first file's with the identity record and syncs the directory (#210) before it returns, and the adapter's open syncs once the engine has opened, so a header the open rewrote is durable before a group follows it. So a zeroed header with data after it is damage, or an unacknowledged creation, and is refused (#211 re-review). Before, a zeroed first sector emptied a last file holding one batch, and a young single-file journal read as uninitialized.
+   - **The search after a header that doesn't decode is bounded.** A candidate batch claiming an end past the data's last non-zero byte is skipped without a checksum. The rest is capped at a few passes over the tail, past which it refuses (#211 re-review). A lost header sector followed by 7 KB of batch-shaped headers in a 64 MiB file took 74 s; it now refuses in 0.74 s.
+   - **A refusal** is `OpenError::Corrupt` naming the file, the position and the reason, with the file untouched.
+
+   **The physical model:** a sector is written whole or not at all, and a buffered write can stop at any byte. The kit's sector tears are that model. `Tail::Sectors` tries every subset of the unsynced sectors at every crash point, over files small enough to rotate, and each opens with every acknowledged group. One mask applies to every dirty file at once: within a file it is exhaustive, but where two files are dirty (about half the crash points, by the re-review's count) the combinations across them are only those of the same mask, and seeded sector tears sample the rest. Its byte tears are past the model, and may be refused, never opened short.
+
+   **What the guard lets through.** It reads one file's tail, so damage that leaves a tail shaped like a torn write is taken for one, and acknowledged groups go with no refusal:
+   - damage confined to the last batch, with nothing after it, where the batch has a sector part of zeros (its own bytes, or a sector the device lost);
+   - the last batch's checksum bytes zeroed, read as a write that stopped short;
+   - zeros from a sector boundary to the end of the file, over whole batches;
+   - the file cut at a sector or batch boundary;
+   - the last file deleted;
+   - two damages to one batch: its length flipped to claim an end in the zeros past the data, together with any byte its item block's checksum covers (not only the checksum) or its item offset. That batch and every later one go, and on a file's first batch the open answers `NotInitialized`.
+
+   What would catch these is an independent record of the synced head. Under `strict` the projection is one for what it had committed: `attach_with_baseline` refuses a journal whose head is below the projection's stamp ("materialized past the journal's durable head"), in both profiles. **Under `replay` the projection trails by up to a cadence, and nothing catches a journal shortened inside that window.** That belongs to step 3's `replay` case, and #212's reinstall trusts the same head.
+
+   **What the guard refuses that a crash can leave:**
+   - a purge's several unsynced `.rewrite` batches, torn, although nothing in them is lost (the journal's `maintain()` has no production caller yet, so not today);
+   - a tenant's payload holding a whole batch's shape, in a write torn inside its header's sector, where the header doesn't decode and the bytes after it are searched; and one with too many batch-shaped headers to search within the bound.
+
+   **After a refusal** (#211 re-review). The voter stays down. It is rebuilt from its peers by replacing it (task-d41, with task-d32's learner), and until that lands there is no supported repair: a domain of three or five tolerates one voter down. A majority refusing is a lost quorum, recovered by a restore from backup (`docs/operations/disaster-recovery.md`). Truncating by hand at the named offset is not a supported step, since it discards every acknowledged group after that offset. There is no runbook or `coordctl` command for it, and none is planned.
+
+   **Recovery on the fault seam.** Each sector-torn crash image of the workload, over fixed-size and rotating files, is reopened on the kit, and crashed at every operation that reopen issues (its truncations and syncs), under both tails. The image that leaves reopens with every acknowledged group: 106 images, 1,766 crash points inside recovery.
+
+   **Not verified:** LZ4-compressed batches (the workload's records sit under the compression threshold) and crashes inside a `.rewrite` purge. Format version 1 files are verified on one path: a header the open rewrites is version 1 (the pin's default) inside a journal created at version 2, and a group torn after it runs the guard's unsigned checks (`a_group_torn_after_a_rewritten_header_keeps_every_acknowledged_group`).
+
+   Under `strict`, coordd also checks the projection against the journal before anything is attached (`validate_projection`). That refuses a stamp naming a record the journal doesn't hold, with an earlier message. A projection past the journal's head passes it and is refused by the attach check above.
+3. **The composed crash matrix:**
+   - **The crash points.** Journal and projection crash together at every counted operation of either, with each tail policy on each, under `strict` and `replay`, over the domains' real `JournaledStore`.
+   - **Its size, and how it's cut** (#209 review). The product of crash points, tail policies, devices and profiles is enumerated exhaustively over a bounded workload, not seeded, so a pass covers every crash point of that workload. The step's PR states the count of crashes in each profile and the run time. CI runs that bounded matrix on every change. A larger matrix (more steps, rotation, both devices dirty at once) runs on a schedule, as the simulator's sweep does. A part that has to be seeded reports its seeds and the crash points it reached, so a pass says what it covered.
+   - **`replay`'s case.** The live projection is lost or unusable in four ways. For each, the node must recover the journal's state, by replay or by installing the baseline, or refuse to serve when there is no baseline:
+     - empty;
+     - a stale stamp behind the baseline;
+     - a stamp naming a record the journal doesn't hold;
+     - a file redb can't open. Today this one is refused at `open` rather than discarded and reinstalled, so the step makes it discard and reinstall.
+4. **Checkpoint and pointer publication** on a fault seam: the image's files, rename and directory sync, the pointer's append, the journal's purge, and the source switch. Each crashed at every point, under both profiles. `coord-checkpoint` uses `std::fs` directly today, so the seam is added first.
+5. **A sync failure stops the service.** On the real journal under `coordd`:
+   - the appender's panic, or a fail-stopped journal, ends the domain thread and the process with the reason, and serves nothing after it;
+   - a restart reopens the journal and doesn't reuse the uncertain handle;
+   - the uncertain record is either in the reopened journal and replayed, or absent and never acknowledged.
+6. **Subprocess death under the oracles.** `coordd` killed with `SIGKILL` at seeded points across the journal's and the projection's writes, three voters on real files, under both profiles. Each run's history is checked by:
+   - `coord-oracle`'s history check;
+   - the protocol oracle (acknowledged values durable at a quorum);
+   - the retry oracle.
+
+   None of them compares rows with a reference replay.
+
+   **Process death isn't power loss** (#209 review). A `SIGKILL` loses what the process held in memory, which under `replay` includes the working commits. So this step does exercise the projection falling behind the journal. But it keeps every byte written and not yet synced, because the kernel still holds it. A vote or a result that leaves after the write and before the sync is therefore invisible to a kill, and to every Jepsen kill run so far. Steps 1 to 4 test that case only in the kit's model.
+   - **So this step has a required variant on a filesystem that drops unsynced writes at the kill:** LazyFS, the FUSE filesystem Jepsen integrates as `jepsen.lazyfs`, under each voter's journal and projection directories. The kill is followed by LazyFS's `clear-cache`, so what wasn't synced is gone, as at a power loss, and the same three oracles check the history.
+   - **The Jepsen kill runs get the same option,** as the testing session's runner work.
+   - **If the variant can't be run on a platform,** the report names power loss as uncontrolled at the system level there, with the kit as its only evidence.
+7. **Negative controls and late effects.**
+   - **WAL, projection-cut and ordering errors, and same-boot late callbacks,** injected on the real engines.
+   - **For each guard,** a build with that guard removed, which the suite must catch:
+     - the projection commit before the journal sync;
+     - a late callback accepted after `reconcile`;
+     - the pointer published before the projection's durable stamp;
+     - the replay validation skipped.
+
+The report from each step separates model evidence from physical evidence, and names the platform, the filesystem and every uncontrolled operation or schedule.
+
+**What gates what** (#209 review).
+- **Reading the bars at `replay`** needs none of these steps. It is a reading, not a default.
+- **Making `replay` the default** needs all seven, through task-j06's gate.
+- **The order's reason:** steps 1 to 3 are the storage evidence, steps 4 and 5 are publication and fail-stop, and steps 6 and 7 are the system's.
+- **The smallest set that could say no to `replay` early** is steps 1 to 3 with step 7's four guards. If the plan needs an early answer, that set runs first.
+
+**Acceptance:** Acknowledged outcomes survive declared failures; sync panic stops affected shared service. Distinguish model from physical evidence and report uncontrolled schedules/platforms. Inject WAL/projection-cut/order errors and same-boot callbacks; suite detects missing obligations and unauthorized late effects. No permissive recovery silently loses durable prefix. Every step passes under `strict` and under `replay`, and task-j06's gate for making `replay` a default reads this matrix's result.
+
+**Review boundary:** Clean close or process kill alone does not prove power-loss behavior; step 6's variant on a filesystem that drops unsynced writes is what the system-level claim rests on.
 
 <a id="task-j06"></a>
 ### task-j06: Replay-backed working-state materialization, promoted, off by default
@@ -4074,7 +4186,7 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
   - **The early solicit** (#204 review): a marked entry holding neither half of a release is submitted again to its ballot's leader alone, once, at one offer ceiling (1 s). The all-voter solicit at 5 s and the count toward the record are unchanged.
   - **Open, owned here (#204 review): a refused command whose release is lost.** A command executed with an admission refusal records nothing under its retry key, so once its release is lost nothing answers its collector: the leader has nothing to rebuild the release from, and the collector's own node holds no record. It ends at the caller's deadline, where the caller set one. An unmarked command is no better off. Two fixes, both durable state: keep the refusal for the key, so the record answers it; or keep the release with its outcome, so the leader can publish it again. The step that owns it picks one.
   - **The switch:** `Feature::AnswerOnRelease`, read on the collector's side, which reads no feature today.
-- **Step B: the leader relay while rounds are slow-only.**
+- **Step B: the leader relay while rounds are slow-only.** Built inside task-d102's batched round, under its `BatchedRound` feature, not alone; what follows is what that task builds of it.
   - **The wire.** A relayed `Submit`, marked as such and sent to the ballot's leader only. The advice bit on the release envelope. A `Proposal` form that carries the payload record beside the vote. A refusal naming `NotLeading` for a relayed submission at a voter that isn't leading.
   - **The leader** sends its release to the origin it recorded. A duplicate relayed submission records its origin, and a command already executed is released to it at once.
   - **The followers.** A relayed proposal's payload is checked as a `PayloadResponse` is: its identity is the proposal's command, and its admission digest the proposal's vote's; one that fails either is dropped and fetched as today. A relayed proposal initializes the command from its payload and adopts it in one batch (payload, dependency and ACCEPT rows), with no pre-acceptance and no fast acknowledgement. The path log applies the adoption as a synchronization of a command not in the suffix (Section 4.1).
@@ -4116,6 +4228,178 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 **Open after #230 (#224's follow-ups; review, nothing blocking):** repair's model (`coord-daemon/tests/repair.rs`) has three voters, so the leader-change case where the follower that adopted a relayed command is outside the new leader's quorum is covered only by the simulator's relay rows. A five-voter case in repair's model, with the adopter outside the campaign's majority, would cover it directly.
 
 **Review boundary:** How a write reaches the voters and how its result reaches the collector. No change to the learning predicates, recovery, what a vote rests on, or the result's bytes.
+
+<a id="task-d101"></a>
+### task-d101: Let followers do less: what reads a follower's projection, and what each option saves
+
+**Prerequisites:** task-d12, task-d86, task-d90.  
+**Design:** Section 17.4 (amended by this task's design step: what a follower's projection is for).
+
+**Implement:** The two local profiles and the row count on #185, read against the runner's tmpfs job at 30 callers (#185 review): the four followers' materializers cost about 0.55 ms an operation and their executions about 0.19, a fifth of the servers, the largest block bar 1 had no lever for. Since task-d90 none of it is on a write's path. The design step is in Section 17.4; this entry is its code steps, each after its own review.
+- **First, the readers.** Every reader of a follower's projection in `coordd`, checked against Section 17.4's table: which wait on a commit (its frontend's gate for a new session, a watch at the node, a signature or external call at the node, a resolve the projection can't yet answer, a half-held entry settling from the record, a page of catch-up arriving), which read a consistent older prefix correctly (retry answers, which carry their request, the comparisons with the leader's result, catch-up served), and which force a commit (the checkpoint, the forgetting floor, an election). A reader the table misses is added to it before any option is built.
+- **Option 1, a follower's own commit cadence,** as task-d86's follower half. A follower's materializer merges commits up to a bound of records and time; a reader that waits asks for the next commit, a catch-up page's end is a commit point, and a watch's events wait out the time bound (events at journal durability being a later design step of their own). The record bound sits under `PIPELINE_RECORDS`, or `PIPELINE_RECORDS` rises with it, since a drain waits on the domain thread. task-d86's size is restated as the leader's half and the followers'. About −0.25 ms an operation over four followers on the runner's tmpfs fit at 30 callers, most of it inside C4's counted −0.2.
+- **Option 2, fewer rows a command:** protocol rows in the journal only, the retry window retired in batches, one history-and-event row a revision. Each is its own design step, about −0.03 to −0.04 ms an operation a row on the runner, about −0.15 to −0.2 together.
+- **Option 3, followers apply the leader's write set,** is sized at −0.06 to −0.075 ms an operation (before about 1.4 KB a command to four followers) and gated on the domain loops' cost model (task-d72): it is built only if that reading shows a follower's executions are a block the loops' parity budget needs cut, and only once its argument is written and reviewed, starting from the four checks that compare a voter's execution with the leader's today (Section 17.4): each command still executed independently by one follower, by rotation, and compared with the leader's write set.
+- **Option 4, lazy execution,** is not built: within a bound it is option 1 with a larger batch, and without one it changes failover time. Its one further saving, coalescing a row a batch writes twice, goes with option 1 and is sized from a count of the rows a batch coalesces, at most about −0.05.
+
+**Acceptance:**
+- **The design step** recorded and reviewed before any code, with the readers' table checked against the code.
+- **Option 1:**
+  - model tests that the gate asks for and gets the next commit, and a watch's events at a follower go within the time bound;
+  - that a retry against a projection behind the journal is submitted, and that a resolve of a command this node has executed but not committed waits for the commit and is never answered `Unknown` or `Forgotten`;
+  - that `settle_from_records` at a follower after a ballot change asks for and gets the commit;
+  - that a catch-up page's end commits, so the next page's request doesn't wait out the bound;
+  - that an election commits before the new leader serves, and that the checkpoint and the forgetting floor force their commits;
+  - the record bound checked against `PIPELINE_RECORDS`, with no drain at the bound's setting;
+  - the storage crash tests at every cut between a follower's execution and its delayed commit, under `strict` and `replay`;
+  - a local pair with commands a commit at each voter, the followers' materializer CPU a command, the gate's and watches' wait and catch-up's pages a second, at 30 and 120 callers, and a row with watches open at every node; the runner pair in the batch job (task-d72).
+- **Option 3, if built:** its argument reviewed, the protocol simulator with every oracle over the sweep, and a negative control: a follower whose own execution is altered on its rotation's commands stops the node.
+
+**Review boundary:** When a follower commits its projection, and what it executes. No change to the protocol, to what a vote rests on, or to what is released.
+
+<a id="task-d102"></a>
+### task-d102: A contended round is a batch: one frame, one group and one acknowledgement a turn
+
+**Prerequisites:** task-d61, task-d84, task-d86, task-d99, task-d100, task-d101.  
+**Design:** Section 4.3 (amended by this task's design step: a contended round is a batch), and Sections 4.8 and 4.9, which the acknowledgement through a position rests on and doesn't change.
+
+**Implement:** From #185's next steps (#185 review): every per-command message and group of a slow round folded into one a turn, for one domain. The design step is in Section 4.3; this entry is its code steps, each its own PR after its own review, in this order.
+- **First, the reading,** on step A's head at five voters, register row, 30 and 120 callers. It reads:
+  - datagrams a command by plane and kind, with ACK-only datagrams on their own line;
+  - the batch at each hop: commands a proposal frame, positions an acknowledgement frame, and releases a release frame (each one today, by construction);
+  - the events the leader's loop takes between two flushes, which bounds those batches;
+  - commands a journal group and a projection commit at each voter;
+  - the servers' CPU a command.
+
+  The figures in the acceptance below are read against it.
+- **The batched frames (`Feature::BatchedRound`),** with task-d100's step B built here and not alone:
+  - **a turn is the leader loop's work between two lowered groups.** The leader queues what it orders for each follower and each collector, and cuts the frames where the loop lowers a journal group (no event ready, `owes_flush`) or at the frame bound. No timer cuts a frame, and one caller gets a frame of one at once;
+  - one proposal frame a follower a turn, carrying every proposal of the turn in sequence-number order with its vote, a relayed command's payload record, and the commit frontier; split only at the transport's frame bound. A turn that orders nothing for a follower sends it the frontier on its own, as today;
+  - step B's relay, switch, advice bit and fallbacks as Section 4.3's B1 and B2 state them, the advice bit once a release frame;
+  - one release frame a collector a turn, each entry checked as one release is today and independent of the others: one `check_release` holds or refuses doesn't hold or refuse the rest;
+  - a follower adopts a frame's proposals in one journal group, each checked and adopted as step B adopts one.
+- **The acknowledgement through a position (`Feature::AckRanges`),** after the frames:
+  - `AdoptedThrough { ballot, ranges }`, its ranges bounded, sent once a batch is durable; above the bound, and for an adoption with no sequence number, today's `SlowAck`;
+  - the leader counts a `SlowAck` with its own proposal's command and admission for each position newly covered, and drops a position it didn't number. A covered position counts only for the proposal the leader holds at that position now, and counts nothing if that proposal was replaced or swept;
+  - a debug assertion in `put_proposal` that a proposal is never replaced within one ballot, which every simulator row runs. Reading `repropose`'s callers doesn't settle whether such a replacement happens; the counting rule above holds either way;
+  - per voter, the contiguous position counted (`adopted_through`, task-d59) and the ranges above it.
+- **The groups and the commits, under their own entries in this order:** task-d84's parts 2 and 3 (one journal sync a turn), then task-d86's leader half and task-d101's option 1 (a follower's commit cadence). This task's acceptance reads them together.
+- **After the first milestone:** a collector's submissions folded into one frame a turn. The goal's datagram target needs it, and it is sized from the first milestone's reading.
+- **Not built:** the extension across domains Section 4.3 describes.
+
+**Acceptance:**
+- **The design step** recorded and reviewed before any code, the acknowledgement's argument with it.
+- **Model tests, the frames:**
+  - a turn's proposals to a follower leave in one frame, in sequence-number order, and a follower adopts them in one journal group;
+  - a payload in a frame whose identity or admission differs from its vote's is dropped and fetched, and the frame's other proposals are adopted;
+  - a turn's releases to a collector leave in one frame, and a collector answers each entry exactly as it answers one release; an entry held or refused leaves the frame's other entries answered;
+  - a turn that orders nothing for a follower sends it the commit frontier on its own;
+  - with one caller, each frame leaves at the first flush, holding one command;
+  - a frame lost, duplicated or split at the bound changes no decision, and the re-send (task-d49, task-d59) re-sends what a voter hasn't acknowledged.
+- **Model tests, the acknowledgement:**
+  - a range is sent only once every adoption it covers, and every outstanding batch of the voter, is durable;
+  - the leader counts a covered position once, with its own proposal's command and admission, and never toward a fast quorum;
+  - a hole (a payload fetched, a lost frame) leaves the positions above it counted, and a proposal held for a rebind (`awaits_rebind`) or refused is never covered;
+  - an adoption restored after a restart is acknowledged by `SlowAck` until `ProposalRequest` gives it a position;
+  - a position past the leader's numbering, or of another ballot, is dropped;
+  - a covered position whose proposal the leader replaced or swept counts nothing, and the replacing proposal is counted only once a range covers its own position.
+- **The protocol simulator,** with both features on in every row and the oracle over the sweep, at three and five voters, with and without catch-up, and the weekly sweep's knob added by the testing session. Two negative controls, each caught by the oracle: a voter that covers a position before its adoption is durable, under crash; and a leader that counts a range under the admission of another proposal.
+- **The storage crash tests** at every cut between a frame's adoption batch and its acknowledgement.
+- **The counts,** at five voters on the register row, on step A's counters, in a local pair and then the runner pair in the batch job (task-d72):
+  - **datagrams, two targets,** with ACK-only datagrams on their own line:
+    - the first milestone (task-d72's 2.0× budget): at 120 callers, at most 5 datagrams a command over both planes (about 16.8 on step A's base);
+    - the goal (parity): at most 3 a command at 120 callers, with a collector's submissions in one frame a turn;
+  - at least 10 commands a journal group at every voter (about 4.9);
+  - the servers' CPU a command at 120 callers at most half of its value at 30.
+
+  A miss is read before the next part is built: which hop's batch is small, and why.
+
+**Review boundary:** What a slow round's frames carry and how many there are, and what a slow acknowledgement's frame claims. No change to what a vote rests on, to the quorum rules, to recovery's selection or rows, or to the fast path.
+
+<a id="task-d103"></a>
+### task-d103: Stop writing the leader's proposal row, which nothing reads
+
+**Prerequisites:** task-d89, task-d101.  
+**Design:** Section 17.4 (amended by this task's design step: protocol rows).  
+**Superseded by [task-d117](#task-d117)** for the proposal row: with protocol state in the journal only, the row isn't written at all. The text below is kept as the record of the cut.
+
+**Implement:** The first of task-d101's option 2 cuts, each its own design step (#185 review). The journal-only cut isn't taken: boot, catch-up served, a campaign's executed rows and resolve read the protocol rows by command over history the journal has retired, and the journal has no index by command (Section 17.4's table). What holds is the leader's proposal row (`ProposalRecordV1`), written in every proposal batch and read by nothing but the checkpoint's trim plan, which nothing calls.
+- The leader writes no proposal row. `ProposalRequest` keeps answering from the leader's proposals in memory, those marked durable (`serve_proposals`).
+- The trim plan's comment on the row ("the leader must be able to resume a proposal that is not yet settled") is removed with the write, since no leader resumes a proposal from a row. `classify` keeps its branch, so a row a store written before this change holds is still trimmed.
+- The follower's vote-time dependency row goes with task-d102's relay and is counted there, not here.
+
+**Acceptance:**
+- **The design step** recorded and reviewed, with its table of readers checked against the code.
+- **Tests:** a leader's proposal batch carries no proposal row; boot, a campaign's report, catch-up served and `ProposalRequest` give the same answers with and without proposal rows in the store; a store holding rows from before the change boots, serves and trims.
+- **The storage crash tests** at every cut of a proposal batch, under `strict` and `replay`.
+- **A local pair:** rows a command at the leader fall by one, and the leader's materializer CPU a command beside it.
+
+**Review boundary:** Which rows a leader's proposal batch writes. No change to what a vote rests on, to recovery's rows or to the wire.
+
+<a id="task-d104"></a>
+### task-d104: Retire the retry window in batches
+
+**Prerequisites:** task-c02, task-d26, task-d99, task-d101.  
+**Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).  
+**Superseded by [task-d117](#task-d117)** for the retry rows: the window lives in memory, and this task's rules apply to it there. The text below is kept as the record of the cut.
+
+**Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
+- **Sized before it is built:** about −0.009 ms an operation at the materializer at the bar (task-d86's profile). Its share of the domain loop is read on the CPU clock first, and the task is kept or dropped on the two together. A domain with thousands of clients, whose floor rows each cost a page, is where its first part would save about a page a command; that is read in the same step if it decides the task.
+- **The rule is a replicated feature, `Feature::BatchedRetirement`,** prepared and activated through task-d99's path. Below its activation position every voter retires as today, and from it in batches. A build that doesn't know it refuses a store that names it.
+- **Second part, after the first's pair: a window that overwrites in place.**
+  - `RetryV1` is keyed by the client instance and the sequence modulo the width. A slot holds its own sequence, and a replaced one answers `Retired`.
+  - The width is carried on the floor row. `ExecutedV1` is unchanged.
+  - This takes the delete. It was priced at about −0.06 to −0.08 ms an operation with the first part, a row at a page's price. At the bar, task-d86's profile reads both parts at the materializer at about −0.009 (the deletes, 2.1 to 2.3% of the thread, and nothing for the floor's rewrite with 30 to 240 clients), so that size doesn't hold (review on #185, 6812429771).
+  - It changes `RetryV1`'s layout, so it takes task-d105's route: one layout a domain, the other refused with the reason.
+  - It is sized and its design checked against resolve and `records_for` before its code.
+
+**Acceptance:**
+- **The design step** recorded and reviewed.
+- **The feature:**
+  - a store written before the activation keeps today's rule through a restart, and switches at the activation position;
+  - every voter's common hash agrees at that position and after it;
+  - a build without the feature refuses a store that names it, with the reason.
+- **Model tests:**
+  - every voter retires the same sequences at the same position, and the common hash agrees across voters through a long run with clients at and near the window's edge;
+  - no request is refused `OutOfWindow` that today's rule admits, over randomized acknowledgement patterns, including an acknowledgement jump past `MAX_RETIRE_PER_COMMAND` after a deferred prefix (the case on #207);
+  - a retry of an acknowledged sequence still retained answers with its result, and one retired answers `Retired` as today;
+  - resolve and `records_for` answer as today;
+  - a session's retained results never exceed `width + K`.
+- **The storage crash tests** at every cut of a retiring batch, under `strict` and `replay`.
+- **A local pair** at `K = 16` against today: rows a command at every voter, and the materializer's CPU a command and a commit.
+
+**Review boundary:** When a client's acknowledged results are retired, and from which position. No change to admission, to what a retry is answered, or to the wire, apart from the feature's activation through task-d99's path.
+
+<a id="task-d105"></a>
+### task-d105: One version row a revision, with the key index in memory
+
+**Prerequisites:** task-d26, task-d37, task-d101.  
+**Design:** Section 17.4 (amended by this task's design step: one version row a revision), and Section 17.5, whose compaction rule it changes.
+
+**Implement:** The third of task-d101's option 2 cuts (#185 review), etcd's layout.
+- **The rows.** `KvHistoryV1` is no longer written. The event row, keyed by revision and ordinal, is the one version row a mutated key a revision.
+- **The index.** It is held in memory, from (namespace, key) to retained (revision, ordinal)s. It is built at boot and at a local image's install from the retained events, and kept up to date by the materializer.
+- **Reads.** Reads at a past revision and range reads at a revision walk the index and read event rows.
+- **Compaction** keeps each key's newest version at or below the floor as its event row, even when the current row holds the same version, and deletes the rest below the floor.
+- **Formats.** `KvHistoryV1` leaves the common hash and the shared checkpoint, and that format's version is raised. The scrub (task-d37) reads the new layout.
+  - **A domain runs one layout.** The store records its layout at initialization. Every open compares it and refuses a live store or image of the other layout, with the reason. No open reads `format_version` today, so this step builds that check.
+- **The index's budget** in task-d26's contract is counted in retained versions and key bytes, so every voter reaches it at the same position. At the limit, a write that adds a retained version is refused as resource-exhausted. Reads, deletes and compactions still run, and nothing compacts on its own.
+- **A voter votes before its index is built.** Executions, releases and reads wait for it.
+- **Second part, after the first's pair: no current row.** `KvCurrentV1` is no longer written. The latest version is an index lookup and an event row, and a range at the latest revision walks the index. It goes unless the pair's list read at the latest revision loses more than the row saves.
+
+**Acceptance:**
+- **The design step** recorded and reviewed.
+- **A differential test** over randomized histories, multi-key transactions and deletes among them, with compactions between: every read at a past revision, range read and watch replay answers as the current layout does, and a read at the floor still finds each key. Named cases include a deleted key: its tombstone's event row is the key's newest version at or below the floor until a compaction passes it, and then the key leaves the index.
+- **Boot and install:** the index rebuilt equals the one kept live, after a restart and after a local image's install. The rebuild's time and the index's memory are measured at 10⁵ and 10⁶ retained versions.
+  - **The bound:** the rebuild's time at the largest retained history the budget admits is under the election's patience.
+  - A restarted voter votes while its index is being built, and executes only once it is.
+- **The budget:** at the limit, every voter refuses the same write at the same position. A compaction lifts the refusal.
+- **The layout:** a live store and a local image of the other layout are each refused at open, with the reason. So are a shared checkpoint of the other format version and an old one.
+- **The checkpoint:** export, install, restore and scrub tests on the new format version.
+- **The storage crash tests** at every cut of a materializer commit and of a compaction.
+- **A local pair:** rows a command at every voter, the materializer's CPU a command, and compaction's deletes a revision. For the second part, add a range read at the latest revision at 10³ and 10⁴ keys, with and without the current row.
+
+**Review boundary:** How versions are stored and found, and the checkpoint format that carries them. No change to what a read at a revision or a watch returns.
 
 <a id="task-d106"></a>
 ### task-d106: Keep carried commits out of the Sync row
