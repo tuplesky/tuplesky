@@ -62,6 +62,7 @@ fn identity_among(me: u8, voters: u8) -> ConfigurationIdentity {
         voters: (0..voters).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -3051,8 +3052,14 @@ fn competing_campaigns_and_delayed_replies_cannot_establish_divergence() {
     }
     // A delayed report page for ballot 1 reaching the ballot-2 leader is
     // a wrong-ballot page; it is refused, not merged.
-    let stale_page =
-        coord_consensus::paginate(&cluster.nodes[0].follower().report(ballot(1, 1)), 16).remove(0);
+    let stale_page = coord_consensus::paginate(
+        &cluster.nodes[0].follower().report(ballot(1, 1)),
+        coord_types::ids::StoreInstanceId(
+            (cluster.nodes[0].follower().report(ballot(1, 1))).replica.0,
+        ),
+        16,
+    )
+    .remove(0);
     let Some(Role::Leader(_)) = &cluster.nodes[2].role else {
         panic!()
     };
@@ -4071,8 +4078,13 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
         entries,
     };
     let deliver = |c: &mut coord_consensus::Campaign, rep: &RecoveryReport| {
-        c.promise(rep.replica);
-        for page in coord_consensus::paginate(rep, 64) {
+        c.promise(
+            rep.replica,
+            coord_types::ids::StoreInstanceId(rep.replica.0),
+        );
+        for page in
+            coord_consensus::paginate(rep, coord_types::ids::StoreInstanceId(rep.replica.0), 64)
+        {
             c.page(page).unwrap();
         }
     };
@@ -4146,8 +4158,12 @@ fn a_campaign_supplies_what_its_candidate_executed() {
             admission: None,
         }],
     );
-    c.promise(r(2));
-    for page in coord_consensus::paginate(&behind, 64) {
+    c.promise(r(2), coord_types::ids::StoreInstanceId(r(2).0));
+    for page in coord_consensus::paginate(
+        &behind,
+        coord_types::ids::StoreInstanceId(behind.replica.0),
+        64,
+    ) {
         c.page(page).unwrap();
     }
     assert_eq!(
@@ -5948,9 +5964,14 @@ fn a_selection_with_a_dependency_cycle_halts_the_candidate_naming_the_commands()
             ballot: new,
             synced: ballot(0, 0),
             replica: r(0),
+            store: coord_types::ids::StoreInstanceId(r(0).0),
         },
     ));
-    for page in coord_consensus::paginate(&report, 64) {
+    for page in coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        64,
+    ) {
         pending.push_back(peer_event(r(0), ProtocolMessage::ReportPage(page)));
     }
     let mut steps = 0;
@@ -6696,6 +6717,7 @@ fn a_command_committed_at_a_deposed_leader_waits_for_its_payload_row() {
             ballot: b1,
             synced: ballot(0, 0),
             replica: r(0),
+            store: coord_types::ids::StoreInstanceId(r(0).0),
         },
     ));
     settle(&mut f, promise);
@@ -6705,7 +6727,11 @@ fn a_command_committed_at_a_deposed_leader_waits_for_its_payload_row() {
         committed_ballot: ballot(0, 0),
         entries: Vec::new(),
     };
-    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+    for page in coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    ) {
         let effects = f.step(peer_event(r(0), ProtocolMessage::ReportPage(page)));
         settle(&mut f, effects);
     }
@@ -6878,8 +6904,13 @@ fn a_campaign_sets_aside_a_report_past_its_bound_and_names_it() {
             .collect::<Vec<_>>()
     };
     let deliver = |c: &mut coord_consensus::Campaign, rep: &RecoveryReport| {
-        c.promise(rep.replica);
-        for page in coord_consensus::paginate(rep, 64) {
+        c.promise(
+            rep.replica,
+            coord_types::ids::StoreInstanceId(rep.replica.0),
+        );
+        for page in
+            coord_consensus::paginate(rep, coord_types::ids::StoreInstanceId(rep.replica.0), 64)
+        {
             c.page(page).unwrap();
         }
     };
@@ -7027,9 +7058,14 @@ fn a_report_past_twice_the_candidates_own_table_is_taken() {
             ballot: b,
             synced: ballot(0, 0),
             replica: r(0),
+            store: coord_types::ids::StoreInstanceId(r(0).0),
         },
     ));
-    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+    for page in coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    ) {
         f.step(peer_event(r(0), ProtocolMessage::ReportPage(page)));
     }
     assert!(
@@ -7256,6 +7292,7 @@ fn a_campaign_asks_again_for_the_promises_that_have_not_arrived() {
             ballot: b,
             synced: ballot(0, 0),
             replica: r(0),
+            store: coord_types::ids::StoreInstanceId(r(0).0),
         },
     ));
     assert_eq!(
@@ -7294,6 +7331,7 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
                     ballot: b,
                     synced: ballot(0, 0),
                     replica: r(replica),
+                    store: coord_types::ids::StoreInstanceId(r(replica).0),
                 },
             ));
             let report = RecoveryReport {
@@ -7308,7 +7346,11 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
                     })
                     .collect(),
             };
-            let pages = coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES);
+            let pages = coord_consensus::paginate(
+                &report,
+                coord_types::ids::StoreInstanceId(report.replica.0),
+                coord_consensus::MAX_PAGE_ENTRIES,
+            );
             for page in pages.into_iter().take(1) {
                 if entries > 0 {
                     f.step(peer_event(r(replica), ProtocolMessage::ReportPage(page)));
@@ -7332,7 +7374,11 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
             .map(|n| accepted_entry(CommandId(Digest32([0x70 + n; 32])), &[]))
             .collect(),
     };
-    let pages = coord_consensus::paginate(&report, 1);
+    let pages = coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        1,
+    );
     assert_eq!(pages.len(), 3);
     assert_eq!(
         c.page(pages[0].clone()),
@@ -7390,6 +7436,7 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
             ballot: b,
             synced: ballot(0, 0),
             replica: r(member),
+            store: coord_types::ids::StoreInstanceId(r(member).0),
         },
     ));
     let report = RecoveryReport {
@@ -7402,7 +7449,11 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
             entry(c, Phase::PreAccept, &[x]),
         ],
     };
-    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+    for page in coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    ) {
         f.step(peer_event(r(member), ProtocolMessage::ReportPage(page)));
     }
     let rejections = f.take_rejections();
@@ -8087,10 +8138,18 @@ fn a_campaign_assembles_its_reports_once_a_majority_is_held() {
     };
     let mut c = coord_consensus::Campaign::new(config.clone());
     c.own_report(report(r(0), 0x10));
-    c.promise(r(1));
-    c.promise(r(2));
-    let mut pages: Vec<_> = coord_consensus::paginate(&report(r(1), 0x40), 2);
-    pages.extend(coord_consensus::paginate(&report(r(2), 0x80), 2));
+    c.promise(r(1), coord_types::ids::StoreInstanceId(r(1).0));
+    c.promise(r(2), coord_types::ids::StoreInstanceId(r(2).0));
+    let mut pages: Vec<_> = coord_consensus::paginate(
+        &report(r(1), 0x40),
+        coord_types::ids::StoreInstanceId((report(r(1), 0x40)).replica.0),
+        2,
+    );
+    pages.extend(coord_consensus::paginate(
+        &report(r(2), 0x80),
+        coord_types::ids::StoreInstanceId((report(r(2), 0x80)).replica.0),
+        2,
+    ));
     let total = pages.len();
     let mut selected = None;
     for (i, page) in pages.into_iter().enumerate() {
@@ -8718,8 +8777,12 @@ fn a_waiting_campaign_assembles_again_only_when_something_moved() {
             admission: None,
         }],
     );
-    c.promise(r(2));
-    for page in coord_consensus::paginate(&behind, 64) {
+    c.promise(r(2), coord_types::ids::StoreInstanceId(r(2).0));
+    for page in coord_consensus::paginate(
+        &behind,
+        coord_types::ids::StoreInstanceId(behind.replica.0),
+        64,
+    ) {
         c.page(page).unwrap();
     }
     for _ in 0..5 {
@@ -8950,9 +9013,13 @@ fn a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name() {
     let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
     c.own_report(report(0, 0));
     for replica in [1, 2] {
-        c.promise(r(replica));
+        c.promise(r(replica), coord_types::ids::StoreInstanceId(r(replica).0));
     }
-    let pages = coord_consensus::paginate(&report(1, 3), 1);
+    let pages = coord_consensus::paginate(
+        &report(1, 3),
+        coord_types::ids::StoreInstanceId((report(1, 3)).replica.0),
+        1,
+    );
     assert_eq!(c.page(pages[0].clone()), Err(PageError::PastBound));
     // r2 not heard yet: waiting is right, since its report may fit.
     assert!(matches!(c.try_select(1, |_, _| false), Ok(None)));
@@ -8961,7 +9028,11 @@ fn a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name() {
         "a report past the bound is not asked for again"
     );
     // r2 past the bound too: every voter answered, and too few fit.
-    let pages = coord_consensus::paginate(&report(2, 4), 1);
+    let pages = coord_consensus::paginate(
+        &report(2, 4),
+        coord_types::ids::StoreInstanceId((report(2, 4)).replica.0),
+        1,
+    );
     assert_eq!(c.page(pages[1].clone()), Err(PageError::PastBound));
     assert_eq!(
         c.try_select(1, |_, _| false),
@@ -8976,11 +9047,19 @@ fn a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name() {
     let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
     c.own_report(report(0, 0));
     for replica in [1, 2] {
-        c.promise(r(replica));
+        c.promise(r(replica), coord_types::ids::StoreInstanceId(r(replica).0));
     }
-    let pages = coord_consensus::paginate(&report(1, 3), 1);
+    let pages = coord_consensus::paginate(
+        &report(1, 3),
+        coord_types::ids::StoreInstanceId((report(1, 3)).replica.0),
+        1,
+    );
     assert_eq!(c.page(pages[2].clone()), Err(PageError::PastBound));
-    for page in coord_consensus::paginate(&report(2, 1), 1) {
+    for page in coord_consensus::paginate(
+        &report(2, 1),
+        coord_types::ids::StoreInstanceId((report(2, 1)).replica.0),
+        1,
+    ) {
         c.page(page).unwrap();
     }
     assert!(matches!(c.try_select(1, |_, _| false), Ok(Some(_))));
@@ -9338,6 +9417,7 @@ fn a_candidate_whose_own_acceptance_is_unbacked_waits_for_a_sync() {
                 ballot: new,
                 synced,
                 replica: r(i),
+                store: coord_types::ids::StoreInstanceId(r(i).0),
             },
         ));
         let report = RecoveryReport {
@@ -9346,7 +9426,11 @@ fn a_candidate_whose_own_acceptance_is_unbacked_waits_for_a_sync() {
             committed_ballot: synced,
             entries: vec![],
         };
-        for page in coord_consensus::paginate(&report, 64) {
+        for page in coord_consensus::paginate(
+            &report,
+            coord_types::ids::StoreInstanceId(report.replica.0),
+            64,
+        ) {
             pending.push_back(peer_event(r(i), ProtocolMessage::ReportPage(page)));
         }
     }

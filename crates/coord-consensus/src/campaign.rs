@@ -8,13 +8,13 @@
 //! message is produced, so a crash after binding republishes the same
 //! result and never selects again under the same identity.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::effect::BarrierId;
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::ids::{Ballot, ReplicaId, StoreInstanceId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -30,6 +30,9 @@ pub struct Campaign {
     config: BallotConfiguration,
     assembler: ReportAssembler,
     promised: BTreeSet<ReplicaId>,
+    /// The store each promise came from (task-d121): a voter's report
+    /// counts only from that store.
+    promise_stores: BTreeMap<ReplicaId, StoreInstanceId>,
     own: Option<RecoveryReport>,
     decision: Option<SyncDecision>,
     bound: Option<BarrierId>,
@@ -89,6 +92,7 @@ impl Campaign {
             config,
             assembler: ReportAssembler::new(ballot),
             promised: BTreeSet::new(),
+            promise_stores: BTreeMap::new(),
             own: None,
             decision: None,
             bound: None,
@@ -232,10 +236,20 @@ impl Campaign {
         &self.config
     }
 
-    /// A voter promised.
-    pub fn promise(&mut self, replica: ReplicaId) {
+    /// A voter promised from the store `store`. A second promise of the
+    /// same voter from another store changes nothing: the first one's
+    /// store is the one its report must come from (task-d121).
+    pub fn promise(&mut self, replica: ReplicaId, store: StoreInstanceId) {
         if self.config.is_voter(&replica) {
+            if self
+                .promise_stores
+                .get(&replica)
+                .is_some_and(|s| *s != store)
+            {
+                return;
+            }
             self.promised.insert(replica);
+            self.promise_stores.insert(replica, store);
         }
     }
 
@@ -252,6 +266,15 @@ impl Campaign {
 
     /// A report page from a voter.
     pub fn page(&mut self, page: ReportPage) -> Result<(), PageError> {
+        // A page from another store than the voter's promise names
+        // another report (task-d121).
+        if self
+            .promise_stores
+            .get(&page.replica)
+            .is_some_and(|s| *s != page.store)
+        {
+            return Err(PageError::Inconsistent);
+        }
         self.assembler.accept(page)
     }
 
@@ -388,7 +411,15 @@ impl Campaign {
             .assembler
             .complete()
             .into_iter()
-            .filter(|r| self.promised.contains(&r.replica))
+            .filter(|r| {
+                // Counted only from the store the promise came from; the
+                // page check above refuses a page that differs once the
+                // promise is in, and this one a report whose pages came
+                // first (task-d121).
+                self.promised.contains(&r.replica)
+                    && self.promise_stores.get(&r.replica)
+                        == self.assembler.store_of(&r.replica).as_ref()
+            })
             .collect();
         if let Some(own) = &self.own {
             out.push(own.clone());

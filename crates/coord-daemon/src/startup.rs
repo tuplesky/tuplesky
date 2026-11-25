@@ -20,6 +20,7 @@ use coord_membership::init::{GenesisStore, InitError, Initialized, StoreFailure,
 use coord_store_api::engine::{LocalEngine, OrderedRead, SnapshotSource, WriteTxn};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::identity::Digest32;
+use coord_types::ids::StoreInstanceId;
 
 use crate::lifecycle::QuarantineReason;
 
@@ -187,12 +188,35 @@ impl<E: LocalEngine, J: NodeJournal> GenesisStore for StoreGenesis<'_, E, J> {
         Ok(Some(Digest32(exact)))
     }
 
-    fn pin(&mut self, digest: Digest32) -> Result<(), StoreFailure> {
+    fn store_instance(&self) -> Result<Option<StoreInstanceId>, StoreFailure> {
+        let view = self.engine.reader().snapshot().map_err(|_| StoreFailure)?;
+        let Some(bytes) = view
+            .get(Collection::MetaV1.id(), meta_fields::STORE_INSTANCE)
+            .map_err(|_| StoreFailure)?
+        else {
+            return Ok(None);
+        };
+        // As for the digest: a record of the wrong length is damaged,
+        // not absent.
+        StoreInstanceId::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| StoreFailure)
+    }
+
+    fn pin(&mut self, digest: Digest32, store: StoreInstanceId) -> Result<(), StoreFailure> {
         let mut txn = self.engine.begin_write().map_err(|_| StoreFailure)?;
         txn.put(
             Collection::MetaV1.id(),
             meta_fields::GENESIS_DIGEST,
             &digest.0,
+        )
+        .map_err(|_| StoreFailure)?;
+        // The store's identity goes in the same transaction: a pinned
+        // store always has one (task-d121).
+        txn.put(
+            Collection::MetaV1.id(),
+            meta_fields::STORE_INSTANCE,
+            store.as_bytes(),
         )
         .map_err(|_| StoreFailure)?;
         // The pin is the node's identity, so it is synced here rather
@@ -268,6 +292,7 @@ impl Startup {
         &mut self,
         manifest: &GenesisManifest,
         store: &mut dyn GenesisStore,
+        fresh: StoreInstanceId,
     ) -> Result<Initialized, StartupError> {
         // The ordering check comes first: initializing would write a pin,
         // and a pin must never be the side effect of a step taken out of
@@ -278,7 +303,7 @@ impl Startup {
                 reached: self.reached,
             });
         }
-        let initialized = initialize(manifest, store).map_err(StartupError::Genesis)?;
+        let initialized = initialize(manifest, store, fresh).map_err(StartupError::Genesis)?;
         self.enter(StartupPhase::MembershipChecked)?;
         Ok(initialized)
     }

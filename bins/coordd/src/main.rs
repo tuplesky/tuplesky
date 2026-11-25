@@ -1040,15 +1040,18 @@ fn main() -> ExitCode {
     // policy, under the same cluster and domain -- is a genesis
     // quarantine, not a new configuration to adopt. It is settled on the
     // projection before the journal replays anything into it.
-    if let Err(e) = genesis::check(
+    let store_instance = match genesis::check(
         &mut opened.generation,
         &placed.manifest,
         genesis::Intent::Serve,
     ) {
-        lifecycle.quarantine(e.quarantine_reason());
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
+        Ok(store_instance) => store_instance,
+        Err(e) => {
+            lifecycle.quarantine(e.quarantine_reason());
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     let attaching = std::time::Instant::now();
     let storage = match opened.attach() {
         Ok(s) => s,
@@ -1139,6 +1142,7 @@ fn main() -> ExitCode {
     let backing = if roles.votes() {
         match voter(
             &placed,
+            store_instance,
             applier,
             boot,
             config.limits.command_table_capacity,
@@ -1545,6 +1549,7 @@ fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feat
 /// storage frontier had already passed.
 fn voter(
     placed: &membership::Placed,
+    store_instance: coord_types::ids::StoreInstanceId,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
     capacity: usize,
@@ -1567,6 +1572,7 @@ fn voter(
         voters: m.voters().map(|v| v.node).collect(),
         replica: placed.replica,
         incarnation: placed.incarnation,
+        store: store_instance,
         role: ReplicaRole::Voter,
     };
     // What this replica already owes, from the authoritative record.

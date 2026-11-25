@@ -15,6 +15,7 @@ use coord_membership::init::{InitError, StoreFailure};
 use coord_store_api::engine::{LocalEngine, OrderedRead, SnapshotSource, WriteTxn};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_testkit::model::ModelEngine;
+use coord_types::ids::StoreInstanceId;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -108,7 +109,7 @@ fn run_to_membership(
     startup.storage_validated()?;
     startup.identity_validated()?;
     let mut store = StoreGenesis::new(engine, journal);
-    let initialized = startup.check_membership(manifest, &mut store)?;
+    let initialized = startup.check_membership(manifest, &mut store, StoreInstanceId([9; 16]))?;
     Ok(initialized.first_boot)
 }
 
@@ -140,6 +141,18 @@ fn a_first_boot_establishes_the_journal_before_it_pins_the_manifest() {
         pinned(&engine).as_deref(),
         Some(&manifest.digest().0[..]),
         "the pin is the manifest's digest, in meta_v1"
+    );
+    // The store's identity is written with it (task-d121).
+    assert_eq!(
+        engine
+            .reader()
+            .snapshot()
+            .unwrap()
+            .get(Collection::MetaV1.id(), meta_fields::STORE_INSTANCE)
+            .unwrap()
+            .as_deref(),
+        Some(&[9u8; 16][..]),
+        "the store identity is pinned beside the digest"
     );
 }
 
@@ -295,7 +308,7 @@ fn no_step_may_run_before_the_one_it_rests_on() {
     let error = {
         let mut store = StoreGenesis::new(&mut engine, &mut journal);
         startup
-            .check_membership(&manifest, &mut store)
+            .check_membership(&manifest, &mut store, StoreInstanceId([9; 16]))
             .expect_err("membership before identity")
     };
     assert_eq!(

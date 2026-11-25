@@ -211,6 +211,12 @@ pub mod meta_fields {
     /// another manifest quarantines rather than reinitializing
     /// (design Section 10.5).
     pub const GENESIS_DIGEST: &[u8] = b"genesis_digest";
+    /// This store's random identity (`StoreInstanceId`, task-d121),
+    /// written in the same transaction as [`GENESIS_DIGEST`] and never
+    /// again. Peers refuse a voter back under another one until membership
+    /// names a new generation. A checkpoint image carries it with the
+    /// other metadata, so a node reinstalled from its own image keeps it.
+    pub const STORE_INSTANCE: &[u8] = b"store_instance";
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, PeerId};
 use coord_types::identity::{Digest32, HashDomain};
-use coord_types::ids::{Ballot, LocalJournalSeq, ReplicaId};
+use coord_types::ids::{Ballot, LocalJournalSeq, ReplicaId, StoreInstanceId};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
@@ -48,11 +48,11 @@ pub struct ServedReport {
 }
 
 impl ServedReport {
-    /// Keep the pages of `report`, sent to `to`.
-    pub fn new(to: PeerId, report: &RecoveryReport) -> Self {
+    /// Keep the pages of `report`, sent to `to` from the store `store`.
+    pub fn new(to: PeerId, report: &RecoveryReport, store: StoreInstanceId) -> Self {
         ServedReport {
             to,
-            pages: paginate(report, MAX_PAGE_ENTRIES),
+            pages: paginate(report, store, MAX_PAGE_ENTRIES),
         }
     }
 
@@ -516,6 +516,9 @@ impl DurableLedger {
 pub struct ReportPage {
     /// Reporting replica.
     pub replica: ReplicaId,
+    /// The reporting replica's store (task-d121): a candidate counts the
+    /// report only under the store its promise came from.
+    pub store: StoreInstanceId,
     /// New ballot.
     pub ballot: Ballot,
     /// Synchronized ballot.
@@ -531,14 +534,17 @@ pub struct ReportPage {
     /// the same ballot cannot be assembled together with pages of a later
     /// one into a report the replica never produced.
     pub snapshot: Digest32,
-    /// Digest binding replica, ballots, page, total, snapshot and entries.
+    /// Digest binding replica, store, ballots, page, total, snapshot and
+    /// entries.
     pub digest: Digest32,
 }
 
-/// Digest of a complete report: what every one of its pages carries.
-fn report_digest(report: &RecoveryReport) -> Digest32 {
+/// Digest of a complete report from the store `store`: what every one of
+/// its pages carries.
+fn report_digest(report: &RecoveryReport, store: &StoreInstanceId) -> Digest32 {
     let body = postcard::to_allocvec(&(
         &report.replica,
+        store,
         &report.ballot,
         &report.committed_ballot,
         &report.entries,
@@ -547,8 +553,13 @@ fn report_digest(report: &RecoveryReport) -> Digest32 {
     HashDomain::JournalBatch.digest(&[b"recovery-report", &body])
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every field is one the digest binds"
+)]
 fn page_digest(
     replica: &ReplicaId,
+    store: &StoreInstanceId,
     ballot: &Ballot,
     committed: &Ballot,
     page: u32,
@@ -556,8 +567,10 @@ fn page_digest(
     snapshot: &Digest32,
     entries: &[ReportEntry],
 ) -> Digest32 {
-    let body = postcard::to_allocvec(&(replica, ballot, committed, page, total, snapshot, entries))
-        .expect("bounded");
+    let body = postcard::to_allocvec(&(
+        replica, store, ballot, committed, page, total, snapshot, entries,
+    ))
+    .expect("bounded");
     HashDomain::JournalBatch.digest(&[b"recovery-page", &body])
 }
 
@@ -578,8 +591,12 @@ pub enum PageError {
     PastBound,
 }
 
-/// Split a report into verified pages.
-pub fn paginate(report: &RecoveryReport, per_page: usize) -> Vec<ReportPage> {
+/// Split a report from the store `store` into verified pages.
+pub fn paginate(
+    report: &RecoveryReport,
+    store: StoreInstanceId,
+    per_page: usize,
+) -> Vec<ReportPage> {
     let per_page = per_page.clamp(1, MAX_PAGE_ENTRIES);
     let chunks: Vec<&[ReportEntry]> = if report.entries.is_empty() {
         alloc::vec![&report.entries[..]]
@@ -587,12 +604,13 @@ pub fn paginate(report: &RecoveryReport, per_page: usize) -> Vec<ReportPage> {
         report.entries.chunks(per_page).collect()
     };
     let total = chunks.len() as u32;
-    let snapshot = report_digest(report);
+    let snapshot = report_digest(report, &store);
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, entries)| ReportPage {
             replica: report.replica,
+            store,
             ballot: report.ballot,
             committed_ballot: report.committed_ballot,
             page: i as u32,
@@ -601,6 +619,7 @@ pub fn paginate(report: &RecoveryReport, per_page: usize) -> Vec<ReportPage> {
             snapshot,
             digest: page_digest(
                 &report.replica,
+                &store,
                 &report.ballot,
                 &report.committed_ballot,
                 i as u32,
@@ -619,8 +638,9 @@ pub struct ReportAssembler {
     /// The most pages a report may announce (task-d28).
     max_pages: u32,
     pages: BTreeMap<ReplicaId, BTreeMap<u32, ReportPage>>,
-    /// Per replica: page total, synchronized ballot and report digest.
-    totals: BTreeMap<ReplicaId, (u32, Ballot, Digest32)>,
+    /// Per replica: page total, synchronized ballot, report digest and
+    /// the store the pages came from (task-d121).
+    totals: BTreeMap<ReplicaId, (u32, Ballot, Digest32, StoreInstanceId)>,
     /// Replicas whose report announced more than `max_pages` pages, with
     /// the total announced (task-d24 review).
     past_bound: BTreeMap<ReplicaId, u32>,
@@ -653,7 +673,7 @@ impl ReportAssembler {
     /// The pages of `replica`'s report still missing: `None` when none has
     /// arrived, so its total is unknown; empty when it is complete.
     pub fn missing(&self, replica: &ReplicaId) -> Option<Vec<u32>> {
-        let (total, _, _) = self.totals.get(replica)?;
+        let (total, _, _, _) = self.totals.get(replica)?;
         let held = self.pages.get(replica);
         Some(
             (0..*total)
@@ -688,6 +708,7 @@ impl ReportAssembler {
         }
         let expected = page_digest(
             &page.replica,
+            &page.store,
             &page.ballot,
             &page.committed_ballot,
             page.page,
@@ -711,10 +732,11 @@ impl ReportAssembler {
         }
         // Every page of one replica's transfer must name the same report.
         match self.totals.get(&page.replica) {
-            Some((total, committed, snapshot))
+            Some((total, committed, snapshot, store))
                 if *total != page.total
                     || *committed != page.committed_ballot
-                    || *snapshot != page.snapshot =>
+                    || *snapshot != page.snapshot
+                    || *store != page.store =>
             {
                 return Err(PageError::Inconsistent);
             }
@@ -722,7 +744,7 @@ impl ReportAssembler {
             None => {
                 self.totals.insert(
                     page.replica,
-                    (page.total, page.committed_ballot, page.snapshot),
+                    (page.total, page.committed_ballot, page.snapshot, page.store),
                 );
             }
         }
@@ -749,7 +771,7 @@ impl ReportAssembler {
         self.pages.iter().filter_map(|(replica, pages)| {
             self.totals
                 .get(replica)
-                .is_some_and(|(total, _, _)| pages.len() == *total as usize)
+                .is_some_and(|(total, _, _, _)| pages.len() == *total as usize)
                 .then_some(replica)
         })
     }
@@ -761,7 +783,7 @@ impl ReportAssembler {
     pub fn complete(&self) -> Vec<RecoveryReport> {
         let mut out = Vec::new();
         for (replica, pages) in &self.pages {
-            let Some((total, committed, snapshot)) = self.totals.get(replica) else {
+            let Some((total, committed, snapshot, store)) = self.totals.get(replica) else {
                 continue;
             };
             if pages.len() != *total as usize {
@@ -777,12 +799,18 @@ impl ReportAssembler {
                 entries,
             };
             // The assembled report is the one the pages claimed.
-            if report_digest(&report) != *snapshot {
+            if report_digest(&report, store) != *snapshot {
                 continue;
             }
             out.push(report);
         }
         out
+    }
+
+    /// The store `replica`'s pages came from, once one of them verified
+    /// (task-d121).
+    pub fn store_of(&self, replica: &ReplicaId) -> Option<StoreInstanceId> {
+        self.totals.get(replica).map(|(_, _, _, store)| *store)
     }
 
     /// Replicas with at least one page but not all.
@@ -792,7 +820,7 @@ impl ReportAssembler {
             .filter(|(r, pages)| {
                 self.totals
                     .get(r)
-                    .is_some_and(|(total, _, _)| pages.len() != *total as usize)
+                    .is_some_and(|(total, _, _, _)| pages.len() != *total as usize)
             })
             .map(|(r, _)| *r)
             .collect()

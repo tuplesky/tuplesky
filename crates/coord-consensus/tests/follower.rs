@@ -58,6 +58,7 @@ fn config(me: u8) -> FollowerConfig {
             voters: voters.clone(),
             replica: r(me),
             incarnation: ReplicaIncarnation::new(1).unwrap(),
+            store: coord_types::ids::StoreInstanceId(r(me).0),
             role: ReplicaRole::Voter,
         },
         quorum: BallotConfiguration::c2(epoch(), ballot(0, 0), voters, [r(0), r(1)].into())

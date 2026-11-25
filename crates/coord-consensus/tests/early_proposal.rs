@@ -59,6 +59,7 @@ fn config(n: u8) -> LeaderConfig {
             voters: voters.clone(),
             replica: r(0),
             incarnation: ReplicaIncarnation::new(1).unwrap(),
+            store: coord_types::ids::StoreInstanceId(r(0).0),
             role: ReplicaRole::Voter,
         },
         quorum: BallotConfiguration::c2_default(epoch(), genesis(), voters).unwrap(),

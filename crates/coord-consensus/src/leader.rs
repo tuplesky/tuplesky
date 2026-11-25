@@ -2071,7 +2071,8 @@ impl Leader {
         let outbox = self.outbox.as_mut().expect("booted");
         // The pages are kept: one that is lost is asked for again, and
         // answered from this version, never a regenerated one (task-d28).
-        let served = crate::summary::ServedReport::new(due.to, &report);
+        let served =
+            crate::summary::ServedReport::new(due.to, &report, self.ballots.identity().store);
         for page in &served.pages {
             outbox.publish(PendingSend {
                 context,
@@ -4582,6 +4583,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(0),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(0).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
@@ -4764,6 +4766,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(1),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(1).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters.clone(), [r(0), r(1)].into())

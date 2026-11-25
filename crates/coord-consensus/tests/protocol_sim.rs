@@ -171,6 +171,7 @@ fn identity(me: u8, n: u8) -> ConfigurationIdentity {
         voters: (0..n).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -5358,7 +5359,13 @@ fn hide_preaccepted(page: coord_consensus::ReportPage) -> coord_consensus::Repor
         entries: page.entries.clone(),
     };
     // Rebuilt unchanged, it is the page sent, or it is left alone.
-    if coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).first() != Some(&page)
+    if coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    )
+    .first()
+        != Some(&page)
     {
         return page;
     }
@@ -5367,7 +5374,12 @@ fn hide_preaccepted(page: coord_consensus::ReportPage) -> coord_consensus::Repor
             e.payload_present = false;
         }
     }
-    coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).remove(0)
+    coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    )
+    .remove(0)
 }
 
 /// The converse of oracle 9's negative control (task-d90, #197 review):

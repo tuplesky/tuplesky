@@ -6,6 +6,7 @@
 //! create-or-open of an empty voter.
 
 use coord_types::identity::Digest32;
+use coord_types::ids::StoreInstanceId;
 
 use crate::genesis::GenesisManifest;
 use crate::membership::{Membership, MembershipError};
@@ -14,8 +15,11 @@ use crate::membership::{Membership, MembershipError};
 pub trait GenesisStore {
     /// The pinned genesis digest, if this node was ever initialized.
     fn pinned_digest(&self) -> Result<Option<Digest32>, StoreFailure>;
-    /// Pin the digest (first boot only).
-    fn pin(&mut self, digest: Digest32) -> Result<(), StoreFailure>;
+    /// This store's identity, written with the pin (task-d121).
+    fn store_instance(&self) -> Result<Option<StoreInstanceId>, StoreFailure>;
+    /// Pin the digest and write the store's identity, in one durable
+    /// transaction (first boot only).
+    fn pin(&mut self, digest: Digest32, store: StoreInstanceId) -> Result<(), StoreFailure>;
     /// Whether the node's own durable journal exists and is intact.
     fn journal_intact(&self) -> Result<bool, StoreFailure>;
     /// Create the node's durable journal (first boot). It must be
@@ -58,12 +62,20 @@ pub struct Initialized {
     pub membership: Membership,
     /// Whether this boot performed the first-time pin.
     pub first_boot: bool,
+    /// This store's identity: the one pinned now on a first boot, the one
+    /// read back otherwise (task-d121).
+    pub store_instance: StoreInstanceId,
 }
 
 /// Initialize (or re-open) this node against `manifest` and `store`.
+///
+/// `fresh` is the store identity a first boot pins. The caller draws it
+/// from a secure random source (core crates draw no randomness); a
+/// returning boot ignores it and reads the pinned one back.
 pub fn initialize(
     manifest: &GenesisManifest,
     store: &mut dyn GenesisStore,
+    fresh: StoreInstanceId,
 ) -> Result<Initialized, InitError> {
     let membership = Membership::from_genesis(manifest).map_err(InitError::Membership)?;
     let digest = manifest.digest();
@@ -75,10 +87,11 @@ pub fn initialize(
             // first and crashing left a pinned digest with no journal,
             // which the returning-node path reads as a lost journal.
             store.establish_journal().map_err(|_| InitError::Store)?;
-            store.pin(digest).map_err(|_| InitError::Store)?;
+            store.pin(digest, fresh).map_err(|_| InitError::Store)?;
             Ok(Initialized {
                 membership,
                 first_boot: true,
+                store_instance: fresh,
             })
         }
         Some(pinned) if pinned == digest => {
@@ -87,9 +100,19 @@ pub fn initialize(
             if !store.journal_intact().map_err(|_| InitError::Store)? {
                 return Err(InitError::JournalLost);
             }
+            // The identity is written with the pin, so a pinned store
+            // without one is damaged, not one to give a new identity:
+            // a voter that took a new identity here would be refused by
+            // every peer that saw the old one, and one that kept none
+            // could not be told from a store initialized again.
+            let store_instance = store
+                .store_instance()
+                .map_err(|_| InitError::Store)?
+                .ok_or(InitError::Store)?;
             Ok(Initialized {
                 membership,
                 first_boot: false,
+                store_instance,
             })
         }
         Some(pinned) => Err(InitError::DigestMismatch {
