@@ -1079,6 +1079,12 @@ pub struct UnreportedDrops {
     /// zero and the journal fails a failed batch's queue with it, as
     /// `coordd`'s does (task-d119's note).
     pub bound_undecided: u64,
+    /// Campaigns given up as `Behind` whose selection dropped a
+    /// possible-fast candidate whose dependencies reach a command no
+    /// report holds and this replica doesn't hold decided: the
+    /// selections task-d121's condition 5 keeps the rule off (its C0
+    /// measurement).
+    pub behind_undecided: u64,
 }
 
 /// What a follower is taking while it learns once for many inputs
@@ -3854,6 +3860,15 @@ impl Follower {
 
     /// Give the campaign up for `refusal`.
     fn refuse_campaign(&mut self, refusal: CampaignRefusal) -> Vec<Effect> {
+        // Read before the campaign and its selection are dropped.
+        if matches!(refusal, CampaignRefusal::Behind(_))
+            && self
+                .campaign
+                .as_ref()
+                .is_some_and(Campaign::selected_past_undecided)
+        {
+            self.unreported_drops.behind_undecided += 1;
+        }
         self.campaign = None;
         match refusal {
             // A candidate further behind than every reporter's window
