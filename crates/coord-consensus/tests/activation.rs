@@ -7413,13 +7413,16 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
     assert!(f.campaign_state().is_none(), "the campaign was given up");
     assert!(f.won().is_none());
     // The selection dropped C behind D, which no report holds and the
-    // candidate does not hold decided; nothing was bound.
+    // candidate does not hold decided; nothing was bound, and the
+    // campaign given up as `Behind` is counted as one such selection kept
+    // (task-d121's C0).
     assert_eq!(
         f.unreported_drops(),
         coord_consensus::UnreportedDrops {
             undecided: 1,
             bound_decided: 0,
             bound_undecided: 0,
+            behind_undecided: 1,
         }
     );
     // It does not campaign again this boot.
