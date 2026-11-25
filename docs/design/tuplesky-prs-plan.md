@@ -1337,6 +1337,7 @@ What exists today:
 The steps:
 1. **A journal fault kit.** A raft-engine `FileSystem` adapter with a volatile image and a durable one, as the redb kit has. It faults:
    - writes and short writes, ENOSPC and EIO on write, sync failures;
+   - **ENOSPC as the pin recognises it** (#210 review). The pin knows no-space by the error's text alone (`is_no_space_err`, `contains("nospace")`), and only then truncates, rotates to a new file and retries the write once. So the kit's ENOSPC carries that text. A one-operation window may then be acknowledged after the retry, and what it acknowledged must survive; a window that never closes must not be acknowledged. Every operation of each rotation it reaches is crashed under every tail policy, since the fault-free workload never rotates;
    - a crash that freezes the files and keeps none, all, or a seeded subset of what wasn't synced, torn at byte level and reordered.
 
    **The audit:** the operations that bypass the adapter, each named in the report as uncontrolled or, where the adapter can reach it, brought under it. These are:
@@ -4288,7 +4289,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 ### task-d103: Stop writing the leader's proposal row, which nothing reads
 
 **Prerequisites:** task-d89, task-d101.  
-**Design:** Section 17.4 (amended by this task's design step: protocol rows).
+**Design:** Section 17.4 (amended by this task's design step: protocol rows).  
+**Superseded by [task-d117](#task-d117)** for the proposal row: with protocol state in the journal only, the row isn't written at all. The text below is kept as the record of the cut.
 
 **Implement:** The first of task-d101's option 2 cuts, each its own design step (#185 review). The journal-only cut isn't taken: boot, catch-up served, a campaign's executed rows and resolve read the protocol rows by command over history the journal has retired, and the journal has no index by command (Section 17.4's table). What holds is the leader's proposal row (`ProposalRecordV1`), written in every proposal batch and read by nothing but the checkpoint's trim plan, which nothing calls.
 - The leader writes no proposal row. `ProposalRequest` keeps answering from the leader's proposals in memory, those marked durable (`serve_proposals`).
@@ -4307,7 +4309,8 @@ So every feature-gated change, task-d98's `EarlyProposal` first, would ship unre
 ### task-d104: Retire the retry window in batches
 
 **Prerequisites:** task-c02, task-d26, task-d99, task-d101.  
-**Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).
+**Design:** Section 17.4 (amended by this task's design step: the retry window retired in batches).  
+**Superseded by [task-d117](#task-d117)** for the retry rows: the window lives in memory, and this task's rules apply to it there. The text below is kept as the record of the cut.
 
 **Implement:** The second of task-d101's option 2 cuts (#185 review). `retirement()` retires a client's acknowledged sequences once at least `RETIRE_BATCH` (`K`) are acknowledged above the floor. It also retires whenever deferring would leave the command's own sequence, or the next `K`, outside the window measured from the unretired floor. A retiring command retires up to `MAX_RETIRE_PER_COMMAND + K − 1` above the floor, so the batched floor is never more than `K − 1` below today's and a retirement reaches at least today's. The rule stays a function of the durable view and the accepted payload. task-d26's bound on a session's retained results becomes `width + K`. `K` is a constant of the format, not a setting, since every voter must compute the same retirement.
 - **Sized before it is built:** about −0.009 ms an operation at the materializer at the bar (task-d86's profile). Its share of the domain loop is read on the CPU clock first, and the task is kept or dropped on the two together. A domain with thousands of clients, whose floor rows each cost a page, is where its first part would save about a page a command; that is read in the same step if it decides the task.

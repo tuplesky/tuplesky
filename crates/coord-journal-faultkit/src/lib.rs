@@ -122,7 +122,8 @@ pub struct FaultPlan {
     /// Fail this sync; the unsynced tail is persisted per `tail`.
     pub fail_sync_at: Option<u64>,
     /// Inclusive ENOSPC window: writes, truncations and allocations fail
-    /// with `StorageFull` while the ordinal lies inside it.
+    /// with [`ENOSPC_MESSAGE`] (kind `StorageFull`) while the ordinal lies
+    /// inside it.
     pub enospc: Option<(u64, u64)>,
     /// Crash immediately after this operation completes.
     pub crash_after: Option<u64>,
@@ -245,6 +246,19 @@ impl Images {
         self.volatile.resize(len as usize, 0);
         self.unsynced.push(Unsynced::SetLen { len });
     }
+}
+
+/// The message of a scripted ENOSPC. The pinned raft-engine recognises
+/// running out of space by its error's text alone (`is_no_space_err`,
+/// `errors.rs`: `contains("nospace")`, the text its own `LogFd` gives
+/// ENOSPC), and only then truncates, rotates to a new file and retries
+/// the write once (`pipe.rs`'s `append`, `engine.rs`'s `write`). Any
+/// other text is an ordinary I/O error and the write is refused, so the
+/// window would never reach the rotation.
+pub const ENOSPC_MESSAGE: &str = "nospace (simulated ENOSPC)";
+
+fn enospc() -> io::Error {
+    io::Error::new(io::ErrorKind::StorageFull, ENOSPC_MESSAGE)
 }
 
 type Files = BTreeMap<PathBuf, Arc<Mutex<Images>>>;
@@ -559,10 +573,7 @@ impl FaultHandle {
         if self.shared.full(n) {
             self.shared.record(Op::Failed);
             self.shared.end(n);
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "simulated ENOSPC",
-            ));
+            return Err(enospc());
         }
         self.inner.truncate(offset)?;
         self.images.lock().unwrap().set_len(offset as u64);
@@ -640,10 +651,7 @@ impl Write for FaultWriter {
         if shared.full(n) {
             shared.record(Op::Failed);
             shared.end(n);
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "simulated ENOSPC",
-            ));
+            return Err(enospc());
         }
         let plan = *shared.plan.lock().unwrap();
         if plan.fail_write_at == Some(n) {
@@ -720,10 +728,7 @@ impl WriteExt for FaultWriter {
         if shared.full(n) {
             shared.record(Op::Failed);
             shared.end(n);
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "simulated ENOSPC",
-            ));
+            return Err(enospc());
         }
         self.inner.allocate(offset, size)?;
         // fallocate without KEEP_SIZE grows the file with zeros.
