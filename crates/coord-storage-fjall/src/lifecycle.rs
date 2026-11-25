@@ -134,7 +134,13 @@ impl FjallGeneration {
         {
             let mut tx = engine.begin_write().map_err(corrupt)?;
             let meta = Collection::MetaV1.id();
-            let rows: [(&[u8], Vec<u8>); 8] = [
+            let rows: [(&[u8], Vec<u8>); 9] = [
+                (
+                    meta_fields::FORMAT_VERSION,
+                    coord_store_api::registry::STORE_FORMAT_VERSION
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
                 (meta_fields::CLUSTER_ID, identity.cluster_id.0.to_vec()),
                 (meta_fields::DOMAIN_ID, identity.domain_id.0.to_vec()),
                 (meta_fields::REPLICA_ID, identity.replica_id.0.to_vec()),

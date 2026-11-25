@@ -10,6 +10,8 @@
 //! | `Evidence` `0x0700` | voter to collector | `ProtocolMessage` (postcard) |
 //! | `Read` `0x0107` | collector to the leader it follows | [`ReadV1`] |
 //! | `ReadAnswer` `0x0702` | leader to collector | [`ReadAnswerV1`] |
+//! | `Freshness` `0x0108` | a voter's collector to the leader it follows | [`FreshnessAskV1`] |
+//! | `FreshnessAnswer` `0x0703` | leader to collector | [`FreshnessAnswerV1`] |
 //!
 //! None of these is decodable by the typed `wire_v1` decoder: they are
 //! dispatched by raw kind at the collector boundary, the way peer
@@ -18,7 +20,7 @@
 use coord_consensus::ProtocolMessage;
 use coord_core::capability::{AdmissionFacts, ReleasedResult};
 use coord_types::identity::RetryKey;
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ExecutionPosition};
 use coord_types::wire_v1::{Frame, RequestV1, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,46 @@ pub const KIND_RELEASE: u16 = 0x0701;
 pub const KIND_EVIDENCE: u16 = 0x0700;
 /// Schema version of every collector frame.
 pub const VERSION: u16 = 1;
+/// The version of a submission or a release for a command its collector
+/// answers on the leader's final release alone (task-d100, step A).
+///
+/// A version-2 submission is the version-1 payload unchanged: the
+/// version is the mark. A version-2 release is a [`ReleaseV2`]: the
+/// released result and the admission digest of the payload the leader
+/// decided. A build from before step A refuses both, which is why a
+/// collector sends them only while its node reads
+/// `Feature::AnswerOnRelease` active, and a store that holds that
+/// activation admits no such build.
+pub const VERSION_ANSWER_ON_RELEASE: u16 =
+    coord_types::wire_v1::COLLECTOR_SUBMIT_ANSWER_ON_RELEASE_VERSION;
+
+/// The version of a submission relayed to its ballot's leader alone
+/// (task-d102, task-d100's step B): the version-1 payload, marked as
+/// version 2 is, and sent only while the collector's node reads
+/// `Feature::BatchedRound` active, which no older build admits.
+pub const VERSION_RELAYED: u16 = coord_types::wire_v1::COLLECTOR_SUBMIT_RELAYED_VERSION;
+
+/// A release for a command answered on the release alone (task-d100,
+/// step A): the released result and the admission digest of the payload
+/// the leader decided, which the collector compares with the one it
+/// submitted under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseV2 {
+    /// The released result, as a version-1 release carries it.
+    pub released: ReleasedResult,
+    /// The decided payload's admission digest.
+    pub admission: coord_types::identity::Digest32,
+}
+
+/// [`ReleaseV2`] over a borrowed result, so a release is framed without
+/// copying its response (#204 review). The same fields in the same
+/// order: postcard encodes the two alike.
+#[derive(Serialize)]
+struct ReleaseV2Ref<'a> {
+    released: &'a ReleasedResult,
+    admission: coord_types::identity::Digest32,
+}
+
 /// A collector's current read, sent to the leader it follows only
 /// (task-d50; design Section 6.3).
 pub use coord_types::wire_v1::KIND_COLLECTOR_READ as KIND_READ;
@@ -104,6 +146,60 @@ pub enum ReadRefusal {
     Busy,
 }
 
+/// A voter's freshness ask (#320): sent by the frontend beside the voter
+/// to the leader of the ballot the voter follows, every half allowance
+/// while it votes (an eighth after an ask that was refused or could not
+/// be sent, and at once when its ballot moves).
+pub use coord_types::wire_v1::KIND_COLLECTOR_FRESHNESS as KIND_FRESHNESS;
+/// The leader's answer to a [`FreshnessAskV1`], in the collector-evidence
+/// range beside [`KIND_READ_ANSWER`].
+pub const KIND_FRESHNESS_ANSWER: u16 = 0x0703;
+
+/// A freshness ask (#320). The leader answers it as it answers a current
+/// read (task-d50): it takes its read index when the ask arrives,
+/// confirms its ballot with a round started after that, waits until
+/// everything it proposed below the index has executed, and answers with
+/// how far it had executed then. Everything the domain committed before
+/// the ask arrived is at or below that position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessAskV1 {
+    /// The ballot the asking voter follows. A voter that does not lead it
+    /// refuses.
+    pub ballot: Ballot,
+    /// The asker's number for this ask, echoed in the answer.
+    pub ask: u64,
+}
+
+/// The leader's answer to a [`FreshnessAskV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessAnswerV1 {
+    /// The ballot the answering voter was at.
+    pub ballot: Ballot,
+    /// The ask answered.
+    pub ask: u64,
+    /// What came of it.
+    pub outcome: FreshnessOutcomeV1,
+}
+
+/// What came of a [`FreshnessAskV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshnessOutcomeV1 {
+    /// Everything committed before the ask reached the leader is at or
+    /// below `position` in the execution order, which is one order at
+    /// every voter.
+    Through {
+        /// How far the leader had executed once a round confirmed it and
+        /// everything below the ask's index had executed.
+        position: ExecutionPosition,
+    },
+    /// Not answered, for the reason a read would not have been. The
+    /// asker stays as fresh as it was and asks again.
+    Refused {
+        /// Why.
+        reason: ReadRefusal,
+    },
+}
+
 /// The submission: what the admitting verifier attested and the exact
 /// request the client sent (its logical bytes are what identity binds).
 ///
@@ -149,10 +245,14 @@ pub enum CollectorWireError {
 }
 
 fn check(frame: &Frame, kind: u16) -> Result<(), CollectorWireError> {
+    check_versions(frame, kind, &[VERSION])
+}
+
+fn check_versions(frame: &Frame, kind: u16, versions: &[u16]) -> Result<(), CollectorWireError> {
     if frame.kind != kind {
         return Err(CollectorWireError::UnexpectedKind { kind: frame.kind });
     }
-    if frame.version != VERSION {
+    if !versions.contains(&frame.version) {
         return Err(CollectorWireError::UnsupportedVersion {
             version: frame.version,
         });
@@ -170,7 +270,11 @@ fn exact<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, CollectorWireEr
 }
 
 fn frame(kind: u16, payload: &[u8]) -> Result<Vec<u8>, CollectorWireError> {
-    encode_frame(kind, VERSION, payload).map_err(|e| match e {
+    frame_versioned(kind, VERSION, payload)
+}
+
+fn frame_versioned(kind: u16, version: u16, payload: &[u8]) -> Result<Vec<u8>, CollectorWireError> {
+    encode_frame(kind, version, payload).map_err(|e| match e {
         WireError::PayloadTooLarge | WireError::LengthAboveClassLimit { .. } => {
             CollectorWireError::TooLarge
         }
@@ -184,10 +288,38 @@ pub fn submit_frame(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
     frame(KIND_SUBMIT, &payload)
 }
 
+/// Encode a submission its collector answers on the leader's final
+/// release alone (task-d100, step A): the version-1 payload under
+/// [`VERSION_ANSWER_ON_RELEASE`].
+pub fn submit_frame_answer_on_release(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(submit).map_err(|_| CollectorWireError::TooLarge)?;
+    frame_versioned(KIND_SUBMIT, VERSION_ANSWER_ON_RELEASE, &payload)
+}
+
+/// Encode a submission relayed to its ballot's leader alone (task-d102):
+/// the version-1 payload under [`VERSION_RELAYED`].
+pub fn submit_frame_relayed(submit: &SubmitV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(submit).map_err(|_| CollectorWireError::TooLarge)?;
+    frame_versioned(KIND_SUBMIT, VERSION_RELAYED, &payload)
+}
+
 /// Decode a submission.
 pub fn decode_submit(frame: &Frame) -> Result<SubmitV1, CollectorWireError> {
-    check(frame, KIND_SUBMIT)?;
-    exact(&frame.payload)
+    decode_submit_marked(frame).map(|(submit, _)| submit)
+}
+
+/// Decode a submission, with whether its collector answers it on the
+/// leader's final release alone (task-d100, step A).
+pub fn decode_submit_marked(frame: &Frame) -> Result<(SubmitV1, bool), CollectorWireError> {
+    check_versions(
+        frame,
+        KIND_SUBMIT,
+        &[VERSION, VERSION_ANSWER_ON_RELEASE, VERSION_RELAYED],
+    )?;
+    Ok((
+        exact(&frame.payload)?,
+        frame.version == VERSION_ANSWER_ON_RELEASE || frame.version == VERSION_RELAYED,
+    ))
 }
 
 /// Encode protocol evidence for the collector.
@@ -207,15 +339,35 @@ pub fn decode_evidence(frame: &Frame) -> Result<ProtocolMessage, CollectorWireEr
     ProtocolMessage::decode(&frame.payload).map_err(|_| CollectorWireError::Malformed)
 }
 
-/// Encode a released result.
+/// Encode a released result: a version-1 release, or a [`ReleaseV2`]
+/// when the release carries the decided payload's admission (task-d100,
+/// step A).
 pub fn release_frame(released: &ReleasedResult) -> Result<Vec<u8>, CollectorWireError> {
-    let payload = postcard::to_allocvec(released).map_err(|_| CollectorWireError::TooLarge)?;
-    frame(KIND_RELEASE, &payload)
+    match released.admission() {
+        None => {
+            let payload =
+                postcard::to_allocvec(released).map_err(|_| CollectorWireError::TooLarge)?;
+            frame(KIND_RELEASE, &payload)
+        }
+        Some(admission) => {
+            let v2 = ReleaseV2Ref {
+                released,
+                admission,
+            };
+            let payload = postcard::to_allocvec(&v2).map_err(|_| CollectorWireError::TooLarge)?;
+            frame_versioned(KIND_RELEASE, VERSION_ANSWER_ON_RELEASE, &payload)
+        }
+    }
 }
 
-/// Decode a released result.
+/// Decode a released result, of either version. A version-2 release
+/// comes back carrying its admission digest.
 pub fn decode_release(frame: &Frame) -> Result<ReleasedResult, CollectorWireError> {
-    check(frame, KIND_RELEASE)?;
+    check_versions(frame, KIND_RELEASE, &[VERSION, VERSION_ANSWER_ON_RELEASE])?;
+    if frame.version == VERSION_ANSWER_ON_RELEASE {
+        let v2: ReleaseV2 = exact(&frame.payload)?;
+        return Ok(v2.released.with_admission(v2.admission));
+    }
     exact(&frame.payload)
 }
 
@@ -240,5 +392,29 @@ pub fn read_answer_frame(answer: &ReadAnswerV1) -> Result<Vec<u8>, CollectorWire
 /// Decode a read's answer.
 pub fn decode_read_answer(frame: &Frame) -> Result<ReadAnswerV1, CollectorWireError> {
     check(frame, KIND_READ_ANSWER)?;
+    exact(&frame.payload)
+}
+
+/// Encode a freshness ask (#320).
+pub fn freshness_frame(ask: &FreshnessAskV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(ask).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_FRESHNESS, &payload)
+}
+
+/// Decode a freshness ask.
+pub fn decode_freshness(frame: &Frame) -> Result<FreshnessAskV1, CollectorWireError> {
+    check(frame, KIND_FRESHNESS)?;
+    exact(&frame.payload)
+}
+
+/// Encode a freshness ask's answer.
+pub fn freshness_answer_frame(answer: &FreshnessAnswerV1) -> Result<Vec<u8>, CollectorWireError> {
+    let payload = postcard::to_allocvec(answer).map_err(|_| CollectorWireError::TooLarge)?;
+    frame(KIND_FRESHNESS_ANSWER, &payload)
+}
+
+/// Decode a freshness ask's answer.
+pub fn decode_freshness_answer(frame: &Frame) -> Result<FreshnessAnswerV1, CollectorWireError> {
+    check(frame, KIND_FRESHNESS_ANSWER)?;
     exact(&frame.payload)
 }

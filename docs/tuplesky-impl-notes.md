@@ -681,7 +681,9 @@ A node certificate binds exactly one role: `PeerBinder` refuses a
 `Hello` that declares any role other than the certificate's own
 node-identity URI. So a `coordd` running `role = "voter-frontend-..."`
 holds a voter certificate and, with only that, cannot present itself as
-a collector to anybody.
+a collector to anybody. A certificate binds exactly one domain the same
+way: the URI names it, and a `Hello` naming another domain is refused,
+since a cluster's domains share its issuer.
 
 That matters because a submission is the *collector's*, not the
 voter's. It carries admission claims minted for a client's session, and
@@ -5558,16 +5560,21 @@ behind by more than a table is sent nothing it can use.
   executed, so the pacer is the floor for an ask nobody answered. The
   pacer registers its next look as a serve-loop deadline, so an idle
   follower with held work, which has no election deadline, still wakes
-  to ask and to ask again. A voter also asks once after it starts,
+  to ask and to ask again. A voter also asks after it starts,
   whatever it holds: a restart forgets the page, and a command whose
   donor kept no row leaves none here either until it executes, so a
-  voter restarted behind can hold nothing that would prompt an ask. A
+  voter restarted behind can hold nothing that would prompt an ask. It
+  goes on asking until a page arrives or every voter has been asked
+  (the leader twice, then each of the others): a donor with nothing past
+  its frontier answers nothing, as a lost ask or page does, and with a
+  leader that has nothing for it to adopt the probe is its only ask
+  (#98, Codex on the carry). A
   page taken whole that stops short of the donor's `through` (the
   command bound or the byte bound) is followed at once.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
-  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  own `executed_through`. A page is at most 125 commands and 1 MiB beyond
   its first, each read from the donor's durable rows: the payload row,
   the epoch's dependency row if it keeps one, and the executed row
   (`coord_storage::protocol::catch_up_entry`). The page stops at the
@@ -7050,7 +7057,7 @@ never closed its gap.
 
 - **A window per batch.** `install_catch_up` installs as many of the
   page's commands as install cleanly, from its head, in one batch: at
-  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  most the page, so 125 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
   `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
   unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
   let into a full table). A window joins a command only when:
@@ -7060,7 +7067,9 @@ never closed its gap.
   - after the window's first, it names the command before it among
     those dependencies.
 - **A command the donor kept no row of is a window of its own.** It has
-  no dependencies to name. What would stop a page (a stale ballot or
+  no dependencies to name. (Seed 73 on #185 removed this: such an entry
+  is not installed, the window ends before it, and the follower asks
+  another donor.) What would stop a page (a stale ballot or
   position, a second decision, a command executed here already, a
   command not installable) ends the window instead, and is dealt with
   when it is the first of the next window, exactly as before.
@@ -7363,16 +7372,38 @@ contract needed and a test for each.
   1,000, is enforced per frontend as a token bucket with a second's
   burst. A retry of an outstanding request takes nothing, and a refused
   request is answered `BACKPRESSURE` ("admission rate").
-  - Catch-up executes up to 64 commands per durable batch (task-d25), so
-    the default leaves a returning voter most of its rate to gain on the
+  - Catch-up executes up to 125 commands per durable batch, with the
+    next page asked ahead while a page executes (task-d25), so the
+    default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
   - The default is a design target and a ceiling, not a proved bound
-    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    (review): the 64-per-10-ms rate it was set under was never measured, and
     task-d33's budget oracle is its check. It gates only client
     requests, after the session-busy check and before the pending
     insert; resolves, watches and held retries bypass it, and one bucket
-    per frontend is shared by every session. At the 35 to 100 commands a
-    second a domain sustains today it never binds.
+    per frontend is shared by every session.
+  - **It is close to binding now.** Five voters on one four-core host
+    with three frontends sustain about 1,500 to 1,700 commands a second
+    at 120 callers (#224, #225). The busiest frontend admits 630 to 770
+    a second at the median and up to 977 in its busiest second. No
+    throughput pair so far was refused (#224's and (e)'s counted no
+    refused or unknown operation), but a faster build's will be. Review's
+    stall runs, with a voter stopped under load, were (#228 review). Catch-up is
+    measured now too: about 22 ms a page plus 0.28 ms a command, so a
+    voter rejoining at full load with the relay executes about 1,600 a
+    second at 64 a page and 2,200 at 125 (#98). That is not the margin
+    the default was set with. Whether to change the limit or its default
+    is the owner's decision; nothing here changes either.
+  - **What a reading shows.** A refusal counts as refused at the
+    admission stage, and an `admission` line with every metrics
+    snapshot gives the frontend's rate and its refusals by why
+    (`rate_limited`, `session_busy`, `other`, and `collection_bound` for
+    a request the gate admitted and the collector's own bound then
+    refused). The bench counts
+    `BACKPRESSURE` as a refusal, `backpressure`, not as an unknown
+    outcome. Every script in `scripts/bench` sets the rate explicitly
+    (`ADMITTED_PER_SECOND`, default 1,000) and states it in its readings'
+    labels.
 
 ### What this does not cover
 
@@ -7926,9 +7957,16 @@ After every step, every limit of the resource contract (design Section
   - A fresh admission never lands past the reserve.
   - Tombstones never exceed capacity plus the conservative keys.
 - **Ledger and bindings.** Durable records and retry-key bindings never
-  exceed six tables. The history sweep (task-d26) runs once they pass
-  four; the peak is those four, the live table, and the retirement
-  window the sweep goes down to.
+  exceed six tables while the live records fit the table. The history
+  sweep (task-d26) keeps the live table and the retirement window, and
+  after a sweep that kept no more than that the next runs once they
+  pass four; the peak is those four, the live table, and the retirement
+  window. A voter behind keeps more live records than that. Its next
+  sweep runs once the records added and the commands executed since the
+  last come to half of what it kept (task-d110), so it holds at most
+  half again what that sweep kept, sweeps at a cost of about three
+  records per record added or command executed, and comes back under
+  six tables as it executes its backlog.
 - **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
 - **Campaigns.**
   - Report pages held never exceed what the promising voters' reports
@@ -9754,6 +9792,12 @@ round.
   and still confirms if its answers come
   (`a_round_in_flight_too_long_does_not_hold_the_next`). Nothing about
   when a read is due or what it may return changes.
+  *Later:* the hold is now a spacing, `ROUND_SPACING_MILLIS` (5 ms), with
+  the serve loop woken at its end. Across regions a read that arrived
+  just after a round started waited for that round and a whole new one,
+  two quorum round trips (the WAN run on #185). Spaced, it waits one
+  (`a_round_out_holds_the_next_back_only_for_the_spacing`,
+  `a_read_waits_one_quorum_round_trip_not_two`).
 - **Counted.** The `metrics` line's `reads` gains `snapshots`, the
   snapshots pinned for due reads, and `behind`, the due reads held again
   because theirs was behind them.
@@ -10715,8 +10759,64 @@ cost task-d73 and task-d74 take. task-d74, measured, is about 4% of the
 nodes' CPU and 6% of a follower's, the largest single lever so far and
 still a small one; task-d73, which removes frames a turn, is worth on
 the order of 1% at that rate. task-d75's reading of the leader's loop is
-the leader's 40%, and what it found is in its own section, "The domain
-loop, read (task-d75)", with #168.
+the leader's 40%, and what it found is in its own section
+([below](#the-domain-loop-read-task-d75)).
+
+## The domain loop, read (task-d75)
+
+The reading first, as the plan asks, on the same host and setup as
+task-d72's (five voters on one 4-CPU host, replay profile, 30 callers),
+at #165's head `2f7f511`: `perf` on the leader (n1) and a follower
+outside the fast set (n4), 15 s of a 40,000-operation run at 499 Hz.
+The domain loop is 41% of the leader's samples and 39% of the
+follower's; the shares below are of the loop.
+
+| On the domain loop | Leader | Follower |
+| --- | --- | --- |
+| the machine's `step` | 23% | 23% |
+| applying (`Applier::apply`), with its reads | 8% | 12% |
+| the read barrier (`pump_reads`) | 14% | -- |
+| settling from records (`settle_from_records`): two snapshots and two lookups a key | 3.4% | 5.0% |
+| `GatedReader::snapshot` (a read transaction and `DurableMeta::read`), all callers | 5% | 6.5% |
+| `load_authorization` (a session get, a trust-rule get, a policy scan, every command) | 3.9% | -- |
+| the outbox's filing (`Outbox::filing`, a lookup in a set of every barrier the boot made durable) | 2.1% | 2.3% |
+| B-tree searches, all callers (32-byte command identities) | 19% | -- |
+
+- **The host is the bound, not the leader's loop.** The leader's domain
+  thread was runnable and waiting for a core for 11.9 s of a 29 s run,
+  and the loop's own CPU is 0.68 ms of the leader's 1.65 ms a write. On
+  this host what any node saves goes to every node, so `ok`/s follows
+  the CPU a write, which the runner's separate nodes do not show.
+- **Amortization is the lever this reading points at, more than any one
+  call.** The leader's counters for the same run: 10,150 commands
+  executed, 8,870 lowerings (1.14 commands each), 4,648 journal appends
+  and 4,222 projection commits (2.2 and 2.4 commands each). The appender
+  served an append in 2.4 ms and the materializer a commit in 1.9 ms, a
+  cost a command pays nearly alone. A turn that took every event ready
+  before it lowered would carry more commands a group without waiting
+  on anything; the loop now turns again (`progressed => continue`) as
+  soon as a turn did something.
+- **The fast path is all but absent on this mix:** 239 commands
+  established fast and 9,911 slow, 9,275 of them `missed_path`.
+- **Each candidate is its own PR with its pair.** The first is the
+  settle read, the cheapest to take whole.
+
+**The settle read (this task's first PR).** `RecordReads` reads the
+half-held commands of a turn from one snapshot, with one lookup a key
+for the records and the conflicts both, and does not look up again a
+command it found with no record until the completed frontier moves: a
+record only appears with a projection commit, and a commit moves the
+frontier (task-d58's rule for the read barrier). Three alternating
+pairs, as task-d72's (20,000 operations):
+
+| Build | ok/s | put p50 | put p99 | Leader a write (its loop) | A follower a write (its loop) | All nodes a write |
+| --- | --- | --- | --- | --- | --- | --- |
+| `2f7f511` | 749 to 790 | 73.6 to 76.9 | 119.8 to 122.5 | 1.63 to 1.70 (0.662 to 0.685) | 1.36 to 1.43 (0.526 to 0.553) | 7.08 to 7.41 |
+| the settle read | 758 to 788 | 73.1 to 76.1 | 118.0 to 122.1 | 1.64 to 1.69 (0.649 to 0.679) | 1.35 to 1.41 (0.504 to 0.525) | 7.05 to 7.33 |
+
+A follower's loop falls by 4% (0.538 to 0.516 ms a write, the means),
+the leader's by 1.5%, what the profile's share said; nothing else
+moves outside the spread.
 
 ## Journal syncs a command, and what each carries (task-d84)
 
@@ -10898,6 +10998,93 @@ window.
   its first reading, the rows exported by kind at two positions, waits
   for it.
 
+## A local checkpoint publication's cost a record (task-d92)
+
+R2 found the process's cost a command steps up once local checkpoint
+publications start, and that the step is the publications' own export
+and write. This is the profile task-d92 asked for, and its lever.
+
+**The setup.** R2's: `command-cost.sh` with `MEASURED=750000`, 10
+callers, three voters on one host (x86_64, 4 CPUs), `replay`, stores on
+tmpfs. Every 0.5 s a script looked for a new `checkpoint` thread in a
+follower and ran `perf record -F 199 --call-graph dwarf` on it while it
+lived. Every voter's threads were read from `/proc` each 5 s. The base
+is `df72e28`.
+
+**The profile** (a follower's 13 publications and reclaims, 8,715
+samples), each sample put under the publication step it ran in:
+
+| Step | Share | Of it, the kernel zeroing fresh pages |
+| --- | --- | --- |
+| The export's encode of each chunk (for its length and digest) | 32.6% | 23.5 points |
+| redb's scan | 20.6% | 0.9 points |
+| Writing and syncing the files | 15.6% | |
+| Verifying the image (its encode of each chunk) | 10.1% | |
+| The store's write (its encode of each chunk) | 9.9% | |
+| The export's rows (copied out of each page) | 5.9% | 3.0 points |
+| Dropping the image, and the rest | 5.3% | |
+
+- **Each chunk was encoded three times,** at 53% of the thread
+  together: once by the export, once by `verify_local`, once by the
+  store's write.
+- **Each encode went a byte at a time.** serde serializes a `Vec<u8>`
+  as a sequence, and postcard pushes each `u8` on its own
+  (`serialize_u8` and `Vec::push` under `RowV1`'s fields).
+- **Its buffer grew by doubling,** and the pages each growth faulted in
+  were zeroed by the kernel: 27% of the thread, almost all of it under
+  the export's encode.
+
+**The change** (the image's bytes do not change):
+- `RowV1`'s key and value serialize as bytes. postcard writes a
+  sequence of bytes and bytes alike, a varint length and the bytes, so
+  the encoding is the same; a test pins it against the derived form at
+  every varint width.
+- `ChunkV1::encode` sizes its buffer for the chunk before it writes.
+- `LocalCheckpointStore::write` writes each chunk from the bytes its
+  verification encoded (`verify_local_each`), so a publication encodes
+  a chunk twice, not three times. An image that does not verify leaves
+  no pending directory.
+- The export moves each scanned row into the image instead of copying
+  it, and verification compares keys by slice.
+- Each chunk after the first is encoded into the buffer the one before
+  it used (`ChunkV1::encode_into`), in the export and in verification.
+
+**The pair.** The base against the head, alternating; the head was
+read twice: with the first four changes (head 1), and with the reused
+buffer too (head 2). µs a record is every voter's export and write over
+the records each publication represented; CPU is each voter's process a
+command.
+
+| Side | Publications | Export µs/record | Write µs/record | Total µs/record | Export and write ms a command a voter | Process CPU ms/cmd (n1, n2, n3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| base | 33 | 6.07 | 2.50 | 8.58 | 0.145 | 0.970, 0.834, 0.820 |
+| head 1 | 36 | 4.83 | 0.70 | 5.54 | 0.108 | 0.950, 0.817, 0.802 |
+| base | 33 | 5.89 | 2.07 | 7.96 | 0.135 | 0.959, 0.830, 0.813 |
+| head 1 | 36 | 4.68 | 0.78 | 5.46 | 0.106 | 0.955, 0.820, 0.806 |
+| head 2 | 36 | 4.80 | 0.85 | 5.65 | 0.112 | 0.942, 0.810, 0.797 |
+| base | 33 | 5.40 | 1.92 | 7.33 | 0.124 | 0.968, 0.840, 0.823 |
+| head 2 | 36 | 4.64 | 0.80 | 5.44 | 0.107 | 0.940, 0.810, 0.793 |
+
+**What it says:**
+- **A publication costs about 30% less a record:** 7.33 to 8.58 µs
+  against 5.44 to 5.65. The write falls by two thirds; the export by
+  about a fifth.
+- **The process's CPU a command falls 2 to 3.6% at every voter** with
+  both heads. The head fits three more publications into the same run,
+  because each takes less time; publications stay on the same cadence
+  (records and time), so that is more images, not less work counted.
+- **The reused buffer moves the publication's time within the spread.**
+  Both of its runs read the process about 1% lower than either run of
+  the first head, which is near the spread too; it stays, since it is
+  four lines and removes the faults a chunk.
+- **What leads now** (the head's profile, 1,107 samples): redb's scan,
+  44.5% of the thread, then the export's encode at 26%, nearly all of it
+  zeroing fresh pages (before the reused buffer). The scan is the
+  engine's; it is not this task's.
+- **On the runner,** R2 sized a publication at the register row's
+  length at 0.15 to 0.2 ms an operation over five voters. A third less
+  is about −0.05 ms an operation. The batch's pairs read it.
+
 ## A fresh proposal's acceptance in its proposal batch (task-d89)
 
 task-d84's reading had the leader syncing three times a command at one
@@ -10974,11 +11161,14 @@ Three waits now also go out as distributions:
 - **The read barrier's wait,** arrival to answer (`cost.reads.waited`),
   at the barrier's millisecond resolution.
 - **The domain loop's run-queue time a pass**
-  (`cost.cpu.domain_scheduling.run_queue_per_pass`): one pass in 16
-  reads the thread's `schedstat` at its start and again at the next
-  pass's start, so a sample is the pass's own preemptions and the wait
-  to run once something woke it. Two reads of a `/proc` file in 16
-  passes; the total run-queue time beside it is unchanged. Idle passes
+  (`cost.cpu.domain_scheduling.run_queue_per_pass`): the first pass to
+  start 10 ms or more after the last sampled one reads the thread's
+  `schedstat` at its start and again at the next pass's start, so a
+  sample is the pass's own preemptions and the wait to run once
+  something woke it. Two reads of a `/proc` file every 10 ms; the total
+  run-queue time beside it is unchanged. (It was one pass in 16 until
+  task-d115: on a busy leader that was 35 of its loop's 55 system calls
+  a turn.) Idle passes
   outnumber working ones many times over, so the samples whose pass
   executed a command also go into `run_queue_per_working_pass`, which
   compares with the commands' own tails.
@@ -11020,3 +11210,260 @@ of the bucket its rank falls in, never past the longest.
 each, from a voter's last snapshot, in a fourth table. A line written
 before task-d97 reads with empty distributions, which have no quantile
 rather than a zero one.
+
+## Why a lowering group ends (task-d73)
+
+task-d47's loop flushes only once no event is ready, after 64 events
+(`FLUSH_EVENTS`), or once `FLUSH_QUEUED` records are queued. task-d73
+counts each flush by its cause, in `Cost::flush_causes` (named so
+beside task-d102's `Cost::flushes`, which counts the events before each
+flush):
+- `idle`: the `owes_flush` arm, which fires when no event is ready;
+- `events`: the 64-event bound;
+- `queued`: a full group;
+- `appending`: beside any of these, a flush while an append is out.
+
+`command_cost.py table` prints them a command.
+
+**The setup.** Three voters on one host (x86_64, 4 CPUs), `replay`,
+stores on tmpfs, 20,000 operations, at 10 and 30 callers. The binaries
+carry this entry's counters over task-d89's head, the shape the batch's
+head side takes.
+
+| callers | node | idle | event bound | full group | while appending | commands/append | commands/commit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | n1 | 0.828 | 0.001 | 0.000 | 0.016 | 1.22 | 1.28 |
+| 10 | n2 | 0.969 | 0.001 | 0.000 | 0.024 | 1.05 | 1.12 |
+| 10 | n3 | 1.034 | 0.002 | 0.000 | 0.015 | 0.98 | 1.04 |
+| 30 | n1 | 0.349 | 0.010 | 0.000 | 0.008 | 2.83 | 2.93 |
+| 30 | n2 | 0.507 | 0.005 | 0.000 | 0.009 | 1.98 | 2.08 |
+| 30 | n3 | 0.513 | 0.012 | 0.001 | 0.012 | 1.94 | 2.07 |
+
+Flushes are a command; n1 is the leader.
+
+**What it says:**
+- **Almost no group ends while events are ready.** As shares of each
+  voter's flushes (the table is a command): 99.8 to 99.9% find nothing
+  ready at 10 callers, and 97.2 to 99.0% at 30. The 64-event bound and a
+  full group are the rest: 0.1 to 0.2% at 10 callers and 1.0 to 2.8% at
+  30, at most 0.013 a command. A larger bound could merge only those,
+  about one flush in eighty commands. So task-d47 already groups what
+  there is, and C3 (task-d72) has nothing worth building.
+- **An append out rarely holds a flush back on tmpfs** (1.4 to 2.5% of
+  flushes). On
+  the runner's disk, where an append takes about 2.3 ms, the queue
+  already grows behind each append.
+- **The materializer's cost is per record more than per commit.** Its
+  served time at the leader is 0.167 to 0.171 ms a command at 10 callers
+  and 0.137 to 0.144 at 30. A line through the two gives about 60 µs a
+  commit and 115 µs a record. task-d86's cadence is re-sized from that:
+  −0.03 to −0.09 ms an operation at the register row, against the
+  −0.15 to −0.30 first sized.
+
+**The bounded wait is not taken.** A wait of a few hundred microseconds
+would at most double the groups at 10 callers. That saves about half a
+commit (about 30 µs at the materializer) and half an append a command a
+voter, plus the datagrams a flush sends, which C1 and C2 already cut.
+It adds up to the wait to every command, and the `service` row's p99 is
+what the batch is furthest from. At one caller, where that p99 is read,
+there is nothing to group. The counters stay for the batch's pairs.
+
+## The api plane's frames by kind (R3, for task-d88)
+
+The api plane carried more datagrams than the peer plane in #155's pairs,
+and nothing said what. Each node now counts the frames it hands its
+transport, and takes from it, on api connections, by kind
+(`traffic.api_frames`, read per command by `command_cost.py`). QUIC packs
+frames into datagrams as it sees fit, so datagrams can't be split by
+kind; the frames can.
+
+**The reading.** The batch's head as #185 assembles it (#179 with #178,
+#180, #184, #182 and #186) with these counters. Three voters on one host,
+each a frontend, 30 callers, the default mix, `replay`, stores on tmpfs,
+150,000 operations (2,107 `ok`/s). Per command executed:
+
+| frames a command | n1 (leader) | n2 | n3 | all |
+| --- | --- | --- | --- | --- |
+| submissions sent to a voter elsewhere | 0.98 | 0.49 | 0.53 | 2.00 |
+| reads sent to the leader (task-d50) | 0 | 0.34 | 0.35 | 0.70 |
+| fast acknowledgements returned to a collector | 0 | 0.76 | 0 | 0.76 |
+| slow acknowledgements returned | 0.51 | 0.76 | 0.74 | 2.00 |
+| leader replies returned | 0.51 | 0 | 0 | 0.51 |
+| releases returned | 0.51 | 0 | 0 | 0.51 |
+| read answers returned | 0.70 | 0 | 0 | 0.70 |
+| callers' frames taken | 0.60 | 0.59 | 0.62 | 1.80 |
+| collectors' frames taken | 1.21 | 0.75 | 0.74 | 2.70 |
+| api datagrams sent | 3.65 | 3.19 | 3.12 | 9.97 |
+| peer datagrams sent | 2.39 | 0.94 | 0.74 | 4.07 |
+
+**What it says:**
+- **The api plane is the larger plane, about 10 datagrams a command
+  against the peer plane's 4.** Frames sent on it come to about 9 a
+  command (the submissions, reads and returned frames above, and about
+  one answer a caller's frame, which isn't counted), so about 1.1
+  datagrams a frame. The peer plane sends
+  about 9 frames on 4.1 datagrams, 0.45 a frame.
+- **Why:** task-d61's several frames a stream is granted on the peer
+  plane only, and coordd hands each frame it returns to a collector to
+  the transport alone (`return_to_collector`, one `send` each), where a
+  turn's peer frames go together (`send_turn`). So every frame between a
+  collector and a voter is a stream of its own.
+- **The lever, recorded before it is built:** several frames a stream
+  on links between a collector and a voter, and a turn's frames for one
+  connection handed over together. At the peer plane's batching, the 7.2
+  collector-to-voter frames a command take about 4.7 datagrams fewer,
+  about a third of the voters' sends. The workers' cost follows datagrams
+  (task-d70's third step), so it is sized at −0.15 to −0.4 ms an
+  operation at the register row.
+- **The lever, built and measured, not kept.** The voter grants a
+  collector's api link a new capability (`0x0021`) and sends what it
+  returns to that collector several frames a stream, and coordd hands a
+  step's frames for one connection to the transport together. A
+  stream the collector opens (a submission or a read) still carries one
+  request. The code is on `claude/task-d88-deliveries-per-stream`
+  (`0c5e122`), with its transport tests and its `spec/wire-v1.md` entry.
+  A local pair on the same head, with the lever and without, alternating,
+  four runs a side, 30 callers, `replay`, tmpfs, 50,000 operations:
+
+  | side | `ok`/s | CPU/cmd, all voters (ms) | api datagrams sent/cmd | peer datagrams sent/cmd |
+  | --- | --- | --- | --- | --- |
+  | without | 2476, 2598, 2598, 2605 | 2.393, 2.474, 2.388, 2.262 | 10.47, 10.95, 10.71, 10.48 | 4.21, 4.39, 4.28, 4.17 |
+  | with | 2485, 2594, 2587, 2551 | 2.403, 2.367, 2.278, 2.375 | 9.31, 9.35, 9.20, 9.31 | 4.28, 4.37, 4.33, 4.36 |
+
+  The api plane's datagrams fell 13% (10.65 to 9.29 a command), a third of
+  what the sizing assumed. Only the returned direction is batched, and a
+  step seldom holds more than a frame or two for one collector. The
+  voters' CPU didn't move: the means are 2.379 and 2.356 ms, and two
+  pairs went each way. That's −0.02 ms against the −0.15 to −0.4 it was
+  sized at. A wire capability for no CPU is not worth carrying, so it
+  stays off the stack. Batching the submission direction too would mean
+  answering a collector's requests on a stream other than the one they
+  came on, and this reading gives no reason to expect more from it.
+- **Not this task's:** which frames a collector needs. A follower in
+  the fast quorum returns both its fast and its slow acknowledgement, and
+  the slow one counts only when the fast path does not hold. Changing what a
+  frontend learns from is a design step of its own.
+- **On the carry since.** Task-d115's lever 4 hands a round's frames for
+  one collector to the transport together (`return_to_collectors`,
+  `offer_many`), and what a full queue refuses is kept and offered again
+  (`coord_daemon::unreturned`). The counts by kind are taken where the
+  transport admits a frame, on the first offer or a later one, so a frame
+  kept and offered again is counted once. The table above was read before
+  that, on one `send` a frame.
+
+## A voter's policy bounded in staleness: what the tests pin (#320)
+
+#320 bounds how long a voter's frontend answers from its own policy: it
+asks the leader it follows every half allowance (`Freshness`,
+`0x0108`), the leader answers once a round started after the ask
+arrived has confirmed and its read index has executed, and the voter
+stamps the ask's send time once its committed projection has reached
+the answer's position. Design 6.4 states the rule. The follow-up to
+#320's review adds the tests and limits below.
+
+- **A stale node refuses a bind before it reads the token.**
+  `PolicySource::fresh` is asked before the token is verified, and the
+  refusal is its own, `BindError::Stale`, closed as
+  `Rejected` with the reason "bind unavailable". A token that would
+  fail verification gets the same answer on a stale node as a good one
+  (`a_stale_policy_holds_output_and_loses_the_watch_rather_than_denying`),
+  so the reason says nothing about the token. The kine client returns
+  `ErrBindUnavailable`, which the backend maps to gRPC `Unavailable`,
+  and keeps its token (`TestBindUnavailableKeepsTheToken`, with a
+  control that a refused token is still dropped once). The SDK's
+  `binding_unavailable` closes the connection and keeps the credential.
+- **An answer after the ballot moved still counts for the ask it
+  answers.** A later ballot's commits need a quorum that left the ask's
+  ballot after confirming, so they follow the ask's arrival, and the
+  answer covers only what was committed before it.
+  `an_answer_after_the_ballot_moved_still_stamps_its_send_time` pins
+  that the old leader's answer stamps its ask, an answer from the new
+  leader to an ask it never got is ignored, and the new leader's answer
+  to its own ask stamps that ask.
+- **A domain whose every voter is stale still turns fresh.** No client
+  write can be the first proposal, since no bind is admitted. A leader
+  with nothing proposed has no read index, so lease renewal proposes
+  `EstablishLeaseAuthority` for it.
+  `an_idle_leader_proposes_so_a_stale_domain_turns_fresh` pins the
+  wiring from `Expiry::renew` through the domain; without the renewal
+  the leader holds the ask and the voter stays stale
+  (`only_a_confirmed_ask_opens_the_policy`).
+- **One origin cannot take the leader's places.** A leader holds 256
+  asks, and 4 from one connection or its own voter
+  (`ASKS_HELD_PER_ORIGIN`). At most about three of a voter's asks can
+  still make it fresh, so 4 is room for those and one more.
+  `a_leader_holds_a_bounded_number_of_freshness_asks_from_each_origin`.
+- **End to end.** `a_cut_off_voter_stops_binding_and_binds_again_once_healed`
+  (`bins/coordd/tests/multi_host.rs`) runs three voters with a 2 s
+  allowance, stops two with `SIGSTOP`, and checks that the third goes
+  stale and refuses a bind ("a binding was refused: Stale" in its log)
+  past the allowance, then that it turns fresh and binds again once the
+  two continue. A revocation in between is not driven end to end:
+  coordd has no command that revokes a session, so the revocation half
+  stays with the `coord-session` tests.
+- **Left as is for alpha.** The allowance runs on the monotonic clock,
+  which stops in suspend: a voter resumed after a freeze answers for at
+  most what was left of one allowance. A leader built before #320
+  closes the link on `0x0108`, so a voter with the bound under it stays
+  stale; voters move to the bound together. The stale transition is a
+  log line, not a metric.
+
+## A disclosure the projection is behind for is held, not answered pending (task-d93)
+
+A follow-up to task-d74 (#167 review). The frontend's output gate reads
+this node's materialized projection, and a session no barrier on this
+node has shown yet is "not yet", not "no" (the section above). The gate
+answered such a disclosure `Pending`. That was rare while every voter
+learned a command from every other voter's acknowledgements. Under
+task-d74's routing a follower learns it from the leader's commit
+frontier, one leader turn and a hop later, so a read right after a bind
+at a follower is answered `Pending` more often. CI on #167's stack
+merge hit it once, in a leader-restart test. The client library reports
+a `Pending` read as unknown, and resolving a read that went to the
+barrier finds nothing, so the application has to read again, and a
+Jepsen history records the read as indeterminate.
+
+**The gate holds the disclosure.** `BoundFrontend::deliver_at` (coordd's
+path for every release) keeps a delivery whose session this node has
+not projected, rather than answering it. `release_held` gates each held
+delivery again against a fresh barrier, and hands out the ones whose
+session the projection now shows, disclosed or refused as the gate
+decides. It answers `Pending` for any still behind at its hold's end:
+the client's own deadline, or `GATE_HOLD_MILLIS` (2 s) after the hold
+began, whichever is earlier. coordd calls it after every flush and every
+settle (`stops_on`), which is when the projection moves, on every turn,
+and at the earliest hold's deadline, which `next_deadline` wakes for. A held
+delivery goes with its connection. The hold is bounded at the frontend's
+request bound, past which it answers `Pending` at once.
+
+**What a release is authorized by doesn't change.** A held delivery is
+gated again when it goes out, against the barrier at that moment. That's
+the same barrier a caller who asked again then would have been gated
+against, and the gate's rules are unchanged. A session a barrier showed
+and no longer shows is still refused, not held. A retained answer isn't
+held, since its caller is answered within the call on the stream it
+retried on; it is answered `Pending` as before (`deliver` keeps that
+behaviour, and `deliver_retained` uses it).
+
+**On the carry, a release is gated as an answer is** (#313 review).
+coordd builds both barriers in `answer_policy`: over the applier's read
+view, so a grant revoked in a group the projection hasn't committed yet
+is seen (#281), and only while the voter's policy is fresh (#320). A
+release over the committed store alone could miss such a revoke, and
+wasn't bounded by the staleness cap. With the policy stale, a held
+disclosure is answered `Pending` when it is released, as an answer
+would be: stale is "not yet", not a denial. One the policy can't be
+read for is withheld.
+
+**A held disclosure keeps its request's record** (Codex on #98). The
+release gates a disclosure from its request's record: its namespace and
+keys. The frontend forgets a settled record once the dispatcher no
+longer holds its key, and the dispatcher lets a leader read's answer go
+when it is answered. So requests arriving while the projection lagged
+could forget a held read's record, and its release was refused with a
+final `OUTPUT_WITHHELD`. The gate's held keys now count as held when
+the frontend forgets records, and in that bound.
+
+**The stopgap goes.** `c01a397` had the two leader-restart tests present
+a read again while their node answered `Pending` (`read_projected`). It is
+reverted, and the tests read once.

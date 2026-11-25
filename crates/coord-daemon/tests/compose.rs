@@ -955,6 +955,54 @@ fn the_command_table_capacity_is_configuration_within_bounds() {
     }
 }
 
+/// The policy staleness bound (#312, #320) is configuration within
+/// bounds: unset, a voter gets the default; inside them, it is taken as
+/// written; outside them, it is refused and the setting named. Zero
+/// would close a leading voter's policy between two looks in one pass,
+/// and a huge value would bound nothing.
+#[test]
+fn the_policy_staleness_is_configuration_within_bounds() {
+    use coord_daemon::config::{
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS, MAX_POLICY_STALENESS_MILLIS,
+        MIN_POLICY_STALENESS_MILLIS,
+    };
+    let unset = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        unset.limits.max_policy_staleness_millis,
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS
+    );
+    let limits = |millis: u64| {
+        base_config(&format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             max_policy_staleness_millis = {millis}\n"
+        ))
+    };
+    for millis in [
+        MIN_POLICY_STALENESS_MILLIS,
+        DEFAULT_MAX_POLICY_STALENESS_MILLIS,
+        MAX_POLICY_STALENESS_MILLIS,
+    ] {
+        let config = Config::parse(&limits(millis)).unwrap();
+        assert_eq!(config.limits.max_policy_staleness_millis, millis);
+    }
+    for millis in [
+        0,
+        MIN_POLICY_STALENESS_MILLIS - 1,
+        MAX_POLICY_STALENESS_MILLIS + 1,
+    ] {
+        assert_eq!(
+            Config::parse(&limits(millis)),
+            Err(ConfigError::OutOfRange {
+                field: "limits.max_policy_staleness_millis",
+                min: MIN_POLICY_STALENESS_MILLIS,
+                max: MAX_POLICY_STALENESS_MILLIS,
+            }),
+            "{millis}"
+        );
+    }
+}
+
 /// The largest configured table still gives a Sync that can be written
 /// as one row and sent as one frame (task-d05, measured again in
 /// task-d20).
@@ -1128,6 +1176,20 @@ fn the_replay_profile_is_opt_in_and_its_cadence_is_bounded() {
     assert_eq!(replay.journal.projection_durable_commits, 64);
     assert_eq!(replay.journal.projection_durable_records, 4096);
     assert_eq!(replay.journal.projection_durable_ms, 100);
+    // The commit hold (task-d86): on under the replay profile, off under
+    // strict, and zero turns it off rather than being refused.
+    assert_eq!(replay.journal.projection_commit_records, 32);
+    assert_eq!(replay.journal.projection_commit_ms, 5);
+    assert_eq!(
+        replay.journal.projection_commit_hold(),
+        Some((32, std::time::Duration::from_millis(5)))
+    );
+    assert_eq!(strict.journal.projection_commit_hold(), None);
+    for field in ["projection_commit_records", "projection_commit_ms"] {
+        let zero = named.replace("[journal]\n", &format!("[journal]\n{field} = 0\n"));
+        let parsed = Config::parse(&zero).unwrap_or_else(|e| panic!("{field} = 0: {e:?}"));
+        assert_eq!(parsed.journal.projection_commit_hold(), None, "{field} = 0");
+    }
 
     for field in [
         "projection_durable_commits",

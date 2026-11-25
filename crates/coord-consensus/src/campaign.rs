@@ -19,7 +19,8 @@ use coord_types::ids::{Ballot, ReplicaId};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{
-    CandidateDecisions, RecoveryError, RecoveryReport, SyncDecision, select_ruled,
+    CandidateDecisions, RecoveryError, RecoveryReport, SelectionCounts, SyncDecision,
+    select_counted,
 };
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
@@ -34,11 +35,22 @@ pub struct Campaign {
     bound: Option<BarrierId>,
     durable: bool,
     published: bool,
-    /// Voters the missing payloads were already asked for. A voter that
-    /// promises later is asked too: the ones asked first may be gone, and
-    /// the campaign must not wait forever on a live quorum that holds the
-    /// payload.
-    payloads_requested: BTreeSet<ReplicaId>,
+    /// What the selection waits for before it is bound: the commands
+    /// [`crate::follower::Follower`]'s selection read named missing when
+    /// the decision was checked, less those supplied since. `None` until
+    /// the decision is checked, which is once per decision: the
+    /// whole-selection checks and this read ran again on every payload
+    /// frame, and a candidate behind by 836 commands spent 12 s of its
+    /// domain thread in them before it led (#98, the takeover gap).
+    awaited: Option<BTreeSet<CommandId>>,
+    /// How many payload asks this campaign made to one voter: the next
+    /// one goes to the next promised voter in turn.
+    payload_asks: usize,
+    /// The voter the last such ask went to.
+    payload_source: Option<ReplicaId>,
+    /// Voters that left an ask unanswered until it was asked again:
+    /// skipped in turn while another promised voter is left.
+    payload_sources_failed: BTreeSet<ReplicaId>,
     /// How many times the complete reports were assembled (task-d26).
     assemblies: u64,
     /// The complete reports last assembled from, by count, and whether a
@@ -57,6 +69,16 @@ pub struct Campaign {
     rows_wanted: Vec<CommandId>,
     /// The rules its selection applies beyond task-29's (task-d90).
     rules: crate::recovery::SelectionRules,
+    /// Possible-fast candidates its selections dropped behind a command
+    /// no report holds and the candidate doesn't hold decided, every
+    /// selection made counted, since last taken (task-d119).
+    unreported_undecided: u64,
+    /// Whether the selection it holds dropped a possible-fast candidate
+    /// whose dependencies reach a command no report holds (task-d119).
+    selected_past_unreported: bool,
+    /// Of those, whether that command is one the candidate doesn't hold
+    /// decided either.
+    selected_past_undecided: bool,
 }
 
 impl Campaign {
@@ -72,7 +94,10 @@ impl Campaign {
             bound: None,
             durable: false,
             published: false,
-            payloads_requested: BTreeSet::new(),
+            awaited: None,
+            payload_asks: 0,
+            payload_source: None,
+            payload_sources_failed: BTreeSet::new(),
             assemblies: 0,
             assembled_from: None,
             supply_moved: false,
@@ -80,6 +105,9 @@ impl Campaign {
             sources: Vec::new(),
             rows_wanted: Vec::new(),
             rules: crate::recovery::SelectionRules::default(),
+            unreported_undecided: 0,
+            selected_past_unreported: false,
+            selected_past_undecided: false,
         }
     }
 
@@ -101,19 +129,78 @@ impl Campaign {
         &self.promised
     }
 
-    /// Promised voters that have not been asked for the missing payloads
-    /// yet, `me` excluded: whom to ask now.
-    pub fn payload_requests_due(&self, me: ReplicaId) -> Vec<ReplicaId> {
-        self.promised
-            .iter()
-            .filter(|v| **v != me && !self.payloads_requested.contains(v))
-            .copied()
-            .collect()
+    /// Whether this campaign asked for payloads yet.
+    pub const fn asked_payloads(&self) -> bool {
+        self.payload_asks > 0
     }
 
-    /// Record that the missing payloads were requested from `voters`.
-    pub fn mark_payloads_requested(&mut self, voters: &[ReplicaId]) {
-        self.payloads_requested.extend(voters.iter().copied());
+    /// The promised voter, `me` excluded, to ask for the next batch of
+    /// payloads: one voter a batch, in turn (the takeover gap on #98).
+    /// Asked of every promised voter, each payload came back once from
+    /// each, and two of every three frames were duplicates. A voter that
+    /// left an ask unanswered is passed over while another is left.
+    pub fn next_payload_source(&mut self, me: ReplicaId) -> Option<ReplicaId> {
+        let others = |skip: &BTreeSet<ReplicaId>| -> Vec<ReplicaId> {
+            self.promised
+                .iter()
+                .filter(|v| **v != me && !skip.contains(v))
+                .copied()
+                .collect()
+        };
+        let mut sources = others(&self.payload_sources_failed);
+        if sources.is_empty() {
+            sources = others(&BTreeSet::new());
+        }
+        let source = *sources.get(self.payload_asks % sources.len().max(1))?;
+        self.payload_asks = self.payload_asks.wrapping_add(1);
+        self.payload_source = Some(source);
+        Some(source)
+    }
+
+    /// The ask out was not answered in full and is asked again: the voter
+    /// it went to is passed over from here on, while another promised
+    /// voter is left.
+    pub fn payload_source_failed(&mut self) {
+        if let Some(v) = self.payload_source.take() {
+            self.payload_sources_failed.insert(v);
+        }
+    }
+
+    /// What the selection waits for, once its decision is checked.
+    pub const fn awaited(&self) -> Option<&BTreeSet<CommandId>> {
+        self.awaited.as_ref()
+    }
+
+    /// The decision is checked, and it waits for `missing`.
+    pub fn await_payloads(&mut self, missing: BTreeSet<CommandId>) {
+        self.awaited = Some(missing);
+    }
+
+    /// Drop from what the selection waits for `command`, if `still`
+    /// says it is no longer missing, and then every awaited command from
+    /// the front that is not: each supplied command leaves once, so the
+    /// waits a candidate makes cost in all what it lacked, not that
+    /// times the selection.
+    pub fn settle_awaited(
+        &mut self,
+        command: Option<&CommandId>,
+        still: impl Fn(&SyncDecision, &CommandId) -> bool,
+    ) {
+        let (Some(decision), Some(awaited)) = (self.decision.as_ref(), self.awaited.as_mut())
+        else {
+            return;
+        };
+        if let Some(c) = command
+            && !still(decision, c)
+        {
+            awaited.remove(c);
+        }
+        while let Some(first) = awaited.first() {
+            if still(decision, first) {
+                break;
+            }
+            awaited.pop_first();
+        }
     }
 
     /// A campaign resumed from a durably bound selection (after a crash):
@@ -122,6 +209,16 @@ impl Campaign {
         let mut c = Campaign::new(config);
         c.decision = Some(decision);
         c.durable = true;
+        c
+    }
+
+    /// A campaign that has selected `decision` and not bound it yet, for
+    /// the tests that read what such a candidate lacks (audit item 5 on
+    /// #98).
+    #[cfg(test)]
+    pub(crate) fn selected(config: BallotConfiguration, decision: SyncDecision) -> Self {
+        let mut c = Campaign::new(config);
+        c.decision = Some(decision);
         c
     }
 
@@ -256,6 +353,28 @@ impl Campaign {
     /// before it.
     pub const fn assemblies(&self) -> u64 {
         self.assemblies
+    }
+
+    /// Possible-fast candidates this campaign's selections dropped whose
+    /// dependencies reach a command no report holds and the candidate
+    /// doesn't hold decided, since the last call: every selection made
+    /// counted, kept or not (task-d119).
+    pub fn take_unreported_undecided(&mut self) -> u64 {
+        core::mem::take(&mut self.unreported_undecided)
+    }
+
+    /// Whether the selection this campaign holds dropped a possible-fast
+    /// candidate whose dependencies reach a command no report holds
+    /// (task-d119).
+    pub const fn selected_past_unreported(&self) -> bool {
+        self.decision.is_some() && self.selected_past_unreported
+    }
+
+    /// Whether the selection this campaign holds dropped a possible-fast
+    /// candidate whose dependencies reach a command no report holds and
+    /// the candidate doesn't hold decided (task-d119).
+    pub const fn selected_past_undecided(&self) -> bool {
+        self.decision.is_some() && self.selected_past_undecided
     }
 
     /// Report pages held (task-d28).
@@ -404,15 +523,23 @@ impl Campaign {
         }
         let decision = loop {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
-            match select_ruled(
+            let counts = SelectionCounts::default();
+            let selected = select_counted(
                 &self.config,
                 &reports,
                 &supplied,
                 source,
                 &decided,
                 self.rules,
-            ) {
-                Ok(decision) => break decision,
+                &counts,
+            );
+            self.unreported_undecided += counts.unreported_undecided.get();
+            match selected {
+                Ok(decision) => {
+                    self.selected_past_unreported = counts.unreported.get() > 0;
+                    self.selected_past_undecided = counts.unreported_undecided.get() > 0;
+                    break decision;
+                }
                 // Rows the runtime reads for the candidate: waited for, as
                 // a payload is (task-d77).
                 Err(RecoveryError::ExecutedRowsUnread { commands }) => {

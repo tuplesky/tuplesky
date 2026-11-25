@@ -391,7 +391,7 @@ fn a_checkpoint_publication_takes_a_commit_out_back_first() {
     let pointer = coord_journal_api::frontier::CheckpointPointerV1 {
         origin: world.store.origin(A).unwrap(),
         represented,
-        format: 1,
+        format: coord_journal_api::frontier::LOCAL_CHECKPOINT_FORMAT_V1,
         manifest_digest: coord_types::identity::Digest32([0x5a; 32]),
         checkpoint_id: coord_types::identity::Digest32([0x5b; 32]),
     };

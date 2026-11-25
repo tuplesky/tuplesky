@@ -89,6 +89,16 @@ fn meshed(said: &str) -> bool {
         && reported(said, "voters submittable=").last() == Some(&2)
 }
 
+/// Whether a voter last said its policy is fresh (#320): a voter binds
+/// nobody until its leader has confirmed its store, after its first
+/// start and after a restart alike, so a caller binds once it has.
+fn policy_fresh(said: &str) -> bool {
+    said.lines()
+        .rev()
+        .find(|line| line.contains("this voter's policy is "))
+        .is_some_and(|line| line.contains("this voter's policy is fresh"))
+}
+
 /// One voter, run from its bundle the way `coord-harness start` runs it.
 struct Voter {
     bundle: PathBuf,
@@ -218,6 +228,11 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
         );
     }
     let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    assert!(
+        voters[0].waits_until(60, 0, policy_fresh),
+        "voter 1's policy never turned fresh:\n{}",
+        voters[0].said()
+    );
     let mut first = Caller::connect(&run, &provisioned, &minter, 0, 0)
         .await
         .expect("a caller bound at voter 1");
@@ -239,6 +254,11 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
             voter.said()
         );
     }
+    assert!(
+        voters[2].waits_until(60, 0, policy_fresh),
+        "the late voter's policy never turned fresh:\n{}",
+        voters[2].said()
+    );
     let mut late = Caller::connect(&run, &provisioned, &minter, 2, 1)
         .await
         .expect("a caller bound at the late voter");
@@ -287,6 +307,7 @@ async fn a_voter_killed_under_the_replay_profile_comes_back_and_serves() {
             projection_durable_commits: Some(u32::MAX),
             projection_durable_records: Some(u32::MAX),
             projection_durable_ms: Some(3_600_000),
+            ..JournalPlan::default()
         },
     )
     .await;
@@ -394,6 +415,11 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     }
 
     let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    assert!(
+        voters[0].waits_until(60, 0, policy_fresh),
+        "voter 1's policy never turned fresh:\n{}",
+        voters[0].said()
+    );
     let mut caller = Caller::connect(&run, &provisioned, &minter, 0, 0)
         .await
         .expect("a caller bound at voter 1");
@@ -406,16 +432,25 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     );
 
     // Voter 3 has applied the write before it goes: under the replay
-    // profile, a working commit its kill loses.
+    // profile, a working commit its kill loses. The caller's session is
+    // a moment old, and a voter that has not projected it yet answers
+    // the read pending (the output gate's "not yet"), so the read is
+    // asked again until it is answered, as `read_value` does.
     if replay {
+        assert!(
+            voters[2].waits_until(60, 0, policy_fresh),
+            "voter 3's policy never turned fresh:\n{}",
+            voters[2].said()
+        );
         let mut at_three = Caller::connect(&run, &provisioned, &minter, 2, 2)
             .await
             .expect("a caller bound at voter 3");
+        // A fresh session's first read can be held at the output gate
+        // and resolved as unknown, so it is asked through `read_value`,
+        // which asks again (it failed once in CI as `Unknown`).
         assert_eq!(
-            at_three
-                .ask(&get(&provisioned, b"before"), Duration::from_secs(30))
-                .await,
-            Answer::Established,
+            read_value(&mut at_three, &provisioned, b"before").await,
+            Some(b"placed".to_vec()),
             "voter 3 did not serve the write before it was killed:\n{}",
             voters[2].said()
         );
@@ -464,6 +499,13 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
         );
     }
 
+    // A restarted voter is stale until its leader confirms its store
+    // again (#320).
+    assert!(
+        voters[2].waits_until(60, since[2], policy_fresh),
+        "the returned voter's policy never turned fresh:\n{}",
+        voters[2].said()
+    );
     let mut returned = Caller::connect(&run, &provisioned, &minter, 2, 1)
         .await
         .expect("a caller bound at the returned voter");
@@ -484,6 +526,184 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
         read_value(&mut returned, &provisioned, b"before").await,
         Some(b"placed".to_vec()),
         "the returned voter did not read back the write from before its kill:\n{}",
+        voters[2].said()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A voter cut off from both others stops binding within its policy
+/// allowance, and binds and serves again once it is back (#320
+/// follow-up).
+///
+/// Voters 1 and 2 are stopped (`SIGSTOP`), not killed: nothing closes,
+/// and voter 3 just hears nothing, as across a partition. Its freshness
+/// asks go unanswered -- sent to a stopped leader, or, if it leads, with
+/// no quorum to confirm its rounds -- so once the allowance after the
+/// last ask it sent before the cut has run, its policy is stale: it says
+/// so, and refuses a new binding as unavailable before it reads the
+/// credential. Continued, the two answer again, and voter 3 turns fresh,
+/// binds a caller and serves a read of the write from before the cut.
+///
+/// What a stale voter would otherwise have disclosed after a revoke is
+/// not driven here: no daemon command revokes a grant, so the serve and
+/// binding tests write the revoke into the store. This covers the cut
+/// and the heal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_off_voter_stops_binding_and_binds_again_once_healed() {
+    // A short allowance, so the cut takes seconds; two of them, so a
+    // voter linked and current never goes stale between asks on a
+    // loaded runner.
+    const ALLOWANCE_MILLIS: u64 = 2_000;
+    if HOSTS.iter().any(|h| UdpSocket::bind((*h, 0)).is_err()) {
+        eprintln!("skipped: {HOSTS:?} are not all assigned on this machine");
+        return;
+    }
+    let dir = workspace("cut");
+    let api = free_everywhere(&[]);
+    let peer = free_everywhere(&[api]);
+    let spec = HOSTS
+        .iter()
+        .enumerate()
+        .map(|(i, host)| format!("n{}={host}:{api}:{peer}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let run = dir.join("run");
+    let provisioned = provision(&Plan {
+        hosts: parse_hosts(&spec).expect("a host list"),
+        // Any limit writes the `[limits]` section the allowance goes in;
+        // this one at the daemon's default.
+        max_admitted_per_second: Some(1_000),
+        ..Plan::loopback(run.clone(), 3, 0)
+    })
+    .expect("provisioned");
+    let mut voters: Vec<Voter> = (1..=3)
+        .map(|n| Voter {
+            bundle: run.join(format!("n{n}")),
+            daemon: None,
+        })
+        .collect();
+    for voter in &voters {
+        let path = voter.bundle.join("coordd.toml");
+        let written = std::fs::read_to_string(&path).expect("the voter's configuration");
+        let edited = written.replacen(
+            "\n[limits]\n",
+            &format!("\n[limits]\nmax_policy_staleness_millis = {ALLOWANCE_MILLIS}\n"),
+            1,
+        );
+        assert_ne!(
+            edited, written,
+            "no [limits] section to put the allowance in"
+        );
+        let config = coord_daemon::config::Config::parse(&edited)
+            .expect("a configuration the daemon accepts");
+        assert_eq!(config.limits.max_policy_staleness_millis, ALLOWANCE_MILLIS);
+        std::fs::write(&path, edited).expect("written");
+    }
+    for (i, voter) in voters.iter_mut().enumerate() {
+        voter.start(i + 1, true);
+    }
+    for (i, voter) in voters.iter().enumerate() {
+        assert!(
+            voter.waits_until(60, 0, meshed),
+            "voter {} did not reach every other voter:\n{}",
+            i + 1,
+            voter.said()
+        );
+        assert!(
+            voter.waits_until(60, 0, policy_fresh),
+            "voter {}'s policy never turned fresh:\n{}",
+            i + 1,
+            voter.said()
+        );
+    }
+    let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    let mut before = Caller::connect(&run, &provisioned, &minter, 2, 0)
+        .await
+        .expect("a caller bound at voter 3");
+    assert_eq!(
+        before
+            .ask(&put(&provisioned, b"before"), Duration::from_secs(30))
+            .await,
+        Answer::Established,
+        "the domain did not establish a write"
+    );
+    assert_eq!(
+        read_value(&mut before, &provisioned, b"before").await,
+        Some(b"placed".to_vec()),
+        "voter 3 did not serve the write before the cut:\n{}",
+        voters[2].said()
+    );
+
+    // The cut. Whatever happens, the two are continued before anything
+    // is asserted, so a failure leaves no stopped daemon behind.
+    let signal = |voter: &Voter, signal: &str| {
+        let pid = voter.daemon.as_ref().expect("running").pid();
+        let status = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(status.success(), "kill {signal} {pid}");
+    };
+    let since = voters[2].said().len();
+    signal(&voters[0], "-STOP");
+    signal(&voters[1], "-STOP");
+    let stopped = std::time::Instant::now();
+    let stale = |said: &str| !policy_fresh(said) && said.contains("this voter's policy is stale");
+    let went_stale = voters[2].waits_until(30, since, stale);
+    // Every stamp is an ask's send time, and every ask an answer could
+    // still come back for was sent before the cut: past the allowance
+    // after it, no answer opens the policy, whatever was in flight.
+    let past = stopped + Duration::from_millis(ALLOWANCE_MILLIS + 250);
+    if let Some(wait) = past.checked_duration_since(std::time::Instant::now()) {
+        tokio::time::sleep(wait).await;
+    }
+    let cut_off = Caller::connect(&run, &provisioned, &minter, 2, 1).await;
+    // The daemon says why it refused before it closes the link, but its
+    // output reaches the log through the harness's reader and writer
+    // threads, so the caller can see the close before the line is in the
+    // file. Wait for the refusal to be said, whatever its reason, and
+    // then read the reason.
+    let _ = voters[2].waits_until(10, since, |said| said.contains("a binding was refused: "));
+    let said_at_the_cut = voters[2].said().get(since..).unwrap_or_default().to_owned();
+    signal(&voters[0], "-CONT");
+    signal(&voters[1], "-CONT");
+    assert!(
+        went_stale,
+        "the cut-off voter never said its policy is stale:\n{}",
+        voters[2].said()
+    );
+    assert!(
+        cut_off.is_err(),
+        "a cut-off voter bound a caller:\n{said_at_the_cut}"
+    );
+    assert!(
+        said_at_the_cut.contains("a binding was refused: Stale"),
+        "the cut-off voter refused the binding for another reason:\n{said_at_the_cut}"
+    );
+
+    // The heal: the voter turns fresh again, binds, and serves.
+    for (i, voter) in voters.iter().enumerate() {
+        assert!(
+            voter.waits_until(60, 0, meshed),
+            "voter {} did not get its links back:\n{}",
+            i + 1,
+            voter.said()
+        );
+    }
+    assert!(
+        voters[2].waits_until(60, since, policy_fresh),
+        "the healed voter's policy never turned fresh again:\n{}",
+        voters[2].said()
+    );
+    let mut healed = Caller::connect(&run, &provisioned, &minter, 2, 2)
+        .await
+        .expect("a caller bound at the healed voter");
+    assert_eq!(
+        read_value(&mut healed, &provisioned, b"before").await,
+        Some(b"placed".to_vec()),
+        "the healed voter did not serve the write from before the cut:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        voters[0].said(),
+        voters[1].said(),
         voters[2].said()
     );
     let _ = std::fs::remove_dir_all(&dir);

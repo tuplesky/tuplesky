@@ -172,12 +172,33 @@ impl EvidenceStore {
         }
     }
 
+    /// Count one more publication of a marked command's release again
+    /// (task-d100, step A), under the same bound as a repaired reply:
+    /// past [`MAX_EVIDENCE_REPAIRS`] the duplicate is refused, as an
+    /// unmarked command's would be (#204 review). Nothing is kept for a
+    /// marked command, so the counts are swept by the table here too.
+    pub fn count_release_again(
+        &mut self,
+        command: CommandId,
+        table: &CommandTable,
+    ) -> Result<(), ReplayRefusal> {
+        let repairs = self.repairs.entry(command).or_insert(0);
+        if *repairs >= MAX_EVIDENCE_REPAIRS {
+            return Err(ReplayRefusal::TooMany);
+        }
+        *repairs += 1;
+        if self.repairs.len() > self.capacity.saturating_mul(2) {
+            self.sweep(table);
+        }
+        Ok(())
+    }
+
     /// Forget every command the table no longer remembers either.
     fn sweep(&mut self, table: &CommandTable) {
-        self.own
-            .retain(|c, _| table.record(c).is_some() || table.tombstones().contains(c));
-        let own = &self.own;
-        self.repairs.retain(|c, _| own.contains_key(c));
+        let remembered =
+            |c: &CommandId| table.record(c).is_some() || table.tombstones().contains(c);
+        self.own.retain(|c, _| remembered(c));
+        self.repairs.retain(|c, _| remembered(c));
     }
 
     /// The sends that publish `command`'s evidence again, or why there

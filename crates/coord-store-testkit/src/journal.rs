@@ -145,6 +145,16 @@ impl ModelJournal {
         self.streams.entry(stream).or_default().records.push(record);
     }
 
+    /// Drop a stream's durable records past its first `len`, for a test
+    /// that writes others in their place with [`Self::inject_record`]: a
+    /// journal another writer would have left, such as a successor's
+    /// format.
+    pub fn truncate_records(&mut self, stream: StorageStreamId, len: usize) {
+        if let Some(s) = self.streams.get_mut(&stream) {
+            s.records.truncate(len);
+        }
+    }
+
     /// What the next record of a stream must be. A stream with durable
     /// records continues their chain; an empty one expects genesis under
     /// the identity its durable mapping was allocated for, so the cluster,

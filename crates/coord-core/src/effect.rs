@@ -43,8 +43,10 @@ pub struct StoreUpdate {
     /// Target collection.
     pub collection: CollectionId,
     /// Ordered key bytes.
+    #[serde(with = "crate::byte_string")]
     pub key: Vec<u8>,
     /// New value, or `None` for a tombstone/delete.
+    #[serde(with = "crate::byte_string::option")]
     pub value: Option<Vec<u8>>,
 }
 

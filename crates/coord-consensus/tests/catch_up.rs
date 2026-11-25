@@ -17,9 +17,9 @@
 use std::collections::VecDeque;
 
 use coord_consensus::{
-    AppliedOutcome, BallotConfiguration, CatchUpEntry, ConfigurationIdentity, Follower,
-    FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_COMMANDS, Phase,
-    ProtocolMessage, ReplicaRole,
+    AppliedOutcome, BallotConfiguration, CatchUpEntry, CatchUpPaths, ConfigurationIdentity,
+    Follower, FollowerConfig, FollowerRejection, Leader, LeaderConfig, MAX_CATCH_UP_BYTES,
+    MAX_CATCH_UP_COMMANDS, Phase, ProtocolMessage, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -145,6 +145,9 @@ struct Cluster {
     /// The most commands a served page carries: a donor whose byte bound
     /// cuts pages short.
     page_limit: usize,
+    /// The length of each put's value: 1, or large values for the byte
+    /// bound.
+    value_len: usize,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -206,6 +209,7 @@ impl Cluster {
             batches: vec![0; VOTERS as usize],
             catch_up_asks: Vec::new(),
             page_limit: MAX_CATCH_UP_COMMANDS,
+            value_len: 1,
         }
     }
 
@@ -296,7 +300,12 @@ impl Cluster {
 
     fn deliver(&mut self, to: usize, from: ReplicaId, frame: Vec<u8>) {
         let event = Event::Peer(AuthenticatedPeerMessage::new(
-            PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
             frame,
         ));
         let effects = self.nodes[to].step(event);
@@ -503,7 +512,7 @@ impl Cluster {
             NamespaceId([5; 16]),
             CanonicalOperation::Put(PutOp {
                 key: vec![key],
-                value: vec![key],
+                value: vec![key; self.value_len],
                 lease: None,
                 prev_kv: false,
             }),
@@ -629,6 +638,40 @@ impl Cluster {
         }
     }
 
+    /// Step node `i` with `frame` from `from`, and return its effects
+    /// unhandled.
+    fn step_peer(&mut self, i: usize, from: ReplicaId, frame: Vec<u8>) -> Vec<Effect> {
+        self.nodes[i].step(Event::Peer(AuthenticatedPeerMessage::new(
+            PeerProvenance::from_transport(
+                from,
+                ReplicaIncarnation::new(1).unwrap(),
+                coord_types::wire_v1::PeerRole::Voter,
+                1,
+            ),
+            frame,
+        )))
+    }
+
+    /// Execute at most `n` of node `i`'s executable commands, each over
+    /// its payload row, durable or in a batch submitted, when its payload
+    /// is held: what `coordd`'s lowering requires (#243 review, rule (b)).
+    fn execute_checked(&mut self, i: usize, n: usize) {
+        for _ in 0..n {
+            let Some(c) = self.follower(i).next_executable() else {
+                return;
+            };
+            assert!(
+                self.follower(i).payload(&c).is_none()
+                    || self.nodes[i]
+                        .storage
+                        .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0),
+                "r{i} ran {c:?} with its payload held and no payload row durable or in a \
+                 batch submitted"
+            );
+            self.execute_at_most(i, 1);
+        }
+    }
+
     fn deliver_page(&mut self, to: usize, from: u8, page: &ProtocolMessage) {
         self.deliver(to, r(from), page.encode());
     }
@@ -639,8 +682,15 @@ impl Cluster {
 /// still holds, so r4 is left with proposals it cannot adopt and
 /// submissions it cannot learn, and its table fills.
 fn left_behind(seed: u64) -> (Cluster, usize) {
+    left_behind_with(seed, |_| {})
+}
+
+/// [`left_behind`], with `before` done to the cluster before r4 is cut
+/// off.
+fn left_behind_with(seed: u64, before: impl FnOnce(&mut Cluster)) -> (Cluster, usize) {
     let capacity = 8;
     let mut cluster = Cluster::new(seed, capacity);
+    before(&mut cluster);
     cluster.down = vec![4];
     for seq in 1..=40 {
         cluster.admit(seq);
@@ -706,6 +756,75 @@ fn a_voter_past_a_full_table_catches_up_and_its_table_drains() {
             !refused.contains(&FollowerRejection::Backpressure),
             "seed {seed}: r4 still refuses for backpressure: {refused:?}"
         );
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}"
+        );
+    }
+}
+
+/// Every map forgetting drops stays bounded by the table at every voter,
+/// including one that falls behind by more than a table and catches up by
+/// pages: before it falls behind, while the others run on without it,
+/// once it has caught up, and while it takes new work after (task-d111
+/// item 4 (d), #221 review). The bound is the backstop sweep's threshold,
+/// four times the capacity: forgetting in order is to keep every map
+/// under it without a sweep. Once every voter has executed everything,
+/// no map is larger than the voter's ledger: an entry made for a
+/// command after it was forgotten, as a peer's late vote made one at r4
+/// before `collect` dropped those, stays over it.
+#[test]
+fn every_history_map_stays_bounded_at_a_voter_that_falls_behind_and_catches_up() {
+    fn maps(cluster: &Cluster, i: usize) -> coord_consensus::HistoryMaps {
+        match &cluster.nodes[i].role {
+            Role::Leader(l) => l.history_maps(),
+            Role::Follower(f) => f.history_maps(),
+        }
+    }
+    fn check(cluster: &Cluster, seed: u64, at: &str, threshold: usize) {
+        for i in 0..cluster.nodes.len() {
+            let m = maps(cluster, i);
+            assert!(
+                m.largest() < threshold,
+                "seed {seed}, {at}: r{i}'s history maps reached {m:?}"
+            );
+        }
+    }
+    // Once every voter has executed everything, an entry is one of a
+    // command the ledger still records: one more, in any map, is of a
+    // command it has forgotten, which nothing but a sweep would drop.
+    fn settled(cluster: &Cluster, seed: u64, at: &str) {
+        for i in 0..cluster.nodes.len() {
+            let (ledger, m) = match &cluster.nodes[i].role {
+                Role::Leader(l) => (l.ledger().len(), l.history_maps()),
+                Role::Follower(f) => (f.ledger().len(), f.history_maps()),
+            };
+            assert!(
+                m.largest() <= ledger,
+                "seed {seed}, {at}: r{i} keeps more than its ledger's {ledger}: {m:?}"
+            );
+        }
+    }
+    for seed in 1..=4 {
+        let (mut cluster, capacity) = left_behind(seed);
+        let threshold = capacity * 4;
+        check(&cluster, seed, "left behind", threshold);
+        cluster.catching = vec![4];
+        cluster.settle_ticking(8);
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}: r4 did not catch up"
+        );
+        check(&cluster, seed, "caught up", threshold);
+        settled(&cluster, seed, "caught up");
+        for seq in 61..=60 + capacity as u64 * 16 {
+            cluster.admit(seq);
+            cluster.settle();
+            check(&cluster, seed, "after", threshold);
+        }
+        cluster.settle_ticking(2);
+        check(&cluster, seed, "at the end", threshold);
+        settled(&cluster, seed, "at the end");
         assert_eq!(
             cluster.nodes[4].executed, cluster.nodes[0].executed,
             "seed {seed}"
@@ -836,38 +955,52 @@ fn a_restart_in_the_middle_of_a_page_resumes_without_executing_twice() {
     assert_eq!(*executed, cluster.nodes[0].executed);
 }
 
-/// A command the donor keeps no decided record of is executed at the
-/// donor's position and goes to history: this voter keeps no dependency
-/// row of it, and its table no record (task-d08).
+/// A page whose first command has no decided record installs nothing
+/// (seed 73): the donor kept no record of the command's decision, and
+/// within an epoch every voter that executed it holds one, so the window
+/// stops there and the next ask goes to another donor. Installed with no
+/// dependencies of its own, as it was, the command ran at the donor's
+/// position and left this voter's report, which took a vote from the
+/// selections that needed it (row 3, seed 0) and its place in this
+/// voter's order from the ones that read its absence (seed 73). A donor
+/// that kept the record brings it, decided.
 #[test]
-fn a_command_the_donor_keeps_no_row_of_goes_to_history() {
+fn a_page_whose_first_command_has_no_decided_record_installs_nothing() {
     let (mut cluster, _) = left_behind(11);
+    cluster.serve = false;
     let after = cluster.follower(4).executed_through();
     let mut page = cluster.page(0, ballot0(), after);
     let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
         unreachable!()
     };
-    let bare = entries[0].command;
-    entries[0].decided = None;
-    entries.truncate(1);
+    let first = entries[0].command;
+    let decided = entries[0].decided.take().expect("the donor's record");
+    let batches = cluster.batches[4];
+    let before = paths(&cluster);
     cluster.deliver_page(4, 0, &page);
     cluster.settle();
-    let f = cluster.follower(4);
-    assert_eq!(f.catch_up_divergence(), None);
-    // At the donor's position; the short page is followed by the rest.
+    assert_eq!(cluster.batches[4], batches, "a window was written");
     assert_eq!(
-        cluster.nodes[4].executed.get(after.get() as usize),
-        Some(&bare)
+        paths(&cluster).stopped_undecided,
+        before.stopped_undecided + 1
     );
-    assert_eq!(f.table().phase_of(&bare), Some(Phase::Executed));
-    assert!(
-        f.table().record(&bare).is_none(),
-        "the record went to history"
+    let f = cluster.follower(4);
+    assert!(f.table().phase_of(&first) < Some(Phase::Commit));
+    assert_eq!(f.executed_through(), after);
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert_eq!(
+        cluster
+            .dependency_rows(4)
+            .into_iter()
+            .find(|(c, _)| *c == first)
+            .map(|(_, r)| r.deps),
+        Some(decided.deps),
+        "r4's row of it is not the donor's decision"
     );
-    assert!(
-        cluster.dependency_rows(4).iter().all(|(c, _)| *c != bare),
-        "r4 kept a dependency row the donor did not have"
-    );
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
 }
 
 /// A pulled command whose installation batch fails is installed again,
@@ -889,6 +1022,12 @@ fn a_failed_installation_is_installed_again() {
     cluster.tick();
     cluster.settle();
     assert_eq!(cluster.failed, 2, "both failures reached r4");
+    // The next event is the leader's commit announcement at the next
+    // tick. Proposals the leader resent used to reach r4 in the same
+    // settle, but the leader forgets an executed command by order now and
+    // resends none of its proposals (task-d111 item 4 (d)).
+    cluster.tick();
+    cluster.settle();
     assert!(
         cluster.nodes[4].executed.len() > before,
         "r4 wedged on a failed installation"
@@ -913,6 +1052,182 @@ fn a_store_that_refuses_every_batch_fails_one_window_a_page() {
         cluster.failed, 1,
         "the window was written again at its failure"
     );
+}
+
+/// A window whose batch failed runs nothing until its rows are written
+/// again (protocol_sim row 21 with storage steps, three voters, seed
+/// 260). Its commands stay committed in the table from the installation.
+/// Put back on the queue, as the window was, `next_executable` read the
+/// learner's order, whose next command was the window's front: committed
+/// over executed dependencies, with no payload row durable or in a batch
+/// submitted, an execution `coordd`'s lowering refuses (rule (b)).
+/// Nothing marked it stale. At seed 260 the front was decided, over a
+/// durable dependency row of the same decision, so the failure left its
+/// record current, and its one payload row, the window's, is not tracked
+/// in `payload_unwritten`.
+#[test]
+fn a_window_whose_batch_failed_runs_nothing_until_its_rows_are_written_again() {
+    let mut runnable = 0;
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        let entries = entries_of(&page).to_vec();
+        let front = entries[0].command;
+        cluster.failing = Some((4, 1));
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(cluster.failed, 1, "seed {seed}");
+        let f = cluster.follower(4);
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
+        assert!(
+            !cluster.nodes[4]
+                .storage
+                .holds_or_writes(Collection::PayloadV1.id().0, &front.0.0),
+            "seed {seed}: the failed batch wrote the front's payload row"
+        );
+        // What the learner would run but for the gate: the front, over
+        // executed dependencies.
+        if f.table().record(&front).is_some_and(|r| {
+            r.deps
+                .iter()
+                .all(|d| matches!(f.table().phase_of(d), None | Some(Phase::Executed)))
+        }) {
+            runnable += 1;
+        }
+        assert_eq!(
+            f.next_executable(),
+            None,
+            "seed {seed}: ran a command of a window whose rows failed"
+        );
+        // The next event that is not a failure writes the window's rows
+        // again, and it runs first, each command over its payload row.
+        cluster.tick();
+        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
+        cluster.deliver(4, from, frame);
+        cluster.execute_checked(4, entries.len());
+        let from = after.get() as usize;
+        let ran = cluster.nodes[4].executed.len() - from;
+        assert!(ran > 0, "seed {seed}: the window never ran again");
+        assert_eq!(
+            cluster.nodes[4].executed[from..],
+            cluster.nodes[0].executed[from..from + ran],
+            "seed {seed}"
+        );
+        cluster.serve = true;
+        cluster.catching = vec![4];
+        cluster.settle_ticking(8);
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}"
+        );
+        assert_eq!(
+            cluster.follower(4).catch_up_divergence(),
+            None,
+            "seed {seed}"
+        );
+    }
+    assert!(runnable > 0, "no seed left the learner a front to run");
+}
+
+/// A campaign is not started while a window whose batch failed waits for
+/// its rows, as one is not while any window is in hand: the role change
+/// a won campaign is drops the window, and its comparison with the donor
+/// (task-d25). Put back on the queue, the window was not in hand.
+#[test]
+fn no_campaign_starts_while_a_failed_window_waits_for_its_rows() {
+    let (mut cluster, _) = left_behind(3);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.failing = Some((4, 1));
+    cluster.deliver_page(4, 0, &page);
+    assert_eq!(cluster.failed, 1);
+    let _ = cluster.nodes[4].follower_mut().take_rejections();
+    let b1 = Ballot {
+        number: 1,
+        leader: r(4),
+        ..ballot0()
+    };
+    let effects = cluster.nodes[4].follower_mut().campaign(b1);
+    assert!(effects.is_empty(), "a campaign started: {effects:?}");
+    assert!(
+        cluster.nodes[4]
+            .follower_mut()
+            .take_rejections()
+            .contains(&FollowerRejection::CatchingUp)
+    );
+}
+
+/// A window whose batch failed, with a Sync of a new ballot activated at
+/// the next event, has its rows written again and runs over them. Put
+/// back on the queue and installed again, as it was, it was stopped there
+/// as a page of a ballot left (task-d08), and its commands stayed
+/// committed in the table, from the first installation, with no rows:
+/// the learner's order ran them with no payload row (rule (b)).
+#[test]
+fn a_failed_window_runs_over_its_rows_after_a_new_ballot_is_activated() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let b1 = Ballot {
+            number: 1,
+            ..ballot0()
+        };
+        cluster.deliver(
+            4,
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b1,
+                executed: ExecutionPosition::ZERO,
+            }
+            .encode(),
+        );
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        let front = entries_of(&page)[0].command;
+        // The window's batch is written; the Sync's marker after it.
+        let installed = cluster.step_peer(4, r(0), page.encode());
+        let window = persisted(installed);
+        let decision = coord_consensus::SyncDecision {
+            ballot: b1,
+            source_ballot: ballot0(),
+            entries: Default::default(),
+            reproposed: Default::default(),
+        };
+        let synced = cluster.step_peer(4, r(0), ProtocolMessage::Sync(decision).encode());
+        let marker = persisted(synced);
+        // The window's batch fails, and the marker is durable next: the
+        // first event after the failure that is not one activates the
+        // ballot, and then installs the window again.
+        let more = cluster.nodes[4].step(Event::Storage(StorageEvent::Failed {
+            barrier_id: window.barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        }));
+        cluster.handle(4, more);
+        cluster.handle(4, vec![Effect::Persist(marker)]);
+        let f = cluster.follower(4);
+        assert_eq!(f.quorum().ballot(), b1, "seed {seed}");
+        assert_eq!(
+            f.table().phase_of(&front),
+            Some(Phase::Commit),
+            "seed {seed}"
+        );
+        let before = cluster.nodes[4].executed.len();
+        cluster.execute_checked(4, usize::MAX);
+        assert_eq!(
+            cluster.nodes[4].executed.get(before),
+            Some(&front),
+            "seed {seed}: the window did not run"
+        );
+        let f = cluster.follower(4);
+        assert_eq!(f.catch_up_paths().stopped_ballot, 0, "seed {seed}");
+        assert_eq!(f.catch_up_divergence(), None, "seed {seed}");
+    }
 }
 
 /// A page cut short of what the donor executed -- by the byte bound as
@@ -945,6 +1260,17 @@ impl Cluster {
         self.handle(i, effects);
         self.settle();
     }
+}
+
+/// The one batch `effects` persist.
+fn persisted(effects: Vec<Effect>) -> coord_core::effect::PersistBatch {
+    let mut batches = effects.into_iter().filter_map(|e| match e {
+        Effect::Persist(batch) => Some(batch),
+        _ => None,
+    });
+    let batch = batches.next().expect("a batch");
+    assert!(batches.next().is_none(), "one batch");
+    batch
 }
 
 fn entries_of(page: &ProtocolMessage) -> &[CatchUpEntry] {
@@ -994,19 +1320,23 @@ fn a_page_installs_as_one_window_in_one_batch() {
     }
 }
 
-/// A command the donor kept no dependency row of has nothing to chain
-/// it to the window before it, so it is a window of its own (task-d25).
+/// A window ends before a command with no decided record, which then
+/// stops the next window as its first (seed 73): the commands before it
+/// run, and it waits for a donor that kept the record. It was a window
+/// of its own, with no dependencies.
 #[test]
-fn a_command_the_donor_kept_no_row_of_is_a_window_of_its_own() {
+fn a_window_ends_before_a_command_with_no_decided_record() {
     let (mut cluster, _) = left_behind(31);
+    cluster.serve = false;
     let after = cluster.follower(4).executed_through();
     let mut page = cluster.page(0, ballot0(), after);
     let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
         unreachable!()
     };
-    entries[3].decided = None;
+    let decided = entries[3].decided.take().expect("the donor's record");
     let entries = entries.clone();
     let batches = cluster.batches[4];
+    let before = paths(&cluster);
     cluster.deliver_page(4, 0, &page);
     assert_eq!(cluster.batches[4] - batches, 1);
     let f = cluster.follower(4);
@@ -1015,12 +1345,30 @@ fn a_command_the_donor_kept_no_row_of_is_a_window_of_its_own() {
     }
     assert!(f.table().phase_of(&entries[3].command) < Some(Phase::Commit));
     cluster.settle();
-    // Three windows: the three before it, it, and the rest.
-    assert_eq!(cluster.batches[4] - batches, 3);
-    let from = after.get() as usize;
+    // The three before it ran, and the window it then started stopped.
+    assert_eq!(cluster.batches[4] - batches, 1);
     assert_eq!(
-        cluster.nodes[4].executed[from..from + entries.len()],
-        cluster.nodes[0].executed[from..from + entries.len()]
+        paths(&cluster).stopped_undecided,
+        before.stopped_undecided + 1
+    );
+    let from = after.get() as usize;
+    assert_eq!(cluster.nodes[4].executed.len(), from + 3);
+    assert_eq!(
+        cluster.nodes[4].executed[from..],
+        cluster.nodes[0].executed[from..from + 3]
+    );
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert_eq!(
+        cluster
+            .dependency_rows(4)
+            .into_iter()
+            .find(|(c, _)| *c == entries[3].command)
+            .map(|(_, r)| r.deps),
+        Some(decided.deps),
+        "r4's row of it is not the donor's decision"
     );
     assert_eq!(cluster.follower(4).catch_up_divergence(), None);
 }
@@ -1245,4 +1593,1057 @@ fn a_pulled_decision_is_reported_over_the_selection_the_voter_held() {
         entry.deps, decided,
         "the selection's acceptance was reported"
     );
+}
+
+/// A commit restored at boot that executes in a pulled window was
+/// compared with the donor there, so nothing waits for it any more
+/// (#213 review): once caught up, a voter that then executes on its own
+/// asks from its own frontier, not from where the last page stopped.
+#[test]
+fn a_restored_commit_pulled_in_a_window_leaves_nothing_waiting() {
+    let (mut cluster, _) = left_behind(41);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    let window = entries_of(&page).len();
+    // The window goes down and r4 restarts before executing any of it:
+    // every command of it is a commit restored at boot.
+    cluster.deliver_page(4, 0, &page);
+    cluster.restart(4);
+    // The same page, delivered before the restart's own execution, so
+    // the restored commits execute in a pulled window.
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert!(
+        cluster.follower(4).catch_up_counts().1 >= window as u64,
+        "the restored commits did not execute through the pulled window: {:?}",
+        cluster.follower(4).catch_up_counts()
+    );
+    cluster.serve = true;
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    cluster.catching.clear();
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    for seq in 61..=64 {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 did not execute the new work"
+    );
+    let frontier = cluster.follower(4).executed_through();
+    let asked = cluster.catch_up_asks.len();
+    cluster.ask(4);
+    assert_eq!(
+        cluster.catch_up_asks.get(asked),
+        Some(&(4, frontier.get())),
+        "the ask did not start at r4's own frontier"
+    );
+}
+
+/// task-d106 step 0 (#213 review): each path that ends an ask or a page
+/// without a rejection of its own is counted, by path.
+#[test]
+fn every_silent_end_of_an_ask_or_a_page_is_counted() {
+    let paths = |cluster: &Cluster| cluster.follower(4).catch_up_paths();
+    let (mut cluster, _) = left_behind(3);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let start = paths(&cluster);
+    assert_eq!(start, CatchUpPaths::default());
+
+    // Asks: of itself, of a stranger, and one published.
+    for donor in [4, 9] {
+        let effects = cluster.nodes[4].follower_mut().request_catch_up(r(donor));
+        assert!(effects.is_empty());
+    }
+    cluster.ask(4);
+    let now = paths(&cluster);
+    assert_eq!((now.declined_donor, now.asked), (2, 1), "{now:?}");
+
+    // Pages dropped: another ballot, a stranger.
+    let other = Ballot {
+        number: 7,
+        ..ballot0()
+    };
+    cluster.deliver_page(4, 0, &cluster.page(0, other, after));
+    let page = cluster.page(0, ballot0(), after);
+    cluster.deliver_page(4, 9, &page);
+    // Ignored: not where r4 asked from.
+    let mut elsewhere = page.clone();
+    let ProtocolMessage::CatchUpPage { after: from, .. } = &mut elsewhere else {
+        unreachable!()
+    };
+    *from = after.checked_next().unwrap();
+    cluster.deliver_page(4, 0, &elsewhere);
+    // Taken nothing: empty.
+    let mut empty = page.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut empty else {
+        unreachable!()
+    };
+    entries.clear();
+    cluster.deliver_page(4, 0, &empty);
+    let now = paths(&cluster);
+    assert_eq!(
+        (
+            now.dropped_ballot,
+            now.dropped_sender,
+            now.ignored_after,
+            now.empty
+        ),
+        (1, 1, 1, 1),
+        "{now:?}"
+    );
+
+    // Taken in part: an entry out of place ends it. With it in hand, the
+    // next page is ignored and the next ask declined.
+    let mut gap = page.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut gap else {
+        unreachable!()
+    };
+    assert!(entries.len() > 2);
+    entries.remove(1);
+    cluster.deliver_page(4, 0, &gap);
+    assert!(cluster.follower(4).catching_up());
+    cluster.deliver_page(4, 0, &page);
+    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(0));
+    assert!(effects.is_empty());
+    let now = paths(&cluster);
+    assert_eq!(
+        (now.cut_short, now.ignored_busy, now.declined_busy),
+        (1, 1, 1),
+        "{now:?}"
+    );
+    // Nothing else moved.
+    assert_eq!(
+        (
+            now.declined_unbooted,
+            now.declined_stopped,
+            now.declined_unsynced,
+            now.dropped_unsynced,
+            now.ignored_stopped,
+            now.ignored_campaign,
+            now.stopped_ballot,
+            now.stopped_stale
+        ),
+        (0, 0, 0, 0, 0, 0, 0, 0),
+        "{now:?}"
+    );
+}
+
+impl Cluster {
+    /// A page from r0 at `after` of its first `n` commands, as if r0 had
+    /// executed no further: taken whole, it is not followed by an ask.
+    fn page_through(&self, after: ExecutionPosition, n: usize) -> ProtocolMessage {
+        let mut page = self.page(0, ballot0(), after);
+        let ProtocolMessage::CatchUpPage {
+            entries, through, ..
+        } = &mut page
+        else {
+            unreachable!()
+        };
+        entries.truncate(n);
+        *through = ExecutionPosition::new(after.get() + n as u64).unwrap();
+        page
+    }
+}
+
+/// task-d25 at the bar's load (#98, 6799183006): a voter that executed
+/// past where it asked from while the page was on its way -- here three
+/// commands, from a page that answered the same ask first -- takes what
+/// the page carries past its frontier, and the chain of asks goes on
+/// from there to the donor's frontier, with no pacer. Before, the page
+/// was dropped whole as `ignored_after`, and nothing asked again until
+/// the pacer's next ask, a second later in `coordd`.
+#[test]
+fn a_page_its_voter_executed_into_while_on_its_way_is_taken_past_the_frontier() {
+    let (mut cluster, _) = left_behind(17);
+    assert!(cluster.catching.is_empty(), "no pacer in this test");
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, start.get())));
+    // The voter's frontier moves past the ask's start.
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    assert_eq!(
+        cluster.follower(4).executed_through().get(),
+        start.get() + 3
+    );
+    let asks = cluster.catch_up_asks.len();
+    // The page the ask brought, from where it asked: cut short of the
+    // donor's frontier, as a page at the byte bound is.
+    cluster.serve = true;
+    let mut stale = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut stale else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    cluster.deliver_page(4, 0, &stale);
+    cluster.settle();
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 6)),
+        "the chain did not go on from the stale page's end"
+    );
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped at a stale page"
+    );
+    let now = paths(&cluster);
+    assert_eq!(
+        (
+            now.ignored_after,
+            now.taken_stale,
+            now.stale_unasked,
+            now.stopped_stale
+        ),
+        (0, 1, 0, 0),
+        "{now:?}"
+    );
+}
+
+/// One ask a page: a stale page answering an earlier ask than the last
+/// is taken for what it carries past the frontier, and asks nothing; the
+/// last ask's page goes on. Two chains would double the donor's reads.
+#[test]
+fn a_late_page_of_an_earlier_ask_starts_no_second_chain() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    // The pacer asks again from the new frontier.
+    cluster.ask(4);
+    let last = cluster.follower(4).executed_through();
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, last.get())));
+    let asks = cluster.catch_up_asks.len();
+    // The first ask's page arrives late, cut short of the donor's
+    // frontier as a page at the byte bound is: taken, and no ask
+    // follows it.
+    let mut late = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut late else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    let carried = entries_of(&late).len() as u64;
+    cluster.deliver_page(4, 0, &late);
+    cluster.settle();
+    assert_eq!(cluster.catch_up_asks.len(), asks, "a second chain started");
+    assert_eq!(
+        cluster.follower(4).executed_through().get(),
+        start.get() + carried,
+        "what the page carried past the frontier was taken"
+    );
+    let now = paths(&cluster);
+    assert_eq!(
+        (now.ignored_after, now.taken_stale, now.stale_unasked),
+        (0, 1, 1),
+        "{now:?}"
+    );
+}
+
+/// After a boot the first ask still has to be answered from exactly the
+/// boot frontier while restored commits wait to be compared (task-d25):
+/// a page that starts below it is ignored, as before, and not taken as
+/// a stale page, even after the voter executed past it.
+#[test]
+fn after_a_boot_a_page_below_the_boot_frontier_is_still_ignored() {
+    let (mut cluster, _) = left_behind(41);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.deliver_page(4, 0, &page);
+    cluster.execute_at_most(4, 1);
+    cluster.restart(4);
+    let boot = cluster.follower(4).executed_through();
+    cluster.settle();
+    assert!(
+        cluster.follower(4).executed_through() > boot,
+        "the restart executed nothing past its frontier: the test shows nothing"
+    );
+    let below = ExecutionPosition::new(boot.get() - 1).unwrap();
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &cluster.page(0, ballot0(), below));
+    let now = paths(&cluster);
+    assert_eq!(now.ignored_after, before.ignored_after + 1, "{now:?}");
+    assert_eq!(now.taken_stale, before.taken_stale, "{now:?}");
+    // The ask from the boot frontier is still answered and compared.
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+fn paths(cluster: &Cluster) -> coord_consensus::CatchUpPaths {
+    cluster.follower(4).catch_up_paths()
+}
+
+/// The latest ask's page arrives while the window of a late page of an
+/// earlier ask is still in hand: it is dropped as busy, and the chain
+/// goes on once that window has executed, without the pacer (Codex on
+/// #223). Before, neither page asked again and the voter stopped short.
+#[test]
+fn the_latest_asks_page_dropped_while_a_late_window_runs_still_continues_the_chain() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let ahead = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &ahead);
+    cluster.settle();
+    cluster.ask(4);
+    let last = cluster.follower(4).executed_through();
+    let asks = cluster.catch_up_asks.len();
+    // The first ask's page, late and cut short, then the last ask's page,
+    // before the first one's window has run.
+    let mut late = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut late else {
+        unreachable!()
+    };
+    entries.truncate(6);
+    let latest = cluster.page(0, ballot0(), last);
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &late);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the late window ran at once: the test shows nothing"
+    );
+    cluster.deliver_page(4, 0, &latest);
+    let now = paths(&cluster);
+    assert_eq!(now.ignored_busy, before.ignored_busy + 1, "{now:?}");
+    cluster.serve = true;
+    cluster.settle();
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 6)),
+        "no ask followed the late window"
+    );
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped short with the latest ask's page dropped"
+    );
+}
+
+/// Cut r4 off while the domain executes `missed` commands, then bring it
+/// back with the leader's traffic flowing, as `left_behind` does.
+fn left_far_behind(seed: u64, missed: u64) -> Cluster {
+    let cluster = left_behind_by(seed, missed, 1);
+    assert!(
+        cluster.nodes[4].executed.len() + 2 * MAX_CATCH_UP_COMMANDS
+            < cluster.nodes[0].executed.len(),
+        "r4 is less than two pages behind: the test shows nothing"
+    );
+    cluster
+}
+
+/// [`left_far_behind`] with values of `value_len` bytes.
+fn left_behind_by(seed: u64, missed: u64, value_len: usize) -> Cluster {
+    let mut cluster = Cluster::new(seed, 8);
+    cluster.value_len = value_len;
+    cluster.down = vec![4];
+    for seq in 1..=missed {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(2);
+    cluster.down.clear();
+    for seq in missed + 1..=missed + 20 {
+        cluster.admit(seq);
+        cluster.settle();
+    }
+    cluster.settle_ticking(3);
+    cluster
+}
+
+fn at(n: u64) -> ExecutionPosition {
+    if n == 0 {
+        ExecutionPosition::ZERO
+    } else {
+        ExecutionPosition::new(n).unwrap()
+    }
+}
+
+/// One page ahead (task-d25): a page taken whole and short of the
+/// donor's frontier is followed by the next ask at once, from the end of
+/// what is in hand, while its window still waits to execute. That page
+/// is queued after it, outside the table, and the chain goes on.
+#[test]
+fn the_next_page_is_asked_while_the_one_in_hand_executes() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    cluster.page_limit = 10;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    let first = cluster.page(0, ballot0(), start);
+    cluster.deliver_page(4, 0, &first);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the first page ran at once: the test shows nothing"
+    );
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 10)),
+        "no ask ahead of the page in hand"
+    );
+    // The page asked ahead arrives before the first window has run.
+    let second = cluster.page(0, ballot0(), at(start.get() + 10));
+    let before = paths(&cluster);
+    cluster.serve = true;
+    cluster.deliver_page(4, 0, &second);
+    let now = paths(&cluster);
+    assert_eq!(now.taken_ahead, before.taken_ahead + 1, "{now:?}");
+    assert_eq!(now.ignored_busy, before.ignored_busy, "{now:?}");
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped short with a page asked ahead"
+    );
+    let now = paths(&cluster);
+    assert!(now.asked_ahead >= 2, "{now:?}");
+    assert_eq!(
+        (now.ignored_after, now.stopped_stale, now.stale_unasked),
+        (0, 0, 0),
+        "{now:?}"
+    );
+}
+
+/// Only the page asked ahead is taken ahead (task-d25, #236 review): a
+/// page that follows exactly what is in hand but answers no ask of this
+/// voter's -- here, after a page that reached its donor's frontier and so
+/// asked nothing ahead -- is dropped as busy, and starts no chain. Taken,
+/// it would queue a window nobody asked for and ask on from its end: a
+/// second chain beside the voter's own, doubling a donor's reads.
+#[test]
+fn a_page_that_follows_the_one_in_hand_unasked_is_not_taken_ahead() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    // Taken whole and at the donor's frontier as it says: nothing is
+    // asked ahead of it.
+    let first = cluster.page_through(start, 3);
+    cluster.deliver_page(4, 0, &first);
+    assert!(
+        cluster.follower(4).catching_up(),
+        "the first page ran at once: the test shows nothing"
+    );
+    assert_eq!(cluster.catch_up_asks.len(), asks, "an ask ahead of it");
+    // A page from exactly the end of what is in hand, unasked.
+    let unasked = cluster.page(0, ballot0(), at(start.get() + 3));
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &unasked);
+    let now = paths(&cluster);
+    assert_eq!(now.taken_ahead, before.taken_ahead, "{now:?}");
+    assert_eq!(now.ignored_busy, before.ignored_busy + 1, "{now:?}");
+    assert_eq!(
+        cluster.catch_up_asks.len(),
+        asks,
+        "the unasked page started a chain"
+    );
+}
+
+/// The reserve holds with a page in hand and one asked ahead: a window is
+/// at most one page, however much is queued behind it.
+#[test]
+fn a_window_is_one_page_with_two_in_hand() {
+    let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let first = cluster.page(0, ballot0(), start);
+    assert_eq!(entries_of(&first).len(), MAX_CATCH_UP_COMMANDS);
+    cluster.deliver_page(4, 0, &first);
+    let second = cluster.page(0, ballot0(), at(start.get() + MAX_CATCH_UP_COMMANDS as u64));
+    cluster.deliver_page(4, 0, &second);
+    assert_eq!(paths(&cluster).taken_ahead, 1, "{:?}", paths(&cluster));
+    let mut largest = 0;
+    let mut windows = 0;
+    while cluster.follower(4).catching_up() {
+        let (_, window) = cluster.follower(4).table_waits();
+        assert!(
+            window <= MAX_CATCH_UP_COMMANDS,
+            "a window of {window} with two pages in hand"
+        );
+        largest = largest.max(window);
+        windows += usize::from(window == MAX_CATCH_UP_COMMANDS);
+        cluster.execute_at_most(4, 1);
+    }
+    // A window shrinks as it executes: each page was one whole window.
+    assert_eq!(largest, MAX_CATCH_UP_COMMANDS);
+    assert_eq!(windows, 2, "the two pages were not two whole windows");
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+/// review's ordering test on #223, with pages asked ahead: seeded random
+/// orders of pacer asks, answers cut at random lengths, late answers,
+/// duplicates and answers to asks never made, with the voter executing a
+/// few commands at a time and moving by itself from the leader's traffic.
+/// After every step r4's executed sequence is a prefix of the leader's,
+/// and once served it ends level. `CATCH_UP_ORDERS` sets the seeds (400 by
+/// default).
+#[test]
+fn two_pages_in_flight_in_any_order_never_install_twice_or_skip() {
+    let seeds: u64 = std::env::var("CATCH_UP_ORDERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    let mut totals = coord_consensus::CatchUpPaths::default();
+    for seed in 1..=seeds {
+        let (mut cluster, _) = left_behind(1000 + seed);
+        cluster.serve = false;
+        cluster.page_limit = 3 + (cluster.rand() % 10) as usize;
+        let mut answered: Vec<ProtocolMessage> = Vec::new();
+        for _ in 0..60 {
+            let pick = cluster.rand() % 8;
+            match pick {
+                0 => {
+                    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(0));
+                    cluster.handle(4, effects);
+                }
+                1..=3 => {
+                    // An answer to a recorded ask, or to one near the
+                    // frontier, cut at a random length.
+                    let mine: Vec<u64> = cluster
+                        .catch_up_asks
+                        .iter()
+                        .filter(|(i, _)| *i == 4)
+                        .map(|(_, a)| *a)
+                        .collect();
+                    let after = if pick < 3 && !mine.is_empty() {
+                        mine[(cluster.rand() % mine.len() as u64) as usize]
+                    } else {
+                        let frontier = cluster.follower(4).executed_through().get();
+                        (frontier + cluster.rand() % 5).saturating_sub(2)
+                    };
+                    let mut page = cluster.page(0, ballot0(), at(after));
+                    if let ProtocolMessage::CatchUpPage { entries, .. } = &mut page {
+                        let keep = (cluster.rand() % (entries.len() as u64 + 1)) as usize;
+                        if cluster.rand() % 2 == 0 {
+                            entries.truncate(keep);
+                        }
+                    }
+                    if std::env::var_os("CATCH_UP_DEBUG").is_some() {
+                        let f = cluster.follower(4);
+                        eprintln!(
+                            "seed {seed} after {after} busy {} last ask {:?} window {:?}",
+                            f.catching_up(),
+                            cluster.catch_up_asks.iter().rev().find(|(i, _)| *i == 4),
+                            f.table_waits().1
+                        );
+                    }
+                    cluster.deliver_page(4, 0, &page);
+                    answered.push(page);
+                }
+                4 if !answered.is_empty() => {
+                    // A duplicate, or a late answer.
+                    let i = (cluster.rand() % answered.len() as u64) as usize;
+                    let page = answered[i].clone();
+                    cluster.deliver_page(4, 0, &page);
+                }
+                5 | 6 => {
+                    let n = 1 + (cluster.rand() % 6) as usize;
+                    cluster.execute_at_most(4, n);
+                }
+                _ => {
+                    // The leader's traffic: r4 may move by itself.
+                    cluster.settle();
+                }
+            }
+            let mine = &cluster.nodes[4].executed;
+            assert_eq!(
+                mine[..],
+                cluster.nodes[0].executed[..mine.len()],
+                "seed {seed}: r4 left the leader's order"
+            );
+            assert_eq!(
+                cluster.follower(4).catch_up_divergence(),
+                None,
+                "seed {seed}"
+            );
+            let (_, window) = cluster.follower(4).table_waits();
+            assert!(
+                window <= MAX_CATCH_UP_COMMANDS,
+                "seed {seed}: a window of {window}"
+            );
+        }
+        cluster.serve = true;
+        cluster.ask(4);
+        cluster.settle_ticking(2);
+        if cluster.nodes[4].executed != cluster.nodes[0].executed {
+            cluster.ask(4);
+        }
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "seed {seed}: r4 did not end level"
+        );
+        let p = paths(&cluster);
+        totals.taken_ahead += p.taken_ahead;
+        totals.asked_ahead += p.asked_ahead;
+        totals.taken_stale += p.taken_stale;
+        totals.stopped_stale += p.stopped_stale;
+        totals.ignored_after += p.ignored_after;
+        totals.ignored_busy += p.ignored_busy;
+        totals.cut_short += p.cut_short;
+        totals.asked += p.asked;
+    }
+    eprintln!("{totals:?}");
+    assert!(
+        totals.taken_ahead > 0,
+        "no page was taken ahead: {totals:?}"
+    );
+    assert!(
+        totals.taken_stale > 0,
+        "no stale page was taken: {totals:?}"
+    );
+}
+
+/// What a voter holds is two pages, however small they are (task-d25
+/// review). Asked ahead while it held at most a page's worth of commands,
+/// a voter served pages of one command -- a donor whose byte bound cuts
+/// every page to one large command -- asked for the next on every
+/// arrival, and held 126 pages with nothing executed: about 250 MiB at
+/// the largest request. Now it asks ahead only while it holds one page.
+/// Every ask is answered at once here, and nothing executes.
+#[test]
+fn what_a_voter_holds_is_two_pages_however_small_they_are() {
+    for limit in [1, 10, MAX_CATCH_UP_COMMANDS] {
+        let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+        cluster.serve = false;
+        cluster.page_limit = limit;
+        let executed = cluster.nodes[4].executed.len();
+        let mut answered = cluster.catch_up_asks.len();
+        cluster.ask(4);
+        while answered < cluster.catch_up_asks.len() && answered < 1_000 {
+            let (i, after) = cluster.catch_up_asks[answered];
+            answered += 1;
+            if i == 4 {
+                let page = cluster.page(0, ballot0(), at(after));
+                cluster.deliver_page(4, 0, &page);
+            }
+        }
+        assert_eq!(
+            cluster.nodes[4].executed.len(),
+            executed,
+            "pages of {limit}: r4 executed meanwhile, so the test shows nothing"
+        );
+        let (pages, _) = cluster.follower(4).catch_up_counts();
+        assert_eq!(
+            pages,
+            2,
+            "pages of {limit}: {pages} pages in hand with nothing executed ({:?})",
+            paths(&cluster)
+        );
+        assert_eq!(paths(&cluster).asked_ahead, 1, "pages of {limit}");
+        // Executed, the chain goes on and ends level.
+        cluster.serve = true;
+        cluster.settle();
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "pages of {limit}: r4 stopped short"
+        );
+    }
+}
+
+/// A page is bounded in bytes where it is taken, as the donor bounds it
+/// (task-d25 review), so two pages in hand are two pages' bytes whatever
+/// the donor sent. A page cut at that bound, or at the command bound, and
+/// nowhere else goes on at once from the cut, as a full page does: a
+/// donor of a later build with a larger page is followed at full pace,
+/// not at the pacer's, as an older build here follows a page of 125.
+#[test]
+fn a_page_past_the_bounds_is_taken_to_them_and_the_chain_goes_on() {
+    for (value_len, limit) in [(64 * 1024, MAX_CATCH_UP_COMMANDS), (1, 200)] {
+        let what = format!("values of {value_len}, pages of {limit}");
+        let mut cluster = if value_len == 1 {
+            left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40)
+        } else {
+            left_behind_by(7, 40, value_len)
+        };
+        // A donor that bounds its pages by neither.
+        cluster.serve = false;
+        cluster.page_limit = limit;
+        let start = cluster.follower(4).executed_through();
+        cluster.ask(4);
+        let page = cluster.page(0, ballot0(), start);
+        let entries = entries_of(&page);
+        let mut bytes = 0usize;
+        let mut fit = 0usize;
+        for e in entries {
+            let len = e.encoded_len();
+            if fit == MAX_CATCH_UP_COMMANDS || fit > 0 && bytes + len > MAX_CATCH_UP_BYTES {
+                break;
+            }
+            bytes += len;
+            fit += 1;
+        }
+        assert!(
+            fit < entries.len(),
+            "{what}: a page of {} is within the bounds, so the test shows nothing",
+            entries.len()
+        );
+        let asks = cluster.catch_up_asks.len();
+        let before = paths(&cluster);
+        cluster.deliver_page(4, 0, &page);
+        let now = paths(&cluster);
+        assert_eq!(now.cut_short, before.cut_short + 1, "{what}: {now:?}");
+        assert_eq!(
+            cluster.catch_up_asks.get(asks),
+            Some(&(4, start.get() + fit as u64)),
+            "{what}: the next ask is not from where the bound cut the page"
+        );
+        // That ask answered, the chain runs to the end.
+        cluster.serve = true;
+        let next = cluster.page(0, ballot0(), at(start.get() + fit as u64));
+        cluster.deliver_page(4, 0, &next);
+        cluster.settle();
+        assert_eq!(
+            cluster.nodes[4].executed, cluster.nodes[0].executed,
+            "{what}: r4 stopped short"
+        );
+    }
+}
+
+/// A window is at most one page when the page in hand ends a window early
+/// and the page asked ahead queues behind its rest (task-d25 review's
+/// case): the first page's window ends at its tenth command, decided
+/// beside the ninth rather than after it, so no window chains it to the
+/// ninth. Without the limit in `install_catch_up`, the second window took
+/// the first page's last 116 and the whole second page, 241, past what
+/// the table's reserve is sized for (`RECOVERY_RESERVE_PARTS`).
+#[test]
+fn a_window_is_one_page_when_the_first_ends_early() {
+    let mut cluster = left_far_behind(5, 2 * MAX_CATCH_UP_COMMANDS as u64 + 40);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let asks = cluster.catch_up_asks.len();
+    let mut first = cluster.page(0, ballot0(), start);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut first else {
+        unreachable!()
+    };
+    assert_eq!(entries.len(), MAX_CATCH_UP_COMMANDS);
+    let beside = entries[8].decided.as_ref().expect("decided").deps.clone();
+    assert!(!beside.contains(&entries[8].command));
+    entries[9].decided.as_mut().expect("decided").deps = beside;
+    cluster.deliver_page(4, 0, &first);
+    assert_eq!(cluster.follower(4).table_waits().1, 9, "the first window");
+    let next = start.get() + MAX_CATCH_UP_COMMANDS as u64;
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, next)),
+        "no ask ahead of the page in hand"
+    );
+    let second = cluster.page(0, ballot0(), at(next));
+    assert_eq!(entries_of(&second).len(), MAX_CATCH_UP_COMMANDS);
+    cluster.deliver_page(4, 0, &second);
+    assert_eq!(paths(&cluster).taken_ahead, 1, "{:?}", paths(&cluster));
+    // A window is installed only once the one before has run, so a window
+    // starts where the last ended.
+    let mut windows = Vec::new();
+    let mut last = 0;
+    while cluster.follower(4).catching_up() {
+        let (_, window) = cluster.follower(4).table_waits();
+        if last <= 1 {
+            windows.push(window);
+        }
+        last = window;
+        cluster.execute_at_most(4, 1);
+    }
+    assert_eq!(
+        windows,
+        vec![9, MAX_CATCH_UP_COMMANDS, MAX_CATCH_UP_COMMANDS - 9],
+        "windows over two pages in hand"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+/// An open chain closes once the voter executes as far as the page that
+/// left it open said its donor had (task-d25 review), however it got
+/// there: here from a late answer to an earlier ask, which says nothing
+/// of the chain itself. Before, it stayed open until a page reached a
+/// frontier, and with the pacer asking on an open chain every
+/// `CHAIN_RETRY`, a voter level by itself would have asked for ever in a
+/// quiet domain, where nobody answers an ask with nothing past it.
+#[test]
+fn an_open_chain_closes_once_the_voter_executes_as_far_as_it_was_owed() {
+    let (mut cluster, _) = left_behind(17);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let whole = cluster.page(0, ballot0(), start);
+    let mut cut = whole.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut cut else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    // The chain's next ask, from the end of the first page, is never
+    // answered.
+    assert_eq!(
+        cluster.catch_up_asks.last(),
+        Some(&(4, start.get() + 3)),
+        "no ask followed the cut page"
+    );
+    assert!(cluster.follower(4).catch_up_chain_open());
+    // The first ask's whole page arrives late, and is taken past the
+    // frontier.
+    cluster.deliver_page(4, 0, &whole);
+    cluster.settle();
+    assert_eq!(paths(&cluster).stale_unasked, 1, "{:?}", paths(&cluster));
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(
+        !cluster.follower(4).catch_up_chain_open(),
+        "a voter level with the donor's frontier still owes its chain"
+    );
+}
+
+/// r4's chain left open by r0's page cut to three, its next ask taken by
+/// a donor that is itself behind (r1 here), whose page reaches its own
+/// frontier four commands on (#236 review). Returns where r4 stood and
+/// what r0's whole first page was.
+fn answered_by_a_donor_behind(cluster: &mut Cluster) -> (ExecutionPosition, ProtocolMessage) {
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let whole = cluster.page(0, ballot0(), start);
+    let mut cut = whole.clone();
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut cut else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    assert!(cluster.follower(4).catch_up_chain_open());
+    // The chain's next ask goes to r1, which has executed only four more.
+    let effects = cluster.nodes[4].follower_mut().request_catch_up(r(1));
+    cluster.handle(4, effects);
+    cluster.settle();
+    let from = at(start.get() + 3);
+    assert_eq!(cluster.catch_up_asks.last(), Some(&(4, from.get())));
+    let mut behind = cluster.page(0, ballot0(), from);
+    let ProtocolMessage::CatchUpPage {
+        entries, through, ..
+    } = &mut behind
+    else {
+        unreachable!()
+    };
+    entries.truncate(4);
+    *through = at(from.get() + 4);
+    cluster.deliver_page(4, 1, &behind);
+    cluster.settle();
+    assert_eq!(cluster.follower(4).executed_through(), at(from.get() + 4));
+    (start, whole)
+}
+
+/// A chain answered by two donors is owed the furthest frontier either
+/// said (#236 review): a donor that is itself behind answers with a page
+/// that reaches its own frontier, and the chain stays open, short of what
+/// the first donor said. Before, that page closed it, and in a quiet
+/// domain nothing asked again: r4 stayed at 135 or 125 of 310 in review's
+/// scratches. Asking on, r4 ends level, and the chain closes there.
+#[test]
+fn a_chain_answered_by_a_donor_behind_stays_owed_the_first_donors_frontier() {
+    let (mut cluster, _) = left_behind(17);
+    answered_by_a_donor_behind(&mut cluster);
+    assert!(
+        cluster.nodes[4].executed.len() < cluster.nodes[0].executed.len(),
+        "r4 is level: the test shows nothing"
+    );
+    assert!(
+        cluster.follower(4).catch_up_chain_open(),
+        "the chain closed at the behind donor's frontier, short of what r0 said"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(!cluster.follower(4).catch_up_chain_open());
+}
+
+/// The furthest frontier said is still one the voter can reach by itself
+/// (#236 review): after a donor behind has answered, a late answer to the
+/// first ask brings r4 level with r0, which is what r0 said, and the chain
+/// closes, with nothing left to ask for.
+#[test]
+fn a_chain_owed_two_donors_frontiers_closes_at_the_further_one() {
+    let (mut cluster, _) = left_behind(17);
+    let (_, whole) = answered_by_a_donor_behind(&mut cluster);
+    assert!(cluster.follower(4).catch_up_chain_open());
+    cluster.deliver_page(4, 0, &whole);
+    cluster.settle();
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(
+        !cluster.follower(4).catch_up_chain_open(),
+        "a voter level with the furthest frontier said still owes its chain"
+    );
+}
+
+/// A chain is open while executions since the boot are left to compare,
+/// even with the voter executed as far as the donor said (#236 review):
+/// that clause of `catch_up_chain_open` is what keeps a restart's
+/// comparisons asked for when the donor is no further on than the voter.
+/// Here the window the crash left installed runs at the restart, and a
+/// donor whose frontier is exactly that answers with a page cut to three:
+/// owed nothing more by position, r4 still has the rest of the window to
+/// compare, and the chain stays open until it has.
+#[test]
+fn a_chain_with_comparisons_left_is_open_at_the_donors_frontier() {
+    let (mut cluster, _) = left_behind(47);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    assert!(
+        entries_of(&page).len() > 6,
+        "a window of {}",
+        entries_of(&page).len()
+    );
+    cluster.deliver_page(4, 0, &page);
+    cluster.restart(4);
+    cluster.settle();
+    let ran = cluster.follower(4).executed_through();
+    assert!(ran.get() > after.get() + 6, "the restart ran the window");
+    let asked = cluster.catch_up_asks.len();
+    cluster.ask(4);
+    let from = at(cluster.catch_up_asks[asked].1);
+    let mut cut = cluster.page(0, ballot0(), from);
+    let ProtocolMessage::CatchUpPage {
+        entries, through, ..
+    } = &mut cut
+    else {
+        unreachable!()
+    };
+    entries.truncate(3);
+    *through = ran;
+    cluster.deliver_page(4, 0, &cut);
+    cluster.settle();
+    assert_eq!(
+        cluster.follower(4).executed_through(),
+        ran,
+        "r4 executed past what the donor said: the test shows nothing"
+    );
+    assert!(
+        cluster.follower(4).catch_up_chain_open(),
+        "executions since the boot are left to compare, and the chain closed"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(!cluster.follower(4).catch_up_chain_open());
+}
+
+/// A command past a page's byte bound by itself is taken alone, and the
+/// chain goes on from it (#236 review): a put at the value limit is
+/// larger than `MAX_CATCH_UP_BYTES` on its own, and the one-command
+/// exemption on receipt is what gets a voter past it. Without it the
+/// voter takes nothing from such a page and stops asking.
+#[test]
+fn a_command_past_the_byte_bound_alone_is_taken_by_itself() {
+    let mut cluster = left_behind_by(9, 3, MAX_CATCH_UP_BYTES);
+    cluster.serve = false;
+    let start = cluster.follower(4).executed_through();
+    cluster.ask(4);
+    let page = cluster.page(0, ballot0(), start);
+    let entries = entries_of(&page);
+    assert!(entries.len() > 1, "a page of {}", entries.len());
+    assert!(
+        entries[0].encoded_len() > MAX_CATCH_UP_BYTES,
+        "its first command is within the bound: the test shows nothing"
+    );
+    let asks = cluster.catch_up_asks.len();
+    let before = paths(&cluster);
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert_eq!(paths(&cluster).cut_short, before.cut_short + 1);
+    assert_eq!(
+        cluster.follower(4).executed_through(),
+        at(start.get() + 1),
+        "the command past the bound was not taken by itself"
+    );
+    assert_eq!(
+        cluster.catch_up_asks.get(asks),
+        Some(&(4, start.get() + 1)),
+        "the chain did not go on from the command taken"
+    );
+    cluster.serve = true;
+    cluster.ask(4);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+}
+
+fn ballot(number: u64, leader: u8) -> Ballot {
+    Ballot {
+        number,
+        leader: r(leader),
+        ..ballot0()
+    }
+}
+
+/// The rewrite stages in the ledger each decided record it writes, as
+/// the installation did (#302 review). The failure dropped their staged
+/// rows, leaving the records ahead of them; staged again, they are
+/// current when `carry_stale` looks in the same step, so the event after
+/// the failure writes the window's rows in one batch and nothing writes
+/// them twice. Once that batch is durable, each is reported at COMMIT
+/// with the donor's dependencies.
+#[test]
+fn a_window_whose_batch_failed_is_written_again_in_one_batch() {
+    for seed in [3, 5, 7, 11, 13] {
+        let (mut cluster, _) = left_behind(seed);
+        cluster.serve = false;
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        cluster.failing = Some((4, 1));
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(cluster.failed, 1, "seed {seed}");
+        let window: Vec<&CatchUpEntry> = entries_of(&page)
+            .iter()
+            .filter(|e| cluster.follower(4).table().phase_of(&e.command) == Some(Phase::Commit))
+            .collect();
+        assert!(
+            window.len() > 1,
+            "seed {seed}: a window of one shows little"
+        );
+        cluster.tick();
+        let (from, frame) = cluster.nodes[4].inbox.pop_front().expect("announced");
+        let effects = cluster.step_peer(4, from, frame);
+        let written: Vec<usize> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Persist(batch) => Some(batch.updates.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            written,
+            [2 * window.len()],
+            "seed {seed}: batches written at the event after the failure, by rows"
+        );
+        cluster.handle(4, effects);
+        let report = cluster.follower(4).report(ballot(1, 1));
+        for e in &window {
+            let decided = e.decided.as_ref().expect("the donor's row");
+            assert_eq!(
+                report
+                    .entries
+                    .iter()
+                    .find(|r| r.command == e.command)
+                    .map(|r| (r.phase, &r.deps)),
+                Some((Phase::Commit, &decided.deps)),
+                "seed {seed}"
+            );
+        }
+    }
 }

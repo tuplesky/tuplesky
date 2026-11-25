@@ -78,14 +78,37 @@ pub struct Limits {
     /// as a burst (task-d26). A retry of a request still outstanding is
     /// not a new one.
     ///
-    /// Bounded below the rate at which a voter catching up executes: a
-    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// Meant to be below the rate at which a voter catching up executes,
+    /// a page of up to 125 commands installed in one batch, the next asked
+    /// ahead while it executes (task-d25). A
     /// voter returning behind gains on the domain by the difference, so
     /// the time it takes to close a gap is bounded by the gap; admitted
     /// faster than it can execute, it never closes it. The bound is per
-    /// frontend: a domain served by several admits their sum.
+    /// frontend: a domain served by several admits their sum, which the
+    /// default no longer keeps below that rate
+    /// ([`DEFAULT_MAX_ADMITTED_PER_SECOND`]).
     #[serde(default = "default_max_admitted_per_second")]
     pub max_admitted_per_second: u32,
+    /// How long, in milliseconds, a voter's frontend still answers from
+    /// its own policy after the send time of its last freshness ask that
+    /// its leader confirmed and its store then reached (#312, #320). Past
+    /// it, the voter decides nothing from its policy: binds are refused as
+    /// unavailable, output is held as pending and watches close as
+    /// source-lost, each of which the caller retries, until an answer
+    /// stamps it fresh again. A voter is past it from its start until its
+    /// first stamp, and a process with no voter always is. Between
+    /// [`MIN_POLICY_STALENESS_MILLIS`] and [`MAX_POLICY_STALENESS_MILLIS`].
+    ///
+    /// A voter cut off, healed, restarted or lagging stops authorizing
+    /// from what it last learned within this of the last instant its store
+    /// was confirmed to hold everything the domain had committed. A voter
+    /// asks about every half allowance, so staying fresh needs an ask's
+    /// round trip, a confirmation round, the leader's execution and this
+    /// voter's projection commit within half of it: a value near the
+    /// minimum suits a domain on one site only. A local setting: no
+    /// replicated result depends on it.
+    #[serde(default = "default_max_policy_staleness_millis")]
+    pub max_policy_staleness_millis: u64,
 }
 
 /// The checkpoint interval in records a strict configuration that names
@@ -101,18 +124,53 @@ pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_RECORDS: u64 = 65_536;
 pub const DEFAULT_REPLAY_CHECKPOINT_AFTER_SECONDS: u64 = 30;
 
 /// The admission rate a configuration that names none gets (task-d26): a
-/// design target and a ceiling, not a proved bound. It is under a sixth
-/// of what catch-up would execute at one 64-command window per durable
-/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
-/// is its check. At the 35 to 100 commands a second a domain sustains
-/// today it never binds. It gates client requests only: resolves,
+/// design target and a ceiling, not a proved bound; task-d33's budget
+/// oracle is its check. It gates client requests only: resolves,
 /// watches and held retries bypass it, and every session of a frontend
 /// shares one bucket.
+///
+/// It is close to binding. Five voters on one four-core host with three
+/// frontends sustain about 1,500 to 1,700 commands a second at 120
+/// callers (#224, #225). The busiest frontend admits 630 to 770 of them
+/// a second at the median, and up to 977 in its busiest second, within
+/// 3% of this bound. A faster domain, or one served by fewer frontends,
+/// is refused here first. So a reading states the rate it ran under,
+/// and the `admission` line says what the rate refused.
+///
+/// Catch-up is measured now, not the 64-command window every 10 ms
+/// assumed here before. A page costs about 22 ms plus 0.28 ms a command,
+/// so a voter rejoining at full load with the relay executes about 1,600
+/// commands a second at 64 a page and 2,200 at 125 (#98). That is not
+/// the sixfold margin over this bound it was set with, and a domain
+/// admitting the sum of several frontends' bounds outruns it.
 pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
 
 const fn default_max_admitted_per_second() -> u32 {
     DEFAULT_MAX_ADMITTED_PER_SECOND
 }
+
+/// The policy staleness a configuration that names none gets: a voter
+/// answers from its own policy for at most 5 s past the send time of the
+/// last freshness ask its leader confirmed and its store reached, so a
+/// cut-off voter stops authorizing within 5 s of the last instant its
+/// store was confirmed current (#312, #320). It asks every 2.5 s.
+pub const DEFAULT_MAX_POLICY_STALENESS_MILLIS: u64 = 5_000;
+
+const fn default_max_policy_staleness_millis() -> u64 {
+    DEFAULT_MAX_POLICY_STALENESS_MILLIS
+}
+
+/// The smallest policy staleness a configuration may name. A voter asks
+/// every half allowance, and each ask needs a round trip, a confirmation
+/// round, the leader's execution and this voter's projection commit
+/// before it stamps. Below this, half an allowance leaves too little
+/// room for that, and a voter linked and current could go stale between
+/// asks and decide nothing.
+pub const MIN_POLICY_STALENESS_MILLIS: u64 = 100;
+
+/// The largest policy staleness a configuration may name: past it the
+/// setting no longer bounds what #312 asks it to bound.
+pub const MAX_POLICY_STALENESS_MILLIS: u64 = 60_000;
 
 /// The command table capacity a configuration that names none gets: the
 /// largest (task-d20).
@@ -150,6 +208,7 @@ impl Default for Limits {
             checkpoint_after_seconds: None,
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
+            max_policy_staleness_millis: default_max_policy_staleness_millis(),
         }
     }
 }
@@ -404,6 +463,20 @@ pub struct JournalConfig {
     /// the end is synced by its own loop.
     #[serde(default = "projection_durable_ms")]
     pub projection_durable_ms: u64,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], journal records a projection
+    /// commit waits for before it goes out (task-d86): records the
+    /// materializer is owed are held for one larger commit until this
+    /// many are, [`JournalConfig::projection_commit_ms`] has passed, or
+    /// something that reads the projection waits for one of them. Zero
+    /// holds nothing: a commit goes out as soon as the last is back.
+    /// Ignored under the strict profile.
+    #[serde(default = "projection_commit_records")]
+    pub projection_commit_records: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a record
+    /// is held for a larger projection commit (task-d86). Zero holds
+    /// nothing. Ignored under the strict profile.
+    #[serde(default = "projection_commit_ms")]
+    pub projection_commit_ms: u64,
 }
 
 impl JournalConfig {
@@ -411,6 +484,29 @@ impl JournalConfig {
     pub fn replays_projection(&self) -> bool {
         self.profile == JOURNAL_REPLAY_PROFILE
     }
+
+    /// The projection commit hold (task-d86): records and the longest
+    /// wait, or `None` where nothing is held (the strict profile, or
+    /// either bound zero).
+    pub fn projection_commit_hold(&self) -> Option<(u32, std::time::Duration)> {
+        (self.replays_projection()
+            && self.projection_commit_records > 0
+            && self.projection_commit_ms > 0)
+            .then(|| {
+                (
+                    self.projection_commit_records,
+                    std::time::Duration::from_millis(self.projection_commit_ms),
+                )
+            })
+    }
+}
+
+fn projection_commit_records() -> u32 {
+    32
+}
+
+fn projection_commit_ms() -> u64 {
+    5
 }
 
 fn projection_durable_commits() -> u32 {
@@ -1038,6 +1134,15 @@ impl Config {
                 field: "limits.max_admitted_per_second",
                 min: 1,
                 max: u64::from(u32::MAX),
+            });
+        }
+        if !(MIN_POLICY_STALENESS_MILLIS..=MAX_POLICY_STALENESS_MILLIS)
+            .contains(&self.limits.max_policy_staleness_millis)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_policy_staleness_millis",
+                min: MIN_POLICY_STALENESS_MILLIS,
+                max: MAX_POLICY_STALENESS_MILLIS,
             });
         }
         // Durable state is opened under the name this build implements or
