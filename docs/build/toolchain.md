@@ -40,10 +40,10 @@ claimed as qualification (Section 22.2).
 | postcard | =1.1.3 | alloc (no default) | wire and journal codecs |
 | bytes | =1.12.1 | default | |
 | blake3 | =1.8.7 | default | domain-separated identity hashing |
-| redb | =4.2.0 | std (no default) | production state engine (coord-storage-redb) |
+| redb | =4.5.0 | std (no default) | production state engine (coord-storage-redb) |
 | fjall | =3.1.10 | lz4 (no default; audited) | experimental state engine (task-s03); linked only by the test-only coord-storage-fjall crate, listed as an external test-only crate in the dependency policy so no production, core or tool crate can reach it |
 | raft-engine | git `097c499a19fbb38754c73aa2f31532329df7c0c6` | none (no default) | shared journal candidate; see audit below |
-| redb | =4.2.0 | std (no default) | production state engine; not yet linked by a crate |
+| redb | =4.5.0 | std (no default) | production state engine; not yet linked by a crate |
 | raft-engine | git `097c499a19fbb38754c73aa2f31532329df7c0c6` | none (no default) | shared journal engine (`coord-journal-raft-engine`, task-j02) and the smoke tool; see audit below |
 | thiserror | =2.0.20 | no default | |
 | anyhow | =1.0.104 | default | binaries/tooling only |

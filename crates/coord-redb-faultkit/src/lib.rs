@@ -124,7 +124,9 @@ struct Images {
 pub struct Shared {
     images: Mutex<Images>,
     ops: AtomicU64,
-    frozen: AtomicBool,
+    /// The power line: shared with another kit's (see
+    /// [`FaultBackend::with_power`]), a crash in either halts both.
+    frozen: Arc<AtomicBool>,
     log: Mutex<Vec<Op>>,
     plan: Mutex<FaultPlan>,
 }
@@ -179,35 +181,58 @@ impl Shared {
 }
 
 fn apply_tail(images: &Images, tail: Tail) -> Vec<u8> {
-    let mut ops: Vec<Unsynced> = images.unsynced.clone();
-    match tail {
-        Tail::None => return images.durable.clone(),
+    split_tail(images, tail).0
+}
+
+/// The image `tail` leaves, and the unsynced operations it did not
+/// persist, in issue order: the ones it dropped, and the unwritten rest of
+/// a write it tore. A failed sync keeps exactly those pending, so a later
+/// crash image never replays an operation the failed sync already
+/// persisted over what came after it.
+fn split_tail(images: &Images, tail: Tail) -> (Vec<u8>, Vec<Unsynced>) {
+    let seed = match tail {
+        Tail::None => return (images.durable.clone(), images.unsynced.clone()),
         // Everything unsynced survives in issue order: exactly the volatile
         // image, including a shrink that followed an earlier write.
-        Tail::All => return images.volatile.clone(),
-        Tail::Seeded(seed) => {
-            let mut rng = ChaCha12Rng::seed_from_u64(seed);
-            // Keep each operation with probability 1/2, tear surviving
-            // writes to a prefix sometimes, and shuffle the survivors. A
-            // length change is one of the operations: it survives, or not,
-            // and lands wherever the shuffle puts it.
-            ops.retain(|_| rng.next_u32() % 2 == 0);
-            for op in &mut ops {
-                if let Unsynced::Write { bytes, .. } = op
-                    && rng.next_u32() % 4 == 0
-                {
-                    let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
-                    bytes.truncate(keep);
-                }
-            }
-            for i in (1..ops.len()).rev() {
-                let j = (rng.next_u32() as usize) % (i + 1);
-                ops.swap(i, j);
+        Tail::All => return (images.volatile.clone(), Vec::new()),
+        Tail::Seeded(seed) => seed,
+    };
+    let mut rng = ChaCha12Rng::seed_from_u64(seed);
+    // Keep each operation with probability 1/2, tear surviving writes to a
+    // prefix sometimes, and shuffle the survivors. A length change is one
+    // of the operations: it survives, or not, and lands wherever the
+    // shuffle puts it.
+    let (mut kept, mut rest) = (Vec::new(), Vec::new());
+    for (i, op) in images.unsynced.iter().enumerate() {
+        if rng.next_u32() % 2 == 0 {
+            kept.push((i, op.clone()));
+        } else {
+            rest.push((i, op.clone()));
+        }
+    }
+    for (i, op) in &mut kept {
+        if let Unsynced::Write { offset, bytes } = op
+            && rng.next_u32() % 4 == 0
+        {
+            let keep = (rng.next_u32() as usize) % (bytes.len() + 1);
+            let unwritten = bytes.split_off(keep);
+            if !unwritten.is_empty() {
+                rest.push((
+                    *i,
+                    Unsynced::Write {
+                        offset: *offset + keep as u64,
+                        bytes: unwritten,
+                    },
+                ));
             }
         }
     }
+    for i in (1..kept.len()).rev() {
+        let j = (rng.next_u32() as usize) % (i + 1);
+        kept.swap(i, j);
+    }
     let mut out = images.durable.clone();
-    for op in ops {
+    for (_, op) in kept {
         match op {
             Unsynced::Write { offset, bytes } => {
                 let end = offset as usize + bytes.len();
@@ -219,7 +244,8 @@ fn apply_tail(images: &Images, tail: Tail) -> Vec<u8> {
             Unsynced::SetLen { len } => out.resize(len as usize, 0),
         }
     }
-    out
+    rest.sort_by_key(|(i, _)| *i);
+    (out, rest.into_iter().map(|(_, op)| op).collect())
 }
 
 /// The backend.
@@ -232,7 +258,22 @@ impl FaultBackend {
     /// New backend over an initial durable image (empty for a fresh
     /// database) with a plan.
     pub fn new(image: Vec<u8>, plan: FaultPlan) -> (FaultBackend, Arc<Shared>) {
-        let shared = Arc::new(Shared::default());
+        Self::with_power(image, plan, Arc::default())
+    }
+
+    /// [`FaultBackend::new`] on a power line shared with other devices
+    /// (task-j05): a crash any of them schedules freezes every one at the
+    /// same instant, as one machine's power loss would, and none of them
+    /// takes a write after it.
+    pub fn with_power(
+        image: Vec<u8>,
+        plan: FaultPlan,
+        power: Arc<AtomicBool>,
+    ) -> (FaultBackend, Arc<Shared>) {
+        let shared = Arc::new(Shared {
+            frozen: power,
+            ..Shared::default()
+        });
         {
             let mut images = shared.images.lock().unwrap();
             images.durable = image.clone();
@@ -330,11 +371,12 @@ impl redb::StorageBackend for FaultBackend {
         let plan = *self.shared.plan.lock().unwrap();
         let mut images = self.shared.images.lock().unwrap();
         if plan.fail_sync_at == Some(n) {
-            // A failed sync may have persisted any permitted subset.
-            let persisted = apply_tail(&images, plan.tail);
+            // A failed sync may have persisted any permitted subset; what
+            // it did not persist, and only that, stays pending against the
+            // new image.
+            let (persisted, pending) = split_tail(&images, plan.tail);
             images.durable = persisted;
-            // What was not persisted stays unsynced; we do not know which,
-            // so treat all as still pending relative to the new durable image.
+            images.unsynced = pending;
             drop(images);
             self.shared.log.lock().unwrap().push(Op::Failed);
             self.maybe_crash(n);
@@ -431,6 +473,43 @@ mod tests {
             shrunk |= out.len() == 4;
         }
         assert!(shrunk, "some schedule keeps the shrink last");
+    }
+
+    /// A failed sync keeps pending only what it did not persist: one that
+    /// persisted everything leaves nothing a later crash image could
+    /// replay over it, and one that persisted nothing keeps everything.
+    #[test]
+    fn a_failed_sync_keeps_pending_only_what_it_did_not_persist() {
+        use redb::StorageBackend;
+        for seed in 0..16 {
+            let (backend, shared) = FaultBackend::new(
+                Vec::new(),
+                FaultPlan {
+                    fail_sync_at: Some(3),
+                    tail: Tail::All,
+                    ..FaultPlan::default()
+                },
+            );
+            backend.write(0, b"aaaa").unwrap();
+            backend.write(0, b"bb").unwrap();
+            assert!(backend.sync_data().is_err());
+            assert_eq!(shared.durable(), b"bbaa");
+            assert_eq!(shared.unsynced(), 0);
+            assert_eq!(shared.crash_image(Tail::Seeded(seed)), b"bbaa", "{seed}");
+        }
+        let (backend, shared) = FaultBackend::new(
+            Vec::new(),
+            FaultPlan {
+                fail_sync_at: Some(3),
+                tail: Tail::None,
+                ..FaultPlan::default()
+            },
+        );
+        backend.write(0, b"aaaa").unwrap();
+        backend.write(0, b"bb").unwrap();
+        assert!(backend.sync_data().is_err());
+        assert_eq!(shared.durable(), b"");
+        assert_eq!(shared.unsynced(), 2);
     }
 
     #[test]

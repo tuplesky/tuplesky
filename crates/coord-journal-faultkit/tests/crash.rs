@@ -293,6 +293,30 @@ fn a_failed_sync_never_acknowledges_and_loses_nothing_acknowledged() {
 /// The matrix's check has teeth: a device that lies about one sync of a
 /// group's write loses that acknowledged group at the crash, and the check
 /// says so. Without this, a check that never looked would pass the matrix.
+/// The check holds a group to all or nothing (#210 review). A journal
+/// that kept the genesis alone is a whole group where the genesis was all
+/// that was attempted, and half of one where the workload's first group,
+/// the genesis and its first record, was in flight: the check passes the
+/// first and refuses the second, which it once let through.
+#[test]
+fn half_a_group_is_caught_by_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let stream = half_a_group(&root);
+    let acked = |attempted: u64| Acked {
+        created: true,
+        stream: Some(stream),
+        through: None,
+        attempted: Some(coord_types::ids::LocalJournalSeq::new(attempted).unwrap()),
+        calls: Vec::new(),
+    };
+    check(&root, &acked(1), "the genesis alone, attempted alone");
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        check(&root, &acked(2), "the genesis alone, of a two-record group")
+    }));
+    assert!(caught.is_err(), "half a group passed the check");
+}
+
 #[test]
 fn a_lying_sync_is_caught_by_the_check() {
     let ops = census();

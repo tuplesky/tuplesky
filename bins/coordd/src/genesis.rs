@@ -41,6 +41,7 @@
 use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;
 use coord_membership::init::{GenesisStore, InitError, StoreFailure};
+use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::Generation;
 use coord_types::ids::StoreInstanceId;
 
@@ -153,8 +154,21 @@ pub fn check(
     manifest: &GenesisManifest,
     intent: Intent,
 ) -> Result<StoreInstanceId, GenesisError> {
+    check_engine(generation.engine(), manifest, intent)
+}
+
+/// [`check`] over a generation's engine, before anything selects or
+/// attaches it: a start runs it inside `store::open_storage_with`, so a
+/// reinstall the genesis refuses leaves `CURRENT` and the earlier
+/// generations where they were (Codex review on #212). Returns the
+/// store identity pinned on that engine.
+pub fn check_engine(
+    engine: &mut RedbEngine,
+    manifest: &GenesisManifest,
+    intent: Intent,
+) -> Result<StoreInstanceId, GenesisError> {
     let mut history = GenerationHistory;
-    let mut store = StoreGenesis::new(generation.engine(), &mut history);
+    let mut store = StoreGenesis::new(engine, &mut history);
     if intent == Intent::Serve {
         let pin = store
             .pinned_digest()
@@ -178,6 +192,53 @@ pub fn check(
         .check_membership(manifest, &mut store, mint_store_instance)
         .map_err(GenesisError::Startup)?;
     Ok(initialized.store_instance)
+}
+
+/// The genesis check a start runs on each generation the open or the
+/// attach would select (`store::open_storage_with`'s `before_attach`,
+/// `store::Opened::attach_checked`), and what it found.
+///
+/// Each check that passes replaces the store identity, so once the attach
+/// returns it is the one pinned on the generation attached: the selected
+/// one, or the reinstall the open or the attach staged and then selected
+/// (task-d121's C1; the lead on #212).
+pub struct PinCheck<'a> {
+    manifest: &'a GenesisManifest,
+    root: String,
+    /// The refusal, where a check refused.
+    pub refused: Option<GenesisError>,
+    /// The store identity the last check that passed read.
+    pub store_instance: Option<StoreInstanceId>,
+}
+
+impl<'a> PinCheck<'a> {
+    /// A check against `manifest`, naming `root` in a refusal.
+    pub const fn new(manifest: &'a GenesisManifest, root: String) -> Self {
+        PinCheck {
+            manifest,
+            root,
+            refused: None,
+            store_instance: None,
+        }
+    }
+
+    /// Check `engine`'s pin, keeping its store identity or the refusal.
+    pub fn check(&mut self, engine: &mut RedbEngine) -> Result<(), crate::store::StoreError> {
+        match check_engine(engine, self.manifest, Intent::Serve) {
+            Ok(id) => {
+                self.store_instance = Some(id);
+                Ok(())
+            }
+            Err(e) => {
+                let refused = crate::store::StoreError::Refused {
+                    root: self.root.clone(),
+                    reason: e.to_string(),
+                };
+                self.refused = Some(e);
+                Err(refused)
+            }
+        }
+    }
 }
 
 fn short(bytes: &[u8]) -> String {
