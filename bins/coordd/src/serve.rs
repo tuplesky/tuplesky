@@ -1028,6 +1028,10 @@ pub struct Domain<P: Persistence> {
     /// When this voter's campaign last asked for the report pages it
     /// lacks (task-d28).
     pages_asked: Option<std::time::Instant>,
+    /// The ballot of this voter's campaign waiting for the reports it
+    /// hasn't read before giving up as `Behind`, and since when
+    /// (task-d120).
+    report_wait: Option<(coord_types::ids::Ballot, std::time::Instant)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -1996,6 +2000,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             features_started: false,
             resend_time: Default::default(),
             pages_asked: None,
+            report_wait: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             unreturned: coord_daemon::unreturned::Unreturned::new(
                 UNRETURNED_FRAMES,
@@ -3970,6 +3975,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // that have not arrived, paced like the re-send (task-d28).
         if voter.node().machine().campaigning() {
             let now = std::time::Instant::now();
+            // A campaign about to give up as `Behind` waits for the
+            // reports it hasn't read, asking again below, for the base
+            // election timeout before jitter and backoff (task-d120): it
+            // is then given up if a selection from every report in hand
+            // is still refused. Woken on the asks' interval.
+            match (voter.node().machine().report_wait(), self.report_wait) {
+                (Some((ballot, _)), Some((waiting, since))) if waiting == ballot => {
+                    if now.duration_since(since) >= crate::election::PATIENCE {
+                        self.report_wait = None;
+                        out.absorb(voter.end_report_wait()?);
+                    }
+                }
+                (Some((ballot, _)), _) => self.report_wait = Some((ballot, now)),
+                (None, _) => self.report_wait = None,
+            }
             if self
                 .pages_asked
                 .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
@@ -3979,6 +3999,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.pages_asked = None;
+            self.report_wait = None;
         }
         // A voter that holds work it does not execute, and has not moved
         // for a while, asks a peer for the commands it executed after

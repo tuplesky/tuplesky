@@ -411,6 +411,10 @@ struct Knobs {
     /// and while healing it restarts every live voter [`GONE_BOOTS`]
     /// times more, as an operator's restarts would. `None`: neither.
     holders_gone: Option<bool>,
+    /// Campaigns give up as `Behind` at once, without waiting for the
+    /// reports they haven't read (before task-d120), as
+    /// `PROTOCOL_SIM_NO_REPORT_WAIT` sets for every run.
+    no_report_wait: bool,
 }
 
 impl Knobs {
@@ -465,6 +469,7 @@ impl Knobs {
         forget_rows: 0,
         forget_everywhere: false,
         holders_gone: None,
+        no_report_wait: false,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -865,6 +870,17 @@ const PATIENCE: u32 = 6;
 /// Rounds a promise, or a campaign of its own, is given to synchronize,
 /// and the longest wait between campaigns (the election's ceiling).
 const CEILING: u32 = 48;
+/// Timer passes a campaign about to give up as `Behind` waits for the
+/// reports it hasn't read (task-d120): the patience, as `coordd` waits
+/// its base election timeout, counted in the passes that ask again.
+const REPORT_WAIT_TIMERS: u32 = PATIENCE / TIMER_EVERY;
+
+/// Whether campaigns wait for the reports they haven't read before
+/// giving up as `Behind` (task-d120): on unless
+/// `PROTOCOL_SIM_NO_REPORT_WAIT` is set, for the count before the wait.
+fn report_wait_on() -> bool {
+    std::env::var_os("PROTOCOL_SIM_NO_REPORT_WAIT").is_none()
+}
 /// Steps one voter's journal is the slow one, with an execution lag.
 const LAG_SPELL: u32 = 300;
 
@@ -930,6 +946,12 @@ struct Sim {
     /// up as `Behind` whose selection dropped a candidate behind an
     /// unreported dependency it doesn't hold decided, as last read.
     behind_undecided_seen: Vec<u64>,
+    /// Each node's current follower machine's count of waits for the
+    /// reports it hadn't read (task-d120), as last read.
+    report_waits_seen: Vec<u64>,
+    /// The ballot of the campaign each node's follower waits on the
+    /// unread reports for, and the timer passes seen since it began.
+    report_wait_timers: Vec<Option<(Ballot, u32)>>,
     /// The commands campaigns were given up as `Behind` on, counted in
     /// this check and not yet read by `Knobs::holders_gone`, and whether
     /// each one's selection counted such a drop.
@@ -1137,6 +1159,9 @@ struct Stats {
     /// off (its C0 measurement).
     behind_undecided: u32,
     behind_unexecuted_undecided: u32,
+    /// Campaigns that waited for the reports they hadn't read before
+    /// giving up as `Behind` (task-d120), each counted once.
+    report_waits: u32,
     /// Campaigns a follower rejected as `HalfInitialized`: an entry at
     /// ACCEPT whose payload no reporter holds (task-d121's payload shape).
     /// Only the rejections are counted. A selection that fails so while its
@@ -1216,6 +1241,7 @@ impl Sim {
                 });
                 follower.set_learning(LearningMode::Full);
                 follower.set_selection_rules(RULES);
+                follower.set_report_wait(report_wait_on() && !knobs.no_report_wait);
                 Role::Follower(follower)
             };
             nodes.push(Node {
@@ -1264,6 +1290,8 @@ impl Sim {
             executed_anywhere: BTreeSet::new(),
             behind_counted: vec![None; usize::from(n)],
             behind_undecided_seen: vec![0; usize::from(n)],
+            report_waits_seen: vec![0; usize::from(n)],
+            report_wait_timers: vec![None; usize::from(n)],
             gave_up: Vec::new(),
             destroyed: BTreeSet::new(),
             gone_mark: None,
@@ -1673,6 +1701,7 @@ impl Sim {
                 let pending = l.pending_sync().cloned();
                 let mut f = Follower::from_recovered(l.into_recovered(), q);
                 f.set_selection_rules(RULES);
+                f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
                 // A new machine: its examinations count from here, against
                 // what it is given from here, its own carried selection
                 // included (task-d34), bounded by the table.
@@ -1690,6 +1719,8 @@ impl Sim {
                 self.window[usize::from(i)] = false;
                 self.behind_counted[usize::from(i)] = None;
                 self.behind_undecided_seen[usize::from(i)] = 0;
+                self.report_waits_seen[usize::from(i)] = 0;
+                self.report_wait_timers[usize::from(i)] = None;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
                 }
@@ -2863,6 +2894,11 @@ impl Sim {
                     let now = f.unreported_drops().behind_undecided;
                     let undecided = now > *seen;
                     *seen = now;
+                    let waits = f.report_waits();
+                    let seen = &mut self.report_waits_seen[usize::from(i)];
+                    self.stats.report_waits +=
+                        u32::try_from(waits.saturating_sub(*seen)).unwrap_or(u32::MAX);
+                    *seen = waits;
                     for r in &rejections {
                         if let FollowerRejection::Behind { missing } = r
                             && self.behind_counted[usize::from(i)] != Some(*missing)
@@ -3084,6 +3120,7 @@ impl Sim {
         .restore_payloads(payload_rows(&node.storage));
         f.set_learning(LearningMode::Full);
         f.set_selection_rules(RULES);
+        f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
         // Restored from rows, its executions are the journal's (task-d90).
         if self.knobs.late_execution && !self.knobs.count_in_memory {
             f.track_execution_durability();
@@ -3093,6 +3130,8 @@ impl Sim {
         node.role = Some(Role::Follower(f));
         self.behind_counted[usize::from(i)] = None;
         self.behind_undecided_seen[usize::from(i)] = 0;
+        self.report_waits_seen[usize::from(i)] = 0;
+        self.report_wait_timers[usize::from(i)] = None;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
     }
@@ -3136,7 +3175,30 @@ impl Sim {
                 }
                 Some(Role::Follower(f)) => {
                     let leader = f.quorum().leader();
-                    let mut effects = f.request_report_pages();
+                    // A campaign waiting for the reports it hasn't read
+                    // (task-d120) waits this many passes, each asking
+                    // again, and is then given up if still refused.
+                    let node = usize::from(i);
+                    let mut effects = match (f.report_wait(), self.report_wait_timers[node]) {
+                        (Some((b, _)), Some((seen, passes))) if seen == b => {
+                            if passes >= REPORT_WAIT_TIMERS {
+                                self.report_wait_timers[node] = None;
+                                f.end_report_wait()
+                            } else {
+                                self.report_wait_timers[node] = Some((b, passes + 1));
+                                Vec::new()
+                            }
+                        }
+                        (Some((b, _)), _) => {
+                            self.report_wait_timers[node] = Some((b, 1));
+                            Vec::new()
+                        }
+                        (None, _) => {
+                            self.report_wait_timers[node] = None;
+                            Vec::new()
+                        }
+                    };
+                    effects.extend(f.request_report_pages());
                     if !f.missing_payloads().is_empty() {
                         effects.extend(f.request_payloads(leader));
                     }
@@ -4737,6 +4799,7 @@ fn run_row(row: u8) {
                         totals.behind_unexecuted += s.behind_unexecuted;
                         totals.behind_undecided += s.behind_undecided;
                         totals.behind_unexecuted_undecided += s.behind_unexecuted_undecided;
+                        totals.report_waits += s.report_waits;
                         totals.half_initialized += s.half_initialized;
                         totals.unreported_drops += s.unreported_drops;
                         totals.unreported_drop_runs += s.unreported_drop_runs;
@@ -5107,6 +5170,12 @@ fn the_two_campaign_stops_heal_when_another_donor_serves_the_record() {
 /// same command, which nothing can bring back. With node 2's storage
 /// only marked, the same run leads again. Task-d121 reads such a
 /// dependency as undecided, and then this run leads.
+///
+/// The seed was found before task-d120, and it runs without the wait for
+/// unread reports: with the wait, its campaign waits instead of giving
+/// up while every holder is down, and the moment is never reached. The
+/// wait does not lead here either: a destroyed holder never reports, so
+/// the wait ends at its bound and the campaign is given up as before.
 #[test]
 fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leader() {
     let knobs = |destroy| Knobs {
@@ -5115,6 +5184,7 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
         campaign: 12_000,
         crash: 5_000,
         holders_gone: Some(destroy),
+        no_report_wait: true,
         ..Knobs::row(10)
     };
     let run =
@@ -5666,6 +5736,7 @@ fn seeds_from_the_environment() {
                 totals.behind_unexecuted += s.behind_unexecuted;
                 totals.behind_undecided += s.behind_undecided;
                 totals.behind_unexecuted_undecided += s.behind_unexecuted_undecided;
+                totals.report_waits += s.report_waits;
                 totals.half_initialized += s.half_initialized;
                 totals.unreported_drops += s.unreported_drops;
                 totals.unreported_drop_runs += s.unreported_drop_runs;
@@ -5689,7 +5760,7 @@ fn seeds_from_the_environment() {
     println!(
         "row {row} at {n} voters, seeds {}..{}: behind {} (on a command no voter executed {}; \
          with an undecided drop {}, of those on a command no voter executed {}), \
-         half-initialized {}, \
+         report waits {}, half-initialized {}, \
          unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
          fenced {}, failed {}",
         v[2],
@@ -5698,6 +5769,7 @@ fn seeds_from_the_environment() {
         totals.behind_unexecuted,
         totals.behind_undecided,
         totals.behind_unexecuted_undecided,
+        totals.report_waits,
         totals.half_initialized,
         totals.unreported_drops,
         totals.unreported_drop_runs,
