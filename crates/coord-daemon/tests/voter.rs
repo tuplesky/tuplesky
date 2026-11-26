@@ -1826,6 +1826,48 @@ fn a_voter_that_installs_a_sync_in_groups_learns_the_stores_it_counted() {
     );
 }
 
+/// A Sync of a higher ballot that arrives while one of a lower ballot
+/// waits for its flush, and is never installed, doesn't cost the lower
+/// one its counted stores (task-d121, C1; Codex on #326).
+#[test]
+fn a_higher_sync_never_installed_leaves_the_pending_one_learned() {
+    let mut peer = stamped(2);
+    peer.node_mut().lower_in_groups();
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    for frame in syncs {
+        peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    assert!(!peer.node().machine().synchronized_at(&campaigned));
+    // A higher ballot's Sync, ahead of its NewLeader: kept, not installed.
+    let higher = Ballot {
+        number: campaigned.number + 1,
+        leader: r(0),
+        ..campaigned
+    };
+    let mut other = std::collections::BTreeMap::new();
+    other.insert(
+        r(0),
+        coord_consensus::CountedStore {
+            incarnation: inc(),
+            store: coord_types::ids::StoreInstanceId([0x0f; 16]),
+        },
+    );
+    peer.resume_counted(higher, other);
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    assert_eq!(peer.node().peer_stores().expect("kept").counts.learned, 1);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+    assert_eq!(durable_row(&peer, r(0), inc()), None, "never installed");
+}
+
 /// A voter that installed a Sync and stopped before the counted stores'
 /// rows were written learns them from the durable Sync it resumes at boot
 /// (task-d121, C1; Codex on #326): here, a voter that kept no rows when

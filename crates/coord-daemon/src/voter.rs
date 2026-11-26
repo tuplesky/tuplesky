@@ -156,11 +156,18 @@ pub struct Voter<P: Persistence> {
     /// Promises and reports waiting for their peer's store row to be
     /// durable (task-d121, C1), under its batch, in the order they came.
     held_peers: crate::peer_store::HeldFrames,
-    /// The stores a Sync counted (task-d121, C1), kept until this voter
-    /// has installed it: a voter lowering in groups installs it only once
-    /// a later flush makes its batch durable (Codex on #326).
-    counted: Option<(Ballot, CountedStores)>,
+    /// The stores each Sync counted (task-d121, C1), kept until this
+    /// voter has installed it or one of a higher ballot: a voter lowering
+    /// in groups installs it only once a later flush makes its batch
+    /// durable, and a Sync of a higher ballot can arrive before that
+    /// without being installed (Codex on #326). In arrival order, one per
+    /// ballot, at most [`PENDING_COUNTED`].
+    counted: Vec<(Ballot, CountedStores)>,
 }
+
+/// The most Syncs whose counted stores a voter keeps until they are
+/// installed (task-d121, C1); past it, the oldest arrival is dropped.
+const PENDING_COUNTED: usize = 4;
 
 /// The stores a Sync's leader counted, by voter (task-d121, C1).
 type CountedStores = std::collections::BTreeMap<
@@ -221,7 +228,7 @@ impl<P: Persistence> Voter<P> {
             release_again_seen_at: None,
             release_again_lookups: 0,
             held_peers: crate::peer_store::HeldFrames::default(),
-            counted: None,
+            counted: Vec::new(),
         }
     }
 
@@ -569,29 +576,32 @@ impl<P: Persistence> Voter<P> {
     /// Learn the stores the Sync of `ballot` counted once this voter has
     /// installed it (task-d121, C1). `coordd` calls this at boot with the
     /// durable Sync of the ballot it synchronized to, so a restart between
-    /// the install and the rows' batch learns them again. Only the Sync
-    /// of the highest ballot is kept: one of a lower ballot is not
-    /// installed over it.
+    /// the install and the rows' batch learns them again. A Sync of
+    /// another ballot doesn't replace it: either may be the one installed.
     pub fn resume_counted(&mut self, ballot: Ballot, counted: CountedStores) {
-        if self.counted.as_ref().is_none_or(|(held, _)| {
-            held.compare_same_epoch(&ballot) != Some(core::cmp::Ordering::Greater)
-        }) {
-            self.counted = Some((ballot, counted));
+        self.counted.retain(|(held, _)| *held != ballot);
+        self.counted.push((ballot, counted));
+        if self.counted.len() > PENDING_COUNTED {
+            self.counted.remove(0);
         }
     }
 
     /// The counted stores of a Sync this voter has now installed, learned
-    /// (task-d121, C1).
+    /// (task-d121, C1). Those of a lower ballot in the same epoch can no longer be
+    /// installed, and are dropped with it.
     fn learn_counted(&mut self) -> Result<Outbound, DriveError> {
-        let Some((ballot, _)) = &self.counted else {
+        let machine = self.node.machine();
+        let Some(at) = self
+            .counted
+            .iter()
+            .position(|(ballot, _)| machine.synchronized_at(ballot))
+        else {
             return Ok(Outbound::default());
         };
-        if !self.node.machine().synchronized_at(ballot) {
-            return Ok(Outbound::default());
-        }
-        let Some((ballot, counted)) = self.counted.take() else {
-            return Ok(Outbound::default());
-        };
+        let (ballot, counted) = self.counted.remove(at);
+        self.counted.retain(|(held, _)| {
+            held.compare_same_epoch(&ballot) != Some(core::cmp::Ordering::Less)
+        });
         self.node
             .learn_peer_stores(ballot.leader, &counted, &self.ballot)
     }
