@@ -153,6 +153,17 @@ pub struct Voter<P: Persistence> {
     /// How many snapshots the waiting releases were looked up in
     /// (diagnostic).
     release_again_lookups: u64,
+    /// Promises and reports waiting for their peer's store row to be
+    /// durable (task-d121, C1), under its batch, in the order they came.
+    held_peers: crate::peer_store::HeldFrames,
+    /// The ballot whose installed Sync's counted stores this voter has
+    /// learned (task-d121, C1). They are read from the Sync's durable row
+    /// once the machine is synchronized at its ballot, not taken from a
+    /// received frame: a voter lowering in groups installs a Sync only
+    /// after a later flush, and Syncs it caches or refuses meanwhile are
+    /// none of its business (Codex on #326). At boot this is `None`, so
+    /// the Sync it synchronized to is learned again.
+    learned_sync: Option<Ballot>,
 }
 
 /// A marked command's release waiting to be published again (task-d100,
@@ -207,6 +218,8 @@ impl<P: Persistence> Voter<P> {
             release_again: std::collections::BTreeMap::new(),
             release_again_seen_at: None,
             release_again_lookups: 0,
+            held_peers: crate::peer_store::HeldFrames::default(),
+            learned_sync: None,
         }
     }
 
@@ -463,13 +476,15 @@ impl<P: Persistence> Voter<P> {
         boot: BootId,
         incarnation: coord_types::ids::ReplicaIncarnation,
     ) -> Result<Outbound, DriveError> {
-        self.node.on_event(
+        let mut out = self.node.on_event(
             Event::Boot {
                 boot_id: boot,
                 incarnation,
             },
             &self.ballot,
-        )
+        )?;
+        out.absorb(self.learn_counted()?);
+        Ok(out)
     }
 
     /// An authenticated frame from a peer.
@@ -498,7 +513,6 @@ impl<P: Persistence> Voter<P> {
         if !provenance.is_voter() {
             return Ok(Outbound::default());
         }
-        let before = self.ballot;
         // What this voter acts on itself is below, and a leader's proposal
         // frame is none of it: the frame goes to the machine undecoded,
         // and the follower decodes it once (cost pass row 11). It is the
@@ -508,6 +522,117 @@ impl<P: Persistence> Voter<P> {
         } else {
             coord_consensus::ProtocolMessage::decode(&frame).ok()
         };
+        // A promise or report names the store it came from (task-d121,
+        // C1): the first from a peer under an incarnation is recorded, and
+        // waits for its row to be durable; one from another store than the
+        // one recorded is refused, and nothing below sees it.
+        let store = match &message {
+            Some(coord_consensus::ProtocolMessage::Promise { store, .. }) => Some(*store),
+            Some(coord_consensus::ProtocolMessage::ReportPage(page)) => Some(page.store),
+            _ => None,
+        };
+        // The stores the installed Sync counted are known before a frame
+        // is checked against them: a voter restarted before it learned
+        // them would otherwise record a wiped peer's new store first.
+        let mut out = self.learn_counted()?;
+        if let Some(store) = store
+            && let Some((check, persisted)) = self.node.check_peer_store(
+                provenance.from(),
+                provenance.incarnation(),
+                store,
+                &self.ballot,
+            )?
+        {
+            out.absorb(persisted);
+            match check {
+                crate::peer_store::Check::Pass => {}
+                crate::peer_store::Check::Refused { .. } => return Ok(out),
+                crate::peer_store::Check::Wait(barrier)
+                | crate::peer_store::Check::Record { barrier, .. } => {
+                    let held = self.held_peers.hold(barrier, provenance, frame);
+                    self.node.count_unheld(held);
+                    out.absorb(self.release_peers()?);
+                    return Ok(out);
+                }
+            }
+        }
+        out.absorb(self.deliver_peer(provenance, frame, message)?);
+        out.absorb(self.release_peers()?);
+        Ok(out)
+    }
+
+    /// Learn the stores the Sync this voter is synchronized to counted,
+    /// once its selection is held for a ballot it has not learned them for
+    /// (task-d121, C1): it records each one it has no row for. It runs at boot,
+    /// before any peer frame is checked, and after every step that can
+    /// complete an install, and again after a failed row batch. The
+    /// stores come from the selection the machine installed, which is
+    /// ahead of the projection. Without its peer stores kept it tries
+    /// again at the next step.
+    fn learn_counted(&mut self) -> Result<Outbound, DriveError> {
+        if self.node.peer_stores().is_none() {
+            return Ok(Outbound::default());
+        }
+        let Some((synced, counted)) = self.node.machine().synced_counted() else {
+            return Ok(Outbound::default());
+        };
+        if self.learned_sync == Some(synced) {
+            return Ok(Outbound::default());
+        }
+        let counted = counted.clone();
+        self.learned_sync = Some(synced);
+        if counted.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.node
+            .learn_peer_stores(synced.leader, &counted, &self.ballot)
+    }
+
+    /// Hand on the promises and reports held behind their peer's store
+    /// row (task-d121, C1) once its batch is durable, in the order they
+    /// came; drop those whose batch failed; the peer's next one is
+    /// recorded again. Every step that can complete a Sync's install ends
+    /// here, so the stores it counted are learned here too.
+    fn release_peers(&mut self) -> Result<Outbound, DriveError> {
+        let mut out = self.learn_counted()?;
+        if self.held_peers.is_empty()
+            && !self
+                .node
+                .peer_stores()
+                .is_some_and(crate::peer_store::PeerStores::unsettled)
+        {
+            return Ok(out);
+        }
+        let settled = self.node.settle_peer_stores();
+        if !settled.failed.is_empty() {
+            // A failed batch can be a learned row's: the Sync is still
+            // installed, so its stores are learned again before anything
+            // is checked against them.
+            self.learned_sync = None;
+            out.absorb(self.learn_counted()?);
+        }
+        for (provenance, frame) in self.held_peers.release(&settled) {
+            let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+            out.absorb(self.deliver_peer(provenance, frame, message)?);
+        }
+        Ok(out)
+    }
+
+    /// Promises and reports held behind their peer's store row
+    /// (task-d121, C1).
+    pub fn held_peers(&self) -> usize {
+        self.held_peers.len()
+    }
+
+    /// A voter's frame past the store check: what this voter acts on
+    /// itself, then the machine.
+    fn deliver_peer(
+        &mut self,
+        provenance: PeerProvenance,
+        frame: Vec<u8>,
+        message: Option<coord_consensus::ProtocolMessage>,
+    ) -> Result<Outbound, DriveError> {
+        let before = self.ballot;
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
@@ -1237,20 +1362,25 @@ impl<P: Persistence> Voter<P> {
         // group's results by [`Voter::finish`] after it.
         let mut out = self.node.stage(&self.ballot)?;
         out.absorb(self.node.flush(&self.ballot)?);
+        out.absorb(self.release_peers()?);
         Ok(out)
     }
 
     /// Materialize the execution group a [`Voter::flush`] staged and hand
     /// out its results (task-d47).
     pub fn finish(&mut self) -> Result<Outbound, DriveError> {
-        self.node.finish(&self.ballot)
+        let mut out = self.node.finish(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 
     /// Take back what a pipelined store's materializer has committed and
     /// hand out what it released (task-d52, [`Node::settle`]). The runtime
     /// calls this when the materializer's waker fires.
     pub fn settle(&mut self) -> Result<Outbound, DriveError> {
-        self.node.settle(&self.ballot)
+        let mut out = self.node.settle(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 
     /// Whether [`Voter::flush`] has anything to do: batches queued, a
@@ -1283,7 +1413,9 @@ impl<P: Persistence> Voter<P> {
 
     /// Apply every command whose turn has come.
     pub fn execute(&mut self) -> Result<Outbound, DriveError> {
-        self.node.execute(&self.ballot)
+        let mut out = self.node.execute(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 }
 

@@ -46,7 +46,7 @@ pub use ids::{
     Ballot, CatalogGeneration, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId,
     EndpointGeneration, ExecutionPosition, FinalizedFrameSeq, KvRevision, LeaseGeneration, LeaseId,
     LocalJournalSeq, NamespaceId, ReadFenceId, ReplicaId, ReplicaIncarnation, RequestSequence,
-    SessionId,
+    SessionId, StoreInstanceId,
 };
 
 /// Crate role marker used by the dependency-policy check.

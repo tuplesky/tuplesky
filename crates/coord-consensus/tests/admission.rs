@@ -74,6 +74,7 @@ fn booted(me: u8) -> Follower {
             voters: voters(),
             replica: r(me),
             incarnation: ReplicaIncarnation::new(1).unwrap(),
+            store: coord_types::ids::StoreInstanceId(r(me).0),
             role: ReplicaRole::Voter,
         },
         quorum: quorum(),

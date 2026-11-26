@@ -589,6 +589,43 @@ impl Machine {
         }
     }
 
+    /// The ballot this replica is synchronized at: the one it leads, or
+    /// the one it follows once it installed its Sync (task-d121, C1).
+    pub fn synchronized_ballot(&self) -> Option<Ballot> {
+        match self {
+            Machine::Leader(m) => Some(m.config_quorum().ballot()),
+            Machine::Follower(m) => {
+                (m.quorum().ballot() == m.ballots().synced()).then(|| m.ballots().synced())
+            }
+        }
+    }
+
+    /// The ballot of the selection this replica is synchronized to and the
+    /// stores its Sync counted (task-d121, C1): a leader's own selection,
+    /// or a follower's once its Sync row is journal-durable, activated or
+    /// not -- a Sync whose row lands after a higher promise's is kept as
+    /// the synchronized selection without being activated, and what it
+    /// counted is as true. `None` while there is no such selection. Never
+    /// read from the projection, which a pipelined materializer leaves
+    /// behind the journal.
+    pub fn synced_counted(
+        &self,
+    ) -> Option<(
+        Ballot,
+        &std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        let selection = match self {
+            Machine::Leader(m) => m
+                .selection()
+                .filter(|d| d.ballot == m.config_quorum().ballot()),
+            Machine::Follower(m) => m.synced_selection(),
+        }?;
+        Some((selection.ballot, &selection.counted))
+    }
+
     /// Whether this replica is synchronized at `ballot`: it leads it, or
     /// it follows it and installed its Sync (task-d08).
     pub fn synchronized_at(&self, ballot: &Ballot) -> bool {
@@ -927,6 +964,8 @@ pub struct Node<P: Persistence> {
     early_without_activation: bool,
     /// This voter's part in activating features (task-d99).
     features: Option<crate::feature::Features>,
+    /// The store each peer voter spoke from (task-d121, C1).
+    peer_stores: Option<crate::peer_store::PeerStores>,
     /// Whether this node reads `Feature::AnswerOnRelease` active
     /// (task-d100, step A): the collector beside it marks its
     /// submissions as answered on the leader's release alone.
@@ -1045,6 +1084,7 @@ impl<P: Persistence> Node<P> {
             early_holders: None,
             early_without_activation: false,
             features: None,
+            peer_stores: None,
             answer_on_release: false,
             batched_round: false,
             sent_bytes: coord_consensus::SentBytes::default(),
@@ -1917,11 +1957,116 @@ impl<P: Persistence> Node<P> {
         counts
     }
 
-    /// Take what the machine refused since the last call, rendered.
+    /// Take what the machine refused since the last call, rendered, and
+    /// the promises and reports the peer store check refused.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        let (rendered, table_full) = self.machine_mut().take_rejections_counted();
+        let (mut rendered, table_full) = self.machine_mut().take_rejections_counted();
         self.table_full += table_full;
+        if let Some(stores) = self.peer_stores.as_mut() {
+            rendered.extend(stores.take_rejections());
+        }
         rendered
+    }
+
+    /// Check the store each peer voter speaks from (task-d121, C1).
+    pub fn keep_peer_stores(&mut self, stores: crate::peer_store::PeerStores) {
+        self.peer_stores = Some(stores);
+    }
+
+    /// This voter's peer store check, when it keeps one.
+    pub const fn peer_stores(&self) -> Option<&crate::peer_store::PeerStores> {
+        self.peer_stores.as_ref()
+    }
+
+    /// Check a peer's promise or report page naming `store`, journaling
+    /// the peer's row where it is the first. `None` where this node keeps
+    /// no check: the message goes on as before.
+    pub fn check_peer_store(
+        &mut self,
+        voter: coord_types::ids::ReplicaId,
+        incarnation: coord_types::ids::ReplicaIncarnation,
+        store: coord_types::ids::StoreInstanceId,
+        ballot: &Ballot,
+    ) -> Result<Option<(crate::peer_store::Check, Outbound)>, DriveError> {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(None);
+        };
+        let applier = &self.applier;
+        let check = stores
+            .check(voter, incarnation, store, || {
+                durable_peer_store(applier, &voter, incarnation)
+            })
+            .map_err(DriveError::Engine)?;
+        let out = match &check {
+            crate::peer_store::Check::Record { barrier, updates } => self.carry_out(
+                vec![Effect::Persist(PersistBatch {
+                    barrier: *barrier,
+                    base: None,
+                    updates: updates.clone(),
+                })],
+                ballot,
+            )?,
+            _ => Outbound::default(),
+        };
+        Ok(Some((check, out)))
+    }
+
+    /// Record the stores an installed Sync from `leader` counted
+    /// (task-d121, C1), but this voter's own: a row for each voter with
+    /// none, and a disagreement with a row logged and counted.
+    pub fn learn_peer_stores(
+        &mut self,
+        leader: coord_types::ids::ReplicaId,
+        counted: &std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let me = self.machine().identity().replica;
+        let applier = &self.applier;
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut effects = Vec::new();
+        for (voter, counted) in counted {
+            if *voter == me {
+                continue;
+            }
+            if let Some((barrier, updates)) = stores
+                .learn(leader, *voter, counted.incarnation, counted.store, || {
+                    durable_peer_store(applier, voter, counted.incarnation)
+                })
+                .map_err(DriveError::Engine)?
+            {
+                effects.push(Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates,
+                }));
+            }
+        }
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
+    }
+
+    /// Count a promise or report the voter did not hold behind its
+    /// peer's store row: a duplicate, or one past the bounds.
+    pub fn count_unheld(&mut self, held: crate::peer_store::Held) {
+        if let Some(stores) = self.peer_stores.as_mut() {
+            stores.count_unheld(held);
+        }
+    }
+
+    /// What became of the peer store rows' batches since the last call.
+    pub fn settle_peer_stores(&mut self) -> crate::peer_store::Settled {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return crate::peer_store::Settled::default();
+        };
+        let outbox = &self.outbox;
+        stores.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b))
     }
 
     /// Times this node's machine found its table full, since boot, as of
@@ -3047,4 +3192,21 @@ enum Lowering {
     /// Wait for the journal append out, take it back, and lend nothing
     /// ([`Persistence::finish_append`], task-d54).
     Await,
+}
+
+/// The store this node durably recorded for `voter` under `incarnation`
+/// (task-d121, C1), read by the row's key.
+fn durable_peer_store<P: Persistence>(
+    applier: &Applier<P>,
+    voter: &coord_types::ids::ReplicaId,
+    incarnation: coord_types::ids::ReplicaIncarnation,
+) -> Result<Option<coord_types::ids::StoreInstanceId>, String> {
+    let gated = applier
+        .store()
+        .reader()
+        .snapshot()
+        .map_err(|e| format!("the peer store row cannot be read: {e:?}"))?;
+    coord_checkpoint::peer_store::read_peer_store(gated.view(), voter, incarnation)
+        .map(|row| row.map(|row| row.store))
+        .map_err(|e| format!("the peer store row cannot be read: {e:?}"))
 }

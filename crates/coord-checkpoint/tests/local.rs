@@ -63,6 +63,19 @@ fn rows() -> Vec<(Collection, Vec<u8>, Vec<u8>)> {
             meta_fields::REPLICA_ID.to_vec(),
             REPLICA.as_bytes().to_vec(),
         ),
+        // The genesis pin, and the store identity written with it
+        // (task-d121): a node reinstalled from its own image must come
+        // back as the store its peers saw, or they refuse it.
+        (
+            Collection::MetaV1,
+            meta_fields::GENESIS_DIGEST.to_vec(),
+            vec![0x5a; 32],
+        ),
+        (
+            Collection::MetaV1,
+            meta_fields::STORE_INSTANCE.to_vec(),
+            vec![0x3c; 16],
+        ),
         // A promise this node made. Losing it would let the node vote
         // again in a ballot it already fenced itself out of.
         (
@@ -412,6 +425,17 @@ fn an_installed_image_is_the_storage_that_was_pinned() {
         view.get(Collection::PayloadV1.id(), b"command-unexecuted")
             .unwrap(),
         Some(b"payload".to_vec())
+    );
+    // So are the genesis pin and the store identity (task-d121).
+    assert_eq!(
+        view.get(Collection::MetaV1.id(), meta_fields::GENESIS_DIGEST)
+            .unwrap(),
+        Some(vec![0x5a; 32])
+    );
+    assert_eq!(
+        view.get(Collection::MetaV1.id(), meta_fields::STORE_INSTANCE)
+            .unwrap(),
+        Some(vec![0x3c; 16])
     );
     // The stamp came back with the rest, so the generation is already at
     // C and an ordinary attach replays (C, J] onto it.

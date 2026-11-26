@@ -67,6 +67,7 @@ fn identity(me: u8) -> ConfigurationIdentity {
         voters: (0..VOTERS).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -1198,6 +1199,7 @@ fn a_failed_window_runs_over_its_rows_after_a_new_ballot_is_activated() {
             source_ballot: ballot0(),
             entries: Default::default(),
             reproposed: Default::default(),
+            counted: Default::default(),
         };
         let synced = cluster.step_peer(4, r(0), ProtocolMessage::Sync(decision).encode());
         let marker = persisted(synced);
@@ -1570,6 +1572,7 @@ fn a_pulled_decision_is_reported_over_the_selection_the_voter_held() {
         .into_iter()
         .collect(),
         reproposed: Default::default(),
+        counted: Default::default(),
     };
     cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
     assert_eq!(cluster.follower(4).quorum().ballot(), b1);

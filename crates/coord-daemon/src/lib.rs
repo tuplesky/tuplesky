@@ -80,6 +80,7 @@ pub mod mailbox;
 pub mod metrics;
 pub mod node;
 pub mod parked;
+pub mod peer_store;
 pub mod pending;
 pub mod reads;
 pub mod role;

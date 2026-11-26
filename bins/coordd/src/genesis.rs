@@ -42,6 +42,7 @@ use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;
 use coord_membership::init::{GenesisStore, InitError, StoreFailure};
 use coord_storage_redb::lifecycle::Generation;
+use coord_types::ids::StoreInstanceId;
 
 /// What the pin is being checked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,14 +131,28 @@ pub fn unfinished(generation: &mut Generation) -> Option<bool> {
     store.pinned_digest().ok().map(|pin| pin.is_none())
 }
 
+/// A new store identity (task-d121), from the TLS stack's secure random
+/// source: the core crates draw no randomness of their own.
+fn mint_store_instance() -> Result<StoreInstanceId, InitError> {
+    let mut bytes = [0u8; StoreInstanceId::LEN];
+    rustls::crypto::aws_lc_rs::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        // No randomness is a store this node cannot give an identity,
+        // and so cannot initialize.
+        .map_err(|_| InitError::Store)?;
+    Ok(StoreInstanceId(bytes))
+}
+
 /// Run the startup sequence over `generation` through the membership
 /// check: pin `manifest` for [`Intent::Initialize`], require and match
-/// the pin for [`Intent::Serve`].
+/// the pin for [`Intent::Serve`]. Returns this store's identity: the one
+/// pinned now for `coordd init`, the one pinned then for a start.
 pub fn check(
     generation: &mut Generation,
     manifest: &GenesisManifest,
     intent: Intent,
-) -> Result<Startup, GenesisError> {
+) -> Result<StoreInstanceId, GenesisError> {
     let mut history = GenerationHistory;
     let mut store = StoreGenesis::new(generation.engine(), &mut history);
     if intent == Intent::Serve {
@@ -157,10 +172,12 @@ pub fn check(
     startup
         .identity_validated()
         .map_err(GenesisError::Startup)?;
-    startup
-        .check_membership(manifest, &mut store)
+    // Drawn only for a first init: a start, and a backup of a pinned
+    // store, read the pinned identity back and draw nothing.
+    let initialized = startup
+        .check_membership(manifest, &mut store, mint_store_instance)
         .map_err(GenesisError::Startup)?;
-    Ok(startup)
+    Ok(initialized.store_instance)
 }
 
 fn short(bytes: &[u8]) -> String {

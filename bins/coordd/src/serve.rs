@@ -9998,6 +9998,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 voters: voters.clone(),
                 replica,
                 incarnation,
+                store: coord_types::ids::StoreInstanceId(replica.0),
                 role: coord_consensus::ReplicaRole::Voter,
             };
             let quorum =
