@@ -9448,6 +9448,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             wif_rules: vec![serde_json::json!({ "issuer": "test" })],
             admin: hex(&[0xa; 16]),
             protocol_version: 1,
+            features: Vec::new(),
         };
         coord_membership::membership::Membership::from_genesis(&manifest).expect("membership")
     }

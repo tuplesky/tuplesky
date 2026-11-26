@@ -1276,7 +1276,7 @@ Intact-storage restart can rotate credentials without resetting history. Lost st
 <a id="s10-2"></a>
 ### 10.2 Genesis
 
-Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping, protocol/version policy and the replicated features active from genesis (task-d121). Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
+Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping, protocol/version policy and the replicated features active from genesis (task-d121). The manifest names those features by their stable names, and only a feature activated through a prepare marker may be named, with every feature it rests on. Each voter's initialization records them active, each with its marker, at the genesis configuration with every genesis voter as a reporter, so no activation round runs, and a later activation keeps them. A manifest that names none serializes, and so pins, as it did before the list existed. A manifest that names any carries protocol version 2. A build from before the list accepts only version 1, so it refuses such a manifest at `init` and at start. It never drops the list and pins another digest beside voters that kept it (#329 review). The features a manifest may name rest on the same table, `Feature::requires`, that a live activation is checked against, so the two ways a feature is turned on agree. Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
 
 Provisioning signer authorization may use existing OIDC/cloud identity instead of a static API root token, but protected trust anchors and signing authority remain necessary.
 
@@ -1719,7 +1719,7 @@ Use Rust 2024 and initial declared minimum 1.90 matching the selected redb. task
 
 | Layer | Starting candidates | Boundary |
 |---|---|---|
-| State | redb 4.2.0 | Ordered synchronous projection and actual StorageBackend fault tests |
+| State | redb 4.5.0 | Ordered synchronous projection and actual StorageBackend fault tests |
 | Experiment | fjall 3.1.10 | Single-writer, explicit SyncAll; not linked in production |
 | QUIC | quinn 0.11.11; quinn-proto 0.11.17 | Production runtime and matched protocol simulator; use resolved quinn-udp |
 | TLS | rustls 0.23.44, AWS-LC | Explicit provider, ordinary certificate validation and TupleSky identity |
@@ -1756,7 +1756,7 @@ edition = "2024"
 rust-version = "1.90"
 
 [workspace.dependencies]
-redb = { version = "=4.2.0", default-features = false, features = ["std"] }
+redb = { version = "=4.5.0", default-features = false, features = ["std"] }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "=0.11.17", default-features = false, features = ["rustls-aws-lc-rs"] }
 rustls = { version = "=0.23.44", default-features = false, features = ["std", "aws_lc_rs"] }
@@ -2015,7 +2015,7 @@ So boot, catch-up served and resolve need no index by command here. Boot reads e
 
 **6. The sizes** (review's model on #233, [6813025752](https://github.com/tuplesky/tuplesky/pull/233#issuecomment-6813025752), replacing this step's first estimate), converted by the profile's rule: a local µs a command over five voters is 0.00079 ms an operation at 120 callers and 0.00066 at 30, on the EPYC 9V74.
 - **The model:**
-  - **Setup.** redb 4.2.0, opened as the adapter opens it, on tmpfs. It uses a real follower's table shapes after 100,000 operations (five voters, `replay`, 120 callers, the carry at `5ffa09e6`).
+  - **Setup.** redb 4.2.0 (measured before the pin moved to 4.5.0), opened as the adapter opens it, on tmpfs. It uses a real follower's table shapes after 100,000 operations (five voters, `replay`, 120 callers, the carry at `5ffa09e6`).
   - **What each command writes:** a follower's rows, each into a table of its own. The payload and dependency rows come at intake. Twelve commands later come the executed, event, history, current and retry rows, a retry delete and the floor. There are three meta rows a commit.
   - **The run:** 50,000 commands are in the tables first, then 30,000 are measured.
   - **Its total matches the profile's:** 9.0 pages and 36.8 KB a command at 8 a commit, where the profile has 9.4 and 38.

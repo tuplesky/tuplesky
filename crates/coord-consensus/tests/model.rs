@@ -2461,6 +2461,7 @@ fn a_pre_acceptance_no_reporter_holds_a_payload_row_for_is_left_out() {
     let cfg = config(3, 2, &[2, 0], 2);
     let rules = coord_consensus::SelectionRules {
         leave_out_unheld: true,
+        decide_nothing: false,
     };
     let select = |cfg: &coord_consensus::BallotConfiguration, reports: &[RecoveryReport]| {
         coord_consensus::select_ruled(
@@ -2536,7 +2537,8 @@ fn without_the_rule_a_pre_acceptance_no_reporter_holds_a_payload_for_is_repropos
     assert_eq!(
         coord_consensus::SelectionRules::default(),
         coord_consensus::SelectionRules {
-            leave_out_unheld: false
+            leave_out_unheld: false,
+            decide_nothing: false,
         }
     );
     let decision = select(&cfg, &reports).unwrap();

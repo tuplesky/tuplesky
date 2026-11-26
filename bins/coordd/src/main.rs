@@ -131,15 +131,19 @@ enum Command {
 /// by running `init` again: a row the projection already holds with the
 /// value it would write is not written a second time, so finishing
 /// writes exactly the rows that are missing.
+///
+/// `features` are the rows of the features the manifest makes active from
+/// genesis ([`genesis_feature_rows`]), written in the same batch.
 fn write_genesis_policy(
     config: &Config,
     storage: &mut store::Storage,
     incarnation: coord_types::ids::ReplicaIncarnation,
+    features: Vec<coord_core::effect::StoreUpdate>,
 ) -> Result<(), String> {
     use coord_storage::Persistence;
     use coord_store_api::engine::OrderedRead;
 
-    let mut updates = Vec::new();
+    let mut updates = features;
     if let Some(sts) = &config.sts {
         let rule = coord_daemon::config::identity_bytes(&sts.trust_rule)
             .ok_or("sts.trust_rule is not an identity")?;
@@ -225,6 +229,38 @@ fn write_genesis_policy(
     Ok(())
 }
 
+/// The rows of the features `manifest` makes active from genesis
+/// (task-d121, design Section 10.2): the activation record every voter
+/// writes alike, from the manifest's own voters and epoch, and this
+/// replica's support row where it is one of them. None where it names
+/// none.
+fn genesis_feature_rows(
+    manifest: &coord_membership::genesis::GenesisManifest,
+    replica: coord_types::ids::ReplicaId,
+) -> Result<Vec<coord_core::effect::StoreUpdate>, String> {
+    use coord_membership::genesis::GenesisManifest;
+    let features = manifest
+        .genesis_features()
+        .map_err(|e| format!("the genesis manifest's features: {e:?}"))?;
+    let (Some(cluster), Some(domain), Some(epoch)) = (
+        manifest.cluster_id(),
+        manifest.domain_id(),
+        manifest.config_epoch(),
+    ) else {
+        return Err("the genesis manifest does not name its domain".into());
+    };
+    let seeds = manifest
+        .voters
+        .iter()
+        .map(|seed| GenesisManifest::voter(seed).map(|(node, _, _)| node))
+        .collect::<Option<std::collections::BTreeSet<_>>>()
+        .ok_or("the genesis manifest names a voter it cannot parse")?;
+    let voters = coord_consensus::quorum::EpochVoters::new(epoch, seeds)
+        .ok_or("the genesis manifest names no voters")?;
+    coord_checkpoint::feature::genesis_rows(cluster, domain, &voters, replica, &features)
+        .map_err(|e| format!("the genesis features: {e}"))
+}
+
 /// Finish initializing `opened`: attach it, write the genesis policy
 /// that is missing, and pin the genesis manifest -- in that order.
 ///
@@ -248,7 +284,8 @@ fn finish_initialization(
 ) -> Result<std::path::PathBuf, String> {
     let directory = {
         let mut storage = opened.attach().map_err(|e| e.to_string())?;
-        write_genesis_policy(config, &mut storage, placed.incarnation)?;
+        let features = genesis_feature_rows(&placed.manifest, placed.replica)?;
+        write_genesis_policy(config, &mut storage, placed.incarnation, features)?;
         storage.generation
     };
     let mut reopened = store::open_storage(
@@ -267,6 +304,26 @@ fn finish_initialization(
     )
     .map_err(|e| e.to_string())?;
     Ok(directory)
+}
+
+/// The genesis check a backup's open and attach run on the generation
+/// each would select (Codex review on #212): the backup is taken under
+/// the genesis the store was initialized with.
+fn backup_pin(
+    engine: &mut coord_storage_redb::RedbEngine,
+    config: &Config,
+    placed: &membership::Placed,
+) -> Result<(), store::StoreError> {
+    genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve)
+        .map(|_| ())
+        .map_err(|e| store::StoreError::Refused {
+            root: config
+                .state
+                .root_path(&config.state_directory)
+                .display()
+                .to_string(),
+            reason: e.to_string(),
+        })
 }
 
 /// How an inspection reports a credential. Bounded words, never keys.
@@ -853,30 +910,19 @@ fn main() -> ExitCode {
         // A backup is taken from this node's store as a start opens it:
         // under the genesis it was initialized with, and with the
         // journal's suffix replayed into the projection.
-        let opened = store::open_storage(
+        // The genesis is checked before the generation is selected or
+        // attached, so a refused one changes nothing (Codex review on
+        // #212).
+        let opened = store::open_storage_with(
             &config,
             store::Intent::Serve,
             placed.membership.cluster(),
             placed.membership.domain(),
             placed.replica,
             placed.incarnation,
+            |engine| backup_pin(engine, &config, &placed),
         )
-        .and_then(|mut opened| {
-            genesis::check(
-                &mut opened.generation,
-                &placed.manifest,
-                genesis::Intent::Serve,
-            )
-            .map_err(|e| store::StoreError::Refused {
-                root: config
-                    .state
-                    .root_path(&config.state_directory)
-                    .display()
-                    .to_string(),
-                reason: e.to_string(),
-            })?;
-            opened.attach()
-        });
+        .and_then(|opened| opened.attach_checked(|engine| backup_pin(engine, &config, &placed)));
         return match opened {
             Ok(storage) => {
                 let origin = coord_checkpoint::export::CheckpointOrigin {
@@ -1020,46 +1066,73 @@ fn main() -> ExitCode {
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
     let booting = std::time::Instant::now();
-    let mut opened = match store::open_storage(
+    // The store is this node's only under the manifest it was
+    // initialized with. Anything else -- another set of voters, another
+    // policy, under the same cluster and domain -- is a genesis
+    // quarantine, not a new configuration to adopt. It is settled on the
+    // projection before the journal replays anything into it, and before
+    // a reinstalled generation is selected, so a refused start leaves
+    // the selection and the earlier generations as they were (Codex
+    // review on #212).
+    //
+    // The store's identity (task-d121, C1) is read from the pin on the
+    // generation that is attached: the one the open selects, or the one
+    // it reinstalls for an unreadable projection, or the one the attach
+    // reinstalls for an invalid one. Each runs the check on its own
+    // engine before it is selected, and the last to run names it.
+    let mut pin = genesis::PinCheck::new(
+        &placed.manifest,
+        config
+            .state
+            .root_path(&config.state_directory)
+            .display()
+            .to_string(),
+    );
+    let opened = store::open_storage_with(
         &config,
         store::Intent::Serve,
         placed.membership.cluster(),
         placed.membership.domain(),
         placed.replica,
         placed.incarnation,
-    ) {
+        |engine| pin.check(engine),
+    );
+    let opened = match opened {
         Ok(o) => o,
         Err(e) => {
-            lifecycle.quarantine(QuarantineReason::Disk);
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-    // The store is this node's only under the manifest it was
-    // initialized with. Anything else -- another set of voters, another
-    // policy, under the same cluster and domain -- is a genesis
-    // quarantine, not a new configuration to adopt. It is settled on the
-    // projection before the journal replays anything into it.
-    let store_instance = match genesis::check(
-        &mut opened.generation,
-        &placed.manifest,
-        genesis::Intent::Serve,
-    ) {
-        Ok(store_instance) => store_instance,
-        Err(e) => {
-            lifecycle.quarantine(e.quarantine_reason());
-            eprintln!("{e}");
+            let reason = pin.refused.as_ref().map_or(
+                QuarantineReason::Disk,
+                genesis::GenesisError::quarantine_reason,
+            );
+            lifecycle.quarantine(reason);
+            match &pin.refused {
+                Some(genesis) => eprintln!("{genesis}"),
+                None => eprintln!("{e}"),
+            }
             return ExitCode::from(2);
         }
     };
     let attaching = std::time::Instant::now();
-    let storage = match opened.attach() {
+    let storage = match opened.attach_checked(|engine| pin.check(engine)) {
         Ok(s) => s,
         Err(e) => {
-            lifecycle.quarantine(QuarantineReason::Disk);
-            eprintln!("{e}");
+            let reason = pin.refused.as_ref().map_or(
+                QuarantineReason::Disk,
+                genesis::GenesisError::quarantine_reason,
+            );
+            lifecycle.quarantine(reason);
+            match &pin.refused {
+                Some(genesis) => eprintln!("{genesis}"),
+                None => eprintln!("{e}"),
+            }
             return ExitCode::from(2);
         }
+    };
+    // Every serve path ran the check on the generation it selects.
+    let Some(store_instance) = pin.store_instance else {
+        lifecycle.quarantine(QuarantineReason::Disk);
+        eprintln!("the store's identity was not read from its genesis pin");
+        return ExitCode::from(2);
     };
     // Attaching is where the journal's frontier and the projection's are
     // checked against each other and the journal's suffix is replayed
