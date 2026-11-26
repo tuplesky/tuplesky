@@ -147,8 +147,8 @@ pub use ballot::{
 pub use campaign::Campaign;
 pub use catch_up::{CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution};
 pub use commands::{
-    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RelayRoom,
-    RetireError, TableWait, TableWaits,
+    CommandRecord, CommandTable, InitError, Initialized, NOTHING_ADMISSION, RECOVERY_RESERVE_PARTS,
+    RelayRoom, RetireError, TableWait, TableWaits, is_nothing,
 };
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
@@ -183,9 +183,10 @@ pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{
-    CandidateDecisions, ExecutedFacts, MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY, RecoveryError,
-    RecoveryReport, ReportEntry, SelectionRules, SyncDecision, SyncEntry, entry_order,
-    max_report_entries, select, select_decided, select_from, select_ruled, select_with,
+    CandidateDecisions, CountedStore, ExecutedFacts, MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY,
+    RecoveryError, RecoveryReport, ReportEntry, SelectionRules, SyncDecision, SyncEntry,
+    entry_order, max_report_entries, select, select_decided, select_from, select_ruled,
+    select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState, ServedRefusal};

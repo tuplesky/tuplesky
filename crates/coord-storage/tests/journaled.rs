@@ -2078,6 +2078,7 @@ fn a_seal_is_recovered_from_its_row_and_the_cut_sees_it_before_the_projection() 
         voters: (0..3).map(|i| ReplicaId([i; 16])).collect(),
         replica: ReplicaId([0; 16]),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(ReplicaId([0; 16]).0),
         role: coord_consensus::ReplicaRole::Voter,
     };
     let mut state = coord_consensus::BallotState::recover_sealed(

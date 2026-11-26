@@ -56,6 +56,7 @@ fn identity(me: u8) -> ConfigurationIdentity {
         voters: (0..3).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -305,7 +306,11 @@ fn pages_assemble_only_when_complete_and_verified() {
         commands.push(c);
     }
     let report = f.report(ballot(1, 2));
-    let pages = paginate(&report, 3);
+    let pages = paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        3,
+    );
     assert_eq!(pages.len(), 3);
     assert!(pages.iter().all(|p| p.total == 3));
     // Delivered out of order, with a duplicate: assembled exactly once.
@@ -336,7 +341,12 @@ fn pages_assemble_only_when_complete_and_verified() {
     assert_eq!(asm.accept(other), Err(PageError::WrongBallot));
     let mut asm2 = ReportAssembler::new(ballot(1, 2));
     asm2.accept(pages[0].clone()).unwrap();
-    let mut inconsistent = paginate(&report, 2)[1].clone();
+    let mut inconsistent = paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        2,
+    )[1]
+    .clone();
     inconsistent.page = 1;
     assert_eq!(asm2.accept(inconsistent), Err(PageError::Inconsistent));
     // Selection never sees an incomplete report: with only one complete
@@ -354,6 +364,7 @@ fn pages_assemble_only_when_complete_and_verified() {
     );
     let _ = ReportPage {
         replica: r(9),
+        store: coord_types::ids::StoreInstanceId(r(9).0),
         ballot: ballot(1, 2),
         committed_ballot: ballot(0, 0),
         page: 0,
@@ -894,6 +905,7 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
             ballot: ballot(1, 0),
             synced: ballot(0, 0),
             replica: r(1),
+            store: coord_types::ids::StoreInstanceId(r(1).0),
         },
         ProtocolMessage::LeaderReply {
             ballot: ballot(0, 0),
@@ -997,6 +1009,8 @@ fn entry_order_is_the_order_of_placing_by_passes() {
             source_ballot: ballot(0, 0),
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
+            nothing: Default::default(),
         };
         assert_eq!(
             coord_consensus::entry_order(&decision),

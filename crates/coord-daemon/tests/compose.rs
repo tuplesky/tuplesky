@@ -1131,6 +1131,8 @@ fn a_sync_past_its_row_refuses_the_campaign_by_name() {
             })
             .collect(),
         reproposed: Default::default(),
+        counted: Default::default(),
+        nothing: Default::default(),
     };
     match bounded_sync_update(ballot.epoch, &decision) {
         Err(RecoveryError::SyncTooLarge {

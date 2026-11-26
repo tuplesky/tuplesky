@@ -269,6 +269,26 @@ fn finish_initialization(
     Ok(directory)
 }
 
+/// The genesis check a backup's open and attach run on the generation
+/// each would select (Codex review on #212): the backup is taken under
+/// the genesis the store was initialized with.
+fn backup_pin(
+    engine: &mut coord_storage_redb::RedbEngine,
+    config: &Config,
+    placed: &membership::Placed,
+) -> Result<(), store::StoreError> {
+    genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve)
+        .map(|_| ())
+        .map_err(|e| store::StoreError::Refused {
+            root: config
+                .state
+                .root_path(&config.state_directory)
+                .display()
+                .to_string(),
+            reason: e.to_string(),
+        })
+}
+
 /// How an inspection reports a credential. Bounded words, never keys.
 fn credential_state(change: &coord_membership::CredentialChange) -> String {
     use coord_membership::CredentialChange as C;
@@ -863,20 +883,9 @@ fn main() -> ExitCode {
             placed.membership.domain(),
             placed.replica,
             placed.incarnation,
-            |engine| {
-                genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve)
-                    .map(|_| ())
-                    .map_err(|e| store::StoreError::Refused {
-                        root: config
-                            .state
-                            .root_path(&config.state_directory)
-                            .display()
-                            .to_string(),
-                        reason: e.to_string(),
-                    })
-            },
+            |engine| backup_pin(engine, &config, &placed),
         )
-        .and_then(store::Opened::attach);
+        .and_then(|opened| opened.attach_checked(|engine| backup_pin(engine, &config, &placed)));
         return match opened {
             Ok(storage) => {
                 let origin = coord_checkpoint::export::CheckpointOrigin {
@@ -1028,7 +1037,22 @@ fn main() -> ExitCode {
     // a reinstalled generation is selected, so a refused start leaves
     // the selection and the earlier generations as they were (Codex
     // review on #212).
+    //
+    // The store's identity (task-d121, C1) is read from the pin on the
+    // generation that is attached: the one the open selects, or the one
+    // it reinstalls for an unreadable projection, or the one the attach
+    // reinstalls for an invalid one. Each runs the check on its own
+    // engine before it is selected, and the last to run names it.
     let mut refused_genesis = None;
+    let mut store_instance = None;
+    let refusal = |e: &genesis::GenesisError| store::StoreError::Refused {
+        root: config
+            .state
+            .root_path(&config.state_directory)
+            .display()
+            .to_string(),
+        reason: e.to_string(),
+    };
     let opened = store::open_storage_with(
         &config,
         store::Intent::Serve,
@@ -1037,16 +1061,12 @@ fn main() -> ExitCode {
         placed.replica,
         placed.incarnation,
         |engine| match genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve) {
-            Ok(_) => Ok(()),
+            Ok(id) => {
+                store_instance = Some(id);
+                Ok(())
+            }
             Err(e) => {
-                let refused = store::StoreError::Refused {
-                    root: config
-                        .state
-                        .root_path(&config.state_directory)
-                        .display()
-                        .to_string(),
-                    reason: e.to_string(),
-                };
+                let refused = refusal(&e);
                 refused_genesis = Some(e);
                 Err(refused)
             }
@@ -1068,13 +1088,38 @@ fn main() -> ExitCode {
         }
     };
     let attaching = std::time::Instant::now();
-    let storage = match opened.attach() {
+    let storage = match opened.attach_checked(|engine| {
+        match genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve) {
+            Ok(id) => {
+                store_instance = Some(id);
+                Ok(())
+            }
+            Err(e) => {
+                let refused = refusal(&e);
+                refused_genesis = Some(e);
+                Err(refused)
+            }
+        }
+    }) {
         Ok(s) => s,
         Err(e) => {
-            lifecycle.quarantine(QuarantineReason::Disk);
-            eprintln!("{e}");
+            let reason = refused_genesis.as_ref().map_or(
+                QuarantineReason::Disk,
+                genesis::GenesisError::quarantine_reason,
+            );
+            lifecycle.quarantine(reason);
+            match refused_genesis {
+                Some(genesis) => eprintln!("{genesis}"),
+                None => eprintln!("{e}"),
+            }
             return ExitCode::from(2);
         }
+    };
+    // Every serve path ran the check on the generation it selects.
+    let Some(store_instance) = store_instance else {
+        lifecycle.quarantine(QuarantineReason::Disk);
+        eprintln!("the store's identity was not read from its genesis pin");
+        return ExitCode::from(2);
     };
     // Attaching is where the journal's frontier and the projection's are
     // checked against each other and the journal's suffix is replayed
@@ -1157,6 +1202,7 @@ fn main() -> ExitCode {
     let backing = if roles.votes() {
         match voter(
             &placed,
+            store_instance,
             applier,
             boot,
             config.limits.command_table_capacity,
@@ -1563,6 +1609,7 @@ fn early_proposal(active: &std::collections::BTreeSet<coord_types::formats::Feat
 /// storage frontier had already passed.
 fn voter(
     placed: &membership::Placed,
+    store_instance: coord_types::ids::StoreInstanceId,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
     capacity: usize,
@@ -1585,6 +1632,7 @@ fn voter(
         voters: m.voters().map(|v| v.node).collect(),
         replica: placed.replica,
         incarnation: placed.incarnation,
+        store: store_instance,
         role: ReplicaRole::Voter,
     };
     // What this replica already owes, from the authoritative record.
@@ -1767,6 +1815,11 @@ fn voter(
     // driver reports its active set as changed when opened, so this sets
     // it from the same activation the store holds.
     voter.node_mut().keep_features(features);
+    // Each peer voter's promises and reports are checked against the store
+    // it first spoke from (task-d121, C1). Its row is read by key when the
+    // peer first speaks, so nothing is read here.
+    let peer_stores = coord_daemon::peer_store::PeerStores::new(placed.incarnation, boot);
+    voter.node_mut().keep_peer_stores(peer_stores);
     if cfg!(feature = "early-proposal-without-activation") {
         voter.node_mut().send_early_without_activation();
     }

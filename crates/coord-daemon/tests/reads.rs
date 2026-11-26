@@ -120,6 +120,7 @@ fn identity(me: u8) -> ConfigurationIdentity {
         voters: (0..3).map(r).collect(),
         replica: r(me),
         incarnation: inc(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }

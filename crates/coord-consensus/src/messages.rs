@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 use coord_types::CommandId;
 use coord_types::error::DecodeError;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId};
+use coord_types::ids::{
+    Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId, StoreInstanceId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::CommandRecord;
@@ -178,6 +180,9 @@ pub enum ProtocolMessage {
         synced: Ballot,
         /// Promising replica.
         replica: ReplicaId,
+        /// The promising replica's store (task-d121): a peer counts the
+        /// promise only under the store it first saw from that replica.
+        store: StoreInstanceId,
     },
     /// The leader's proposal for a command (`MFastAck` from the leader,
     /// carrying its sequence number and the per-key path anchors a

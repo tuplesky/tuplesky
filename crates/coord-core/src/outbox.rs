@@ -450,6 +450,11 @@ pub const RUNTIME_BARRIERS: u64 = 1 << 62;
 /// which a runtime allocates from [`RUNTIME_BARRIERS`] in the same boot.
 pub const FEATURE_BARRIERS: u64 = RUNTIME_BARRIERS + (1 << 61);
 
+/// The first sequence of the runtime's peer store batches (task-d121): the
+/// upper half of the runtime's lower half, so they never meet a floor's,
+/// which counts up from [`RUNTIME_BARRIERS`], or a feature batch's.
+pub const PEER_STORE_BARRIERS: u64 = RUNTIME_BARRIERS + (1 << 60);
+
 /// Whether `barrier` was allocated by an applier ([`BarrierAllocator::for_application`]).
 pub const fn is_application(barrier: &BarrierId) -> bool {
     barrier.sequence >= APPLICATION_BARRIERS
@@ -480,11 +485,23 @@ impl BarrierAllocator {
     }
 
     /// The same allocator moved to the runtime's own sequences, between
-    /// the protocol's and the application's, below the feature batches'.
+    /// the protocol's and the application's, below the peer store and
+    /// feature batches'.
     #[must_use]
     pub const fn for_runtime(mut self) -> Self {
         if self.next < RUNTIME_BARRIERS {
             self.next = RUNTIME_BARRIERS;
+        }
+        self.end = PEER_STORE_BARRIERS;
+        self
+    }
+
+    /// The same allocator moved to the runtime's peer store batches
+    /// (task-d121), between the floor's and the feature batches'.
+    #[must_use]
+    pub const fn for_peer_stores(mut self) -> Self {
+        if self.next < PEER_STORE_BARRIERS {
+            self.next = PEER_STORE_BARRIERS;
         }
         self.end = FEATURE_BARRIERS;
         self

@@ -300,6 +300,8 @@ fn protocol_rows() -> Vec<Row> {
                 source_ballot: ballot(2),
                 entries: BTreeMap::new(),
                 reproposed: BTreeSet::new(),
+                counted: Default::default(),
+                nothing: Default::default(),
             },
         })
         .unwrap(),

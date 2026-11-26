@@ -643,7 +643,19 @@ impl Opened {
     /// caught up with the journal has forgotten transitions this node
     /// already acknowledged.
     pub fn attach(self) -> Result<Storage, StoreError> {
-        self.attach_between(|| Ok(()))
+        self.attach_checked(|_| Ok(()))
+    }
+
+    /// [`Opened::attach`], running `pin` on a generation the attach
+    /// reinstalls for an invalid projection, before it is selected, as
+    /// `open_storage_with`'s `before_attach` runs on the generation the
+    /// open selects or reinstalls (#212 review). A start reads the store's
+    /// genesis pin, and its identity, from the generation it attaches.
+    pub fn attach_checked(
+        self,
+        pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
+    ) -> Result<Storage, StoreError> {
+        self.attach_between(|| Ok(()), pin)
     }
 
     /// [`Opened::attach`], running `between` after an adoption's first
@@ -652,6 +664,7 @@ impl Opened {
     fn attach_between(
         self,
         between: impl FnOnce() -> Result<(), StoreError>,
+        pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
     ) -> Result<Storage, StoreError> {
         let Opened {
             mut store,
@@ -746,6 +759,7 @@ impl Opened {
                 baseline.as_ref().zip(image.as_ref()),
                 represented,
                 options,
+                pin,
             )?
         };
         let directory = generation.directory().to_path_buf();
@@ -880,6 +894,10 @@ fn refuse_if_invalid(
 /// node's own state at the baseline, and the attach then replays
 /// `(C, J]` onto it. Without a baseline there is nothing to install, and
 /// the node refuses to serve rather than guess.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the store, the generation, the baseline and the checks the reinstall runs"
+)]
 fn reinstall_if_invalid(
     store: &JournaledStore<RaftEngineJournal, RedbEngine>,
     journal_root: &Path,
@@ -891,6 +909,7 @@ fn reinstall_if_invalid(
     )>,
     represented: LocalJournalSeq,
     options: OpenOptions,
+    pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
 ) -> Result<Generation, StoreError> {
     let directory = generation.directory().to_path_buf();
     let refused = |reason: String| StoreError::Refused {
@@ -945,8 +964,10 @@ fn reinstall_if_invalid(
         },
         other => other,
     };
-    let checked = rollback_guard(staged.engine(), &staged_directory)
-        .map_err(in_the_image)
+    // The genesis pin first, as on the open's reinstall: the identity a
+    // start serves under is read from the generation it attaches.
+    let checked = pin(staged.engine())
+        .and_then(|_| rollback_guard(staged.engine(), &staged_directory).map_err(in_the_image))
         .and_then(|_| {
             refuse_unapplied_activation(
                 store,
@@ -1602,12 +1623,15 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 
         let opened = serve(&config, 2).expect("open at the next generation");
         assert!(opened.adoption.is_some(), "no adoption was pending");
-        let stopped = opened.attach_between(|| {
-            Err(StoreError::Refused {
-                root: "test".into(),
-                reason: "stopped between the two writes".into(),
-            })
-        });
+        let stopped = opened.attach_between(
+            || {
+                Err(StoreError::Refused {
+                    root: "test".into(),
+                    reason: "stopped between the two writes".into(),
+                })
+            },
+            |_| Ok(()),
+        );
         assert!(
             matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
             "the start did not stop where this test stops it: {:?}",
@@ -1997,6 +2021,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
                 Some((&baseline, &image)),
                 baseline.represented,
                 opened.options,
+                |_| Ok(()),
             )
             .expect("reinstalled");
             // The process stops here: the reinstalled generation is
@@ -2220,12 +2245,15 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 
         let opened = serve(&config, 2).expect("open at the next generation");
         assert!(opened.adoption.is_some(), "no adoption was pending");
-        let stopped = opened.attach_between(|| {
-            Err(StoreError::Refused {
-                root: "test".into(),
-                reason: "stopped between the two writes".into(),
-            })
-        });
+        let stopped = opened.attach_between(
+            || {
+                Err(StoreError::Refused {
+                    root: "test".into(),
+                    reason: "stopped between the two writes".into(),
+                })
+            },
+            |_| Ok(()),
+        );
         assert!(
             matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
             "{:?}",
@@ -2289,6 +2317,68 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         serve(&config, 1)
             .and_then(Opened::attach)
             .expect("the next start reinstalls");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The attach's reinstall of an invalid projection runs the pin on the
+    /// staged generation before it is selected, as the open's does (#212
+    /// review), so a start reads its genesis, and its store identity, from
+    /// the generation it attaches: a refusal leaves `CURRENT` where it
+    /// was, a pin that passes runs once, on the staging, and an attach
+    /// with nothing to reinstall runs none.
+    #[test]
+    fn an_invalid_projections_reinstall_the_pin_refuses_is_never_selected() {
+        let dir = workspace("reinstall-invalid-pin");
+        let mut config = config(&dir);
+        a_projection_behind_its_baseline(&config, &dir, 1);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let database = selected_database(&config);
+
+        let refused = serve(&config, 1).expect("serve").attach_checked(|_| {
+            Err(StoreError::Refused {
+                root: "test".into(),
+                reason: "the pin refuses".into(),
+            })
+        });
+        assert!(
+            matches!(&refused, Err(StoreError::Refused { reason, .. }) if reason == "the pin refuses"),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            selected_database(&config),
+            database,
+            "the staging was selected"
+        );
+
+        let mut ran = 0;
+        drop(
+            serve(&config, 1)
+                .expect("serve")
+                .attach_checked(|_| {
+                    ran += 1;
+                    Ok(())
+                })
+                .expect("the reinstall"),
+        );
+        assert_eq!(ran, 1, "the pin ran on the staging");
+        assert_ne!(
+            selected_database(&config),
+            database,
+            "the reinstall was selected"
+        );
+
+        let mut ran = 0;
+        drop(
+            serve(&config, 1)
+                .expect("serve")
+                .attach_checked(|_| {
+                    ran += 1;
+                    Ok(())
+                })
+                .expect("serves"),
+        );
+        assert_eq!(ran, 0, "nothing was reinstalled");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

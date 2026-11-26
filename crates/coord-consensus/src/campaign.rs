@@ -8,18 +8,18 @@
 //! message is produced, so a crash after binding republishes the same
 //! result and never selects again under the same identity.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use coord_core::effect::BarrierId;
+use coord_core::effect::{BarrierId, PeerId};
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation, StoreInstanceId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{
-    CandidateDecisions, RecoveryError, RecoveryReport, SelectionCounts, SyncDecision,
+    CandidateDecisions, CountedStore, RecoveryError, RecoveryReport, SelectionCounts, SyncDecision,
     select_counted,
 };
 use crate::summary::{PageError, ReportAssembler, ReportPage};
@@ -30,6 +30,15 @@ pub struct Campaign {
     config: BallotConfiguration,
     assembler: ReportAssembler,
     promised: BTreeSet<ReplicaId>,
+    /// The store each promise came from (task-d121): a voter's report
+    /// counts only from that store.
+    promise_stores: BTreeMap<ReplicaId, StoreInstanceId>,
+    /// The incarnation each of those promises came from, where the
+    /// transport named it: what the Sync's counted stores are keyed by
+    /// at the voters that install it (task-d121).
+    promise_incarnations: BTreeMap<ReplicaId, ReplicaIncarnation>,
+    /// The candidate's own store, counted with its own report.
+    own_store: Option<CountedStore>,
     own: Option<RecoveryReport>,
     decision: Option<SyncDecision>,
     bound: Option<BarrierId>,
@@ -89,6 +98,9 @@ impl Campaign {
             config,
             assembler: ReportAssembler::new(ballot),
             promised: BTreeSet::new(),
+            promise_stores: BTreeMap::new(),
+            promise_incarnations: BTreeMap::new(),
+            own_store: None,
             own: None,
             decision: None,
             bound: None,
@@ -232,11 +244,39 @@ impl Campaign {
         &self.config
     }
 
-    /// A voter promised.
-    pub fn promise(&mut self, replica: ReplicaId) {
+    /// A voter promised from the store `store`. A second promise of the
+    /// same voter from another store changes nothing: the first one's
+    /// store is the one its report must come from (task-d121).
+    pub fn promise(&mut self, replica: ReplicaId, store: StoreInstanceId) {
         if self.config.is_voter(&replica) {
+            if self
+                .promise_stores
+                .get(&replica)
+                .is_some_and(|s| *s != store)
+            {
+                return;
+            }
             self.promised.insert(replica);
+            self.promise_stores.insert(replica, store);
         }
+    }
+
+    /// A voter promised as `peer` from the store `store`:
+    /// [`Campaign::promise`], keeping the incarnation for the Sync's
+    /// counted stores (task-d121).
+    pub fn promise_from(&mut self, peer: PeerId, store: StoreInstanceId) {
+        self.promise(peer.replica, store);
+        if self.promise_stores.get(&peer.replica) == Some(&store) {
+            self.promise_incarnations
+                .entry(peer.replica)
+                .or_insert(peer.incarnation);
+        }
+    }
+
+    /// The candidate's own store and incarnation, counted with its own
+    /// report in the Sync (task-d121).
+    pub fn own_store(&mut self, incarnation: ReplicaIncarnation, store: StoreInstanceId) {
+        self.own_store = Some(CountedStore { incarnation, store });
     }
 
     /// The candidate's own report (its promise to itself).
@@ -252,6 +292,15 @@ impl Campaign {
 
     /// A report page from a voter.
     pub fn page(&mut self, page: ReportPage) -> Result<(), PageError> {
+        // A page from another store than the voter's promise names
+        // another report (task-d121).
+        if self
+            .promise_stores
+            .get(&page.replica)
+            .is_some_and(|s| *s != page.store)
+        {
+            return Err(PageError::Inconsistent);
+        }
         self.assembler.accept(page)
     }
 
@@ -388,7 +437,15 @@ impl Campaign {
             .assembler
             .complete()
             .into_iter()
-            .filter(|r| self.promised.contains(&r.replica))
+            .filter(|r| {
+                // Counted only from the store the promise came from; the
+                // page check above refuses a page that differs once the
+                // promise is in, and this one a report whose pages came
+                // first (task-d121).
+                self.promised.contains(&r.replica)
+                    && self.promise_stores.get(&r.replica)
+                        == self.assembler.store_of(&r.replica).as_ref()
+            })
             .collect();
         if let Some(own) = &self.own {
             out.push(own.clone());
@@ -521,7 +578,7 @@ impl Campaign {
                 _ => Ok(None),
             };
         }
-        let decision = loop {
+        let mut decision = loop {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
             let counts = SelectionCounts::default();
             let selected = select_counted(
@@ -560,6 +617,21 @@ impl Campaign {
             }
         };
         self.rows_wanted.clear();
+        // The stores whose reports it was selected from (task-d121).
+        decision.counted = reports
+            .iter()
+            .filter_map(|r| {
+                let counted = if r.replica == self.config.leader() {
+                    self.own_store?
+                } else {
+                    CountedStore {
+                        incarnation: *self.promise_incarnations.get(&r.replica)?,
+                        store: *self.promise_stores.get(&r.replica)?,
+                    }
+                };
+                Some((r.replica, counted))
+            })
+            .collect();
         self.decision = Some(decision);
         Ok(self.decision.as_ref())
     }
