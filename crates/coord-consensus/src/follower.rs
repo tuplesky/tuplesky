@@ -2793,6 +2793,7 @@ impl Follower {
                     self.durable_payloads.push(barrier, *command);
                 }
                 updates.push(self.dependency_row(command, demoted));
+                updates.extend(nothing_purge(command, demoted));
                 self.ledger.stage(barrier, *command, demoted.clone());
             }
             self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
@@ -2852,13 +2853,13 @@ impl Follower {
     /// Hold `command` as nothing (task-d121), for a Sync entry or a
     /// proposal that carries it so: a record it doesn't hold yet is made,
     /// and one below COMMIT under facts is replaced, its payload dropped
-    /// as a release drops it. Returns the deletion of the replaced
-    /// record's payload row, for the batch that writes the nothing.
+    /// as a release drops it. The payload row on disk goes with every
+    /// batch that writes the nothing's row ([`nothing_purge`]).
     ///
     /// A record at COMMIT or executed is left as it is: under facts, the
     /// nothing is a second decision, which the caller's admission check
     /// stops on.
-    fn take_nothing(&mut self, command: CommandId) -> Option<StoreUpdate> {
+    fn take_nothing(&mut self, command: CommandId) {
         match self.table.phase_of(&command) {
             None => {
                 let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
@@ -2867,7 +2868,6 @@ impl Follower {
                 let _ = self
                     .table
                     .initialize_beyond_capacity(command, NOTHING_ADMISSION, keys);
-                None
             }
             Some(phase)
                 if phase < Phase::Commit
@@ -2882,9 +2882,8 @@ impl Follower {
                 self.served_payloads.remove(&command);
                 self.payload_unwritten.remove(&command);
                 self.note_lacking(command);
-                Some(crate::rows::payload_delete(&command))
             }
-            Some(_) => None,
+            Some(_) => {}
         }
     }
 
@@ -3113,6 +3112,7 @@ impl Follower {
                 rows.push(payload_write(&self.table, command, held).expect("bounded"));
             }
             rows.push(dependencies);
+            rows.extend(nothing_purge(command, &record));
             let bytes: usize = rows.iter().map(row_bytes).sum();
             if !batch.updates.is_empty()
                 && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
@@ -3315,11 +3315,9 @@ impl Follower {
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
                 self.note_sync(command);
-                let dropped = if entry.admission.as_ref().is_some_and(is_nothing) {
-                    self.take_nothing(command)
-                } else {
-                    None
-                };
+                if entry.admission.as_ref().is_some_and(is_nothing) {
+                    self.take_nothing(command);
+                }
                 if self.table.record(&command).is_none() {
                     // Executed here and already retired: `phase_of` answers
                     // EXECUTED from the tombstone, and there is no record
@@ -3410,7 +3408,7 @@ impl Follower {
                 // The payload row of the record the nothing replaced goes
                 // in the same batch as the nothing's row, as a release's
                 // does (task-d121).
-                updates.extend(dropped);
+                updates.extend(nothing_purge(&command, &record));
                 // Its own payload row, where its payload is held here with
                 // none durable or in flight (seed 275 of `relayed_rows`):
                 // taken from a relayed proposal (`take_relayed_payload`),
@@ -3621,6 +3619,7 @@ impl Follower {
                 self.durable_payloads.push(barrier, c);
             }
             updates.push(row);
+            updates.extend(nothing_purge(&c, &record));
             self.ledger.stage(barrier, c, record);
         }
         self.pending.insert(barrier, Pending::Carry(first));
@@ -5144,6 +5143,7 @@ impl Follower {
                 .expect("committed until executed")
                 .clone();
             updates.push(self.dependency_row(&command, &record));
+            updates.extend(nothing_purge(&command, &record));
             staged.push((command, record));
         }
         for (command, record) in staged {
@@ -7360,6 +7360,7 @@ impl Follower {
                 updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
             }
             updates.push(row);
+            updates.extend(nothing_purge(&d, &record));
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
         }
@@ -7583,11 +7584,9 @@ impl Follower {
                 self.note_lacking(command);
                 // A nothing replaces what is held below COMMIT, and its
                 // payload row goes in this adoption's batch (task-d121).
-                let dropped = if is_nothing(&held.proposal.admission) {
-                    self.take_nothing(command)
-                } else {
-                    None
-                };
+                if is_nothing(&held.proposal.admission) {
+                    self.take_nothing(command);
+                }
                 // The proposal asserts the admission it was ordered under.
                 // Adopted under other attested facts, this replica would
                 // execute a command the quorum never admitted as such --
@@ -7645,7 +7644,7 @@ impl Follower {
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
                 let mut updates = alloc::vec![self.dependency_row(&command, &record)];
-                updates.extend(dropped);
+                updates.extend(nothing_purge(&command, &record));
                 // The payload row with it, where none is durable or being
                 // written here (task-d90): its batch failed, or it was
                 // never written. The acknowledgement waits on the batch
@@ -8653,6 +8652,20 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .iter()
         .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
         .collect()
+}
+
+/// The deletion of `command`'s payload row, for every batch that writes
+/// the dependency row of a nothing (task-d121). A nothing has no payload,
+/// and the record under facts it replaced below COMMIT may have left its
+/// payload row on disk. Every such batch carries the deletion, not only
+/// the first: that batch can fail, and the one that writes the row again
+/// (a Sync's installation resumed, a stale record's, a carried one's)
+/// left the payload row beside the nothing, which a restart recovers
+/// (#327 review). Deleting a row that is not there changes nothing.
+fn nothing_purge(command: &CommandId, record: &CommandRecord) -> Option<StoreUpdate> {
+    record
+        .is_nothing()
+        .then(|| crate::rows::payload_delete(command))
 }
 
 /// A selection's entries and their dependency edges, one unit each.
