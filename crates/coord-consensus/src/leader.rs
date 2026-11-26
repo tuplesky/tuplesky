@@ -34,7 +34,7 @@ use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
-use crate::commands::{CommandRecord, CommandTable, InitError};
+use crate::commands::{CommandRecord, CommandTable, InitError, NOTHING_ADMISSION, is_nothing};
 use crate::digest::{self, DigestMap};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
@@ -749,6 +749,35 @@ fn raise(
     }
 }
 
+/// The value a selection gives a command it re-proposes (task-d121, C4):
+/// what [`Leader::repropose`] proposes, not the value of the record it
+/// happens to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selected {
+    /// Nothing: an entry whose admission is the marker, or a re-proposal
+    /// the Sync lists among its nothing re-proposals.
+    Nothing,
+    /// The facts an entry names.
+    Facts(Digest32),
+    /// What this leader holds: a re-proposal the selection names no value
+    /// for, an entry naming no digest, or a command it took in after
+    /// cutting its report.
+    Held,
+}
+
+impl Selected {
+    fn of(decision: &SyncDecision, command: &CommandId) -> Self {
+        if decision.nothing.contains(command) {
+            return Selected::Nothing;
+        }
+        match decision.entries.get(command).and_then(|e| e.admission) {
+            Some(d) if is_nothing(&d) => Selected::Nothing,
+            Some(d) => Selected::Facts(d),
+            None => Selected::Held,
+        }
+    }
+}
+
 /// The commands a chain of re-proposals follows once `ready`, entries of
 /// `decision` that were waiting on re-proposed commands, are placed after
 /// `last` (task-d34): those of `last` and `ready` that no other of them
@@ -1138,7 +1167,12 @@ impl Leader {
                 continue;
             }
             let deps = entry.deps.clone();
-            effects.extend(leader.repropose_counted(*c, deps, &mut published));
+            effects.extend(leader.repropose_counted(
+                *c,
+                deps,
+                Selected::of(decision, c),
+                &mut published,
+            ));
         }
         let mut done: BTreeSet<CommandId> = BTreeSet::new();
         for c in &decision.reproposed {
@@ -1154,7 +1188,12 @@ impl Leader {
                 })
                 .copied()
                 .collect();
-            if leader.table.phase_of(c).is_none() {
+            // A re-proposal this leader holds no record of, which the
+            // selection doesn't give the value nothing: nothing to propose
+            // it from. A nothing re-proposal goes on below, chained after
+            // the recovered order like any other (task-d121, C4): it is
+            // where a `Behind`-shape dependency lands.
+            if leader.table.phase_of(c).is_none() && !decision.nothing.contains(c) {
                 effects.extend(leader.repropose_entries(decision, &ready, &mut published));
                 if !ready.is_empty() {
                     last = ready_tails(decision, &last, &ready);
@@ -1186,7 +1225,12 @@ impl Leader {
             if !ready.is_empty() {
                 last = ready_tails(decision, &last, &ready);
             }
-            effects.extend(leader.repropose_counted(*c, deps, &mut published));
+            effects.extend(leader.repropose_counted(
+                *c,
+                deps,
+                Selected::of(decision, c),
+                &mut published,
+            ));
             effects.extend(leader.repropose_entries(decision, &ready, &mut published));
         }
         // What the candidate took in after cutting its own report, which
@@ -1204,7 +1248,7 @@ impl Leader {
                 continue;
             }
             let deps = core::mem::replace(&mut last, alloc::vec![*c]);
-            effects.extend(leader.repropose_counted(*c, deps, &mut published));
+            effects.extend(leader.repropose_counted(*c, deps, Selected::Held, &mut published));
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -1342,9 +1386,6 @@ impl Leader {
         );
     }
 
-    /// Propose a known command under this ballot with `deps`. With
-    /// `publish` false the proposal is recorded and made durable but not
-    /// sent: [`Leader::resend_unvoted`] sends it, paced (task-d07).
     /// Re-propose `entries` of `decision`, in the order given, with their
     /// selected dependencies (task-d34): the entries that waited on a
     /// re-proposed command, once it is.
@@ -1360,7 +1401,12 @@ impl Leader {
             if entry.phase >= Phase::Commit && self.table.phase_of(c) == Some(Phase::Executed) {
                 continue;
             }
-            effects.extend(self.repropose_counted(*c, entry.deps.clone(), published));
+            effects.extend(self.repropose_counted(
+                *c,
+                entry.deps.clone(),
+                Selected::of(decision, c),
+                published,
+            ));
         }
         effects
     }
@@ -1374,24 +1420,33 @@ impl Leader {
         &mut self,
         command: CommandId,
         deps: Vec<CommandId>,
+        value: Selected,
         published: &mut usize,
     ) -> Vec<Effect> {
-        let made = self.repropose(command, deps, *published < REPROPOSE_BATCH);
+        let made = self.repropose(command, deps, value, *published < REPROPOSE_BATCH);
         if !made.is_empty() {
             *published += 1;
         }
         made
     }
 
+    /// Propose a known command under this ballot with `deps`, under the
+    /// value the selection gives it (task-d121, C4): see [`Selected`].
+    /// With `publish` false the proposal is recorded and made durable but
+    /// not sent: [`Leader::resend_unvoted`] sends it, paced (task-d07).
     fn repropose(
         &mut self,
         command: CommandId,
         deps: Vec<CommandId>,
+        value: Selected,
         publish: bool,
     ) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
+        if !self.take_selected(command, &deps, value) {
+            return Vec::new();
+        }
         if self.table.phase_of(&command).is_none() {
             return Vec::new();
         }
@@ -1483,6 +1538,13 @@ impl Leader {
             }
         }
         let admission = proposal.admission;
+        // The leader's own proposal starts the set, before what arrived
+        // early is adopted: a vote set counts the first admission it sees
+        // and refuses votes under another (`VoteSet::add`). So a stray
+        // fast acknowledgement under a digest, from a retry a voter
+        // admitted before the proposal of a nothing reached it, is the
+        // vote refused here, and the nothing's votes count (task-d121,
+        // C4).
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
@@ -1511,6 +1573,85 @@ impl Leader {
             base: None,
             updates,
         })]
+    }
+
+    /// Make this leader's record of `command` hold the value the selection
+    /// gives it, before it is proposed under `deps` (task-d121, C4).
+    /// Returns whether to go on and propose it.
+    ///
+    /// - **Nothing.** A record this leader doesn't hold is made, as a
+    ///   nothing on the conservative key: a `Behind`-shape dependency, or
+    ///   an entry or re-proposal whose payload it never held. One it
+    ///   holds below COMMIT under facts is replaced, its payload dropped
+    ///   as a release drops it, and the proposal's batch deletes the
+    ///   payload row (`nothing_purge`). Proposed under its old digest, it
+    ///   would wait for a payload no voter can supply.
+    /// - **Facts over a nothing.** A nothing this leader holds below
+    ///   COMMIT, where the selection names facts, is replaced by them,
+    ///   from the payload the campaign fetched. The proposal's batch
+    ///   writes the payload row after the dependency row.
+    ///
+    /// The replacement is made only where the acceptance then takes
+    /// ([`CommandTable::accepts`], #327 review A3), so a replaced record
+    /// is never in memory without the row the proposal's batch writes.
+    /// A record at COMMIT or executed is a decision and stays: the
+    /// candidate doesn't bind a selection that contradicts one
+    /// (`selection_gap`), so a disagreement here is not proposed.
+    fn take_selected(&mut self, command: CommandId, deps: &[CommandId], value: Selected) -> bool {
+        let phase = self.table.phase_of(&command);
+        let held = self.table.record(&command).and_then(|r| r.payload);
+        match value {
+            Selected::Held => true,
+            Selected::Nothing => {
+                if phase >= Some(Phase::Commit) {
+                    let agrees = phase == Some(Phase::Executed) && held.is_none()
+                        || held.as_ref().is_some_and(is_nothing);
+                    debug_assert!(agrees, "a nothing selected over a decision: {command:?}");
+                    return agrees;
+                }
+                if held.as_ref().is_some_and(is_nothing) {
+                    return true;
+                }
+                if !self.table.accepts(&command, deps) {
+                    return false;
+                }
+                if phase.is_none() {
+                    let keys = alloc::vec![CONSERVATIVE_KEY.to_vec()];
+                    // Recovery work, bounded by the Sync that carries it,
+                    // as a selected entry's payload is.
+                    return self
+                        .table
+                        .initialize_beyond_capacity(command, NOTHING_ADMISSION, keys)
+                        .is_ok();
+                }
+                if !self.table.rebind(&command, NOTHING_ADMISSION) {
+                    return false;
+                }
+                if let Some(payload) = self.payloads.remove(&command)
+                    && self.bindings.get(&payload.retry_key) == Some(&command)
+                {
+                    self.bindings.remove(&payload.retry_key);
+                }
+                self.served_payloads.remove(&command);
+                true
+            }
+            Selected::Facts(digest) => {
+                if phase >= Some(Phase::Commit) || !held.as_ref().is_some_and(is_nothing) {
+                    return true;
+                }
+                // The campaign bound the selection with this payload in
+                // hand (`selection_missing`).
+                let fetched = self
+                    .payloads
+                    .get(&command)
+                    .is_some_and(|p| p.admission_digest() == digest);
+                debug_assert!(
+                    fetched,
+                    "facts selected over a nothing with no payload: {command:?}"
+                );
+                fetched && self.table.accepts(&command, deps) && self.table.rebind(&command, digest)
+            }
+        }
     }
 
     /// Send each voter, again, the proposals of this ballot it has not

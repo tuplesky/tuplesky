@@ -1851,7 +1851,10 @@ fn a_wiped_candidate_is_refused_a_promise() {
     };
     let mut sent = messages(
         &peer
-            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), ask([0xee; 16]))
+            .on_peer(
+                PeerProvenance::from_local_voter(r(1), inc()),
+                ask([0xee; 16]),
+            )
             .expect("stepped"),
     );
     for _ in 0..4 {

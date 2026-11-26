@@ -12163,3 +12163,354 @@ fn a_relayed_proposal_under_facts_over_a_nothing_rebinds_on_its_payload() {
     assert_eq!(record.payload, Some(facts), "{record:?}");
     assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
 }
+
+/// Make node `i` the leader of `decision` as a won campaign would
+/// (task-d121, C4): every live voter, `i` among them, promises its ballot
+/// and installs its Sync, and `i` becomes its leader through
+/// `Leader::from_recovered`. No selection decides a nothing before C5, so
+/// a test of the leader's proposal of one hands it the Sync. `before`
+/// runs on the new leader before its first effects are handled.
+fn lead_by_hand(
+    cluster: &mut Cluster,
+    i: usize,
+    decision: &SyncDecision,
+    before: impl FnOnce(&mut Cluster, &mut Leader),
+) {
+    let b = decision.ballot;
+    let mut order: Vec<usize> = (0..cluster.nodes.len()).filter(|k| *k != i).collect();
+    order.push(i);
+    for k in order {
+        if !cluster.nodes[k].alive {
+            continue;
+        }
+        let executed = cluster.nodes[k].executed_through();
+        let effects = cluster.nodes[k].step(peer_event(
+            b.leader,
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed,
+                store: coord_types::ids::StoreInstanceId(b.leader.0),
+            },
+        ));
+        cluster.handle(k, effects);
+        // A leader deposed by the promise follows from here.
+        cluster.convert_roles();
+        let effects = cluster.nodes[k].step(peer_event(
+            b.leader,
+            ProtocolMessage::Sync(decision.clone()),
+        ));
+        cluster.handle(k, effects);
+        assert_eq!(cluster.nodes[k].follower().ballots().synced(), b);
+    }
+    let (mut leader, effects) = Leader::from_recovered(
+        cluster.nodes[i]
+            .role
+            .take()
+            .map(role_into_recovered)
+            .unwrap(),
+        quorum(b),
+        decision,
+    );
+    before(cluster, &mut leader);
+    cluster.nodes[i].role = Some(Role::Leader(leader));
+    cluster.handle(i, effects);
+}
+
+fn leader_of(cluster: &Cluster, i: usize) -> &Leader {
+    match cluster.nodes[i].role.as_ref().unwrap() {
+        Role::Leader(l) => l,
+        Role::Follower(_) => panic!("follower"),
+    }
+}
+
+fn leader_mut(cluster: &mut Cluster, i: usize) -> &mut Leader {
+    match cluster.nodes[i].role.as_mut().unwrap() {
+        Role::Leader(l) => l,
+        Role::Follower(_) => panic!("follower"),
+    }
+}
+
+/// Whether node `i` holds `command` as nothing, executed.
+fn executed_as_nothing(cluster: &Cluster, i: usize, command: &CommandId) -> bool {
+    let table = match cluster.nodes[i].role.as_ref().unwrap() {
+        Role::Leader(l) => l.table(),
+        Role::Follower(f) => f.table(),
+    };
+    table.phase_of(command) == Some(Phase::Executed)
+        && dependency_rows(&cluster.nodes[i].storage)
+            .iter()
+            .any(|(c, r)| c == command && r.is_nothing())
+}
+
+/// task-d121, C4: a re-proposal the Sync lists as nothing, of a command
+/// the new leader holds no record of, is proposed as nothing: the
+/// `Behind` shape, where an entry `x` names a dependency `d` the leader's
+/// selection read no report holding. Before C4 the leader proposed
+/// nothing for it (`phase_of` read none), and proposed `x` waiting on it
+/// for ever.
+///
+/// `d` goes after the recovered order, and `x` right after it. Every
+/// voter commits `d` as nothing and executes it as a refusal, then `x`.
+#[test]
+fn a_nothing_reproposal_the_leader_holds_no_record_of_is_proposed_and_its_waiter_after_it() {
+    let mut c = Cluster::new(3);
+    let a = c.admit(1, 1);
+    c.settle();
+    // `d` reached voter 1 alone; `x`, on the same key, voter 2 alone.
+    let d = c.admit_at(2, 2, &[1]);
+    let x = c.admit_at(3, 2, &[2]);
+    assert_eq!(c.nodes[2].follower().table().phase_of(&d), None);
+    let decision = SyncDecision {
+        ballot: ballot(1, 2),
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, accepted_sync_entry(x, vec![d]))]),
+        reproposed: BTreeSet::from([d]),
+        counted: Default::default(),
+        nothing: BTreeSet::from([d]),
+    };
+    lead_by_hand(&mut c, 2, &decision, |_, leader| {
+        let nothing = leader.proposal(&d).expect("d is proposed");
+        assert_eq!(nothing.admission, coord_consensus::NOTHING_ADMISSION);
+        assert!(
+            nothing.deps.contains(&a),
+            "after the recovered order: {:?}",
+            nothing.deps
+        );
+        let waiter = leader.proposal(&x).expect("x is proposed");
+        assert_eq!(waiter.deps, vec![d]);
+        assert!(nothing.seqnum < waiter.seqnum, "x right after d");
+        assert!(leader.table().record(&d).unwrap().is_nothing());
+    });
+    c.settle();
+    for i in 0..3 {
+        assert!(
+            executed_as_nothing(&c, i, &d),
+            "voter {i} did not execute d as nothing"
+        );
+        let executed = &c.nodes[i].executed;
+        let at = |cmd: &CommandId| executed.iter().position(|e| e == cmd);
+        assert!(
+            at(&d) < at(&x) && at(&x).is_some(),
+            "voter {i}: {executed:?}"
+        );
+    }
+}
+
+/// task-d121, C4: a leader holding `d` below COMMIT under facts, whose
+/// payload it holds, proposes the nothing the selection gives it, as an
+/// entry and as a re-proposal. Proposed under its digest, `d` would
+/// wait for a payload no voter supplies once the nothing is decided
+/// elsewhere. The leader's record becomes the nothing, the proposal's
+/// batch deletes the payload row, and a submission of `d` is then held
+/// over the nothing, not taken as a duplicate of the facts.
+#[test]
+fn a_leader_holding_facts_below_commit_proposes_the_nothing_the_selection_gives() {
+    for as_entry in [true, false] {
+        let mut c = Cluster::new(3);
+        c.settle();
+        let d = c.admit_at(1, 1, &[2]);
+        assert_eq!(
+            c.nodes[2].follower().table().phase_of(&d),
+            Some(Phase::PreAccept)
+        );
+        assert!(
+            payload_rows(&c.nodes[2].storage)
+                .iter()
+                .any(|(k, _)| *k == d)
+        );
+        let decision = SyncDecision {
+            ballot: ballot(1, 2),
+            source_ballot: ballot(0, 0),
+            entries: if as_entry {
+                BTreeMap::from([(
+                    d,
+                    sync_entry(d, Phase::Accept, coord_consensus::NOTHING_ADMISSION),
+                )])
+            } else {
+                BTreeMap::new()
+            },
+            reproposed: if as_entry {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([d])
+            },
+            counted: Default::default(),
+            nothing: if as_entry {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([d])
+            },
+        };
+        lead_by_hand(&mut c, 2, &decision, |_, leader| {
+            let p = leader.proposal(&d).expect("d is proposed");
+            assert_eq!(
+                p.admission,
+                coord_consensus::NOTHING_ADMISSION,
+                "as an entry: {as_entry}"
+            );
+            assert!(leader.table().record(&d).unwrap().is_nothing());
+        });
+        c.settle();
+        assert!(
+            !payload_rows(&c.nodes[2].storage)
+                .iter()
+                .any(|(k, _)| *k == d),
+            "as an entry: {as_entry}: the payload row is deleted"
+        );
+        for i in 0..3 {
+            assert!(
+                executed_as_nothing(&c, i, &d),
+                "as an entry: {as_entry}: voter {i}"
+            );
+        }
+        // A retry now meets the decided nothing at the leader: refused,
+        // not answered from the facts it dropped.
+        let (retry, event) = admission(1, 1);
+        assert_eq!(retry, d);
+        let _ = c.nodes[2].step(event);
+        let rejections = leader_mut(&mut c, 2).take_rejections();
+        assert!(
+            rejections.contains(&coord_consensus::Rejection::DecidedNothing(d)),
+            "as an entry: {as_entry}: {rejections:?}"
+        );
+    }
+}
+
+/// task-d121, C4: a leader holding its own nothing below the source
+/// re-proposes `d` with its payload where another report holds it under
+/// facts at the source. Voter 1 accepted `d` as nothing at ballot 2;
+/// voter 0 accepted it under facts at ballot 3, the source. Voter 1's
+/// campaign, reading the two, carries `d` under facts, fetches the
+/// payload, and its leader proposes `d` with it: `d` commits and
+/// executes with its payload at both.
+#[test]
+fn a_leader_holding_its_own_nothing_below_the_source_proposes_the_payload() {
+    let mut c = Cluster::new(3);
+    c.settle();
+    let d = c.admit_at(1, 1, &[0, 1]);
+    let (_, payload) = payload_rows(&c.nodes[0].storage)
+        .into_iter()
+        .find(|(k, _)| *k == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    install_sync(
+        &mut c,
+        ballot(2, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    assert!(
+        c.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    // Voter 0 installs the source ballot's Sync, naming `d` under facts.
+    let b3 = ballot(3, 2);
+    let executed = c.nodes[0].executed_through();
+    let effects = c.nodes[0].step(peer_event(
+        b3.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b3,
+            executed,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
+        },
+    ));
+    c.handle(0, effects);
+    c.convert_roles();
+    let effects = c.nodes[0].step(peer_event(
+        b3.leader,
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b3,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::from([(d, sync_entry(d, Phase::Accept, facts))]),
+            reproposed: BTreeSet::new(),
+            counted: Default::default(),
+            nothing: BTreeSet::new(),
+        }),
+    ));
+    c.handle(0, effects);
+    assert_eq!(c.nodes[0].follower().ballots().synced(), b3);
+    // Voter 2 stays out, so the campaign reads voters 0 and 1.
+    c.nodes[2].alive = false;
+    c.campaign(1, ballot(4, 1));
+    c.settle();
+    let leader = leader_of(&c, 1);
+    let p = leader.proposal(&d).expect("d is proposed");
+    assert_eq!(p.admission, facts, "proposed with the payload");
+    for i in 0..2 {
+        let table = match c.nodes[i].role.as_ref().unwrap() {
+            Role::Leader(l) => l.table(),
+            Role::Follower(f) => f.table(),
+        };
+        assert_eq!(table.phase_of(&d), Some(Phase::Executed), "voter {i}");
+        assert_eq!(
+            table.record(&d).and_then(|r| r.payload),
+            Some(facts),
+            "voter {i}"
+        );
+    }
+    assert!(
+        payload_rows(&c.nodes[1].storage)
+            .iter()
+            .any(|(k, _)| *k == d)
+    );
+}
+
+/// task-d121, C4: a stray fast acknowledgement of `d` under its digest,
+/// from a retry a voter admitted before the nothing's proposal reached
+/// it, reaches the leader and a follower before any of the nothing's
+/// votes. The leader's set starts with its own proposal of the nothing,
+/// so the stray vote is the one refused; `d` is decided as nothing and
+/// executes as a refusal at every voter.
+#[test]
+fn a_stray_acknowledgement_under_the_digest_does_not_keep_the_nothing_from_being_decided() {
+    let mut c = Cluster::new(3);
+    c.settle();
+    let d = c.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&c.nodes[1].storage)
+        .into_iter()
+        .find(|(k, _)| *k == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::from([d]),
+        counted: Default::default(),
+        nothing: BTreeSet::from([d]),
+    };
+    let stray = ProtocolMessage::FastAck(coord_consensus::FastAck {
+        replica: r(1),
+        ballot: b,
+        command: d,
+        deps: Vec::new(),
+        paths: Vec::new(),
+        path: coord_consensus::empty_path(),
+        admission: facts,
+        seqnum: None,
+    });
+    lead_by_hand(&mut c, 2, &decision, |c, leader| {
+        let _ = leader.step(peer_event(r(1), stray.clone()));
+        let rejections = leader.take_rejections();
+        assert!(
+            rejections
+                .iter()
+                .any(|r| matches!(r, coord_consensus::Rejection::Vote(_))),
+            "{rejections:?}"
+        );
+        let effects = c.nodes[0].step(peer_event(r(1), stray.clone()));
+        c.handle(0, effects);
+    });
+    c.settle();
+    for i in 0..3 {
+        assert!(executed_as_nothing(&c, i, &d), "voter {i}");
+    }
+}
