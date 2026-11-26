@@ -561,9 +561,9 @@ impl<P: Persistence> Voter<P> {
         Ok(out)
     }
 
-    /// Learn the stores the Sync this voter installed counted, once it is
-    /// synchronized at a ballot it has not learned them for (task-d121,
-    /// C1): it records each one it has no row for. It runs at boot,
+    /// Learn the stores the Sync this voter is synchronized to counted,
+    /// once its selection is held for a ballot it has not learned them for
+    /// (task-d121, C1): it records each one it has no row for. It runs at boot,
     /// before any peer frame is checked, and after every step that can
     /// complete an install, and again after a failed row batch. The
     /// stores come from the selection the machine installed, which is

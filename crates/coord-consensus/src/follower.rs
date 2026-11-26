@@ -5867,9 +5867,10 @@ impl Follower {
         &self.ballots
     }
 
-    /// The selection of the ballot this replica is synchronized at, once
+    /// The selection of the ballot this replica is synchronized to, once
     /// its Sync row is journal-durable or was read back at a restart
-    /// (task-d121, C1): the Sync it installed, ahead of the projection.
+    /// (task-d121, C1), whether or not a higher promise kept the ballot
+    /// from being activated. It is ahead of the projection.
     pub fn synced_selection(&self) -> Option<&SyncDecision> {
         self.synced_selection
             .as_ref()

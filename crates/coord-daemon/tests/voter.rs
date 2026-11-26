@@ -2052,6 +2052,64 @@ fn a_learned_row_that_fails_is_learned_again() {
     );
 }
 
+/// A Sync whose row becomes durable after a higher promise's is kept as
+/// the synchronized selection without being activated, and the stores it
+/// counted are learned all the same (from Astra's review of C1): the
+/// active quorum stays where it was, and nothing else would record them.
+#[test]
+fn a_superseded_sync_still_teaches_the_counted_stores() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    peer.node_mut().applier_mut().store_mut().hold = true;
+    for frame in syncs {
+        peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    let higher = Ballot {
+        epoch: campaigned.epoch,
+        number: campaigned.number + 1,
+        leader: r(0),
+    };
+    new_leader(&mut peer, 0, higher);
+    let mut held = core::mem::take(&mut peer.node_mut().applier_mut().store_mut().held);
+    assert!(
+        held.len() >= 2,
+        "the Sync row and the promise row: {held:?}"
+    );
+    peer.node_mut().applier_mut().store_mut().hold = false;
+    // The higher promise's row lands first, then the Sync's.
+    let promise = held.pop().expect("the promise row");
+    held.insert(0, promise);
+    let at = peer.ballot();
+    for (seq, barrier) in held.into_iter().enumerate() {
+        peer.node_mut()
+            .on_storage(
+                coord_core::event::StorageEvent::JournalDurable {
+                    barrier_id: barrier,
+                    journal_seq: coord_types::ids::LocalJournalSeq::new(seq as u64 + 1000)
+                        .expect("a sequence"),
+                },
+                &at,
+            )
+            .expect("a storage fact");
+    }
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    assert!(
+        !peer.node().machine().synchronized_at(&campaigned),
+        "superseded, not activated"
+    );
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.learned, 1, "the Sync's leader's store");
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+}
+
 /// A Sync that counted another store for a voter than the one this voter
 /// recorded is installed all the same, and the row is kept; the
 /// disagreement is logged and counted (task-d121, C1).

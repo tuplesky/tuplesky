@@ -600,11 +600,14 @@ impl Machine {
         }
     }
 
-    /// The ballot this replica is synchronized at and the stores its Sync
-    /// counted, from the selection the machine installed (task-d121, C1):
-    /// `None` while it is not synchronized or holds no selection of that
-    /// ballot. Never read from the projection, which a pipelined
-    /// materializer leaves behind the journal.
+    /// The ballot of the selection this replica is synchronized to and the
+    /// stores its Sync counted (task-d121, C1): a leader's own selection,
+    /// or a follower's once its Sync row is journal-durable, activated or
+    /// not -- a Sync whose row lands after a higher promise's is kept as
+    /// the synchronized selection without being activated, and what it
+    /// counted is as true. `None` while there is no such selection. Never
+    /// read from the projection, which a pipelined materializer leaves
+    /// behind the journal.
     pub fn synced_counted(
         &self,
     ) -> Option<(
@@ -614,12 +617,13 @@ impl Machine {
             coord_consensus::recovery::CountedStore,
         >,
     )> {
-        let ballot = self.synchronized_ballot()?;
         let selection = match self {
-            Machine::Leader(m) => m.selection(),
+            Machine::Leader(m) => m
+                .selection()
+                .filter(|d| d.ballot == m.config_quorum().ballot()),
             Machine::Follower(m) => m.synced_selection(),
         }?;
-        (selection.ballot == ballot).then_some((ballot, &selection.counted))
+        Some((selection.ballot, &selection.counted))
     }
 
     /// Whether this replica is synchronized at `ballot`: it leads it, or
