@@ -374,6 +374,7 @@ impl<P: Persistence> Voter<P> {
                 coord_consensus::ProtocolMessage::NewLeader {
                     ballot: self.ballot,
                     executed: self.node.machine().executed_through(),
+                    store: self.node.machine().identity().store,
                 }
                 .encode(),
             ));
@@ -547,6 +548,43 @@ impl<P: Persistence> Voter<P> {
         // is checked against them: a voter restarted before it learned
         // them would otherwise record a wiped peer's new store first.
         let mut out = self.learn_counted()?;
+        // A candidate's `NewLeader`, and a Sync counting its leader's own
+        // store, are checked against the row this voter holds for that
+        // replica, and record none (C4): one naming another store is a
+        // candidate wiped and initialized again under its identity, and is
+        // refused, so this voter neither promises it nor installs its
+        // selection. Without a row it goes on as before. A Sync that counts
+        // no store for its leader (read from a version 3 row) goes on.
+        let leader_store = match &message {
+            Some(coord_consensus::ProtocolMessage::NewLeader { ballot, store, .. })
+                if ballot.leader == provenance.from() =>
+            {
+                Some((
+                    ballot.leader,
+                    provenance.incarnation(),
+                    *store,
+                    crate::peer_store::Named::Candidate,
+                ))
+            }
+            Some(coord_consensus::ProtocolMessage::Sync(decision)) => {
+                decision.counted.get(&decision.ballot.leader).map(|own| {
+                    (
+                        decision.ballot.leader,
+                        own.incarnation,
+                        own.store,
+                        crate::peer_store::Named::SyncLeader,
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some((leader, incarnation, store, named)) = leader_store
+            && self
+                .node
+                .refuses_leader_store(leader, incarnation, store, named)?
+        {
+            return Ok(out);
+        }
         if let Some(store) = store
             && let Some((check, persisted)) = self.node.check_peer_store(
                 provenance.from(),

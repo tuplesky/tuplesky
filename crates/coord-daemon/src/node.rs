@@ -1547,6 +1547,31 @@ impl<P: Persistence> Node<P> {
         if !change {
             return Ok(None);
         }
+        // A deposed leader's saved Sync (`Leader::pending_sync`) passed the
+        // leader-store check as it arrived, but a row recorded since can
+        // name another store for its leader (task-d121, C4; #332 review).
+        // It is checked again before the follower this leader becomes
+        // replays it, and a disagreement is refused as an arriving Sync
+        // would be: logged, counted as `refused_syncs`, and dropped.
+        let pending_leader = match self.machine() {
+            Machine::Leader(l) => l.pending_sync().and_then(|(_, decision)| {
+                let leader = decision.ballot.leader;
+                decision
+                    .counted
+                    .get(&leader)
+                    .map(|own| (leader, own.incarnation, own.store))
+            }),
+            Machine::Follower(_) => None,
+        };
+        let refuse_pending = match pending_leader {
+            Some((leader, incarnation, store)) => self.refuses_leader_store(
+                leader,
+                incarnation,
+                store,
+                crate::peer_store::Named::SyncLeader,
+            )?,
+            None => false,
+        };
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
         if let Machine::Leader(l) = self.machine() {
@@ -1570,7 +1595,7 @@ impl<P: Persistence> Node<P> {
             }
             Machine::Leader(l) => {
                 let quorum = l.config_quorum();
-                let pending = l.pending_sync().cloned();
+                let pending = l.pending_sync().cloned().filter(|_| !refuse_pending);
                 let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
                 follower.set_selection_rules(self.selection_rules());
                 self.won = None;
@@ -2080,6 +2105,9 @@ impl<P: Persistence> Node<P> {
                 durable_peer_store(applier, &voter, incarnation)
             })
             .map_err(DriveError::Engine)?;
+        if matches!(check, crate::peer_store::Check::Record { .. }) {
+            self.refuse_held_syncs()?;
+        }
         let out = match &check {
             crate::peer_store::Check::Record { barrier, updates } => self.carry_out(
                 vec![Effect::Persist(PersistBatch {
@@ -2092,6 +2120,30 @@ impl<P: Persistence> Node<P> {
             _ => Outbound::default(),
         };
         Ok(Some((check, out)))
+    }
+
+    /// Whether a candidate's `NewLeader`, or a Sync counting its own
+    /// leader's store, that names `store` for `leader` under `incarnation`
+    /// is refused because this voter recorded another store for it
+    /// (task-d121, C4). Nothing is recorded. False where this node keeps
+    /// no check.
+    pub fn refuses_leader_store(
+        &mut self,
+        leader: coord_types::ids::ReplicaId,
+        incarnation: coord_types::ids::ReplicaIncarnation,
+        store: coord_types::ids::StoreInstanceId,
+        named: crate::peer_store::Named,
+    ) -> Result<bool, DriveError> {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(false);
+        };
+        let applier = &self.applier;
+        let refused = stores
+            .check_leader(leader, incarnation, store, named, || {
+                durable_peer_store(applier, &leader, incarnation)
+            })
+            .map_err(DriveError::Engine)?;
+        Ok(refused.is_some())
     }
 
     /// The stores each Sync whose row became durable here counted, a
@@ -2152,7 +2204,54 @@ impl<P: Persistence> Node<P> {
         if effects.is_empty() {
             return Ok(Outbound::default());
         }
+        self.refuse_held_syncs()?;
         self.carry_out(effects, ballot)
+    }
+
+    /// Check again the leader store of each Sync the follower holds to
+    /// install later, once this voter records a peer's store (task-d121,
+    /// C4; #332 review). Each was checked as it arrived, but one installed
+    /// later (once its promise is durable, every higher promise failed, or
+    /// the rows ahead of it are written) is installed by the machine
+    /// without a frame, and a row recorded since could name another
+    /// store for its leader. That Sync is refused as one arriving would
+    /// be, logged and counted, and dropped. It runs before the row's
+    /// batch is carried out, since carrying it out can install the Sync.
+    /// A leader's saved Sync is checked when it steps down, before the
+    /// follower it becomes replays it (`change_role`).
+    fn refuse_held_syncs(&mut self) -> Result<(), DriveError> {
+        let Some(Machine::Follower(follower)) = self.machine.as_mut() else {
+            return Ok(());
+        };
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(());
+        };
+        let held: Vec<_> = follower
+            .held_syncs()
+            .filter_map(|decision| {
+                let leader = decision.ballot.leader;
+                decision
+                    .counted
+                    .get(&leader)
+                    .map(|own| (decision.ballot, leader, own.incarnation, own.store))
+            })
+            .collect();
+        let applier = &self.applier;
+        for (ballot, leader, incarnation, store) in held {
+            let refused = stores
+                .check_leader(
+                    leader,
+                    incarnation,
+                    store,
+                    crate::peer_store::Named::SyncLeader,
+                    || durable_peer_store(applier, &leader, incarnation),
+                )
+                .map_err(DriveError::Engine)?;
+            if refused.is_some() {
+                follower.refuse_held_sync(ballot);
+            }
+        }
+        Ok(())
     }
 
     /// Count a promise or report the voter did not hold behind its
