@@ -10745,3 +10745,73 @@ fn a_command_recorded_under_other_facts_after_its_sync_is_asked_for_under_the_na
     );
     assert_eq!(f.missing_payload_count(8), 1);
 }
+
+/// Three voters, a ballot of r0's; r1's and r2's reports are empty. The
+/// stores are never the replicas' ids, so a rule that read one for the
+/// other would show (task-d121, C1; review on #326).
+fn store_campaign() -> (coord_consensus::Campaign, impl Fn(u8) -> RecoveryReport) {
+    let voters: BTreeSet<ReplicaId> = (0..3).map(r).collect();
+    let config = BallotConfiguration::c2_default(epoch(), ballot(3, 0), voters).unwrap();
+    let b = config.ballot();
+    let report = move |i| RecoveryReport {
+        replica: r(i),
+        ballot: b,
+        committed_ballot: ballot(2, 1),
+        entries: Vec::new(),
+    };
+    let mut c = coord_consensus::Campaign::new(config);
+    c.own_report(report(0));
+    (c, report)
+}
+
+const STORE_A: StoreInstanceId = StoreInstanceId([0xa1; 16]);
+const STORE_B: StoreInstanceId = StoreInstanceId([0xb2; 16]);
+
+#[test]
+fn a_second_promise_from_another_store_changes_nothing() {
+    let (mut c, report) = store_campaign();
+    c.promise(r(1), STORE_A);
+    c.promise(r(1), STORE_B);
+    // The first promise's store is the one the report must come from.
+    for page in coord_consensus::paginate(&report(1), STORE_B, 64) {
+        assert_eq!(c.page(page), Err(PageError::Inconsistent));
+    }
+    assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+    for page in coord_consensus::paginate(&report(1), STORE_A, 64) {
+        assert_eq!(c.page(page), Ok(()));
+    }
+    assert!(c.try_select(usize::MAX, |_, _| false).unwrap().is_some());
+}
+
+#[test]
+fn a_page_from_another_store_than_its_promise_is_refused() {
+    let (mut c, report) = store_campaign();
+    c.promise(r(1), STORE_A);
+    for page in coord_consensus::paginate(&report(1), STORE_B, 64) {
+        assert_eq!(c.page(page), Err(PageError::Inconsistent));
+    }
+    assert!(c.reports().iter().all(|rep| rep.replica != r(1)));
+    assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+}
+
+#[test]
+fn a_report_whose_pages_came_before_a_promise_from_another_store_is_not_counted() {
+    // The pages verify and assemble before any promise names a store, so
+    // only `reports()` can set them aside.
+    let (mut c, report) = store_campaign();
+    for page in coord_consensus::paginate(&report(1), STORE_B, 64) {
+        assert_eq!(c.page(page), Ok(()));
+    }
+    c.promise(r(1), STORE_A);
+    assert!(c.reports().iter().all(|rep| rep.replica != r(1)));
+    assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+
+    // The control: the same pages, then a promise from their store.
+    let (mut same, report) = store_campaign();
+    for page in coord_consensus::paginate(&report(1), STORE_B, 64) {
+        assert_eq!(same.page(page), Ok(()));
+    }
+    same.promise(r(1), STORE_B);
+    assert!(same.reports().iter().any(|rep| rep.replica == r(1)));
+    assert!(same.try_select(usize::MAX, |_, _| false).unwrap().is_some());
+}

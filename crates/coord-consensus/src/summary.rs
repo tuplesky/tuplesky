@@ -1110,4 +1110,86 @@ mod tests {
         assert!((5..=8).contains(&sweeps), "{sweeps} sweeps");
         assert!(looked <= 3 * BEHIND, "{looked} looked at for {BEHIND}");
     }
+
+    /// A two-page report from replica 2 under the store `store`, for a
+    /// ballot of replica 0's. The store is never the replica's id, so a
+    /// check that read one for the other would show.
+    fn two_pages(store: StoreInstanceId) -> (RecoveryReport, Vec<ReportPage>) {
+        let ballot = |number, leader: u8| Ballot {
+            epoch: coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+            number,
+            leader: ReplicaId([leader; 16]),
+        };
+        let entry = |n: u8| ReportEntry {
+            command: CommandId(Digest32([n; 32])),
+            phase: Phase::Accept,
+            deps: Vec::new(),
+            path: Digest32([0; 32]),
+            paths: Vec::new(),
+            seqnum: 0,
+            keys: Vec::new(),
+            payload_present: true,
+            admission: None,
+        };
+        let report = RecoveryReport {
+            replica: ReplicaId([2; 16]),
+            ballot: ballot(3, 0),
+            committed_ballot: ballot(1, 0),
+            entries: alloc::vec![entry(1), entry(2)],
+        };
+        let pages = paginate(&report, store, 1);
+        assert_eq!(pages.len(), 2);
+        (report, pages)
+    }
+
+    const STORE_A: StoreInstanceId = StoreInstanceId([0xa1; 16]);
+    const STORE_B: StoreInstanceId = StoreInstanceId([0xb2; 16]);
+
+    /// Pages of one report from two stores are refused as inconsistent,
+    /// even with the report's own digest and each page's digest intact
+    /// (task-d121, C1; review on #326): the store is one of the things
+    /// every page of a transfer must agree on.
+    #[test]
+    fn pages_of_one_report_from_two_stores_are_inconsistent() {
+        let (_, pages) = two_pages(STORE_A);
+        // The second page as another store would send it, with the same
+        // snapshot and a digest that verifies.
+        let mut moved = pages[1].clone();
+        moved.store = STORE_B;
+        moved.digest = page_digest(
+            &moved.replica,
+            &moved.store,
+            &moved.ballot,
+            &moved.committed_ballot,
+            moved.page,
+            moved.total,
+            &moved.snapshot,
+            &moved.entries,
+        );
+        let mut assembler = ReportAssembler::new(pages[0].ballot);
+        assert_eq!(assembler.accept(pages[0].clone()), Ok(()));
+        assert_eq!(assembler.accept(moved), Err(PageError::Inconsistent));
+        // The control: the page as its store sent it completes the report.
+        assert_eq!(assembler.accept(pages[1].clone()), Ok(()));
+        assert_eq!(assembler.complete().len(), 1);
+    }
+
+    /// The store is bound into the digests (task-d121, C1; review on
+    /// #326): a page relabelled with another store fails its digest, and
+    /// the same report from two stores has two snapshots.
+    #[test]
+    fn the_digests_bind_the_store() {
+        let (report, pages) = two_pages(STORE_A);
+        let mut relabelled = pages[0].clone();
+        relabelled.store = STORE_B;
+        let mut assembler = ReportAssembler::new(pages[0].ballot);
+        assert_eq!(assembler.accept(relabelled), Err(PageError::Corrupt));
+        assert_ne!(
+            report_digest(&report, &STORE_A),
+            report_digest(&report, &STORE_B)
+        );
+        let (_, other) = two_pages(STORE_B);
+        assert_ne!(pages[0].snapshot, other[0].snapshot);
+        assert_ne!(pages[0].digest, other[0].digest);
+    }
 }
