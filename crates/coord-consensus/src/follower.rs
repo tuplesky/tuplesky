@@ -2644,6 +2644,36 @@ impl Follower {
         effects
     }
 
+    /// The Syncs this follower holds to install later, without a frame
+    /// arriving: ahead of its promise, behind a promise in flight, or
+    /// behind the COMMIT rows written ahead of it. The runtime checks
+    /// each one's leader store again when it records a peer's store, since
+    /// it checked them as they arrived (task-d121, C4; #332 review).
+    pub fn held_syncs(&self) -> impl Iterator<Item = &SyncDecision> {
+        self.early_sync
+            .iter()
+            .map(|(_, decision)| decision)
+            .chain(
+                self.sync_behind_promise
+                    .iter()
+                    .map(|(_, decision)| decision),
+            )
+            .chain(self.sync_behind_rows.iter().map(|held| &held.decision))
+    }
+
+    /// Drop every Sync of `ballot` this follower holds to install later,
+    /// as the runtime refused it (task-d121, C4): its leader's store
+    /// disagrees with the one recorded since it arrived. The runtime logs
+    /// and counts the refusal. Rows already written for a Sync held
+    /// behind them are facts either way, as when another Sync replaces it.
+    pub fn refuse_held_sync(&mut self, ballot: Ballot) {
+        self.early_sync.take_if(|(_, kept)| kept.ballot == ballot);
+        self.sync_behind_promise
+            .take_if(|(_, kept)| kept.ballot == ballot);
+        self.sync_behind_rows
+            .take_if(|held| held.decision.ballot == ballot);
+    }
+
     /// Adopt a Sync: only for the ballot this replica promised and from
     /// its leader. The synchronized ballot is persisted, the entries are
     /// installed under the guards (missing payloads are fetched first),

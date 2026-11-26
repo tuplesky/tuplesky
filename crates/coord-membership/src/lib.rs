@@ -49,8 +49,9 @@ pub use configuration::{
     VerifiedConfiguration, VoterAuthority, sign_message, verify_endpoint_catalog, verify_signature,
 };
 pub use genesis::{
-    FEATURES_PROTOCOL_VERSION, GenesisError, GenesisManifest, PROTOCOL_VERSION, SignedGenesis,
-    VoterSeed, admin_key_from_pem, sign_genesis, sign_genesis_pem, verify_genesis,
+    FEATURES_PROTOCOL_VERSION, GenesisError, GenesisManifest, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS, SignedGenesis, VoterSeed, admin_key_from_pem, sign_genesis,
+    sign_genesis_pem, verify_genesis,
 };
 pub use init::{GenesisStore, InitError, Initialized, initialize};
 pub use membership::{CredentialChange, Membership, MembershipError, VoterEntry};
