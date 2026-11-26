@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -103,10 +104,14 @@ impl Default for LinkFaults {
 }
 
 /// Virtual time: a base instant plus ticks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Clock {
     base: Instant,
     tick: u64,
+    /// The tick as BBR's guard reads it ([`coord_transport::congestion`]):
+    /// every datagram is stamped with the time it is handled at, so the
+    /// guard sees no stamp lag.
+    shared: Arc<AtomicU64>,
 }
 
 impl Clock {
@@ -114,7 +119,21 @@ impl Clock {
         Clock {
             base: Instant::now(),
             tick: 0,
+            shared: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn set(&mut self, tick: u64) {
+        self.tick = tick;
+        self.shared.store(tick, Ordering::Relaxed);
+    }
+
+    /// The virtual clock BBR's guard reads.
+    fn reader(&self) -> coord_transport::congestion::Clock {
+        let (base, shared) = (self.base, self.shared.clone());
+        Arc::new(move || {
+            base + TICK * u32::try_from(shared.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+        })
     }
 
     /// Current tick.
@@ -313,7 +332,13 @@ fn frame_or_close(
 }
 
 impl Node {
-    fn new(id: NodeId, config: NodeConfig, seed: [u8; 32], time: Arc<VirtualTime>) -> Self {
+    fn new(
+        id: NodeId,
+        config: NodeConfig,
+        seed: [u8; 32],
+        time: Arc<VirtualTime>,
+        clock: &coord_transport::congestion::Clock,
+    ) -> Self {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let verifier =
             WebPkiClientVerifier::builder_with_provider(config.roots.clone(), provider.clone())
@@ -333,7 +358,12 @@ impl Node {
         let quic_server = QuicServerConfig::try_from(server).expect("quic server");
         let limits = config.limits;
         let lane_config = |l: &LaneLimits| {
-            coord_transport::lane::transport_config(l, &limits).expect("lane config")
+            coord_transport::lane::transport_config_with(
+                l,
+                &limits,
+                coord_transport::lane::controller(&limits, clock),
+            )
+            .expect("lane config")
         };
         let lane_transport = [
             lane_config(&limits.lanes[0]),
@@ -1055,6 +1085,8 @@ impl PacketWorld {
         let time = Arc::new(VirtualTime {
             unix_base: 1_800_000_000,
         });
+        let clock = Clock::new();
+        let reader = clock.reader();
         let nodes = nodes
             .into_iter()
             .enumerate()
@@ -1062,7 +1094,7 @@ impl PacketWorld {
                 let mut s = [0u8; 32];
                 s[..16].copy_from_slice(&rng.bytes16(&format!("endpoint-{i}-a")));
                 s[16..].copy_from_slice(&rng.bytes16(&format!("endpoint-{i}-b")));
-                Node::new(i, config, s, time.clone())
+                Node::new(i, config, s, time.clone(), &reader)
             })
             .collect();
         PacketWorld {
@@ -1070,7 +1102,7 @@ impl PacketWorld {
             faults: BTreeMap::new(),
             default_faults: LinkFaults::default(),
             rng,
-            clock: Clock::new(),
+            clock,
             trace: blake3::Hasher::new(),
             datagrams: 0,
             dropped: 0,
@@ -1338,7 +1370,7 @@ impl PacketWorld {
             Some(t) => {
                 // Never spin at one tick: a timer that re-arms at "now"
                 // still moves virtual time forward by one tick.
-                self.clock.tick = t.max(self.clock.tick + 1).min(limit);
+                self.clock.set(t.max(self.clock.tick + 1).min(limit));
                 true
             }
             None => false,
@@ -1354,7 +1386,7 @@ impl PacketWorld {
     pub fn advance_to(&mut self, tick: u64) {
         while self.clock.tick < tick {
             if !self.step_within(tick) {
-                self.clock.tick = tick;
+                self.clock.set(tick);
             }
         }
     }

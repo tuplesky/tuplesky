@@ -6,11 +6,13 @@
 //! capability identifier and admitted only for roles that may use it.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use coord_types::wire_v1::{HelloV1, PeerRole};
 use quinn::VarInt;
 
 use crate::config::{Congestion, Limits};
+use crate::congestion::{Clock, GuardedBbrConfig};
 
 /// One traffic lane of a peer link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -198,13 +200,33 @@ pub fn transport_config(
     lane: &LaneLimits,
     limits: &Limits,
 ) -> Result<Arc<quinn::TransportConfig>, String> {
+    let clock: Clock = Arc::new(Instant::now);
+    transport_config_with(lane, limits, controller(limits, &clock))
+}
+
+/// The congestion controller `limits` names. BBR's guard judges receipt
+/// stamps against `clock` ([`crate::congestion`]): production reads
+/// [`Instant::now`], and a simulation its virtual time, which stamps its
+/// datagrams.
+pub fn controller(
+    limits: &Limits,
+    clock: &Clock,
+) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match limits.congestion {
+        Congestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+        Congestion::Bbr => Arc::new(GuardedBbrConfig::with_clock(clock.clone())),
+        Congestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+    }
+}
+
+/// [`transport_config`] with the congestion controller given rather than
+/// the one `limits` names.
+pub fn transport_config_with(
+    lane: &LaneLimits,
+    limits: &Limits,
+    congestion: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> Result<Arc<quinn::TransportConfig>, String> {
     let reordering = limits.reordering;
-    let congestion: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
-        match limits.congestion {
-            Congestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
-            Congestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
-            Congestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
-        };
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_concurrent_uni_streams(VarInt::from_u32(lane.max_uni_streams))
