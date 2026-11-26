@@ -23,7 +23,7 @@ use coord_core::outbox::{BarrierAllocator, PendingSend};
 use coord_store_api::engine::EngineError;
 use coord_types::ids::{
     Ballot, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition, LocalJournalSeq, ReplicaId,
-    ReplicaIncarnation,
+    ReplicaIncarnation, StoreInstanceId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,11 @@ pub struct ConfigurationIdentity {
     pub replica: ReplicaId,
     /// This replica's incarnation.
     pub incarnation: ReplicaIncarnation,
+    /// This replica's store, the random identity `init` pinned beside the
+    /// genesis digest (task-d121). Its promises and reports carry it, so a
+    /// peer can tell this store from one initialized again under the same
+    /// replica and incarnation.
+    pub store: StoreInstanceId,
     /// This replica's role.
     pub role: ReplicaRole,
 }
@@ -584,6 +589,7 @@ impl BallotState {
                     ballot,
                     synced: self.synced,
                     replica: self.identity.replica,
+                    store: self.identity.store,
                 }
                 .encode(),
             })
@@ -634,6 +640,7 @@ impl BallotState {
                 ballot,
                 synced: self.synced,
                 replica: self.identity.replica,
+                store: self.identity.store,
             }
             .encode(),
         };

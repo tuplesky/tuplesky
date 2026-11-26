@@ -171,6 +171,7 @@ fn identity(me: u8, n: u8) -> ConfigurationIdentity {
         voters: (0..n).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -4507,14 +4508,30 @@ fn assert_none_failed(failures: &[String]) {
 
 /// One run with `knobs`, its panic caught and said with its seed.
 fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<Stats, String> {
+    run_knobs_keeping(n, knobs, seed, catch_up).map_err(|failed| failed.0)
+}
+
+/// [`run_knobs`], keeping a failed run's stats as they stood when it
+/// failed (task-d121's C1, from #324's review): the mark, whether it led
+/// after it and its `Behind` give-ups are counted as the run goes, so a
+/// run the oracle fails after the mark still says what followed it. The
+/// stats the run sums only at its end (`unreported_drop_runs`, `ballots`,
+/// `decisions` and the like) stay as they were when it failed.
+fn run_knobs_keeping(
+    n: u8,
+    knobs: Knobs,
+    seed: u64,
+    catch_up: Option<bool>,
+) -> Result<Stats, Box<(String, Stats)>> {
     let row = knobs.row;
     let early = if knobs.early {
         " with early proposals"
     } else {
         ""
     };
+    let mut sim = None;
     let outcome = quietly(|| {
-        let mut sim = Sim::new(n, knobs, seed);
+        let sim = sim.insert(Sim::new(n, knobs, seed));
         if let Some(on) = catch_up {
             sim.catch_up = on;
         }
@@ -4522,7 +4539,10 @@ fn run_knobs(n: u8, knobs: Knobs, seed: u64, catch_up: Option<bool>) -> Result<S
     });
     outcome.map_err(|e| {
         let text = panic_text(&*e);
-        format!("row {row}{early} at {n} voters, seed {seed}: {text}")
+        Box::new((
+            format!("row {row}{early} at {n} voters, seed {seed}: {text}"),
+            sim.map(|s| s.stats).unwrap_or_default(),
+        ))
     })
 }
 
@@ -5339,7 +5359,13 @@ fn hide_preaccepted(page: coord_consensus::ReportPage) -> coord_consensus::Repor
         entries: page.entries.clone(),
     };
     // Rebuilt unchanged, it is the page sent, or it is left alone.
-    if coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).first() != Some(&page)
+    if coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    )
+    .first()
+        != Some(&page)
     {
         return page;
     }
@@ -5348,7 +5374,12 @@ fn hide_preaccepted(page: coord_consensus::ReportPage) -> coord_consensus::Repor
             e.payload_present = false;
         }
     }
-    coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES).remove(0)
+    coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    )
+    .remove(0)
 }
 
 /// The converse of oracle 9's negative control (task-d90, #197 review):
@@ -5556,7 +5587,11 @@ fn one_seed_from_the_environment() {
 /// `HalfInitialized`, and, with `PROTOCOL_SIM_HOLDERS_GONE`, the runs
 /// that reached the mark, never led after it, and had every give-up
 /// after it kept off the rule by condition 5. A seed that fails adds
-/// nothing to any of these: it is listed with the failures instead.
+/// nothing to the counters: it is listed with the failures instead. If
+/// it had reached the mark, its failure says what followed the mark,
+/// and the runs that failed after the mark are counted under their own
+/// label beside the marked ones, so the stalls the oracle fails (seeds
+/// 281, 338 and 2971) are seen as stalls. The test still fails.
 /// The loss of acknowledgements to followers and catch-up are the
 /// environment's, as in a sweep; `PROTOCOL_SIM_HOLD`, `PROTOCOL_SIM_CAMPAIGN` and
 /// `PROTOCOL_SIM_CRASH` (parts per million) set those chances where the
@@ -5592,29 +5627,39 @@ fn seeds_from_the_environment() {
     // of those the ones where every campaign given up as `Behind` after
     // it had a selection condition 5 keeps the rule off.
     let (mut marked, mut stalled, mut kept) = (0u32, 0u32, 0u32);
+    // The same, for runs the oracle failed after the mark.
+    let (mut failed_marked, mut failed_stalled, mut failed_kept) = (0u32, 0u32, 0u32);
+    // What followed the mark, and whether the run is a stall condition 5
+    // keeps the rule off.
+    let after_the_mark = |s: &Stats| {
+        s.gone_on.map(|on| {
+            let stall = !s.led_after_gone;
+            let keeps = stall
+                && s.behind_after_gone > 0
+                && s.behind_after_gone_undecided == s.behind_after_gone;
+            let line = format!(
+                "holders of {} gone (mask {:b}), led after {}, \
+                 behind after {} ({} on it, {} with an undecided drop), \
+                 boots after {}",
+                short(&on),
+                s.gone,
+                s.led_after_gone,
+                s.behind_after_gone,
+                s.behind_after_gone_on_it,
+                s.behind_after_gone_undecided,
+                s.boots_after_gone
+            );
+            (stall, keeps, line)
+        })
+    };
     for seed in v[2]..v[3] {
-        match run_knobs(n, knobs, seed, None) {
+        match run_knobs_keeping(n, knobs, seed, None) {
             Ok(s) => {
-                if let Some(on) = s.gone_on {
+                if let Some((stall, keeps, line)) = after_the_mark(&s) {
                     marked += 1;
-                    let stall = !s.led_after_gone;
-                    let keeps = stall
-                        && s.behind_after_gone > 0
-                        && s.behind_after_gone_undecided == s.behind_after_gone;
                     stalled += u32::from(stall);
                     kept += u32::from(keeps);
-                    println!(
-                        "seed {seed}: holders of {} gone (mask {:b}), led after {}, \
-                         behind after {} ({} on it, {} with an undecided drop), \
-                         boots after {}",
-                        short(&on),
-                        s.gone,
-                        s.led_after_gone,
-                        s.behind_after_gone,
-                        s.behind_after_gone_on_it,
-                        s.behind_after_gone_undecided,
-                        s.boots_after_gone
-                    );
+                    println!("seed {seed}: {line}");
                 }
                 totals.behind += s.behind;
                 totals.behind_unexecuted += s.behind_unexecuted;
@@ -5626,7 +5671,18 @@ fn seeds_from_the_environment() {
                 totals.bound_unreported += s.bound_unreported;
                 totals.fenced += s.fenced;
             }
-            Err(e) => failures.push(e),
+            Err(failed) => {
+                let (e, s) = *failed;
+                match after_the_mark(&s) {
+                    Some((stall, keeps, line)) => {
+                        failed_marked += 1;
+                        failed_stalled += u32::from(stall);
+                        failed_kept += u32::from(keeps);
+                        failures.push(format!("{e}; after the mark: {line}"));
+                    }
+                    None => failures.push(e),
+                }
+            }
         }
     }
     println!(
@@ -5651,7 +5707,9 @@ fn seeds_from_the_environment() {
     if knobs.holders_gone.is_some() {
         println!(
             "row {row} at {n} voters: marked {marked}, never led after the mark {stalled}, \
-             of those every `Behind` after it with an undecided drop {kept}"
+             of those every `Behind` after it with an undecided drop {kept}; \
+             failed after the mark {failed_marked}, never led after it {failed_stalled}, \
+             of those every `Behind` after it with an undecided drop {failed_kept}"
         );
     }
     assert_none_failed(&failures);

@@ -66,6 +66,7 @@ fn identity(me: u8) -> ConfigurationIdentity {
         voters: (0..VOTERS).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }

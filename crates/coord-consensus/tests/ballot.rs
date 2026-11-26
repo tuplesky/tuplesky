@@ -52,6 +52,7 @@ fn identity(role: ReplicaRole) -> ConfigurationIdentity {
         voters: (0..3).map(r).collect(),
         replica: r(1),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(1).0),
         role,
     }
 }
@@ -111,6 +112,7 @@ fn promise_reply_waits_for_the_row_and_every_batch_before_the_cut() {
             ballot: ballot(1, 1, 2),
             synced: ballot(1, 0, 0),
             replica: r(1),
+            store: coord_types::ids::StoreInstanceId(r(1).0),
         }
     );
     outbox.publish(effects.reply.clone());

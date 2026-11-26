@@ -1944,6 +1944,10 @@ impl Follower {
             if let Some(c) = self.campaign.as_mut()
                 && c.ballot() == due.ballot
             {
+                c.own_store(
+                    self.config.identity.incarnation,
+                    self.ballots.identity().store,
+                );
                 c.own_report(report);
             }
             return self.advance_campaign();
@@ -1957,7 +1961,8 @@ impl Follower {
         let outbox = self.outbox.as_mut().expect("booted");
         // The pages are kept: one that is lost is asked for again, and
         // answered from this version, never a regenerated one (task-d28).
-        let served = crate::summary::ServedReport::new(due.to, &report);
+        let served =
+            crate::summary::ServedReport::new(due.to, &report, self.ballots.identity().store);
         for page in &served.pages {
             outbox.publish(PendingSend {
                 context,
@@ -5862,6 +5867,16 @@ impl Follower {
         &self.ballots
     }
 
+    /// The selection of the ballot this replica is synchronized to, once
+    /// its Sync row is journal-durable or was read back at a restart
+    /// (task-d121, C1), whether or not a higher promise kept the ballot
+    /// from being activated. It is ahead of the projection.
+    pub fn synced_selection(&self) -> Option<&SyncDecision> {
+        self.synced_selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+    }
+
     /// Proposals held for a payload or lagging dependencies.
     pub fn held(&self) -> &BTreeMap<CommandId, HeldProposal> {
         &self.held
@@ -7891,13 +7906,16 @@ impl Follower {
                 self.on_committed(from.replica, ballot, through)
             }
             ProtocolMessage::Promise {
-                ballot, replica, ..
+                ballot,
+                replica,
+                store,
+                ..
             } => {
                 if let Some(c) = self.campaign.as_mut()
                     && c.ballot() == ballot
                     && replica == from.replica
                 {
-                    c.promise(replica);
+                    c.promise_from(from, store);
                 }
                 self.advance_campaign()
             }
@@ -8422,6 +8440,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(1),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(1).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
@@ -8463,6 +8482,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(1),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(1).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
@@ -8498,6 +8518,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(1),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(1).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),
@@ -8547,6 +8568,7 @@ mod tests {
             source_ballot: genesis,
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         let follower = Follower::recover_with_syncs(
             config,
@@ -8588,6 +8610,7 @@ mod tests {
             source_ballot: genesis,
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         let mut follower =
             Follower::recover_with_syncs(config, None, None, [], [], [], ExecutionPosition::ZERO);
@@ -8631,6 +8654,7 @@ mod tests {
                 voters: voters.clone(),
                 replica: r(1),
                 incarnation: ReplicaIncarnation::new(1).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(1).0),
                 role: ReplicaRole::Voter,
             },
             quorum: BallotConfiguration::c2(epoch, genesis, voters, [r(0), r(1)].into()).unwrap(),

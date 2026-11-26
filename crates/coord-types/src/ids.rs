@@ -100,6 +100,15 @@ fixed_id!(
     /// Stable identity of one permission rule in `policy_v1`.
     PolicyRuleId
 );
+fixed_id!(
+    /// Random identity of one voter's store, written once by `init` beside the
+    /// genesis pin (task-d121). Peers record the first one they see from a
+    /// replica and refuse another until membership names a new generation, so
+    /// a voter initialized again on an empty store is not counted as the one
+    /// that voted before. A copy of the store carries it, so a restore from an
+    /// older copy is not detected (Section 5.4).
+    StoreInstanceId
+);
 
 macro_rules! checked_counter {
     ($(#[$doc:meta])* $name:ident, max = $max:expr) => {
