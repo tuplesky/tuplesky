@@ -2076,6 +2076,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.election.is_some() && self.recency.fresh(now)
     }
 
+    /// Until when [`Self::policy_fresh_at`] holds as far as this loop
+    /// knows now, for the transport's pre-bind gate (task-d122); `None`
+    /// where it does not hold now. Looking at the projection again
+    /// ([`Self::policy_open`]) may move it later, never earlier, so the
+    /// gate errs only towards saying a bind is unavailable, which the
+    /// caller retries.
+    fn policy_fresh_until(&self) -> Option<std::time::Instant> {
+        self.election.as_ref()?;
+        self.recency.fresh_until()
+    }
+
     /// Whether this node's policy may be read for an answer now, looking
     /// again first at how far the committed projection has reached if
     /// the policy is stale (#320). An answer the store had not reached
@@ -2686,7 +2697,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// must not be able to decide how long the voter goes without its
     /// own turn -- its timers, its peers, its recovery -- so the loop
     /// only waits on a socket once the voter has nothing left to do.
-    pub async fn run(&mut self, transport: &mut Transport, clock: impl Fn() -> u64) {
+    pub async fn run(
+        &mut self,
+        transport: &mut Transport,
+        clock: impl Fn() -> u64 + Clone + Send + Sync + 'static,
+    ) {
         // Every lane wake-up this loop's sends make is held for its
         // hand-offs (task-d115, lever 8). What it still holds when it
         // stops goes then, as it would have at the next hand-off: the
@@ -2700,7 +2715,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     async fn serve(
         &mut self,
         transport: &mut Transport,
-        clock: impl Fn() -> u64,
+        clock: impl Fn() -> u64 + Clone + Send + Sync + 'static,
         hold: &coord_transport::WakeHold,
     ) {
         // Reach the other voters. The first dials are the re-dial
@@ -2713,6 +2728,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // arriving first was always correct anyway, since an unreachable
         // voter contributes nothing and the quorum rule decides.
         self.api_traffic = Some(transport.traffic_reader());
+        // A connection without a certificate has its first bind's token
+        // checked on its own task, against this frontend's keys and under
+        // this loop's clock, before anything of it reaches this loop; and
+        // a node that does not take binds says so before checking one
+        // (task-d122).
+        transport.publish_fresh_until(self.policy_fresh_until());
+        transport.set_bind_gate(std::sync::Arc::new(TokenGate {
+            config: self.frontend.frontend.config().clone(),
+            clock: Box::new(clock.clone()),
+        }));
         let now = std::time::Instant::now();
         if let Some(plane) = &mut self.plane {
             plane.redial.start(now);
@@ -2732,6 +2757,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // due goes out before the work, so a pass that never ends
             // does not take the interval's counters with it.
             self.pacing.woke();
+            // Until when this node takes binds, for the transport's gate
+            // (task-d122).
+            transport.publish_fresh_until(self.policy_fresh_until());
             let executed = match &self.backing {
                 Backing::Voting(voter) => voter.node().executed,
                 _ => 0,
@@ -5345,7 +5373,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     return;
                 }
                 let health = ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS);
-                let retry_key = invocation_of(&frame);
+                // Only a bound connection's frame names an invocation this
+                // node acts on: an unbound one's is refused whatever it
+                // names, so it is not decoded for it (task-d122).
+                let retry_key = self
+                    .frontend
+                    .frontend
+                    .binding(connection.0)
+                    .and_then(|_| invocation_of(&frame));
                 // A request this domain has already executed is answered
                 // from its durable record rather than submitted again.
                 //
@@ -5400,6 +5435,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.carry_out(transport, connection, decided, responder)
                     .await;
             }
+            // A connection closed before negotiation reached a lane never
+            // had a `Connected`, so there is nothing of it to forget; and
+            // anyone can cause one with a handshake, so it costs the loop
+            // nothing (task-d122).
+            TransportEvent::Closed { lane: None, .. } => {}
             TransportEvent::Closed { connection, .. } => {
                 self.links_moved = true;
                 // Both sides of the same closing: the frontend forgets
@@ -7086,6 +7126,12 @@ impl Recency {
             .is_some_and(|at| now.saturating_duration_since(at) <= self.allowance)
     }
 
+    /// The last instant at which [`Self::fresh`] holds, where it holds at
+    /// any (task-d122).
+    fn fresh_until(&self) -> Option<std::time::Instant> {
+        self.last.map(|at| at + self.allowance)
+    }
+
     /// Say on the log when the policy turns fresh or stale at `now`, once
     /// a turn (#320 review): an operator, and a test, can see when this
     /// voter answers from its policy.
@@ -7127,6 +7173,27 @@ fn ask_commit_reaching<P: Persistence>(recency: &mut Recency, applier: &mut Appl
         applier
             .store_mut()
             .request_projection_commit_for(coord_storage::AskCause::Other);
+    }
+}
+
+/// The pre-bind gate this node's API transport checks the first bind of
+/// a connection without a client certificate with (task-d122): its
+/// token verified against the frontend's keys, issuer and audience, as
+/// the frontend verifies it, on the connection's own task. A token this
+/// refuses, the frontend would refuse too; one it passes, the frontend
+/// still decides.
+struct TokenGate {
+    config: BindingConfig,
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl coord_transport::BindGate for TokenGate {
+    fn check(&self, frame: &Frame) -> coord_transport::BindCheck {
+        let health = ClockHealth::healthy((self.clock)(), CLOCK_UNCERTAINTY_SECONDS);
+        match coord_session::check_bind(&self.config, frame, &health) {
+            Ok(()) => coord_transport::BindCheck::Pass,
+            Err(_) => coord_transport::BindCheck::Refused,
+        }
     }
 }
 
@@ -7238,6 +7305,19 @@ fn retained_answer<P: Persistence>(
 ) -> Option<Vec<u8>> {
     use coord_storage::retry::Resolution;
 
+    // The connection must be bound, and bound to the session whose
+    // invocation this is. A retained result belongs to a session,
+    // and reading one is not something an unbound caller -- or a
+    // caller of another session -- may do. Whether it is bound is asked
+    // first, so an unbound caller's frame is not even decoded here
+    // (task-d122).
+    let session = {
+        let binding = frontend.binding(connection)?;
+        if !binding.active(health) {
+            return None;
+        }
+        binding.session
+    };
     let (key, command, logical, resolving) = match decode(frame).ok()? {
         MessageV1::Request(request) => {
             let logical = request.logical().ok()?;
@@ -7247,12 +7327,7 @@ fn retained_answer<P: Persistence>(
         MessageV1::ResolveRequest(resolve) => (resolve.retry_key, resolve.command_id, None, true),
         _ => return None,
     };
-    // The connection must be bound, and bound to the session whose
-    // invocation this is. A retained result belongs to a session,
-    // and reading one is not something an unbound caller -- or a
-    // caller of another session -- may do.
-    let binding = frontend.binding(connection)?;
-    if !binding.active(health) || binding.session != key.session_id {
+    if session != key.session_id {
         return None;
     }
     let (logical, resolved, executed, below_floor, nothing) = {
