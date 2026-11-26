@@ -1553,6 +1553,17 @@ impl Collector {
         // outcome, this node's durable record of the key, answers it
         // ([`Collector::settle_from_record`] for this command's own
         // record, [`Collector::settle_conflict_from_record`] for another's).
+        // But one answer is a decision, not a voter's view: the command
+        // was decided as nothing (task-d121, #325). A voter gives it only
+        // from a nothing committed or executed there, or its tombstone,
+        // never from a binding a minority could hold or a nothing below
+        // COMMIT, which a later ballot can still replace with the
+        // payload. Held instead, a caller whose release was lost waited
+        // after the outcome was final: an executed nothing writes no
+        // record under the key to settle from.
+        if matches!(refusal, SubmissionRefusal::DecidedNothing) {
+            return Ok(self.settle_decided_nothing(command));
+        }
         let entry = self.pending.get_mut(&command).expect("present");
         // A voter that isn't leading says nothing about the command
         // (task-d102): a relayed entry falls back to fan-out at once, and
@@ -1953,6 +1964,40 @@ impl Collector {
             fast: false,
             attached: entry.attached,
         }))
+    }
+
+    /// End `command`, pending, with the canonical refusal of a decided
+    /// nothing (task-d121): the answer its execution gives, revision none
+    /// and [`coord_storage::retry::decided_nothing_response`]'s bytes, the
+    /// same at every voter and against every state, so the caller gets
+    /// what a release of it would have handed over. Not kept in the
+    /// resolved window, as [`Collector::settle_conflict_from_record`]'s
+    /// answer is not: nothing here says the position it executed at, and
+    /// a later release is never compared with it.
+    fn settle_decided_nothing(&mut self, command: CommandId) -> Progress {
+        let entry = self.pending.remove(&command).expect("present");
+        self.undelivered_bytes = self
+            .undelivered_bytes
+            .saturating_sub(entry.dissemination.reserved);
+        self.bindings.remove(&entry.retry_key);
+        record(&mut self.trace, || CollectorEvent::SettledFromRecord {
+            command: command_hex(&command),
+            corroborated: "decided-nothing".into(),
+        });
+        let response = self.answer_of(
+            command,
+            None,
+            &coord_storage::retry::decided_nothing_response(),
+        );
+        Progress::Released(Release {
+            retry_key: entry.retry_key,
+            command,
+            session: entry.session,
+            response,
+            speculative: false,
+            fast: false,
+            attached: entry.attached,
+        })
     }
 
     fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1, executed: Said) {

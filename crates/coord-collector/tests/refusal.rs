@@ -627,3 +627,46 @@ fn only_a_traced_collector_keeps_its_trace() {
     assert!(taken.len() >= 3, "{taken:?}");
     assert!(traced.trace().is_empty());
 }
+
+/// task-d121 (#325): a voter's answer from a decided nothing settles the
+/// entry at once, from that one voter, marked or not. It is the one
+/// refusal that does: a voter gives it only from a decision. The caller
+/// gets the nothing's canonical refusal, what a release of it would have
+/// handed over, and the entry no longer waits on a record an executed
+/// nothing never writes under its key.
+#[test]
+fn a_decided_nothing_from_one_voter_ends_the_entry_with_the_canonical_refusal() {
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        let Progress::Released(release) = c
+            .on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing))
+            .unwrap()
+        else {
+            panic!("not settled");
+        };
+        assert_eq!(release.command, command);
+        assert!(!release.speculative && !release.fast);
+        match &release.response.outcome {
+            OutcomeV1::Ok {
+                revision: None,
+                result,
+            } => assert_eq!(
+                result.as_slice(),
+                coord_storage::retry::decided_nothing_response().as_slice()
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(c.half_established().is_empty());
+        assert!(c.trace().iter().any(|e| matches!(
+            e,
+            CollectorEvent::SettledFromRecord { corroborated, .. } if corroborated == "decided-nothing"
+        )));
+        // Another voter's answer finds nothing pending.
+        assert_eq!(
+            c.on_evidence(from(0), refused(command, SubmissionRefusal::DecidedNothing)),
+            Err(EvidenceError::UnknownCommand)
+        );
+    }
+}

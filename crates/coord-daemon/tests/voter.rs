@@ -2330,4 +2330,31 @@ fn a_committed_nothing_executes_as_its_canonical_refusal() {
             .unwrap()
             .is_none()
     );
+    // Its collector settles it from this row by command id (#325): an
+    // executed nothing writes no record under its key.
+    let key = |sequence: u64| RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([3; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(sequence).unwrap(),
+    };
+    let mut reads = coord_daemon::settle::RecordReads::default();
+    let read = reads.read(voter.node().applier(), [(nothing, key(900))]);
+    assert!(read.conflicts.is_empty());
+    let [(settled, record)] = read.records.as_slice() else {
+        panic!("{:?}", read.records);
+    };
+    assert_eq!(*settled, nothing);
+    assert_eq!(record.command_id, nothing);
+    assert_eq!(record.position, after);
+    assert_eq!(record.revision, None);
+    assert_eq!(
+        record.response,
+        coord_storage::retry::decided_nothing_response()
+    );
+    assert_eq!(
+        record.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
 }
