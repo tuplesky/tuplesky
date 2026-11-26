@@ -81,6 +81,7 @@ var rejectionReasons = map[string]RejectionReason{
 	"SessionInvalid":    RejectedSessionInvalid,
 	"RetryUnauthorized": RejectedRetryUnauthorized,
 	"AdmissionMismatch": RejectedAdmissionMismatch,
+	"DecidedNothing":    RejectedDecidedNothing,
 }
 
 var unitOutcomes = map[string]OutcomeKind{

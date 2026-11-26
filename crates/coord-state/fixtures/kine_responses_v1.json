@@ -548,6 +548,30 @@
         }
       },
       "payload_hex": "14230d"
+    },
+    {
+      "name": "err-rejected-decided-nothing",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "DecidedNothing"
+          }
+        }
+      },
+      "payload_hex": "14230e"
+    },
+    {
+      "name": "decided-nothing-canonical",
+      "response": {
+        "revision": 0,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "DecidedNothing"
+          }
+        }
+      },
+      "payload_hex": "00230e"
     }
   ]
 }

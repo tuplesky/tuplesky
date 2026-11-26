@@ -391,6 +391,20 @@ pub fn result_digest(response: &[u8]) -> Digest32 {
     HashDomain::CommandResult.digest(&[response])
 }
 
+/// The encoded canonical response of a command decided as nothing
+/// (task-d121): [`coord_state::Response::decided_nothing`].
+pub fn decided_nothing_response() -> Vec<u8> {
+    postcard::to_allocvec(&coord_state::Response::decided_nothing()).expect("bounded response")
+}
+
+/// The result digest a decided nothing's executed row holds (task-d121).
+/// The response reads no state, so the digest is one constant: a row with
+/// it is the nothing's execution, and a row with any other is not, since
+/// every other refusal's response carries the revision it ran at.
+pub fn decided_nothing_digest() -> Digest32 {
+    result_digest(&decided_nothing_response())
+}
+
 /// The row saying `command` executed, at `position`, with the result
 /// digested as `result_digest`.
 ///
