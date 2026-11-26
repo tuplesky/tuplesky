@@ -321,6 +321,33 @@ pub fn check_with(root: &Path, acked: &Acked, case: &str, options: &JournalOptio
         ),
         None => assert!(head.is_none(), "{case}: records nobody appended"),
     }
+    // A group is written whole or not at all (#210 review): the reopened
+    // head ends the last acknowledged group or the one in flight, never a
+    // record inside it.
+    assert!(
+        head == acked.through || head == acked.attempted,
+        "{case}: reopened head {head:?} is inside a group: acknowledged through {:?}, \
+         attempted through {:?}",
+        acked.through,
+        acked.attempted
+    );
+}
+
+/// A journal at `root` that holds the genesis alone, the first half of
+/// the workload's first group; the stream it is in.
+pub fn half_a_group(root: &Path) -> StorageStreamId {
+    let mut journal = RaftEngineJournal::create(root, identity(), &options()).unwrap();
+    let mut allocator = StreamAllocator::new();
+    let mapping = allocator.allocate(key(), ShardId::new(0).unwrap()).unwrap();
+    journal
+        .persist_mapping(allocator.high_water(), &mapping)
+        .unwrap();
+    let all = records(mapping.stream);
+    journal
+        .append_group(&group(1, mapping.stream, all[..1].to_vec()))
+        .unwrap();
+    drop(journal);
+    mapping.stream
 }
 
 /// The ordinals and kinds of a fault-free run, to choose fault points from.

@@ -452,6 +452,22 @@ fn check_steps(rows: &Rows, boot: &Boot, case: &str) {
             );
         }
     }
+    // A step's two transitions are one journal group, written whole or
+    // not at all (#210 review): a step in flight at the crash has all of
+    // its rows or none.
+    for step in boot.acked.max(boot.durable) + 1..=boot.attempted {
+        let held = [
+            (Collection::ProtocolV1, protocol_key(step)),
+            (Collection::KvCurrentV1, kv_key(step)),
+            (Collection::EventsV1, event_key(step)),
+            (Collection::ExecutionV1, execution_key(step)),
+        ]
+        .map(|(collection, key)| has(collection, &key));
+        assert!(
+            held.iter().all(|h| *h) || held.iter().all(|h| !*h),
+            "{case}: step {step}, in flight, is partly there: {held:?}"
+        );
+    }
     for step in boot.attempted + 1..=STEPS {
         assert!(
             !has(Collection::KvCurrentV1, &kv_key(step)),
