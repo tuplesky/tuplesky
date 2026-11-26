@@ -157,7 +157,10 @@ fn find_serving(
         ..identity
     };
     match Generation::open_existing(root, stamped, options) {
-        Ok(generation) => Ok(Found::Opened(generation, pending)),
+        Ok(generation) => {
+            report_rollback(&generation, root);
+            Ok(Found::Opened(generation, pending))
+        }
         Err(error) if error.is_unreadable_database() => Ok(Found::Unreadable {
             stamped,
             pending,
@@ -234,6 +237,20 @@ fn initialize(
         );
     }
     Ok(generation)
+}
+
+/// Say that the open rolled the projection back to the commit before its
+/// last, which failed its checksums (#212 review): a crash tore that
+/// commit or its pages were damaged. What remains is checked against the
+/// journal and carried forward from it like any other projection.
+fn report_rollback(generation: &Generation, root: &Path) {
+    if generation.rolled_back_last_commit() {
+        eprintln!(
+            "the projection under {} was rolled back to the commit before its last, which \
+             failed its checksums; the journal carries it forward again",
+            show(root)
+        );
+    }
 }
 
 fn show(path: &Path) -> String {
@@ -852,10 +869,12 @@ fn rollback_guard(
 }
 
 /// Under the strict profile, refuse a projection that does not continue
-/// the journal before anything is attached (#211). Nothing rolls a strict
-/// projection back, so one behind the published baseline, or whose stamp
-/// names a record the journal does not hold where it says, is damage, and
-/// is not reinstalled. A projection stamped past the journal's head passes
+/// the journal before anything is attached (#211). The one rollback a
+/// strict projection takes is the open's, of a last commit that failed
+/// its checksums, which is reported (`report_rollback`); one behind the
+/// published baseline, or whose stamp names a record the journal does not
+/// hold where it says, is damage, rolled back or not, and is refused here,
+/// not reinstalled. A projection stamped past the journal's head passes
 /// this check; the attach refuses it ("materialized past the journal's
 /// durable head"), in both profiles.
 fn refuse_if_invalid(
@@ -1216,7 +1235,9 @@ fn adopt(
             identity.incarnation.get()
         );
     }
-    Generation::open_existing(&root, identity, options).map_err(refused)
+    let generation = Generation::open_existing(&root, identity, options).map_err(refused)?;
+    report_rollback(&generation, &root);
+    Ok(generation)
 }
 
 /// The journal an initialization created before it stopped, or

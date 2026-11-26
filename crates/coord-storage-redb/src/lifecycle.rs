@@ -294,6 +294,7 @@ pub struct Generation {
     manifest: StoreManifestV1,
     _lock: RootLock,
     directory: PathBuf,
+    rolled_back: bool,
 }
 
 const CURRENT: &str = "CURRENT";
@@ -344,6 +345,7 @@ impl Generation {
             manifest,
             _lock: lock,
             directory,
+            rolled_back: false,
         })
     }
 
@@ -398,13 +400,14 @@ impl Generation {
             return Err(other_registry(&directory.join(DATABASE)));
         }
         let db_path = directory.join(DATABASE);
-        let db = open_verified_database(&db_path, &manifest, &options)?;
+        let (db, rolled_back) = open_verified_database(&db_path, &manifest, &options)?;
         let engine = RedbEngine::from_database(db, db_path, options.cache_bytes);
         Ok(Generation {
             engine,
             manifest,
             _lock: lock,
             directory,
+            rolled_back,
         })
     }
 
@@ -529,6 +532,18 @@ impl Generation {
     /// The engine.
     pub fn engine(&mut self) -> &mut RedbEngine {
         &mut self.engine
+    }
+
+    /// Whether the integrity check of this open rolled the database back
+    /// to the commit before its last, because the last failed its
+    /// checksums. A projection under the journal commits in one phase, so
+    /// a crash that tore its last commit does this, and so does damage to
+    /// that commit's pages: the two can't be told apart. Either way the
+    /// rolled-back state is checked against the journal like any other
+    /// projection's and carried forward from it. The open is reported, not
+    /// refused, so an operator can see it happened.
+    pub fn rolled_back_last_commit(&self) -> bool {
+        self.rolled_back
     }
 
     /// A pinned read view of this generation.
@@ -831,6 +846,18 @@ fn other_registry(db_path: &Path) -> OpenError {
     ))
 }
 
+/// Whether a progress report of redb's repair is the one it makes after
+/// rolling back the last commit. redb 4.5 reports fixed points: 0.0 as
+/// the repair starts, 0.3 only once it has rolled back a primary commit
+/// that failed its checksums, then 0.6 and 0.9 as it rebuilds the
+/// allocator state, which the integrity check on open does every time. A
+/// report strictly between the start and 0.6 is the rollback. The tests
+/// pin this against a damaged commit and an undamaged one, so a redb that
+/// moves these points fails them rather than going quiet.
+fn rollback_reported(progress: f64) -> bool {
+    progress > 0.0 && progress < 0.6
+}
+
 /// Open the database of a generation whose manifest has already been
 /// verified, and apply the in-database checks every selected generation
 /// must pass before anything reads or replaces it, in this order:
@@ -851,17 +878,22 @@ fn other_registry(db_path: &Path) -> OpenError {
 /// backstop. Identity is read only from a file that verified, so a
 /// damaged identity leaf is unreadable, never another node's database,
 /// and a foreign database is refused for its identity whatever tables it
-/// lacks. A file the check repaired (its allocator rebuilt, or a last
-/// commit rolled back) verified after the repair and is used: its stamp
-/// is checked against the journal like any other projection's. redb does
-/// not say whether the open repaired anything, so no line is written for
-/// it; a second `check_integrity()` would say, at the cost of reading the
-/// whole file again at every start.
+/// lacks.
+///
+/// The check rebuilds the allocator state at every open; that is not a
+/// repair of anything found. What it may repair is the last commit: one
+/// written in one phase whose pages fail their checksums is rolled back to
+/// the commit before it, which verified, and the file is used (one
+/// written in two phases is `Corrupted`, and refused). Every commit of a
+/// projection under the journal is one phase, under both profiles, so a
+/// torn last commit and a damaged one are both rolled back. The second
+/// value says that happened: the caller reports it, and the stamp of what
+/// remains is checked against the journal like any other projection's.
 fn open_verified_database(
     db_path: &Path,
     manifest: &StoreManifestV1,
     options: &OpenOptions,
-) -> Result<redb::Database, OpenError> {
+) -> Result<(redb::Database, bool), OpenError> {
     let meta = match std::fs::metadata(db_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -875,10 +907,17 @@ fn open_verified_database(
     if let Some(found) = file_key(&meta).and_then(held_unreadable) {
         return Err(OpenError::DatabaseUnreadable(found));
     }
+    let rolled_back = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = rolled_back.clone();
     let db = unwinding("open", || {
         redb::Database::builder()
             .set_cache_size(options.cache_bytes)
             .set_check_integrity_on_open(true)
+            .set_repair_callback(move |session| {
+                if rollback_reported(session.progress()) {
+                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
             .open(db_path)
             .map_err(|e| match OpenError::from_database(e) {
                 OpenError::DatabaseUnreadable(m) => {
@@ -947,7 +986,7 @@ fn open_verified_database(
         Ok(())
     }));
     match read {
-        Ok(Ok(())) => Ok(db),
+        Ok(Ok(())) => Ok((db, rolled_back.load(std::sync::atomic::Ordering::Relaxed))),
         Ok(Err(e)) => Err(e),
         Err(payload) => {
             // Not closed: redb's close writes its allocator state and
@@ -1210,6 +1249,7 @@ impl InactiveGeneration {
             manifest,
             _lock: lock,
             directory,
+            rolled_back: false,
         })
     }
 
@@ -1423,7 +1463,8 @@ fn read_selected_for(
     // generation that open would refuse (a swapped or foreign database, a
     // missing table, damaged pages) fails closed here too, rather than being
     // silently replaced and later pruned.
-    let opened = open_verified_database(&directory.join(DATABASE), &manifest, options);
+    let opened =
+        open_verified_database(&directory.join(DATABASE), &manifest, options).map(|(db, _)| db);
     if obligations == Obligations::Unreadable {
         return match opened {
             Ok(_) => Err(OpenError::Corrupt(
@@ -1474,6 +1515,65 @@ mod tests {
         OpenOptions {
             cache_bytes: 8 * 1024 * 1024,
         }
+    }
+
+    /// What the open of a generation does with its last commit, written
+    /// in one phase or two, as a crash right after it leaves the file,
+    /// with that commit's pages damaged or not: (whether the open said it
+    /// rolled back, whether the commit before it is there, whether the
+    /// last is), or the open's refusal.
+    fn after_a_crash(two_phase: bool, damaged: bool) -> Result<(bool, bool, bool), OpenError> {
+        const MARK: u8 = 0xA5;
+        let dir = tempfile::tempdir().unwrap();
+        drop(Generation::create(dir.path(), identity(), options()).unwrap());
+        let path = dir.path().join("gen-000001").join(DATABASE);
+        let table = table_definition(Collection::PayloadV1);
+        let db = redb::Database::create(&path).unwrap();
+        let write = |key: &[u8], value: &[u8], two_phase: bool| {
+            let mut txn = db.begin_write().unwrap();
+            txn.set_two_phase_commit(two_phase);
+            txn.open_table(table).unwrap().insert(key, value).unwrap();
+            txn.commit().unwrap();
+        };
+        write(b"before", b"kept", true);
+        write(b"last", &[MARK; 2048], two_phase);
+        // Taken before the handle closes: a clean close commits again.
+        let mut image = std::fs::read(&path).unwrap();
+        drop(db);
+        if damaged {
+            let at = image
+                .windows(64)
+                .position(|w| w.iter().all(|b| *b == MARK))
+                .expect("the last commit's value is in the file");
+            image[at] ^= 0xFF;
+        }
+        std::fs::write(&path, &image).unwrap();
+
+        let rolled_back =
+            Generation::open_existing(dir.path(), identity(), options())?.rolled_back_last_commit();
+        let db = redb::Database::open(&path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let rows = txn.open_table(table).unwrap();
+        let has = |key: &[u8]| rows.get(key).unwrap().is_some();
+        Ok((rolled_back, has(b"before"), has(b"last")))
+    }
+
+    /// A last commit written in one phase whose pages fail their checksums
+    /// is rolled back to the commit before it, and the open says so; the
+    /// same commit undamaged is opened as it is and the open says nothing;
+    /// written in two phases, the damaged commit is refused (#212 review).
+    /// Every commit under the journal is one phase, in both profiles.
+    #[test]
+    fn an_open_that_rolls_back_a_damaged_last_commit_says_so() {
+        assert_eq!(after_a_crash(false, true).unwrap(), (true, true, false));
+        assert_eq!(after_a_crash(false, false).unwrap(), (false, true, true));
+        assert_eq!(after_a_crash(true, false).unwrap(), (false, true, true));
+        let refused = after_a_crash(true, true);
+        assert!(
+            matches!(&refused, Err(e) if e.is_unreadable_database()),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// A panic in the identity read leaves the database's handle open, and
