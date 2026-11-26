@@ -589,17 +589,6 @@ impl Machine {
         }
     }
 
-    /// The ballot this replica is synchronized at: the one it leads, or
-    /// the one it follows once it installed its Sync (task-d121, C1).
-    pub fn synchronized_ballot(&self) -> Option<Ballot> {
-        match self {
-            Machine::Leader(m) => Some(m.config_quorum().ballot()),
-            Machine::Follower(m) => {
-                (m.quorum().ballot() == m.ballots().synced()).then(|| m.ballots().synced())
-            }
-        }
-    }
-
     /// The ballot of the selection this replica is synchronized to and the
     /// stores its Sync counted (task-d121, C1): a leader's own selection,
     /// or a follower's once its Sync row is journal-durable, activated or
@@ -618,12 +607,19 @@ impl Machine {
         >,
     )> {
         let selection = match self {
-            Machine::Leader(m) => m
-                .selection()
-                .filter(|d| d.ballot == m.config_quorum().ballot()),
+            Machine::Leader(m) => m.selection().filter(|d| d.ballot == m.quorum().ballot()),
             Machine::Follower(m) => m.synced_selection(),
         }?;
         Some((selection.ballot, &selection.counted))
+    }
+
+    /// The ballot configuration this replica works under: the one it
+    /// leads, or the one it follows or campaigns in.
+    pub fn configuration(&self) -> &coord_consensus::BallotConfiguration {
+        match self {
+            Machine::Leader(m) => m.quorum(),
+            Machine::Follower(m) => m.quorum(),
+        }
     }
 
     /// Whether this replica is synchronized at `ballot`: it leads it, or
@@ -2024,13 +2020,17 @@ impl<P: Persistence> Node<P> {
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
         let me = self.machine().identity().replica;
+        // A Sync names only the epoch's voters; any other entry is
+        // skipped unread, so a Sync costs at most one row per voter
+        // (#326 review).
+        let voters = self.machine().configuration().voters().clone();
         let applier = &self.applier;
         let Some(stores) = self.peer_stores.as_mut() else {
             return Ok(Outbound::default());
         };
         let mut effects = Vec::new();
         for (voter, counted) in counted {
-            if *voter == me {
+            if *voter == me || !voters.contains(voter) {
                 continue;
             }
             if let Some((barrier, updates)) = stores

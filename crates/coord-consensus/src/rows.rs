@@ -455,12 +455,12 @@ pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
 
 /// Decode a Sync row.
 ///
-/// Only the current layout is read. A row of an earlier version names no
-/// admission facts, and reading it as a selection without them would let
-/// the replica install and execute its entries under whichever facts it
-/// happens to hold, which is the divergence version 3 exists to prevent
-/// (task-d14). It is refused as corrupt, loudly, and the store has to be
-/// started fresh.
+/// The current layout and version 3 are read. A row of a version before 3
+/// names no admission facts, and reading it as a selection without them
+/// would let the replica install and execute its entries under whichever
+/// facts it happens to hold, which is the divergence version 3 exists to
+/// prevent (task-d14). It is refused as corrupt, loudly, and the store has
+/// to be started fresh.
 ///
 /// A version 3 row is read with no counted stores (task-d121): what it
 /// selected is whole, and the stores only teach the voter that installs
