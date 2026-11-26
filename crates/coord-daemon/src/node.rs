@@ -1547,6 +1547,31 @@ impl<P: Persistence> Node<P> {
         if !change {
             return Ok(None);
         }
+        // A deposed leader's saved Sync (`Leader::pending_sync`) passed the
+        // leader-store check as it arrived, but a row recorded since can
+        // name another store for its leader (task-d121, C4; #332 review).
+        // It is checked again before the follower this leader becomes
+        // replays it, and a disagreement is refused as an arriving Sync
+        // would be: logged, counted as `refused_syncs`, and dropped.
+        let pending_leader = match self.machine() {
+            Machine::Leader(l) => l.pending_sync().and_then(|(_, decision)| {
+                let leader = decision.ballot.leader;
+                decision
+                    .counted
+                    .get(&leader)
+                    .map(|own| (leader, own.incarnation, own.store))
+            }),
+            Machine::Follower(_) => None,
+        };
+        let refuse_pending = match pending_leader {
+            Some((leader, incarnation, store)) => self.refuses_leader_store(
+                leader,
+                incarnation,
+                store,
+                crate::peer_store::Named::SyncLeader,
+            )?,
+            None => false,
+        };
         let counts = self.machine_mut().take_resend_counts();
         self.resends.add(&counts);
         if let Machine::Leader(l) = self.machine() {
@@ -1570,7 +1595,7 @@ impl<P: Persistence> Node<P> {
             }
             Machine::Leader(l) => {
                 let quorum = l.config_quorum();
-                let pending = l.pending_sync().cloned();
+                let pending = l.pending_sync().cloned().filter(|_| !refuse_pending);
                 let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
                 follower.set_selection_rules(self.selection_rules());
                 self.won = None;
@@ -2192,6 +2217,8 @@ impl<P: Persistence> Node<P> {
     /// store for its leader. That Sync is refused as one arriving would
     /// be, logged and counted, and dropped. It runs before the row's
     /// batch is carried out, since carrying it out can install the Sync.
+    /// A leader's saved Sync is checked when it steps down, before the
+    /// follower it becomes replays it (`change_role`).
     fn refuse_held_syncs(&mut self) -> Result<(), DriveError> {
         let Some(Machine::Follower(follower)) = self.machine.as_mut() else {
             return Ok(());

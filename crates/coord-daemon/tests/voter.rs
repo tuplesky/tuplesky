@@ -2051,6 +2051,86 @@ fn a_held_sync_is_refused_once_its_leader_is_recorded_under_another_store() {
     );
 }
 
+/// A leader's saved Sync of a higher ballot is checked again when the
+/// leader steps down, before the follower it becomes replays it (task-d121,
+/// C4; #332 review). The Sync arrived before any row named its leader, and
+/// a row recorded since names another store for that leader. The leader
+/// promises the candidate's `NewLeader` under the recorded store, and the
+/// saved Sync is refused, logged and counted, not installed.
+#[test]
+fn a_leaders_saved_sync_is_refused_at_handoff_once_its_leader_is_recorded_under_another_store() {
+    let mut peer = stamped(2);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let recorded = coord_types::ids::StoreInstanceId(r(1).0);
+    let mut voter = stamped(0);
+    keep_peer_stores(&mut voter);
+    assert!(voter.leads());
+    // Candidate 1's Sync, counting its own store as another one, reaches
+    // the leader ahead of its NewLeader. No row names r1: it is saved.
+    for frame in syncs {
+        let frame = match coord_consensus::ProtocolMessage::decode(&frame) {
+            Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                decision.counted.insert(
+                    r(1),
+                    coord_consensus::CountedStore {
+                        incarnation: inc(),
+                        store: coord_types::ids::StoreInstanceId([0x0f; 16]),
+                    },
+                );
+                coord_consensus::ProtocolMessage::Sync(decision).encode()
+            }
+            _ => frame,
+        };
+        voter
+            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    assert!(voter.leads(), "a Sync alone does not depose");
+    match voter.node().machine() {
+        Machine::Leader(l) => assert!(l.pending_sync().is_some(), "the Sync is saved"),
+        Machine::Follower(_) => panic!("still the leader"),
+    }
+    assert_eq!(
+        voter
+            .node()
+            .peer_stores()
+            .expect("kept")
+            .counts
+            .refused_syncs,
+        0,
+        "saved, not refused, as it arrived"
+    );
+    // A row recorded since names r1 under `recorded`.
+    write_store_row(&mut voter, r(1), recorded.0);
+    // r1's NewLeader names the store recorded: promised, and the leader
+    // steps down.
+    let mut sent = messages(&new_leader(&mut voter, 1, campaigned));
+    for _ in 0..4 {
+        sent.extend(messages(&voter.flush().expect("flushed")));
+        sent.extend(messages(&voter.finish().expect("finished")));
+    }
+    assert!(!voter.leads(), "the deposed leader still leads");
+    assert!(
+        sent.iter().any(|(to, m)| *to == r(1)
+            && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == campaigned)),
+        "r1 was promised: {sent:?}"
+    );
+    let counts = voter.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused_candidates, 0, "{counts:?}");
+    assert_eq!(counts.refused_syncs, 1, "{counts:?}");
+    let rejections = voter.take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r.contains("a Sync counting the store of its leader") && r.contains("refused")),
+        "{rejections:?}"
+    );
+    assert!(
+        !voter.node().machine().synchronized_at(&campaigned),
+        "the saved Sync was installed"
+    );
+}
+
 /// A Sync's counted entry that names no voter of the epoch is skipped
 /// unread (#326 review): a Sync costs at most one row per voter.
 #[test]
