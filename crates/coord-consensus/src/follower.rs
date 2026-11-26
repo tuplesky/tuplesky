@@ -942,6 +942,15 @@ pub struct Follower {
     /// (task-d30). A report takes each of its entries over a durable
     /// record that is behind it, whatever installation has reached.
     synced_selection: Option<SyncDecision>,
+    /// The stores each Sync whose row became durable here counted, with
+    /// its ballot, until the driver takes them
+    /// ([`Follower::take_durable_counted`], task-d121, C1). A superseded
+    /// Sync's are among them: one whose row lands in the flush that also
+    /// installs a higher Sync is never the synchronized selection when
+    /// the driver looks, and what it counted is as true (Astra on #326's
+    /// five-voter case, again on #327). Filled from every durable Sync
+    /// row at a restart.
+    durable_counted: Vec<(Ballot, BTreeMap<ReplicaId, crate::recovery::CountedStore>)>,
     /// The commit frontier the leader of the current ballot announced:
     /// every proposal of the ballot up to this sequence number is
     /// committed there (task-d09). Reset with the ballot.
@@ -1281,6 +1290,12 @@ impl Follower {
             durable_promise,
             durable_seal,
         );
+        let syncs: Vec<(Ballot, SyncDecision)> = syncs.into_iter().collect();
+        let durable_counted = syncs
+            .iter()
+            .filter(|(_, d)| !d.counted.is_empty())
+            .map(|(b, d)| (*b, d.counted.clone()))
+            .collect();
         let resumed: Option<SyncDecision> = syncs
             .into_iter()
             .find(|(b, _)| *b == ballots.synced())
@@ -1403,6 +1418,7 @@ impl Follower {
             mark_next_admitted: false,
             mark_next_relayed: false,
             synced_selection: resumed.clone(),
+            durable_counted,
             resumed,
             early_sync: None,
             sync_behind_promise: None,
@@ -1658,6 +1674,7 @@ impl Follower {
             sync_behind_promise: None,
             sync_behind_rows: None,
             synced_selection: selection,
+            durable_counted: Vec::new(),
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -3231,6 +3248,21 @@ impl Follower {
         // (task-d121).
         if entry.admission.is_some() && self.retired_unread(command) {
             return Some(*command);
+        }
+        // Committed or executed here under other facts than the entry
+        // names: a second decision of one command, which `advance_sync`
+        // stops on. Nothing the entry waits for can change that, and held
+        // behind a dependency it never reported while the replica went on
+        // executing its own facts (Astra on #327).
+        if let (Some(selected), Some(held)) = (
+            entry.admission,
+            self.table
+                .record(command)
+                .filter(|r| r.phase >= Phase::Commit)
+                .and_then(|r| r.payload),
+        ) && held != selected
+        {
+            return None;
         }
         let nothing = entry.admission.as_ref().is_some_and(is_nothing);
         if !nothing
@@ -6169,6 +6201,18 @@ impl Follower {
             .filter(|d| d.ballot == self.ballots.synced())
     }
 
+    /// The stores every Sync whose row became durable here since the last
+    /// call counted, with its ballot, in the order they became durable
+    /// (task-d121, C1): a superseded Sync's included, which
+    /// [`Follower::synced_selection`] never names. After a restart, every
+    /// durable Sync row's, as the rows were read. Learning them is
+    /// idempotent, so the order is not a rule.
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(Ballot, BTreeMap<ReplicaId, crate::recovery::CountedStore>)> {
+        core::mem::take(&mut self.durable_counted)
+    }
+
     /// Proposals held for a payload or lagging dependencies.
     pub fn held(&self) -> &BTreeMap<CommandId, HeldProposal> {
         &self.held
@@ -6792,6 +6836,19 @@ impl Follower {
         let command = proposal.command;
         let seqnum = proposal.seqnum.unwrap_or(u64::MAX);
         let held = self.held.contains_key(&command);
+        // Facts proposed over a nothing held below COMMIT (task-d121): the
+        // proposal is held for its payload, and the payload this copy
+        // brought is that payload. `take_relayed_payload` finds the
+        // command known and leaves it to the proposal path, so it rebinds
+        // below, as a `PayloadResponse` has it rebind. Dropped, it was
+        // asked for again (Astra on #327).
+        let over_nothing = (takes
+            && !is_nothing(&proposal.admission)
+            && self.table.phase_of(&command) < Some(Phase::Commit)
+            && holds_nothing(&self.table, &command)
+            && !self.payloads.contains_key(&command))
+        .then(|| payload.clone());
+        let mut known = false;
         let mut kept = None;
         let took = if takes {
             match self.take_relayed_payload(&proposal, payload, false) {
@@ -6801,6 +6858,7 @@ impl Follower {
                 }
                 Relayed::Known => {
                     self.relayed_known = self.relayed_known.saturating_add(1);
+                    known = true;
                     false
                 }
                 Relayed::Mismatch => {
@@ -6831,6 +6889,9 @@ impl Follower {
         // row 1 at 3 voters, seed 11).
         if took && held {
             effects.extend(self.advance_pending());
+        }
+        if let Some(payload) = over_nothing.filter(|_| known) {
+            effects.extend(self.on_payload(command, payload));
         }
         effects
     }
@@ -7042,6 +7103,30 @@ impl Follower {
         (self.kept.len(), self.kept_bytes)
     }
 
+    /// Whether a proposal of `command` under `admission` meets it decided
+    /// here, at COMMIT or executed, with a nothing against facts either
+    /// way round (task-d121): a second decision of one command. Reported,
+    /// and this replica stops.
+    fn stops_on_decided(&mut self, command: CommandId, admission: Digest32) -> bool {
+        let Some(accepted) = self.table.record(&command).and_then(|r| r.payload) else {
+            return false;
+        };
+        if accepted == admission
+            || self.table.phase_of(&command) < Some(Phase::Commit)
+            || !(is_nothing(&admission) || is_nothing(&accepted))
+        {
+            return false;
+        }
+        self.rejections
+            .push(FollowerRejection::IncompatibleAdmission {
+                command,
+                held: accepted,
+                selected: admission,
+            });
+        self.halted = Some(command);
+        true
+    }
+
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
         if let Some(transition) = self.ballots.seal_held() {
             self.rejections
@@ -7065,6 +7150,14 @@ impl Follower {
         let command = proposal.command;
         if self.held.contains_key(&command) {
             // Duplicate proposal of one still held: nothing acknowledged yet.
+            return Vec::new();
+        }
+        // A nothing against what this replica decided, either way round,
+        // stops it before anything is acknowledged again, a duplicate of
+        // an adoption included: replayed, the acknowledgement reported the
+        // old facts and the replica went on executing them (Astra on
+        // #327).
+        if self.stops_on_decided(command, proposal.admission) {
             return Vec::new();
         }
         if self.adopted.contains_key(&command) {
@@ -7152,23 +7245,9 @@ impl Follower {
         // holds below COMMIT at adoption, payload and all: Paxos lets a
         // ballot's proposal replace an acceptance at a lower one. At
         // COMMIT or executed, a nothing against facts either way round is
-        // a second decision of one command, and this replica stops, as at
-        // a Sync's installation.
+        // a second decision of one command, and this replica stopped
+        // above, as at a Sync's installation (`stops_on_decided`).
         let nothing = is_nothing(&proposal.admission);
-        if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
-            && accepted != proposal.admission
-            && self.table.phase_of(&command) >= Some(Phase::Commit)
-            && (nothing || is_nothing(&accepted))
-        {
-            self.rejections
-                .push(FollowerRejection::IncompatibleAdmission {
-                    command,
-                    held: accepted,
-                    selected: proposal.admission,
-                });
-            self.halted = Some(command);
-            return Vec::new();
-        }
         if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
             && accepted != proposal.admission
             && !nothing
@@ -7920,6 +7999,10 @@ impl Follower {
                     // not this ballot is still the one to activate: the
                     // table follows its rows.
                     self.ledger.durable(barrier, *journal_seq);
+                    if !decision.counted.is_empty() {
+                        self.durable_counted
+                            .push((decision.ballot, decision.counted.clone()));
+                    }
                     if self.ballots.synced() == decision.ballot {
                         self.synced_selection = Some(decision.clone());
                     }

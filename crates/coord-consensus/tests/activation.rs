@@ -11832,3 +11832,115 @@ fn a_proposal_under_facts_over_a_nothing_rebinds_on_the_payload() {
     assert_eq!(record.payload, Some(facts), "{record:?}");
     assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
 }
+
+/// task-d121, C2: a Sync entry carrying a command committed here under
+/// facts as nothing stops the voter at once, a dependency it has not
+/// accepted notwithstanding: nothing the entry could wait for makes the
+/// two decisions one, and waiting, the voter went on executing its own
+/// facts (Astra on #327).
+#[test]
+fn a_nothing_sync_entry_over_a_commit_stops_before_its_dependencies() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    let facts = facts_of(&cluster.nodes[1], &d).expect("its payload row");
+    // Never submitted anywhere: no voter knows it.
+    let e = cluster.admit_at(2, 2, &[]);
+    let mut entry = sync_entry(d, Phase::Commit, coord_consensus::NOTHING_ADMISSION);
+    entry.deps = vec![e];
+    let rejections = install_sync(&mut cluster, ballot(1, 2), vec![entry]);
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, held, selected }
+                if *command == d
+                    && *held == facts
+                    && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+}
+
+/// task-d121, C2: a proposal of a nothing for a command this voter
+/// adopted and committed under facts in the same ballot stops it, rather
+/// than replaying the acknowledgement it kept (Astra on #327).
+#[test]
+fn a_duplicate_nothing_proposal_of_an_adopted_commit_stops() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&d),
+        Some(Phase::Commit)
+    );
+    let facts = facts_of(&cluster.nodes[1], &d).expect("its payload row");
+    propose(
+        &mut cluster,
+        ballot(0, 0),
+        d,
+        coord_consensus::NOTHING_ADMISSION,
+    );
+    let rejections = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, held, selected }
+                if *command == d
+                    && *held == facts
+                    && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+}
+
+/// task-d121, C2: facts proposed over a nothing held below COMMIT, with
+/// their payload relayed in the proposal, rebind on that copy, as on a
+/// `PayloadResponse`, and nothing is left missing (Astra on #327).
+#[test]
+fn a_relayed_proposal_under_facts_over_a_nothing_rebinds_on_its_payload() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    // The next ballot re-proposes D under facts, relaying its payload.
+    let b2 = ballot(2, 2);
+    install_sync_reproposing(&mut cluster, b2, vec![], BTreeSet::from([d]));
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::RelayedProposal {
+            vote: coord_consensus::FastAck {
+                replica: b2.leader,
+                ballot: b2,
+                command: d,
+                deps: vec![],
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission: facts,
+                seqnum: Some(0),
+            },
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert_eq!(record.payload, Some(facts), "{record:?}");
+    assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
+}

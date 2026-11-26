@@ -2370,3 +2370,83 @@ fn a_committed_nothing_executes_as_its_canonical_refusal() {
     assert_eq!(*read, nothing);
     assert!(decided.is_nothing());
 }
+
+/// A Sync whose row becomes durable in the flush that also installs a
+/// higher Sync, cached ahead of its `NewLeader`, is never the selection
+/// this voter is synchronized to when it learns, and the stores it
+/// counted are learned all the same (Astra's five-voter case on #326,
+/// again on #327).
+#[test]
+fn a_sync_superseded_in_its_own_flush_still_teaches_the_counted_stores() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let higher = Ballot {
+        epoch: campaigned.epoch,
+        number: campaigned.number + 1,
+        leader: r(0),
+    };
+    // The next leader's Sync, counting its own store.
+    let later: Vec<Vec<u8>> = syncs
+        .iter()
+        .filter_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
+            Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                decision.ballot = higher;
+                decision.counted = std::collections::BTreeMap::from([(
+                    r(0),
+                    coord_consensus::recovery::CountedStore {
+                        incarnation: inc(),
+                        store: coord_types::ids::StoreInstanceId(r(0).0),
+                    },
+                )]);
+                Some(coord_consensus::ProtocolMessage::Sync(decision).encode())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!later.is_empty());
+    peer.node_mut().applier_mut().store_mut().hold = true;
+    for frame in syncs {
+        peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    for frame in later {
+        peer.on_peer(PeerProvenance::from_local_voter(r(0), inc()), frame)
+            .expect("stepped");
+    }
+    new_leader(&mut peer, 0, higher);
+    let held = core::mem::take(&mut peer.node_mut().applier_mut().store_mut().held);
+    assert!(!held.is_empty(), "the first Sync's row is held");
+    peer.node_mut().applier_mut().store_mut().hold = false;
+    let at = peer.ballot();
+    for (seq, barrier) in held.into_iter().enumerate() {
+        peer.node_mut()
+            .on_storage(
+                coord_core::event::StorageEvent::JournalDurable {
+                    barrier_id: barrier,
+                    journal_seq: coord_types::ids::LocalJournalSeq::new(seq as u64 + 1000)
+                        .expect("a sequence"),
+                },
+                &at,
+            )
+            .expect("a storage fact");
+    }
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    assert!(
+        peer.node().machine().synchronized_at(&higher),
+        "the higher Sync is the selection"
+    );
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "the superseded Sync's store"
+    );
+    assert_eq!(
+        durable_row(&peer, r(0), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(0).0)),
+        "the installed Sync's store"
+    );
+}

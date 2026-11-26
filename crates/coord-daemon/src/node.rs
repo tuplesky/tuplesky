@@ -613,6 +613,24 @@ impl Machine {
         Some((selection.ballot, &selection.counted))
     }
 
+    /// The stores each Sync whose row became durable since the last call
+    /// counted, a superseded one's included (task-d121, C1); none for a
+    /// leader, whose own selection [`Machine::synced_counted`] names.
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.take_durable_counted(),
+        }
+    }
+
     /// The ballot configuration this replica works under: the one it
     /// leads, or the one it follows or campaigns in.
     pub fn configuration(&self) -> &coord_consensus::BallotConfiguration {
@@ -970,6 +988,16 @@ pub struct Node<P: Persistence> {
     features: Option<crate::feature::Features>,
     /// The store each peer voter spoke from (task-d121, C1).
     peer_stores: Option<crate::peer_store::PeerStores>,
+    /// What [`Machine::take_durable_counted`] gave up at a role change,
+    /// for the voter to learn (task-d121, C1): the follower that held it
+    /// is gone by the time the voter looks.
+    durable_counted: Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )>,
     /// Whether this node reads `Feature::AnswerOnRelease` active
     /// (task-d100, step A): the collector beside it marks its
     /// submissions as answered on the leader's release alone.
@@ -1089,6 +1117,7 @@ impl<P: Persistence> Node<P> {
             early_without_activation: false,
             features: None,
             peer_stores: None,
+            durable_counted: Vec::new(),
             answer_on_release: false,
             batched_round: false,
             sent_bytes: coord_consensus::SentBytes::default(),
@@ -1535,6 +1564,8 @@ impl<P: Persistence> Node<P> {
     /// commands it had learned and not released are not timed: the role
     /// that would release them is going.
     fn leave_role(&mut self) {
+        let counted = self.machine_mut().take_durable_counted();
+        self.durable_counted.extend(counted);
         let counts = self.machine_mut().take_fast_path_counts();
         self.fast_path.add(&counts);
         // A follower's catch-up counts start again with the role: kept
@@ -2013,6 +2044,22 @@ impl<P: Persistence> Node<P> {
             _ => Outbound::default(),
         };
         Ok(Some((check, out)))
+    }
+
+    /// The stores each Sync whose row became durable here counted, a
+    /// superseded one's included, since the last call (task-d121, C1).
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        let mut out = core::mem::take(&mut self.durable_counted);
+        out.extend(self.machine_mut().take_durable_counted());
+        out
     }
 
     /// Record the stores an installed Sync from `leader` counted
