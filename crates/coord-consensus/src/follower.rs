@@ -42,7 +42,9 @@ use crate::campaign::Campaign;
 use crate::catch_up::{
     CatchUp, CatchUpDivergence, CatchUpPaths, DonorExecution, OwnExecution, Running, SinceBoot,
 };
-use crate::commands::{CommandRecord, CommandTable, InitError, RelayRoom};
+use crate::commands::{
+    CommandRecord, CommandTable, InitError, NOTHING_ADMISSION, RelayRoom, is_nothing,
+};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
     CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
@@ -2785,6 +2787,45 @@ impl Follower {
         effects
     }
 
+    /// Hold `command` as nothing (task-d121), for a Sync entry or a
+    /// proposal that carries it so: a record it doesn't hold yet is made,
+    /// and one below COMMIT under facts is replaced, its payload dropped
+    /// as a release drops it. Returns the deletion of the replaced
+    /// record's payload row, for the batch that writes the nothing.
+    ///
+    /// A record at COMMIT or executed is left as it is: under facts, the
+    /// nothing is a second decision, which the caller's admission check
+    /// stops on.
+    fn take_nothing(&mut self, command: CommandId) -> Option<StoreUpdate> {
+        match self.table.phase_of(&command) {
+            None => {
+                let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+                // Recovery work, bounded by the Sync or the proposal that
+                // carries it, as a selected entry's payload is.
+                let _ = self
+                    .table
+                    .initialize_beyond_capacity(command, NOTHING_ADMISSION, keys);
+                None
+            }
+            Some(phase)
+                if phase < Phase::Commit
+                    && self.table.record(&command).is_some_and(|r| !r.is_nothing()) =>
+            {
+                self.table.rebind(&command, NOTHING_ADMISSION);
+                if let Some(payload) = self.payloads.remove(&command)
+                    && self.bindings.get(&payload.retry_key) == Some(&command)
+                {
+                    self.bindings.remove(&payload.retry_key);
+                }
+                self.served_payloads.remove(&command);
+                self.payload_unwritten.remove(&command);
+                self.note_lacking(command);
+                Some(crate::rows::payload_delete(&command))
+            }
+            Some(_) => None,
+        }
+    }
+
     /// Drop what this replica holds of an undecided command a durable Sync
     /// released (task-d24): its table slot, its payload and binding, and
     /// ballot-scoped state, as if it had never held it.
@@ -2980,7 +3021,7 @@ impl Follower {
     fn commit_row_writable(&self, command: &CommandId) -> bool {
         self.table.record(command).is_some_and(|r| {
             r.phase == Phase::Commit
-                && (r.payload.is_none()
+                && (r.facts().is_none()
                     || self.served_payloads.contains(command)
                     || self.payloads.contains_key(command))
         })
@@ -3003,7 +3044,8 @@ impl Follower {
             let record = self.table.record(command).expect("held").clone();
             let dependencies = self.dependency_row(command, &record);
             let mut rows = Vec::with_capacity(2);
-            let payload = record.payload.is_some() && !self.served_payloads.contains(command);
+            // A nothing (task-d121) has no payload: its dependency row alone.
+            let payload = record.facts().is_some() && !self.served_payloads.contains(command);
             if payload {
                 let held = self.payloads.get(command).expect("writable");
                 rows.push(payload_update(command, held).expect("bounded"));
@@ -3110,8 +3152,14 @@ impl Follower {
     /// `None` if it can be installed now: the entry itself while it has
     /// no record here or awaits the selected facts, else its first
     /// dependency below ACCEPT.
+    ///
+    /// A nothing entry (task-d121) waits on neither: it has no payload to
+    /// fetch, and it replaces whatever this replica holds below COMMIT.
     fn sync_blocker(&self, command: &CommandId, entry: &SyncEntry) -> Option<CommandId> {
-        if self.table.phase_of(command).is_none() || self.awaits_selected_facts(command) {
+        let nothing = entry.admission.as_ref().is_some_and(is_nothing);
+        if !nothing
+            && (self.table.phase_of(command).is_none() || self.awaits_selected_facts(command))
+        {
             return Some(*command);
         }
         match crate::phase::guard_accept(&entry.deps, |d| self.table.phase_of(d)) {
@@ -3196,6 +3244,11 @@ impl Follower {
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
                 self.note_sync(command);
+                let dropped = if entry.admission.as_ref().is_some_and(is_nothing) {
+                    self.take_nothing(command)
+                } else {
+                    None
+                };
                 if self.table.record(&command).is_none() {
                     // Executed here and already retired: `phase_of` answers
                     // EXECUTED from the tombstone, and there is no record
@@ -3279,6 +3332,10 @@ impl Follower {
                 let row = self.dependency_row(&command, &record);
                 let barrier = self.allocate();
                 let mut updates = alloc::vec![row];
+                // The payload row of the record the nothing replaced goes
+                // in the same batch as the nothing's row, as a release's
+                // does (task-d121).
+                updates.extend(dropped);
                 // Its own payload row, where its payload is held here with
                 // none durable or in flight (seed 275 of `relayed_rows`):
                 // taken from a relayed proposal (`take_relayed_payload`),
@@ -5664,11 +5721,15 @@ impl Follower {
     /// with the chain total, nothing after it. The proposal is kept, the
     /// leader's payload is asked for as missing, and `on_payload` rebinds
     /// the record to it while nothing has been accepted over it.
+    ///
+    /// Never for a proposal of a nothing (task-d121): it has no payload to
+    /// fetch, and it replaces the record at adoption.
     fn awaits_rebind(&self, command: &CommandId) -> bool {
         self.held.get(command).is_some_and(|h| {
-            self.table.record(command).is_some_and(|r| {
-                r.phase < Phase::Commit && r.payload.is_some_and(|p| p != h.proposal.admission)
-            })
+            !is_nothing(&h.proposal.admission)
+                && self.table.record(command).is_some_and(|r| {
+                    r.phase < Phase::Commit && r.payload.is_some_and(|p| p != h.proposal.admission)
+                })
         })
     }
 
@@ -6808,8 +6869,30 @@ impl Follower {
         // command sat at PRE-ACCEPT here for ever, and with the chain
         // total, so did everything after it.
         let mut rebinding = false;
+        // A proposal of a nothing (task-d121) replaces what this replica
+        // holds below COMMIT at adoption, payload and all: Paxos lets a
+        // ballot's proposal replace an acceptance at a lower one. At
+        // COMMIT or executed, a nothing against facts either way round is
+        // a second decision of one command, and this replica stops, as at
+        // a Sync's installation.
+        let nothing = is_nothing(&proposal.admission);
         if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
             && accepted != proposal.admission
+            && self.table.phase_of(&command) >= Some(Phase::Commit)
+            && (nothing || is_nothing(&accepted))
+        {
+            self.rejections
+                .push(FollowerRejection::IncompatibleAdmission {
+                    command,
+                    held: accepted,
+                    selected: proposal.admission,
+                });
+            self.halted = Some(command);
+            return Vec::new();
+        }
+        if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
+            && accepted != proposal.admission
+            && !nothing
         {
             self.rejections
                 .push(FollowerRejection::AdmissionConflict { command, accepted });
@@ -7065,8 +7148,17 @@ impl Follower {
     /// toward a decision has to rest on the command's payload at the
     /// voter, not only on its admission digest: else a crash of every
     /// voter can leave a released command's payload durable nowhere.
+    ///
+    /// A nothing (task-d121) has no payload row to wait on: what makes its
+    /// acknowledgement safe is its dependency row, which the batch the
+    /// acknowledgement follows writes.
     fn payload_row(&self, command: &CommandId) -> Option<Vec<BarrierId>> {
-        if self.served_payloads.contains(command) {
+        if self.served_payloads.contains(command)
+            || self
+                .table
+                .record(command)
+                .is_some_and(CommandRecord::is_nothing)
+        {
             return Some(Vec::new());
         }
         if !self.payloads.contains_key(command) {
@@ -7150,10 +7242,14 @@ impl Follower {
     /// never written, is initialized with no payload here, and adopted it
     /// was a slow vote no recovery could re-execute from. It waits for
     /// the payload, which `held_missing` asks for.
+    ///
+    /// A proposal of a nothing (task-d121) waits on neither: it has no
+    /// payload, and adoption makes or replaces its record.
     fn held_blocker(&self, command: &CommandId, held: &HeldProposal) -> Option<CommandId> {
-        if !self.table.is_initialized(command)
-            || self.awaits_rebind(command)
-            || !self.payloads.contains_key(command)
+        if !is_nothing(&held.proposal.admission)
+            && (!self.table.is_initialized(command)
+                || self.awaits_rebind(command)
+                || !self.payloads.contains_key(command))
         {
             return Some(*command);
         }
@@ -7238,6 +7334,13 @@ impl Follower {
                 let held = self.held.remove(&command).expect("ready");
                 self.unkeep(&command);
                 self.note_lacking(command);
+                // A nothing replaces what is held below COMMIT, and its
+                // payload row goes in this adoption's batch (task-d121).
+                let dropped = if is_nothing(&held.proposal.admission) {
+                    self.take_nothing(command)
+                } else {
+                    None
+                };
                 // The proposal asserts the admission it was ordered under.
                 // Adopted under other attested facts, this replica would
                 // execute a command the quorum never admitted as such --
@@ -7295,6 +7398,7 @@ impl Follower {
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
                 let mut updates = alloc::vec![self.dependency_row(&command, &record)];
+                updates.extend(dropped);
                 // The payload row with it, where none is durable or being
                 // written here (task-d90): its batch failed, or it was
                 // never written. The acknowledgement waits on the batch
@@ -8071,6 +8175,20 @@ impl Follower {
         // command is asked for again if a later selection names it.
         if self.sync_barrier.is_some() && self.sync_released.contains(&command) {
             return Vec::new();
+        }
+        // A nothing this replica holds below COMMIT, which a selection
+        // names facts over (task-d121): the payload replaces it, as a
+        // rebind replaces other facts.
+        if !self.payloads.contains_key(&command)
+            && self
+                .table
+                .record(&command)
+                .is_some_and(CommandRecord::is_nothing)
+            && self.awaits_selected_facts(&command)
+        {
+            let mut effects = self.rebind(command, payload);
+            effects.extend(self.advance_sync());
+            return effects;
         }
         if self.payloads.contains_key(&command) {
             let for_proposal = self.awaits_rebind(&command)

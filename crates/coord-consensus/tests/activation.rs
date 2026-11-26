@@ -10919,3 +10919,305 @@ fn a_report_whose_pages_came_before_a_promise_from_another_store_is_not_counted(
     assert!(same.reports().iter().any(|rep| rep.replica == r(1)));
     assert!(same.try_select(usize::MAX, |_, _| false).unwrap().is_some());
 }
+
+/// A Sync entry for `d` at `phase` under `admission`, with no order.
+fn sync_entry(d: CommandId, phase: Phase, admission: Digest32) -> coord_consensus::SyncEntry {
+    coord_consensus::SyncEntry {
+        command: d,
+        phase,
+        deps: vec![],
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: Some(admission),
+    }
+}
+
+/// Node 1 promises `b`, from its leader, and installs its Sync of
+/// `entries`.
+fn install_sync(
+    cluster: &mut Cluster,
+    b: Ballot,
+    entries: Vec<coord_consensus::SyncEntry>,
+) -> Vec<FollowerRejection> {
+    let effects = cluster.nodes[1].step(peer_event(
+        b.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    let decision = SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: entries.into_iter().map(|e| (e.command, e)).collect(),
+        reproposed: Default::default(),
+        counted: Default::default(),
+        nothing: Default::default(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(b.leader, ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), b);
+    cluster.nodes[1].follower_mut().take_rejections()
+}
+
+/// task-d121, C2: a Sync entry carrying a command as nothing replaces
+/// what a voter holds of it below COMMIT under facts, and the payload
+/// row goes with the record, in the batch that writes the nothing. A
+/// later Sync naming the command under facts again waits for the
+/// payload, as a rebind does, and installs once it arrives.
+#[test]
+fn a_nothing_sync_entry_replaces_an_acceptance_under_facts() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    let record = cluster.nodes[1]
+        .follower()
+        .table()
+        .record(&d)
+        .unwrap()
+        .clone();
+    assert!(record.is_nothing(), "{record:?}");
+    assert_eq!(record.phase, Phase::Accept);
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "the replaced record's payload row is gone"
+    );
+    let (_, row) = dependency_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .unwrap();
+    assert!(row.is_nothing() && row.phase == Phase::Accept, "{row:?}");
+    // The other way round: facts over a nothing below COMMIT wait for the
+    // payload under them.
+    install_sync(
+        &mut cluster,
+        ballot(2, 2),
+        vec![sync_entry(d, Phase::Accept, facts)],
+    );
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing(),
+        "not installed without its payload"
+    );
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::PayloadResponse {
+            command: d,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert_eq!(record.payload, Some(facts));
+    assert_eq!(record.phase, Phase::Accept);
+}
+
+/// task-d121, C2: a voter that holds nothing of a command installs a
+/// nothing entry for it at once, with no payload to wait for, and writes
+/// its dependency row alone.
+#[test]
+fn a_nothing_sync_entry_installs_with_nothing_held() {
+    let mut cluster = Cluster::new(3);
+    let d = CommandId(Digest32([0xd0; 32]));
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert!(record.is_nothing());
+    assert_eq!(record.phase, Phase::Commit);
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing()),
+        "the nothing's row is durable"
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
+    );
+}
+
+/// task-d121, C2: a voter holding a command committed under facts that
+/// meets a Sync entry carrying it as nothing holds two decisions of one
+/// command, and stops.
+#[test]
+fn a_nothing_sync_entry_over_a_commit_under_facts_stops() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&d),
+        Some(Phase::Commit)
+    );
+    let rejections = install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, selected, .. }
+                if *command == d && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+    assert!(
+        !cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+}
+
+/// A proposal of `d` under `admission` from the leader of `b`, with no
+/// order.
+fn propose(cluster: &mut Cluster, b: Ballot, d: CommandId, admission: Digest32) {
+    let effects = cluster.nodes[1].step(peer_event(
+        b.leader,
+        ProtocolMessage::Proposal(coord_consensus::FastAck {
+            replica: b.leader,
+            ballot: b,
+            command: d,
+            deps: vec![],
+            paths: Vec::new(),
+            path: coord_consensus::empty_path(),
+            admission,
+            seqnum: Some(0),
+        }),
+    ));
+    cluster.handle(1, effects);
+}
+
+/// task-d121, C2: a proposal of a nothing replaces what a voter accepted
+/// below COMMIT under facts, with no payload to wait for and no
+/// `AdmissionConflict`, and the payload row goes in the adoption's batch.
+#[test]
+fn a_nothing_proposal_replaces_an_acceptance_under_facts() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![sync_entry(d, Phase::Accept, facts)]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    assert!(cluster.nodes[1].follower_mut().take_rejections().is_empty());
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert!(record.is_nothing(), "{record:?}");
+    assert_eq!(record.phase, Phase::Accept);
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "the replaced record's payload row is gone"
+    );
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing()),
+        "the nothing's row is durable"
+    );
+}
+
+/// task-d121, C2: a voter that holds nothing of a command adopts a
+/// proposal of a nothing for it at once.
+#[test]
+fn a_nothing_proposal_is_adopted_with_nothing_held() {
+    let mut cluster = Cluster::new(3);
+    let d = CommandId(Digest32([0xd1; 32]));
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert!(record.is_nothing(), "{record:?}");
+    assert_eq!(record.phase, Phase::Accept);
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing())
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
+    );
+}
+
+/// task-d121, C2: a voter holding a command committed under facts that
+/// meets a proposal of it as nothing holds two decisions of one command,
+/// and stops.
+#[test]
+fn a_nothing_proposal_over_a_commit_under_facts_stops() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    let facts = cluster.nodes[1]
+        .follower()
+        .table()
+        .record(&d)
+        .unwrap()
+        .payload
+        .unwrap();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![sync_entry(d, Phase::Commit, facts)]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    let rejections = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, selected, .. }
+                if *command == d && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+    assert_eq!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .payload,
+        Some(facts)
+    );
+}
