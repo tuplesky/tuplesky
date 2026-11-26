@@ -14,15 +14,13 @@
 //! row lives in `checkpoint_v1`, which is node-private: no shared
 //! checkpoint carries it to another node.
 
-use std::ops::Bound;
-
 use coord_core::effect::StoreUpdate;
-use coord_store_api::engine::{Direction, EngineError, OrderedRead, ScanRequest};
+use coord_store_api::engine::{EngineError, OrderedRead};
 use coord_store_api::registry::Collection;
 use coord_types::ids::{ReplicaId, ReplicaIncarnation, StoreInstanceId};
 use serde::{Deserialize, Serialize};
 
-use crate::trim::{TrimError, TrimLimits, corrupt, decode_record, encode_record};
+use crate::trim::{corrupt, decode_record, encode_record};
 
 /// Record kind of a peer's store row in `checkpoint_v1`.
 pub const PEER_STORE_RECORD_KIND: u16 = 0x000c;
@@ -71,60 +69,24 @@ pub fn peer_store_key(voter: &ReplicaId, incarnation: ReplicaIncarnation) -> Vec
     key
 }
 
-/// The peer store rows this node durably holds, in key order.
-pub fn read_peer_stores<V: OrderedRead>(
+/// The row this node durably holds for `voter` under `incarnation`, read
+/// by its key: a node never reads the rows whole, so however many
+/// incarnations a peer has had, every set of rows it wrote reopens.
+pub fn read_peer_store<V: OrderedRead>(
     view: &V,
-    limits: &TrimLimits,
-) -> Result<Vec<PeerStoreV1>, TrimError> {
-    limits.validate()?;
-    let mut out: Vec<PeerStoreV1> = Vec::new();
-    let mut resume: Option<Vec<u8>> = None;
-    loop {
-        let page = view.scan_page(
-            Collection::CheckpointV1.id(),
-            &ScanRequest {
-                lower: Bound::Included(PEER_STORE_KEY_PREFIX.to_vec()),
-                upper: Bound::Unbounded,
-                direction: Direction::Forward,
-                resume_after: resume.clone(),
-                max_rows: limits.page_rows(),
-                max_bytes: limits.page_bytes(),
-            },
-        )?;
-        let mut past_prefix = false;
-        for row in &page.rows {
-            let Some(suffix) = row.key.strip_prefix(PEER_STORE_KEY_PREFIX) else {
-                past_prefix = true;
-                break;
-            };
-            if out.len() as u32 >= limits.max_acknowledgements {
-                return Err(TrimError::AcknowledgementBudget {
-                    limit: limits.max_acknowledgements,
-                });
-            }
-            if suffix.len() != ReplicaId::LEN + 8 {
-                return Err(TrimError::Engine(corrupt("peer store key")));
-            }
-            let (voter, incarnation) = suffix.split_at(ReplicaId::LEN);
-            let voter = ReplicaId::from_slice(voter).map_err(|_| corrupt("peer store key"))?;
-            let incarnation = ReplicaIncarnation::new(u64::from_be_bytes(
-                incarnation
-                    .try_into()
-                    .map_err(|_| corrupt("peer store key"))?,
-            ))
-            .map_err(|_| corrupt("peer store key"))?;
-            let record = PeerStoreV1::decode(&row.value)?;
-            if record.voter != voter || record.incarnation != incarnation {
-                return Err(TrimError::Engine(corrupt(
-                    "peer store row disagrees with its key",
-                )));
-            }
-            out.push(record);
-        }
-        match page.rows.last() {
-            Some(last) if !past_prefix && !page.exhausted => resume = Some(last.key.clone()),
-            _ => break,
-        }
+    voter: &ReplicaId,
+    incarnation: ReplicaIncarnation,
+) -> Result<Option<PeerStoreV1>, EngineError> {
+    let Some(value) = view.get(
+        Collection::CheckpointV1.id(),
+        &peer_store_key(voter, incarnation),
+    )?
+    else {
+        return Ok(None);
+    };
+    let record = PeerStoreV1::decode(&value)?;
+    if record.voter != *voter || record.incarnation != incarnation {
+        return Err(corrupt("peer store row disagrees with its key"));
     }
-    Ok(out)
+    Ok(Some(record))
 }

@@ -155,7 +155,7 @@ pub struct Voter<P: Persistence> {
     release_again_lookups: u64,
     /// Promises and reports waiting for their peer's store row to be
     /// durable (task-d121, C1), under its batch, in the order they came.
-    held_peers: Vec<(coord_core::effect::BarrierId, PeerProvenance, Vec<u8>)>,
+    held_peers: crate::peer_store::HeldFrames,
 }
 
 /// A marked command's release waiting to be published again (task-d100,
@@ -210,7 +210,7 @@ impl<P: Persistence> Voter<P> {
             release_again: std::collections::BTreeMap::new(),
             release_again_seen_at: None,
             release_again_lookups: 0,
-            held_peers: Vec::new(),
+            held_peers: crate::peer_store::HeldFrames::default(),
         }
     }
 
@@ -535,7 +535,8 @@ impl<P: Persistence> Voter<P> {
                 crate::peer_store::Check::Refused { .. } => return Ok(out),
                 crate::peer_store::Check::Wait(barrier)
                 | crate::peer_store::Check::Record { barrier, .. } => {
-                    self.held_peers.push((barrier, provenance, frame));
+                    let held = self.held_peers.hold(barrier, provenance, frame);
+                    self.node.count_unheld(held);
                     out.absorb(self.release_peers()?);
                     return Ok(out);
                 }
@@ -579,18 +580,7 @@ impl<P: Persistence> Voter<P> {
             return Ok(out);
         }
         let settled = self.node.settle_peer_stores();
-        if !settled.failed.is_empty() {
-            self.held_peers
-                .retain(|(barrier, ..)| !settled.failed.contains(barrier));
-        }
-        if settled.durable.is_empty() {
-            return Ok(out);
-        }
-        let (ready, waiting): (Vec<_>, Vec<_>) = core::mem::take(&mut self.held_peers)
-            .into_iter()
-            .partition(|(barrier, ..)| settled.durable.contains(barrier));
-        self.held_peers = waiting;
-        for (_, provenance, frame) in ready {
+        for (provenance, frame) in self.held_peers.release(&settled) {
             let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
             out.absorb(self.deliver_peer(provenance, frame, message)?);
         }

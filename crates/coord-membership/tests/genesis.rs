@@ -352,13 +352,16 @@ fn a_signed_genesis_initializes_pinned_membership() {
     // a different manifest is a digest mismatch (quarantine); a lost
     // journal quarantines.
     let mut store = Store::default();
-    let init = initialize(&verified, &mut store, StoreInstanceId([7; 16])).unwrap();
+    let init = initialize(&verified, &mut store, || Ok(StoreInstanceId([7; 16]))).unwrap();
     assert!(init.first_boot);
     assert_eq!(init.membership.epoch().get(), 1);
     assert_eq!(init.store_instance, StoreInstanceId([7; 16]));
-    // A returning boot reads the pinned identity back, whatever it is
-    // handed (task-d121).
-    let again = initialize(&verified, &mut store, StoreInstanceId([8; 16])).unwrap();
+    // A returning boot reads the pinned identity back, and draws none
+    // (task-d121; from Astra's review of C1: a backup drew one).
+    let again = initialize(&verified, &mut store, || {
+        panic!("a pinned store draws no identity")
+    })
+    .unwrap();
     assert!(!again.first_boot);
     assert_eq!(again.store_instance, StoreInstanceId([7; 16]));
     // Five voters, not four: another manifest the design allows
@@ -374,21 +377,21 @@ fn a_signed_genesis_initializes_pinned_membership() {
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
     let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
     assert!(matches!(
-        initialize(&other_verified, &mut store, StoreInstanceId([8; 16])),
+        initialize(&other_verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::DigestMismatch { .. })
     ));
     // A pinned store without its identity is damaged, and is not given
     // a new one.
     store.instance = None;
     assert_eq!(
-        initialize(&verified, &mut store, StoreInstanceId([8; 16])),
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::Store)
     );
     assert_eq!(store.instance, None);
     store.instance = Some(StoreInstanceId([7; 16]));
     store.journal = false;
     assert_eq!(
-        initialize(&verified, &mut store, StoreInstanceId([8; 16])),
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::JournalLost)
     );
     let _ = &mut issuer;
@@ -697,7 +700,7 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
 
     let mut store = CrashOnPin::default();
     assert_eq!(
-        initialize(&verified, &mut store, StoreInstanceId([7; 16])),
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([7; 16]))),
         Err(InitError::Store)
     );
     // Nothing was pinned, and the journal is there: the retry is an
@@ -709,7 +712,7 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
         journal: store.journal,
         ..Store::default()
     };
-    let init = initialize(&verified, &mut retry, StoreInstanceId([7; 16])).unwrap();
+    let init = initialize(&verified, &mut retry, || Ok(StoreInstanceId([7; 16]))).unwrap();
     assert!(init.first_boot);
 }
 

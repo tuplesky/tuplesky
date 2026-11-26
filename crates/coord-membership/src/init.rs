@@ -69,13 +69,14 @@ pub struct Initialized {
 
 /// Initialize (or re-open) this node against `manifest` and `store`.
 ///
-/// `fresh` is the store identity a first boot pins. The caller draws it
-/// from a secure random source (core crates draw no randomness); a
-/// returning boot ignores it and reads the pinned one back.
+/// `fresh` draws the store identity a first boot pins, from a secure
+/// random source the caller holds (core crates draw no randomness). Only
+/// a first boot calls it: a returning boot, and a backup of a pinned
+/// store, read the pinned one back and draw nothing.
 pub fn initialize(
     manifest: &GenesisManifest,
     store: &mut dyn GenesisStore,
-    fresh: StoreInstanceId,
+    fresh: impl FnOnce() -> Result<StoreInstanceId, InitError>,
 ) -> Result<Initialized, InitError> {
     let membership = Membership::from_genesis(manifest).map_err(InitError::Membership)?;
     let digest = manifest.digest();
@@ -86,12 +87,15 @@ pub fn initialize(
             // through deployment trust. The order matters: pinning
             // first and crashing left a pinned digest with no journal,
             // which the returning-node path reads as a lost journal.
+            let store_instance = fresh()?;
             store.establish_journal().map_err(|_| InitError::Store)?;
-            store.pin(digest, fresh).map_err(|_| InitError::Store)?;
+            store
+                .pin(digest, store_instance)
+                .map_err(|_| InitError::Store)?;
             Ok(Initialized {
                 membership,
                 first_boot: true,
-                store_instance: fresh,
+                store_instance,
             })
         }
         Some(pinned) if pinned == digest => {

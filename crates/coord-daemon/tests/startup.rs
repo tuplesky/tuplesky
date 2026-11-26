@@ -109,7 +109,8 @@ fn run_to_membership(
     startup.storage_validated()?;
     startup.identity_validated()?;
     let mut store = StoreGenesis::new(engine, journal);
-    let initialized = startup.check_membership(manifest, &mut store, StoreInstanceId([9; 16]))?;
+    let initialized =
+        startup.check_membership(manifest, &mut store, || Ok(StoreInstanceId([9; 16])))?;
     Ok(initialized.first_boot)
 }
 
@@ -308,7 +309,7 @@ fn no_step_may_run_before_the_one_it_rests_on() {
     let error = {
         let mut store = StoreGenesis::new(&mut engine, &mut journal);
         startup
-            .check_membership(&manifest, &mut store, StoreInstanceId([9; 16]))
+            .check_membership(&manifest, &mut store, || Ok(StoreInstanceId([9; 16])))
             .expect_err("membership before identity")
     };
     assert_eq!(

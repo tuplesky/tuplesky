@@ -1954,8 +1954,11 @@ impl<P: Persistence> Node<P> {
         let Some(stores) = self.peer_stores.as_mut() else {
             return Ok(None);
         };
+        let applier = &self.applier;
         let check = stores
-            .check(voter, incarnation, store)
+            .check(voter, incarnation, store, || {
+                durable_peer_store(applier, &voter, incarnation)
+            })
             .map_err(DriveError::Engine)?;
         let out = match &check {
             crate::peer_store::Check::Record { barrier, updates } => self.carry_out(
@@ -1984,6 +1987,7 @@ impl<P: Persistence> Node<P> {
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
         let me = self.machine().identity().replica;
+        let applier = &self.applier;
         let Some(stores) = self.peer_stores.as_mut() else {
             return Ok(Outbound::default());
         };
@@ -1993,7 +1997,9 @@ impl<P: Persistence> Node<P> {
                 continue;
             }
             if let Some((barrier, updates)) = stores
-                .learn(leader, *voter, counted.incarnation, counted.store)
+                .learn(leader, *voter, counted.incarnation, counted.store, || {
+                    durable_peer_store(applier, voter, counted.incarnation)
+                })
                 .map_err(DriveError::Engine)?
             {
                 effects.push(Effect::Persist(PersistBatch {
@@ -2007,6 +2013,14 @@ impl<P: Persistence> Node<P> {
             return Ok(Outbound::default());
         }
         self.carry_out(effects, ballot)
+    }
+
+    /// Count a promise or report the voter did not hold behind its
+    /// peer's store row: a duplicate, or one past the bounds.
+    pub fn count_unheld(&mut self, held: crate::peer_store::Held) {
+        if let Some(stores) = self.peer_stores.as_mut() {
+            stores.count_unheld(held);
+        }
     }
 
     /// What became of the peer store rows' batches since the last call.
@@ -3141,4 +3155,21 @@ enum Lowering {
     /// Wait for the journal append out, take it back, and lend nothing
     /// ([`Persistence::finish_append`], task-d54).
     Await,
+}
+
+/// The store this node durably recorded for `voter` under `incarnation`
+/// (task-d121, C1), read by the row's key.
+fn durable_peer_store<P: Persistence>(
+    applier: &Applier<P>,
+    voter: &coord_types::ids::ReplicaId,
+    incarnation: coord_types::ids::ReplicaIncarnation,
+) -> Result<Option<coord_types::ids::StoreInstanceId>, String> {
+    let gated = applier
+        .store()
+        .reader()
+        .snapshot()
+        .map_err(|e| format!("the peer store row cannot be read: {e:?}"))?;
+    coord_checkpoint::peer_store::read_peer_store(gated.view(), voter, incarnation)
+        .map(|row| row.map(|row| row.store))
+        .map_err(|e| format!("the peer store row cannot be read: {e:?}"))
 }

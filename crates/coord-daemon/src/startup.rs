@@ -292,7 +292,7 @@ impl Startup {
         &mut self,
         manifest: &GenesisManifest,
         store: &mut dyn GenesisStore,
-        fresh: StoreInstanceId,
+        fresh: impl FnOnce() -> Result<StoreInstanceId, coord_membership::init::InitError>,
     ) -> Result<Initialized, StartupError> {
         // The ordering check comes first: initializing would write a pin,
         // and a pin must never be the side effect of a step taken out of

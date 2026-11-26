@@ -1756,19 +1756,9 @@ fn voter(
     // it from the same activation the store holds.
     voter.node_mut().keep_features(features);
     // Each peer voter's promises and reports are checked against the store
-    // it first spoke from (task-d121, C1), from the rows this store holds.
-    let peer_stores = {
-        use coord_storage::Persistence;
-        let gated = voter
-            .node()
-            .applier()
-            .store()
-            .reader()
-            .snapshot()
-            .map_err(|e| format!("the peer store rows cannot be read: {e:?}"))?;
-        coord_daemon::peer_store::PeerStores::open(gated.view(), placed.incarnation, boot)
-            .map_err(|e| format!("the peer store rows cannot be read: {e}"))?
-    };
+    // it first spoke from (task-d121, C1). Its row is read by key when the
+    // peer first speaks, so nothing is read here.
+    let peer_stores = coord_daemon::peer_store::PeerStores::new(placed.incarnation, boot);
     voter.node_mut().keep_peer_stores(peer_stores);
     if cfg!(feature = "early-proposal-without-activation") {
         voter.node_mut().send_early_without_activation();

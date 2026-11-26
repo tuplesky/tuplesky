@@ -1442,27 +1442,29 @@ fn both_of_a_commands_batches_fail_then_a_later_vote_names_it() {
     }
 }
 
-/// Give `voter` the peer store check (task-d121, C1), from the rows its
-/// store holds now.
+/// Give `voter` the peer store check (task-d121, C1).
 fn keep_peer_stores(voter: &mut Voter<Stamped>) {
-    let stores = {
-        let gated = coord_storage::Persistence::reader(voter.node().applier().store())
-            .snapshot()
-            .expect("a view");
-        coord_daemon::peer_store::PeerStores::open(gated.view(), inc(), BootId([7; 16]))
-            .expect("the rows read")
-    };
-    voter.node_mut().keep_peer_stores(stores);
+    voter
+        .node_mut()
+        .keep_peer_stores(coord_daemon::peer_store::PeerStores::new(
+            inc(),
+            BootId([7; 16]),
+        ));
 }
 
-/// The peer store rows `voter`'s store holds, read afresh as a restart
-/// reads them.
-fn reopened(voter: &Voter<Stamped>) -> coord_daemon::peer_store::PeerStores {
+/// The store `voter`'s store durably records for `about` under
+/// `incarnation`, read by key as a restart reads it.
+fn durable_row(
+    voter: &Voter<Stamped>,
+    about: ReplicaId,
+    incarnation: ReplicaIncarnation,
+) -> Option<coord_types::ids::StoreInstanceId> {
     let gated = coord_storage::Persistence::reader(voter.node().applier().store())
         .snapshot()
         .expect("a view");
-    coord_daemon::peer_store::PeerStores::open(gated.view(), inc(), BootId([7; 16]))
-        .expect("the rows read")
+    coord_checkpoint::peer_store::read_peer_store(gated.view(), &about, incarnation)
+        .expect("the row reads")
+        .map(|row| row.store)
 }
 
 /// The frames in `out` for `to`, undecoded, as the link carries them.
@@ -1568,7 +1570,7 @@ fn a_peers_first_promise_and_report_wait_for_its_store_row() {
             .collect(),
     );
     assert_eq!(
-        reopened(&candidate).recorded(&r(2), inc()),
+        durable_row(&candidate, r(2), inc()),
         Some(coord_types::ids::StoreInstanceId(r(2).0)),
         "a restart reads the peer's store"
     );
@@ -1682,7 +1684,7 @@ fn a_store_row_that_fails_is_recorded_again() {
     );
     let counts = candidate.node().peer_stores().expect("kept").counts;
     assert_eq!(counts.failed, 1);
-    assert_eq!(reopened(&candidate).recorded(&r(2), inc()), None);
+    assert_eq!(durable_row(&candidate, r(2), inc()), None);
     let mut sent = Vec::new();
     for frame in frames {
         let out = candidate
@@ -1703,21 +1705,32 @@ fn a_store_row_that_fails_is_recorded_again() {
 /// Write a row recording `store` for voter `about` into `voter`'s store,
 /// as an earlier promise would have.
 fn write_store_row(voter: &mut Voter<Stamped>, about: ReplicaId, store: [u8; 16]) {
-    let row = coord_checkpoint::peer_store::PeerStoreV1 {
-        voter: about,
-        incarnation: inc(),
-        store: coord_types::ids::StoreInstanceId(store),
-    };
+    write_rows(
+        voter,
+        vec![coord_checkpoint::peer_store::PeerStoreV1 {
+            voter: about,
+            incarnation: inc(),
+            store: coord_types::ids::StoreInstanceId(store),
+        }],
+    );
+}
+
+/// Write `rows` into `voter`'s store, a hundred to a batch.
+fn write_rows(voter: &mut Voter<Stamped>, rows: Vec<coord_checkpoint::peer_store::PeerStoreV1>) {
+    let mut barriers = BarrierAllocator::new(inc(), BootId([7; 16])).for_runtime();
     let inner = &mut voter.node_mut().applier_mut().store_mut().inner;
-    inner
-        .submit(coord_core::effect::PersistBatch {
-            barrier: BarrierAllocator::new(inc(), BootId([7; 16]))
-                .for_runtime()
-                .allocate(),
-            base: None,
-            updates: vec![row.update().expect("encoded")],
-        })
-        .expect("taken");
+    for chunk in rows.chunks(100) {
+        inner
+            .submit(coord_core::effect::PersistBatch {
+                barrier: barriers.allocate(),
+                base: None,
+                updates: chunk
+                    .iter()
+                    .map(|row| row.update().expect("encoded"))
+                    .collect(),
+            })
+            .expect("taken");
+    }
     inner.flush().expect("flushed");
 }
 
@@ -1775,13 +1788,12 @@ fn a_voter_that_installs_a_sync_learns_the_stores_it_counted() {
     let counts = peer.node().peer_stores().expect("kept").counts;
     assert_eq!(counts.learned, 1, "the candidate's store, not its own");
     assert_eq!(counts.disagreed, 0);
-    let rows = reopened(&peer);
     assert_eq!(
-        rows.recorded(&r(1), inc()),
+        durable_row(&peer, r(1), inc()),
         Some(coord_types::ids::StoreInstanceId(r(1).0)),
         "a restart reads the candidate's store"
     );
-    assert_eq!(rows.recorded(&r(2), inc()), None, "no row for itself");
+    assert_eq!(durable_row(&peer, r(2), inc()), None, "no row for itself");
 }
 
 /// A Sync that counted another store for a voter than the one this voter
@@ -1809,8 +1821,82 @@ fn a_sync_that_counted_another_store_is_installed_and_the_row_kept() {
         "the disagreement is logged: {rejections:?}"
     );
     assert_eq!(
-        reopened(&peer).recorded(&r(1), inc()),
+        durable_row(&peer, r(1), inc()),
         Some(coord_types::ids::StoreInstanceId([0xee; 16])),
         "the row is never overwritten"
     );
+}
+
+/// A peer whose history holds more rows than any whole read of them
+/// allowed is served: each row is read by its key (from Astra's review of
+/// C1, where 1,025 rows kept a voter from reopening).
+#[test]
+fn a_peer_history_of_any_length_is_served() {
+    let mut candidate = stamped(1);
+    let last = 1_100u64;
+    write_rows(
+        &mut candidate,
+        (1..=last)
+            .map(|i| coord_checkpoint::peer_store::PeerStoreV1 {
+                voter: r(2),
+                incarnation: ReplicaIncarnation::new(i).unwrap(),
+                store: coord_types::ids::StoreInstanceId(r(2).0),
+            })
+            .collect(),
+    );
+    keep_peer_stores(&mut candidate);
+    let (campaigned, _) = candidate
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    let frames = answer(campaigned);
+    let mut sent = Vec::new();
+    for frame in frames.clone() {
+        let out = candidate
+            .on_peer(
+                PeerProvenance::from_local_voter(r(2), ReplicaIncarnation::new(last).unwrap()),
+                frame,
+            )
+            .expect("stepped");
+        sent.extend(messages(&out));
+    }
+    let counts = candidate.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.matched, frames.len() as u64, "the row read by key");
+    assert_eq!(counts.recorded, 0);
+    assert!(
+        sent.iter().any(|(_, m)| is_sync(m)),
+        "the campaign counted the peer: {sent:?}"
+    );
+}
+
+/// A peer's retries while its row is in the journal are held once each,
+/// not once per retry (from Astra's review of C1: three copies of one page
+/// were held).
+#[test]
+fn a_retried_page_waits_once_behind_its_store_row() {
+    let mut candidate = stamped(1);
+    keep_peer_stores(&mut candidate);
+    let (campaigned, _) = candidate
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    let page = answer(campaigned)
+        .into_iter()
+        .find(|f| {
+            matches!(
+                coord_consensus::ProtocolMessage::decode(f),
+                Ok(coord_consensus::ProtocolMessage::ReportPage(_))
+            )
+        })
+        .expect("a page");
+    candidate.node_mut().applier_mut().store_mut().hold = true;
+    for _ in 0..3 {
+        candidate
+            .on_peer(PeerProvenance::from_local_voter(r(2), inc()), page.clone())
+            .expect("stepped");
+    }
+    assert_eq!(candidate.held_peers(), 1, "one copy held");
+    let counts = candidate.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.recorded, 1);
+    assert_eq!(counts.duplicates, 2);
 }

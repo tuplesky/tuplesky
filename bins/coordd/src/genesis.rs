@@ -133,14 +133,14 @@ pub fn unfinished(generation: &mut Generation) -> Option<bool> {
 
 /// A new store identity (task-d121), from the TLS stack's secure random
 /// source: the core crates draw no randomness of their own.
-fn mint_store_instance() -> Result<StoreInstanceId, GenesisError> {
+fn mint_store_instance() -> Result<StoreInstanceId, InitError> {
     let mut bytes = [0u8; StoreInstanceId::LEN];
     rustls::crypto::aws_lc_rs::default_provider()
         .secure_random
         .fill(&mut bytes)
         // No randomness is a store this node cannot give an identity,
         // and so cannot initialize.
-        .map_err(|_| GenesisError::Startup(StartupError::Genesis(InitError::Store)))?;
+        .map_err(|_| InitError::Store)?;
     Ok(StoreInstanceId(bytes))
 }
 
@@ -172,11 +172,10 @@ pub fn check(
     startup
         .identity_validated()
         .map_err(GenesisError::Startup)?;
-    // A start found the pin above, so the identity drawn here is never
-    // written: it reads the pinned one back.
-    let fresh = mint_store_instance()?;
+    // Drawn only for a first init: a start, and a backup of a pinned
+    // store, read the pinned identity back and draw nothing.
     let initialized = startup
-        .check_membership(manifest, &mut store, fresh)
+        .check_membership(manifest, &mut store, mint_store_instance)
         .map_err(GenesisError::Startup)?;
     Ok(initialized.store_instance)
 }
