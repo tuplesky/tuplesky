@@ -2544,6 +2544,55 @@ fn a_committed_nothing_executes_as_its_canonical_refusal() {
         record.result_digest,
         coord_storage::retry::decided_nothing_digest()
     );
+    // A nothing writes no record under its key, so a later command may
+    // take it (Astra on #328). Its own execution still answers it, and
+    // only it: another command without one, under that key, is that
+    // record's conflict.
+    let later = coord_types::CommandId(Digest32([0x77; 32]));
+    let response = vec![0x01];
+    {
+        let mut barriers = BarrierAllocator::new(inc(), BootId([7; 16])).for_runtime();
+        let inner = &mut voter.node_mut().applier_mut().store_mut().inner;
+        let base = inner.application_base();
+        inner
+            .submit(coord_core::effect::PersistBatch {
+                barrier: barriers.allocate(),
+                base: Some(base),
+                updates: vec![coord_core::StoreUpdate {
+                    collection: Collection::RetryV1.id(),
+                    key: coord_storage::codecs::retry_key(&key(900)),
+                    value: Some(
+                        coord_storage::codecs::encode_retry(
+                            &coord_storage::codecs::RetryRecordV1 {
+                                command_id: later,
+                                position: after,
+                                revision: None,
+                                result_digest: coord_storage::retry::result_digest(&response),
+                                response,
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                }],
+            })
+            .expect("taken");
+        inner.flush().expect("flushed");
+    }
+    let read = coord_daemon::settle::RecordReads::default().read(
+        voter.node().applier(),
+        [
+            (nothing, key(900)),
+            (coord_types::CommandId(Digest32([0x55; 32])), key(900)),
+        ],
+    );
+    let [(settled, record)] = read.records.as_slice() else {
+        panic!("{read:?}");
+    };
+    assert_eq!((*settled, record.command_id), (nothing, nothing));
+    assert_eq!(
+        read.conflicts,
+        vec![(coord_types::CommandId(Digest32([0x55; 32])), later)]
+    );
     // The executed-row read the retired-command tripwire and a campaign's
     // execution check go through finds the nothing's decided record. In
     // C2a it found none, the donor serving no command without a payload
