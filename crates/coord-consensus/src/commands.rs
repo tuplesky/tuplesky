@@ -37,6 +37,27 @@ use crate::digest::{self, DigestSet};
 use crate::graph::{ClosureCursor, ClosureProgress, PathLog, Position, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
+/// The admission a command decided as nothing holds in place of
+/// attested facts (task-d121, C2): `HashDomain::DecidedNothing` over
+/// `nothing`, written out so a hot check compares bytes rather than
+/// hashing (`the_nothing_admission_is_its_domains_digest` pins it).
+///
+/// A record holding it is initialized, and it binds as any admission
+/// does: a vote, a Sync entry or a report under it differs from one
+/// under attested facts, so every check that refuses two admissions of
+/// one command refuses a nothing beside facts. What it never has is a
+/// payload: no payload row is written, fetched or asked for under it,
+/// and its execution has no effect.
+pub const NOTHING_ADMISSION: Digest32 = Digest32([
+    0xaa, 0xfe, 0x4d, 0xac, 0xfc, 0xc0, 0xc0, 0xff, 0x3b, 0x90, 0xa0, 0x30, 0xc5, 0xec, 0xda, 0x80,
+    0x6f, 0xd4, 0x13, 0xfc, 0x57, 0x82, 0x08, 0xce, 0x7a, 0xba, 0xfa, 0xa8, 0xba, 0x30, 0x6c, 0x84,
+]);
+
+/// Whether `admission` is the nothing value ([`NOTHING_ADMISSION`]).
+pub fn is_nothing(admission: &Digest32) -> bool {
+    *admission == NOTHING_ADMISSION
+}
+
 /// A command as this replica knows it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandRecord {
@@ -72,6 +93,19 @@ pub struct CommandRecord {
 }
 
 impl CommandRecord {
+    /// Whether this record holds the command decided, or accepted, as
+    /// nothing (task-d121).
+    pub fn is_nothing(&self) -> bool {
+        self.payload.as_ref().is_some_and(is_nothing)
+    }
+
+    /// The attested facts this record holds the command under: its
+    /// admission, unless that is none or the nothing value, which no
+    /// payload goes with.
+    pub fn facts(&self) -> Option<Digest32> {
+        self.payload.filter(|p| !is_nothing(p))
+    }
+
     /// This record, demoted by a Sync that does not carry it
     /// ([`CommandTable::demote`]): PRE-ACCEPT, with no path evidence.
     pub(crate) fn demote(&mut self) {

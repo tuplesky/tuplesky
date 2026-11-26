@@ -884,6 +884,11 @@ impl Leader {
         self.config.quorum.clone()
     }
 
+    /// The ballot configuration this leader leads, borrowed.
+    pub const fn quorum(&self) -> &BallotConfiguration {
+        &self.config.quorum
+    }
+
     /// The selection this leader leads from, when it won a campaign
     /// (task-d121, C1).
     pub fn selection(&self) -> Option<&SyncDecision> {
@@ -4828,6 +4833,7 @@ mod tests {
             entries: BTreeMap::new(),
             reproposed: BTreeSet::new(),
             counted: Default::default(),
+            nothing: Default::default(),
         };
         let (mut leader, _) = Leader::from_recovered(follower.into_recovered(), quorum, &decision);
         assert_eq!(leader.ledger.len(), behind as usize);

@@ -301,6 +301,7 @@ fn protocol_rows() -> Vec<Row> {
                 entries: BTreeMap::new(),
                 reproposed: BTreeSet::new(),
                 counted: Default::default(),
+                nothing: Default::default(),
             },
         })
         .unwrap(),
