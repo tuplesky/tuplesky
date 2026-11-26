@@ -2811,14 +2811,16 @@ impl Follower {
                 // durable without its payload, which a later vote named
                 // and a selection then re-proposed with no supplier
                 // (protocol_sim row 21, five voters, seed 609).
+                // The row first (task-d121), as everywhere a record's
+                // rows go down together.
+                updates.push(self.dependency_row(command, demoted));
+                updates.extend(nothing_purge(command, demoted));
                 if self.payload_row(command).is_none()
                     && let Some(payload) = self.payloads.get(command)
                 {
                     updates.push(payload_write(&self.table, command, payload).expect("bounded"));
                     self.durable_payloads.push(barrier, *command);
                 }
-                updates.push(self.dependency_row(command, demoted));
-                updates.extend(nothing_purge(command, demoted));
                 self.ledger.stage(barrier, *command, demoted.clone());
             }
             self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
@@ -3129,15 +3131,16 @@ impl Follower {
         for command in commands {
             let record = self.table.record(command).expect("held").clone();
             let dependencies = self.dependency_row(command, &record);
-            let mut rows = Vec::with_capacity(2);
-            // A nothing (task-d121) has no payload: its dependency row alone.
+            // The dependency row first: a store refuses a payload put while
+            // the command's latest row is a nothing (task-d121). A nothing
+            // has no payload: its dependency row alone.
+            let mut rows = alloc::vec![dependencies];
+            rows.extend(nothing_purge(command, &record));
             let payload = record.facts().is_some() && !self.served_payloads.contains(command);
             if payload {
                 let held = self.payloads.get(command).expect("writable");
                 rows.push(payload_write(&self.table, command, held).expect("bounded"));
             }
-            rows.push(dependencies);
-            rows.extend(nothing_purge(command, &record));
             let bytes: usize = rows.iter().map(row_bytes).sum();
             if !batch.updates.is_empty()
                 && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
@@ -3650,6 +3653,7 @@ impl Follower {
         let barrier = self.allocate();
         let mut updates = Vec::new();
         for c in payloads_due {
+            updates.extend(self.row_over_nothing(barrier, &c));
             let payload = self.payloads.get(&c).expect("held");
             updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
             self.durable_payloads.push(barrier, c);
@@ -3658,15 +3662,16 @@ impl Follower {
         for c in due {
             self.unwritten.remove(&c);
             let record = self.table.record(&c).expect("retained").clone();
-            let row = self.dependency_row(&c, &record);
+            // The row before the payload (task-d121): a store refuses a
+            // payload put while the command's latest row is a nothing.
+            updates.push(self.dependency_row(&c, &record));
+            updates.extend(nothing_purge(&c, &record));
             if record.payload.is_some()
                 && let Some(payload) = self.payloads.get(&c)
             {
                 updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
                 self.durable_payloads.push(barrier, c);
             }
-            updates.push(row);
-            updates.extend(nothing_purge(&c, &record));
             self.ledger.stage(barrier, c, record);
         }
         self.pending.insert(barrier, Pending::Carry(first));
@@ -6748,9 +6753,10 @@ impl Follower {
             .clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
+        // The row first (task-d121), as a rebind writes them.
         let mut updates = alloc::vec![
-            payload_write(&self.table, &command, &payload).expect("bounded"),
-            row
+            row,
+            payload_write(&self.table, &command, &payload).expect("bounded")
         ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
@@ -7372,13 +7378,17 @@ impl Follower {
                 let Some(barrier) = self.barrier_outside_frame(&mut effects) else {
                     return effects;
                 };
+                let mut updates: Vec<StoreUpdate> = self
+                    .row_over_nothing(barrier, &proposal.command)
+                    .into_iter()
+                    .collect();
                 let payload = &self.payloads[&proposal.command];
+                updates
+                    .push(payload_write(&self.table, &proposal.command, payload).expect("bounded"));
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
                     base: None,
-                    updates: alloc::vec![
-                        payload_write(&self.table, &proposal.command, payload).expect("bounded")
-                    ],
+                    updates,
                 }));
                 self.durable_payloads.push(barrier, proposal.command);
                 alloc::vec![barrier]
@@ -7478,12 +7488,12 @@ impl Follower {
                 continue;
             }
             let record = record.clone();
-            let row = self.dependency_row(&d, &record);
+            // The row before the payload (task-d121).
+            updates.push(self.dependency_row(&d, &record));
+            updates.extend(nothing_purge(&d, &record));
             if let Some(payload) = payload {
                 updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
             }
-            updates.push(row);
-            updates.extend(nothing_purge(&d, &record));
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
         }
@@ -7495,6 +7505,36 @@ impl Follower {
     /// installation and its demotions, a carried commit's rows, a stale
     /// record's, a vote's and an adoption's, the rows a batch carries for
     /// what it names, a window's, a submission's and a rebinding's.
+    /// The dependency row a payload row of `command` goes after in the
+    /// batch at `barrier`, staged there: the record the table holds, where
+    /// a row written of it here, durable or in flight, is a decided
+    /// nothing (task-d121, #328 review). The store refuses a payload row
+    /// put while the command's latest dependency row is the marker,
+    /// reading the batch's own rows first, so a payload over one never
+    /// goes alone: a rebind whose batch failed leaves the facts in memory
+    /// and the marker on disk, and the payload's next writer would be
+    /// refused at every attempt and at every replay.
+    fn row_over_nothing(&mut self, barrier: BarrierId, command: &CommandId) -> Option<StoreUpdate> {
+        let over = self
+            .ledger
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
+            || self
+                .ledger
+                .newest(command)
+                .is_some_and(CommandRecord::is_nothing);
+        if !over {
+            return None;
+        }
+        let record = self.table.record(command)?.clone();
+        if record.is_nothing() {
+            return None;
+        }
+        let row = self.dependency_row(command, &record);
+        self.ledger.stage(barrier, *command, record);
+        Some(row)
+    }
+
     fn dependency_row(&self, command: &CommandId, record: &CommandRecord) -> StoreUpdate {
         dependency_update(self.config.identity.epoch, command, record).expect("bounded")
     }
@@ -8660,10 +8700,15 @@ impl Follower {
         self.note_lacking(command);
         let barrier = self.allocate();
         self.durable_payloads.push(barrier, command);
+        let mut updates: Vec<StoreUpdate> = self
+            .row_over_nothing(barrier, &command)
+            .into_iter()
+            .collect();
+        updates.push(payload_write(&self.table, &command, &payload).expect("bounded"));
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
-            updates: alloc::vec![payload_write(&self.table, &command, &payload).expect("bounded")],
+            updates,
         })];
         // A proposal held for this payload is adopted now, its
         // acknowledgement waiting on this batch (task-d90).

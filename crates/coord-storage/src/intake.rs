@@ -1174,6 +1174,11 @@ impl<'a> Assigner<'a> {
         };
         let executed = decode_executed(value)?;
         let position = executed.position;
+        // A decided nothing's execution (task-d121): the canonical
+        // refusal's digest, which no other execution produces, and no
+        // revision, as the donor requires (#328 review).
+        let nothing = executed.result_digest == crate::retry::decided_nothing_digest()
+            && executed.revision.is_none();
         let key = position_key(position).to_vec();
         let row = StoreUpdate {
             collection: execution,
@@ -1185,9 +1190,11 @@ impl<'a> Assigner<'a> {
             return Ok(Assigned::Writes(vec![row]));
         }
         let Some((order, payload)) = self.pending_of(&command, read)? else {
-            if self.holds_nothing(&command, read)? {
+            if nothing && self.holds_nothing(&command, read)? {
                 // A decided nothing (task-d121) executes with no payload:
-                // `payload_v1` has no row at its position, by decision.
+                // `payload_v1` has no row at its position, by decision. Its
+                // execution carries the canonical digest, or it is no
+                // nothing's (#328 review).
                 self.delta.execute((prefix(&command), position.get()));
                 let mut writes = vec![row];
                 writes.extend(self.move_decided(&command, position, read)?);
@@ -1202,6 +1209,19 @@ impl<'a> Assigner<'a> {
                 ),
             ));
         };
+        if nothing {
+            // A nothing's execution beside a pending payload: the payload
+            // is no decision's, since every batch writing a nothing's row
+            // deletes it (#328 review).
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                format!(
+                    "a decided nothing executed at position {} beside a pending payload \
+                     (task-d121)",
+                    position.get()
+                ),
+            ));
+        }
         self.delta.execute((prefix(&command), position.get()));
         let mut writes = vec![
             row,
@@ -1379,6 +1399,23 @@ mod tests {
         }
     }
 
+    /// The executed row of a decided nothing at `position`: the canonical
+    /// refusal's digest.
+    fn executed_nothing(command: &CommandId, position: u64) -> StoreUpdate {
+        StoreUpdate {
+            collection: Collection::ExecutedV1.id(),
+            key: crate::codecs::executed_key(command),
+            value: Some(
+                crate::codecs::encode_executed(&crate::codecs::ExecutedRecordV1 {
+                    position: ExecutionPosition::new(position).unwrap(),
+                    revision: None,
+                    result_digest: crate::retry::decided_nothing_digest(),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
     fn executed(command: &CommandId, position: u64) -> StoreUpdate {
         StoreUpdate {
             collection: Collection::ExecutedV1.id(),
@@ -1520,7 +1557,14 @@ mod tests {
         let c = cmd(8);
         rows.assign(&mut assigner, 1, 0, record_row(1, &c, NOTHING_ADMISSION))
             .unwrap();
-        rows.assign(&mut assigner, 2, 0, executed(&c, 3)).unwrap();
+        // Not with another execution's digest (#328 review): only the
+        // canonical refusal's is a nothing's.
+        let err = rows
+            .assign(&mut assigner, 2, 0, executed(&c, 3))
+            .unwrap_err();
+        assert!(err.diagnostic.contains("rule (b)"), "{}", err.diagnostic);
+        rows.assign(&mut assigner, 2, 1, executed_nothing(&c, 3))
+            .unwrap();
         let at = position_key(ExecutionPosition::new(3).unwrap());
         assert_eq!(rows.of(Collection::ExecutionV1), 1);
         assert_eq!(
@@ -1537,9 +1581,24 @@ mod tests {
         rows.assign(&mut assigner, 3, 0, record_row(1, &d, Digest32([7; 32])))
             .unwrap();
         let err = rows
-            .assign(&mut assigner, 4, 0, executed(&d, 4))
+            .assign(&mut assigner, 4, 0, executed_nothing(&d, 4))
             .unwrap_err();
         assert!(err.diagnostic.contains("rule (b)"), "{}", err.diagnostic);
+
+        // A nothing's execution beside a pending payload is refused
+        // (#328 review): the payload is no decision's.
+        let e = cmd(11);
+        rows.assign(&mut assigner, 5, 0, payload(&e, Some(1)))
+            .unwrap();
+        let err = rows
+            .assign(&mut assigner, 6, 0, executed_nothing(&e, 5))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Corrupt);
+        assert!(
+            err.diagnostic.contains("beside a pending payload"),
+            "{}",
+            err.diagnostic
+        );
     }
 
     /// No payload is put under a decided nothing (task-d121, #312's

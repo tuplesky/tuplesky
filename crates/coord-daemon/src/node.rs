@@ -1136,13 +1136,16 @@ impl<P: Persistence> Node<P> {
         node
     }
 
-    /// Whether a command's turn has come and this replica holds its
-    /// payload: whether [`Node::execute`] would apply something now.
+    /// Whether a command's turn has come and this replica can apply it:
+    /// it holds the command's payload, or the command is a decided
+    /// nothing (task-d121), which has none to wait for. Whether
+    /// [`Node::execute`] would apply something now, and so whether the
+    /// runtime owes a flush (Astra on #328).
     pub fn can_execute(&self) -> bool {
         let machine = self.machine();
-        machine
-            .next_executable()
-            .is_some_and(|command| machine.holds_payload(&command))
+        machine.next_executable().is_some_and(|command| {
+            machine.holds_payload(&command) || machine.executes_as_nothing(&command)
+        })
     }
 
     /// Whether this node lowers in groups ([`Node::lower_in_groups`]).

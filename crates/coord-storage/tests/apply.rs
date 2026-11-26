@@ -721,6 +721,20 @@ fn a_decided_nothing_executes_as_its_canonical_refusal() {
         coord_storage::retry::decided_nothing_digest()
     );
     assert_eq!(entry.admission(), Some(NOTHING_ADMISSION));
+    // Short of the canonical digest, the same decided record is no
+    // nothing's to serve without a payload (#328 review).
+    let executed = coord_storage::protocol::executed_record(&gated, &nothing)
+        .unwrap()
+        .expect("executed");
+    let other = coord_storage::codecs::ExecutedRecordV1 {
+        result_digest: coord_types::identity::Digest32([0x11; 32]),
+        ..executed
+    };
+    assert!(
+        coord_storage::protocol::catch_up_entry_at(&gated, epoch, &nothing, other)
+            .unwrap()
+            .is_none()
+    );
     let ordinary = coord_storage::protocol::catch_up_entry(&gated, epoch, &first)
         .unwrap()
         .expect("served");

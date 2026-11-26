@@ -385,7 +385,9 @@ pub enum EvidenceError {
     Vote(VoteError),
     /// Not an evidence message (a recovery or transfer message).
     NotEvidence,
-    /// A second, different release for the command.
+    /// A second, different release for the command, or a voter's
+    /// `DecidedNothing` against a final release of other facts held for
+    /// it (task-d121).
     ReleaseMismatch,
     /// Evidence from a replica that is not a voter of the current
     /// configuration (task-d22), or from a link bound under any role but
@@ -711,7 +713,11 @@ pub struct Collector {
     /// executions at different positions can answer with the same bytes,
     /// and an answer over the deliverable bound is the same
     /// `RESULT_TOO_LARGE` whatever it replaced.
-    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Said)>,
+    ///
+    /// The execution is `None` for a decided nothing settled from one
+    /// voter's `DecidedNothing` (task-d121): its canonical refusal names
+    /// no position, and nothing here learned one.
+    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Option<Said>)>,
     resolved_order: VecDeque<RetryKey>,
     /// The golden event trace, kept only by a collector made with
     /// [`Collector::traced`]: it grows with every transition and nothing
@@ -1562,6 +1568,19 @@ impl Collector {
         // after the outcome was final: an executed nothing writes no
         // record under the key to settle from.
         if matches!(refusal, SubmissionRefusal::DecidedNothing) {
+            // A final release the entry holds of anything but the nothing
+            // says otherwise (#328 review): a divergence, not an answer,
+            // and the entry stays as it is.
+            if self
+                .pending
+                .get(&command)
+                .and_then(|entry| entry.released.as_ref())
+                .is_some_and(|(_, released)| {
+                    !released.speculative() && !releases_a_nothing(released)
+                })
+            {
+                return Err(EvidenceError::ReleaseMismatch);
+            }
             return Ok(self.settle_decided_nothing(command));
         }
         let entry = self.pending.get_mut(&command).expect("present");
@@ -1645,6 +1664,16 @@ impl Collector {
                     let response =
                         self.answer_of(command, established.revision(), released.response());
                     let release = Said::released(sender, released);
+                    // A decided nothing answered from one voter named no
+                    // position: the release is compared with the
+                    // canonical refusal at the position it names.
+                    let own = own.unwrap_or_else(|| Said {
+                        release: None,
+                        position: established.position(),
+                        revision: None,
+                        result_digest: coord_storage::retry::decided_nothing_digest(),
+                        response_len: coord_storage::retry::decided_nothing_response().len(),
+                    });
                     let differs = Differs {
                         response: response != answered,
                         ..release.differs(&own)
@@ -1813,7 +1842,7 @@ impl Collector {
             OutcomeV1::Ok { revision, .. } => revision.map(|r| r.get()),
             _ => None,
         };
-        self.retain(entry.retry_key, command, response.clone(), executed);
+        self.retain(entry.retry_key, command, response.clone(), Some(executed));
         record(&mut self.trace, || CollectorEvent::Released {
             command: command_hex(&command),
             speculative,
@@ -1982,16 +2011,19 @@ impl Collector {
     /// nothing (task-d121): the answer its execution gives, revision none
     /// and [`coord_storage::retry::decided_nothing_response`]'s bytes, the
     /// same at every voter and against every state, so the caller gets
-    /// what a release of it would have handed over. Not kept in the
-    /// resolved window, as [`Collector::settle_conflict_from_record`]'s
-    /// answer is not: nothing here says the position it executed at, and
-    /// a later release is never compared with it.
+    /// what a release of it would have handed over.
+    ///
+    /// Kept in the resolved window, with no execution (Astra on #328): a
+    /// caller whose reply was lost resolves the invocation, or sends it
+    /// again, and gets the same refusal, not `Unknown` or new work. A
+    /// late release is compared with the canonical refusal at the
+    /// position the release names, since nothing here says where it
+    /// executed.
     fn settle_decided_nothing(&mut self, command: CommandId) -> Progress {
         let entry = self.pending.remove(&command).expect("present");
         self.undelivered_bytes = self
             .undelivered_bytes
             .saturating_sub(entry.dissemination.reserved);
-        self.bindings.remove(&entry.retry_key);
         record(&mut self.trace, || CollectorEvent::SettledFromRecord {
             command: command_hex(&command),
             corroborated: "decided-nothing".into(),
@@ -2001,6 +2033,7 @@ impl Collector {
             None,
             &coord_storage::retry::decided_nothing_response(),
         );
+        self.retain(entry.retry_key, command, response.clone(), None);
         Progress::Released(Release {
             retry_key: entry.retry_key,
             command,
@@ -2012,7 +2045,13 @@ impl Collector {
         })
     }
 
-    fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1, executed: Said) {
+    fn retain(
+        &mut self,
+        key: RetryKey,
+        command: CommandId,
+        response: ResponseV1,
+        executed: Option<Said>,
+    ) {
         self.resolved.insert(key, (command, response, executed));
         self.resolved_order.push_back(key);
         while self.resolved_order.len() > self.config.max_resolved {

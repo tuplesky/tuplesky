@@ -207,7 +207,9 @@ impl RecordReads {
 /// no other execution produces: an ordinary refusal's covers the
 /// revision it ran at. A row with any other digest settles nothing. The
 /// record handed on holds the canonical response, at the row's position.
-fn nothing_record<V: coord_store_api::OrderedRead>(
+///
+/// `coordd` answers a resolve its record leaves pending from it too.
+pub fn nothing_record<V: coord_store_api::OrderedRead>(
     gated: &coord_storage::GatedView<V>,
     command: &CommandId,
 ) -> Option<RetryRecordV1> {

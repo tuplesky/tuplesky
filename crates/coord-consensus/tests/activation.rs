@@ -199,6 +199,12 @@ struct Cluster {
     /// Fail, once, the next batch of this node that deletes a payload
     /// row (task-d121).
     fail_payload_delete: Option<usize>,
+    /// Fail, once, the next batch of this node that puts a payload row
+    /// (task-d121, #328 review).
+    fail_payload_put: Option<usize>,
+    /// Fail, once, the next batch of this node that writes a dependency
+    /// row of this command (task-d121, #328 review).
+    fail_row_of: Option<(usize, CommandId)>,
     /// Fail every batch of this node that deletes a payload row while it
     /// follows (task-d121, #327 review A1): what a follower writes again
     /// fails, so only what it writes once it leads can land.
@@ -309,6 +315,8 @@ impl Cluster {
             proposed: Vec::new(),
             reject_unpublished: None,
             fail_payload_delete: None,
+            fail_payload_put: None,
+            fail_row_of: None,
             fail_follower_payload_deletes: None,
             rejected: None,
             turns: false,
@@ -336,6 +344,36 @@ impl Cluster {
                         .updates
                         .iter()
                         .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_none());
+                    let puts_payload = batch
+                        .updates
+                        .iter()
+                        .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some());
+                    let writes_row_of = |c: &CommandId| {
+                        batch.updates.iter().any(|u| {
+                            u.collection == Collection::ProtocolV1.id()
+                                && u.key.len() == 41
+                                && u.key[8] == 0x01
+                                && u.key[9..] == c.0.0[..]
+                                && u.value.is_some()
+                        })
+                    };
+                    let fails_row = self
+                        .fail_row_of
+                        .is_some_and(|(n, c)| n == i && writes_row_of(&c));
+                    let fails_put = puts_payload && self.fail_payload_put == Some(i);
+                    if fails_put || fails_row {
+                        if fails_put {
+                            self.fail_payload_put = None;
+                        } else {
+                            self.fail_row_of = None;
+                        }
+                        let more = self.nodes[i].step(Event::Storage(StorageEvent::Failed {
+                            barrier_id: barrier,
+                            error: coord_core::event::StorageError::NoSpace,
+                        }));
+                        self.handle(i, more);
+                        continue;
+                    }
                     let following = matches!(self.nodes[i].role, Some(Role::Follower(_)));
                     if deletes_payload
                         && (self.fail_payload_delete == Some(i)
@@ -367,6 +405,7 @@ impl Cluster {
                         continue;
                     }
                     let node = &mut self.nodes[i];
+                    refuse_payload_over_nothing(&node.storage, &batch);
                     node.storage.submit(batch);
                     node.storage.complete(barrier).unwrap();
                     let more = node.step(Event::Storage(StorageEvent::JournalDurable {
@@ -801,6 +840,37 @@ impl Cluster {
     fn campaign(&mut self, i: usize, b: Ballot) {
         let effects = self.nodes[i].follower_mut().campaign(b);
         self.handle(i, effects);
+    }
+}
+
+/// The store's refusal that the model doesn't make (task-d121,
+/// `coord-storage`'s `intake.rs`): a payload row put for a command whose
+/// latest dependency row is the nothing marker, the batch's own rows
+/// before it read first. Every batch a node here commits is checked
+/// (#328 review).
+fn refuse_payload_over_nothing(storage: &StorageModel, batch: &PersistBatch) {
+    let mut nothing: BTreeMap<CommandId, bool> = dependency_rows(storage)
+        .into_iter()
+        .map(|(c, r)| (c, r.is_nothing()))
+        .collect();
+    for update in &batch.updates {
+        let key = &update.key;
+        if update.collection == Collection::ProtocolV1.id() && key.len() == 41 && key[8] == 0x01 {
+            if let Some(value) = &update.value {
+                let command = CommandId(Digest32(key[9..].try_into().unwrap()));
+                nothing.insert(command, decode_dependency(value).unwrap().is_nothing());
+            }
+        } else if update.collection == Collection::PayloadV1.id()
+            && update.value.is_some()
+            && key.len() == 32
+        {
+            let command = CommandId(Digest32(key[..].try_into().unwrap()));
+            assert!(
+                !nothing.get(&command).copied().unwrap_or(false),
+                "a payload row put while {command:?}'s latest dependency row is a nothing: \
+                 the store refuses it"
+            );
+        }
     }
 }
 
@@ -11831,6 +11901,95 @@ fn a_proposal_under_facts_over_a_nothing_rebinds_on_the_payload() {
     let record = cluster.nodes[1].follower().table().record(&d).unwrap();
     assert_eq!(record.payload, Some(facts), "{record:?}");
     assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
+}
+
+/// task-d121 (#328 review): a rebind over a durable nothing whose batch
+/// fails leaves the facts in memory and the marker on disk. The payload's
+/// next writer, the next event that is not a failure, writes the facts'
+/// dependency row before it: a payload row alone is refused by the store
+/// at every attempt, and at every replay of the journal after a restart.
+/// The cluster's storage refuses it as the store does.
+#[test]
+fn a_failed_rebind_over_a_nothing_writes_the_facts_row_before_the_payload_again() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing()),
+        "the nothing is durable"
+    );
+    let b2 = ballot(2, 2);
+    install_sync_reproposing(&mut cluster, b2, vec![], BTreeSet::from([d]));
+    // The rebind's batch, the facts' row and payload, fails, and so does
+    // the adoption's after it, the facts' row alone: the marker stays the
+    // newest durable row.
+    cluster.fail_payload_put = Some(1);
+    cluster.fail_row_of = Some((1, d));
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::RelayedProposal {
+            vote: coord_consensus::FastAck {
+                replica: b2.leader,
+                ballot: b2,
+                command: d,
+                deps: vec![],
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission: facts,
+                seqnum: Some(0),
+            },
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.fail_payload_put, None, "the rebind's batch failed");
+    assert_eq!(cluster.fail_row_of, None, "the adoption's batch failed");
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == d)
+            .is_some_and(|(_, r)| r.is_nothing()),
+        "the marker is still the newest durable row"
+    );
+    assert_eq!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .payload,
+        Some(facts),
+        "memory holds the facts"
+    );
+    // The next event that is not a failure: the leader's announcement.
+    let executed = cluster.nodes[1].executed_through();
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed,
+        },
+    ));
+    cluster.handle(1, effects);
+    let rows = dependency_rows(&cluster.nodes[1].storage);
+    let durable = rows.iter().rev().find(|(c, _)| *c == d).expect("a row");
+    assert_eq!(durable.1.payload, Some(facts), "{:?}", durable.1);
+    assert!(
+        payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, p)| *c == d && p.admission_digest() == facts),
+        "the facts' payload row is durable"
+    );
 }
 
 /// task-d121, C2: a Sync entry carrying a command committed here under

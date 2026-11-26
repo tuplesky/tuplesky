@@ -2371,6 +2371,69 @@ fn a_committed_nothing_executes_as_its_canonical_refusal() {
     assert!(decided.is_nothing());
 }
 
+/// A committed nothing is owed a flush (Astra on #328): a voter lowering
+/// in groups is flushed by the runtime only while
+/// [`Voter::owes_flush`] says so, and a decided nothing whose turn has
+/// come is something to apply though no payload is held for it. Driven
+/// here as the runtime drives it, with no flush it does not owe.
+#[test]
+fn a_committed_nothing_is_owed_the_flush_that_executes_it() {
+    let mut voter = stamped(2);
+    voter.node_mut().lower_in_groups();
+    let before = voter.node().machine().executed_through();
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    new_leader(&mut voter, 1, candidate);
+    let nothing = coord_types::CommandId(Digest32([0x4e; 32]));
+    let decision = coord_consensus::SyncDecision {
+        ballot: candidate,
+        source_ballot: ballot(),
+        entries: [(
+            nothing,
+            coord_consensus::SyncEntry {
+                command: nothing,
+                phase: coord_consensus::Phase::Commit,
+                deps: Vec::new(),
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: Some(coord_consensus::commands::NOTHING_ADMISSION),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        reproposed: BTreeSet::new(),
+        counted: Default::default(),
+        nothing: Default::default(),
+    };
+    voter
+        .on_peer(
+            PeerProvenance::from_local_voter(r(1), inc()),
+            coord_consensus::ProtocolMessage::Sync(decision).encode(),
+        )
+        .expect("stepped");
+    let mut turns = 0;
+    while voter.owes_flush() {
+        turns += 1;
+        assert!(turns <= 16, "a flush owed for ever");
+        voter.flush().expect("flushed");
+        voter.finish().expect("finished");
+    }
+    assert_eq!(
+        voter.node().machine().next_executable(),
+        None,
+        "nothing left to apply once no flush is owed"
+    );
+    assert_eq!(
+        voter.node().machine().executed_through().get(),
+        before.get() + 1,
+        "the nothing took one position"
+    );
+}
+
 /// A Sync whose row becomes durable in the flush that also installs a
 /// higher Sync, cached ahead of its `NewLeader`, is never the selection
 /// this voter is synchronized to when it learns, and the stores it
