@@ -572,6 +572,30 @@ async fn an_unbound_connection_is_closed_at_its_deadline_and_its_place_freed() {
     assert!(frontend.open());
 }
 
+/// A lane configured with a single bidirectional stream still leaves an
+/// anonymous caller, held at the floor, a stream for its bind beside the
+/// control stream (#334 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_with_one_stream_still_leaves_room_for_the_bind() {
+    let f = fixture(&[PeerRole::Voter]);
+    let mut narrow = limits();
+    narrow.lanes[3].max_bidi_streams = 1;
+    let mut t = acceptor(&f, narrow);
+    CountingGate::install(&t);
+    let dialed = anonymous(&f, &t).await;
+    let _recv = timeout(Duration::from_secs(1), dialed.send(&bind_frame(GOOD)))
+        .await
+        .expect("a stream for the bind beside the control stream");
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::ApiRequest { .. }
+    ));
+}
+
 /// A caller that grants the acceptor no stream credit can't be sent its
 /// `HelloAck`, and holds its place until the bind deadline closes it
 /// (#334 review).
