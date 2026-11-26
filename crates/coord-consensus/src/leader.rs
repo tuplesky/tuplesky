@@ -4821,6 +4821,7 @@ mod tests {
             source_ballot: genesis,
             entries: BTreeMap::new(),
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         let (mut leader, _) = Leader::from_recovered(follower.into_recovered(), quorum, &decision);
         assert_eq!(leader.ledger.len(), behind as usize);

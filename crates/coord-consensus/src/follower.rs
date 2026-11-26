@@ -1944,6 +1944,10 @@ impl Follower {
             if let Some(c) = self.campaign.as_mut()
                 && c.ballot() == due.ballot
             {
+                c.own_store(
+                    self.config.identity.incarnation,
+                    self.ballots.identity().store,
+                );
                 c.own_report(report);
             }
             return self.advance_campaign();
@@ -7901,7 +7905,7 @@ impl Follower {
                     && c.ballot() == ballot
                     && replica == from.replica
                 {
-                    c.promise(replica, store);
+                    c.promise_from(from, store);
                 }
                 self.advance_campaign()
             }
@@ -8554,6 +8558,7 @@ mod tests {
             source_ballot: genesis,
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         let follower = Follower::recover_with_syncs(
             config,
@@ -8595,6 +8600,7 @@ mod tests {
             source_ballot: genesis,
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         let mut follower =
             Follower::recover_with_syncs(config, None, None, [], [], [], ExecutionPosition::ZERO);

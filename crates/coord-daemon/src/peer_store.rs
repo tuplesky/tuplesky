@@ -14,6 +14,12 @@
 //! A voter that comes back through membership as a new generation
 //! (task-d41) does so under a new incarnation, which has no row yet.
 //!
+//! A Sync names the store of each voter its leader counted. A voter that
+//! installs it records each one it has no row for, and never overwrites
+//! one: a counted store that disagrees with a row is logged and counted,
+//! and the Sync is installed all the same, since refusing it would stall
+//! the domain over a record this voter can't arbitrate.
+//!
 //! The rows are the runtime's, like a floor's readiness (task-d27) and a
 //! feature's support (task-d99): the machines do no I/O and keep no row
 //! per peer.
@@ -41,6 +47,10 @@ pub struct PeerStoreCounts {
     /// A row's batch that failed: its held messages are dropped, and the
     /// peer's next message is recorded again.
     pub failed: u64,
+    /// A store learned from an installed Sync, for a peer with no row.
+    pub learned: u64,
+    /// A store an installed Sync counted that disagrees with the row.
+    pub disagreed: u64,
 }
 
 /// What to do with a peer's promise or report page.
@@ -173,6 +183,48 @@ impl PeerStores {
                     barrier,
                     updates: vec![update],
                 })
+            }
+        }
+    }
+
+    /// A store an installed Sync from `leader` counted for `voter` under
+    /// `incarnation`: the row to journal under its barrier if there is
+    /// none, and nothing otherwise. Nothing waits on that batch.
+    pub fn learn(
+        &mut self,
+        leader: ReplicaId,
+        voter: ReplicaId,
+        incarnation: ReplicaIncarnation,
+        store: StoreInstanceId,
+    ) -> Result<Option<(BarrierId, Vec<StoreUpdate>)>, String> {
+        let key = (voter, incarnation);
+        match self.rows.get(&key) {
+            Some((held, _)) if *held == store => Ok(None),
+            Some((held, _)) => {
+                let recorded = *held;
+                self.counts.disagreed += 1;
+                self.rejections.push(format!(
+                    "a Sync from leader {leader:?} counted store {store:?} for voter {voter:?} \
+                     (incarnation {}), not the store {recorded:?} recorded for it: installed, \
+                     and the row kept (task-d121)",
+                    incarnation.get()
+                ));
+                Ok(None)
+            }
+            None => {
+                let row = PeerStoreV1 {
+                    voter,
+                    incarnation,
+                    store,
+                };
+                let update = row
+                    .update()
+                    .map_err(|e| format!("the peer store row: {e:?}"))?;
+                let barrier = self.barriers.allocate();
+                self.rows.insert(key, (store, Some(barrier)));
+                self.unsettled.push_back(Batch { barrier, key });
+                self.counts.learned += 1;
+                Ok(Some((barrier, vec![update])))
             }
         }
     }

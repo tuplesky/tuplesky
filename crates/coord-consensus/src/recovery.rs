@@ -31,7 +31,7 @@ use core::cell::Cell;
 
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation, StoreInstanceId};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::CommandRecord;
@@ -117,6 +117,16 @@ pub struct SyncEntry {
     pub admission: Option<Digest32>,
 }
 
+/// The store a counted voter's promise came from, under the incarnation
+/// it promised as (task-d121).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CountedStore {
+    /// The voter's incarnation.
+    pub incarnation: ReplicaIncarnation,
+    /// The store its promise came from.
+    pub store: StoreInstanceId,
+}
+
 /// The selected recovery result (`MSync`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SyncDecision {
@@ -130,6 +140,13 @@ pub struct SyncDecision {
     /// re-proposed under the new ballot, as many as fit beside the
     /// entries within [`MAX_REPORT_ENTRIES`] (task-d24).
     pub reproposed: BTreeSet<CommandId>,
+    /// The store of each voter whose promise and report the selection
+    /// counted, the candidate's own among them (task-d121). A voter that
+    /// installs the Sync records each one it has no record of, so it
+    /// learns the stores of voters whose promises it never received.
+    /// Empty in a Sync selected before the campaign counted it, and in
+    /// one read from a version 3 row.
+    pub counted: BTreeMap<ReplicaId, CountedStore>,
 }
 
 /// Why no Sync was selected.
@@ -858,6 +875,7 @@ pub(crate) fn select_counted(
         source_ballot,
         entries,
         reproposed,
+        counted: Default::default(),
     })
 }
 

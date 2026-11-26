@@ -2441,6 +2441,7 @@ fn sync_entry_over_a_relayed_payload(phase: Phase) {
             source_ballot: ballot(0, 0),
             entries: [(c1, entry)].into_iter().collect(),
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         }),
     ));
     let all = settle(&mut f, synced, &mut seq);
@@ -3677,6 +3678,7 @@ fn empty_sync(from: u8, ballot: Ballot) -> Event {
             source_ballot: self::ballot(0, 0),
             entries: std::collections::BTreeMap::new(),
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         }),
     )
 }

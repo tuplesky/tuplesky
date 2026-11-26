@@ -541,7 +541,25 @@ impl<P: Persistence> Voter<P> {
                 }
             }
         }
+        // A Sync names the stores its leader counted (task-d121, C1):
+        // once this voter installed it, it records those it has no row for.
+        let counted = match &message {
+            Some(coord_consensus::ProtocolMessage::Sync(decision))
+                if !decision.counted.is_empty() && provenance.from() == decision.ballot.leader =>
+            {
+                Some((decision.ballot, decision.counted.clone()))
+            }
+            _ => None,
+        };
         out.absorb(self.deliver_peer(provenance, frame, message)?);
+        if let Some((ballot, counted)) = counted
+            && self.node.machine().synchronized_at(&ballot)
+        {
+            out.absorb(
+                self.node
+                    .learn_peer_stores(ballot.leader, &counted, &self.ballot)?,
+            );
+        }
         out.absorb(self.release_peers()?);
         Ok(out)
     }
@@ -552,7 +570,12 @@ impl<P: Persistence> Voter<P> {
     /// recorded again.
     fn release_peers(&mut self) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
-        if self.held_peers.is_empty() {
+        if self.held_peers.is_empty()
+            && !self
+                .node
+                .peer_stores()
+                .is_some_and(crate::peer_store::PeerStores::unsettled)
+        {
             return Ok(out);
         }
         let settled = self.node.settle_peer_stores();

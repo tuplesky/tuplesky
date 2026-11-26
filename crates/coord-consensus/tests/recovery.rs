@@ -1009,6 +1009,7 @@ fn entry_order_is_the_order_of_placing_by_passes() {
             source_ballot: ballot(0, 0),
             entries,
             reproposed: BTreeSet::new(),
+            counted: Default::default(),
         };
         assert_eq!(
             coord_consensus::entry_order(&decision),

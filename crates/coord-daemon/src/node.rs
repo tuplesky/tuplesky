@@ -1971,6 +1971,44 @@ impl<P: Persistence> Node<P> {
         Ok(Some((check, out)))
     }
 
+    /// Record the stores an installed Sync from `leader` counted
+    /// (task-d121, C1), but this voter's own: a row for each voter with
+    /// none, and a disagreement with a row logged and counted.
+    pub fn learn_peer_stores(
+        &mut self,
+        leader: coord_types::ids::ReplicaId,
+        counted: &std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let me = self.machine().identity().replica;
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let mut effects = Vec::new();
+        for (voter, counted) in counted {
+            if *voter == me {
+                continue;
+            }
+            if let Some((barrier, updates)) = stores
+                .learn(leader, *voter, counted.incarnation, counted.store)
+                .map_err(DriveError::Engine)?
+            {
+                effects.push(Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates,
+                }));
+            }
+        }
+        if effects.is_empty() {
+            return Ok(Outbound::default());
+        }
+        self.carry_out(effects, ballot)
+    }
+
     /// What became of the peer store rows' batches since the last call.
     pub fn settle_peer_stores(&mut self) -> crate::peer_store::Settled {
         let Some(stores) = self.peer_stores.as_mut() else {

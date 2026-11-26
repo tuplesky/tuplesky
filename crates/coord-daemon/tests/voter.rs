@@ -1310,6 +1310,7 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
             })
             .collect(),
         reproposed: BTreeSet::new(),
+        counted: Default::default(),
     };
     voter
         .on_peer(
@@ -1544,9 +1545,27 @@ fn a_peers_first_promise_and_report_wait_for_its_store_row() {
         0,
         "handed on once the row is durable"
     );
-    assert!(
-        sent.iter().any(|(_, m)| is_sync(m)),
-        "the campaign counted the peer: {sent:?}"
+    let counted = sent
+        .iter()
+        .find_map(|(_, m)| match m {
+            coord_consensus::ProtocolMessage::Sync(d) => Some(d.counted.clone()),
+            _ => None,
+        })
+        .expect("the campaign counted the peer");
+    // The Sync names the store of every voter it counted, the
+    // candidate's own among them.
+    assert_eq!(
+        counted,
+        [1, 2]
+            .into_iter()
+            .map(|i| (
+                r(i),
+                coord_consensus::CountedStore {
+                    incarnation: inc(),
+                    store: coord_types::ids::StoreInstanceId(r(i).0),
+                }
+            ))
+            .collect(),
     );
     assert_eq!(
         reopened(&candidate).recorded(&r(2), inc()),
@@ -1678,5 +1697,120 @@ fn a_store_row_that_fails_is_recorded_again() {
     assert!(
         sent.iter().any(|(_, m)| is_sync(m)),
         "the campaign counted the peer: {sent:?}"
+    );
+}
+
+/// Write a row recording `store` for voter `about` into `voter`'s store,
+/// as an earlier promise would have.
+fn write_store_row(voter: &mut Voter<Stamped>, about: ReplicaId, store: [u8; 16]) {
+    let row = coord_checkpoint::peer_store::PeerStoreV1 {
+        voter: about,
+        incarnation: inc(),
+        store: coord_types::ids::StoreInstanceId(store),
+    };
+    let inner = &mut voter.node_mut().applier_mut().store_mut().inner;
+    inner
+        .submit(coord_core::effect::PersistBatch {
+            barrier: BarrierAllocator::new(inc(), BootId([7; 16]))
+                .for_runtime()
+                .allocate(),
+            base: None,
+            updates: vec![row.update().expect("encoded")],
+        })
+        .expect("taken");
+    inner.flush().expect("flushed");
+}
+
+/// Candidate 1 campaigns and `peer` (replica 2) promises; the Sync frames
+/// the candidate sends the peer once it wins, and the ballot.
+fn won_with(peer: &mut Voter<Stamped>) -> (Ballot, Vec<Vec<u8>>) {
+    let mut candidate = stamped(1);
+    keep_peer_stores(&mut candidate);
+    let (campaigned, _) = candidate
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    let mut to_peer = Vec::new();
+    for frame in frames_to(&new_leader(peer, 1, campaigned), r(1)) {
+        let out = candidate
+            .on_peer(PeerProvenance::from_local_voter(r(2), inc()), frame)
+            .expect("stepped");
+        to_peer.extend(frames_to(&out, r(2)));
+    }
+    for _ in 0..4 {
+        to_peer.extend(frames_to(&candidate.flush().expect("flushed"), r(2)));
+        to_peer.extend(frames_to(&candidate.finish().expect("finished"), r(2)));
+    }
+    let syncs: Vec<_> = to_peer
+        .into_iter()
+        .filter(|f| matches!(coord_consensus::ProtocolMessage::decode(f), Ok(m) if is_sync(&m)))
+        .collect();
+    assert!(!syncs.is_empty(), "the candidate won");
+    (campaigned, syncs)
+}
+
+/// Deliver the Sync `frames` from candidate 1 to `voter`, and settle.
+fn install(voter: &mut Voter<Stamped>, frames: Vec<Vec<u8>>) {
+    for frame in frames {
+        voter
+            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    for _ in 0..4 {
+        voter.flush().expect("flushed");
+        voter.finish().expect("finished");
+    }
+}
+
+/// A voter that installs a Sync records the store of each voter it
+/// counted that it has no row for (task-d121, C1): here the candidate's,
+/// whose promise it never received.
+#[test]
+fn a_voter_that_installs_a_sync_learns_the_stores_it_counted() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.learned, 1, "the candidate's store, not its own");
+    assert_eq!(counts.disagreed, 0);
+    let rows = reopened(&peer);
+    assert_eq!(
+        rows.recorded(&r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "a restart reads the candidate's store"
+    );
+    assert_eq!(rows.recorded(&r(2), inc()), None, "no row for itself");
+}
+
+/// A Sync that counted another store for a voter than the one this voter
+/// recorded is installed all the same, and the row is kept; the
+/// disagreement is logged and counted (task-d121, C1).
+#[test]
+fn a_sync_that_counted_another_store_is_installed_and_the_row_kept() {
+    let mut peer = stamped(2);
+    write_store_row(&mut peer, r(1), [0xee; 16]);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(
+        peer.node().machine().synchronized_at(&campaigned),
+        "installed"
+    );
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.disagreed, 1);
+    assert_eq!(counts.learned, 0);
+    let rejections = peer.take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r.contains("counted store") && r.contains("installed")),
+        "the disagreement is logged: {rejections:?}"
+    );
+    assert_eq!(
+        reopened(&peer).recorded(&r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId([0xee; 16])),
+        "the row is never overwritten"
     );
 }
