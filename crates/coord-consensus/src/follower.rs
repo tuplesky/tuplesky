@@ -57,7 +57,8 @@ use crate::recovery::{RecoveryReport, ReportEntry};
 use crate::role::RecoveredState;
 use crate::rows::promise_update;
 use crate::rows::{
-    PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, payload_update,
+    PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, nothing_purge,
+    payload_update,
 };
 use crate::summary::DurableLedger;
 use crate::summary::PageError;
@@ -285,6 +286,13 @@ pub enum FollowerRejection {
     /// decided dependencies are not executed here (task-d08). The rest of
     /// the page is dropped and asked for again.
     CatchUpNotInstalled(CommandId),
+    /// A submission of a command decided here as nothing (task-d121):
+    /// refused as [`SubmissionRefusal::DecidedNothing`].
+    DecidedNothing(CommandId),
+    /// A submission of a command this replica holds as nothing below
+    /// COMMIT (task-d121): neither refused nor admitted, and answered by
+    /// the command's release.
+    HeldOverNothing(CommandId),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -934,6 +942,15 @@ pub struct Follower {
     /// (task-d30). A report takes each of its entries over a durable
     /// record that is behind it, whatever installation has reached.
     synced_selection: Option<SyncDecision>,
+    /// The stores each Sync whose row became durable here counted, with
+    /// its ballot, until the driver takes them
+    /// ([`Follower::take_durable_counted`], task-d121, C1). A superseded
+    /// Sync's are among them: one whose row lands in the flush that also
+    /// installs a higher Sync is never the synchronized selection when
+    /// the driver looks, and what it counted is as true (Astra on #326's
+    /// five-voter case, again on #327). Filled from every durable Sync
+    /// row at a restart.
+    durable_counted: Vec<(Ballot, BTreeMap<ReplicaId, crate::recovery::CountedStore>)>,
     /// The commit frontier the leader of the current ballot announced:
     /// every proposal of the ballot up to this sequence number is
     /// committed there (task-d09). Reset with the ballot.
@@ -1273,6 +1290,12 @@ impl Follower {
             durable_promise,
             durable_seal,
         );
+        let syncs: Vec<(Ballot, SyncDecision)> = syncs.into_iter().collect();
+        let durable_counted = syncs
+            .iter()
+            .filter(|(_, d)| !d.counted.is_empty())
+            .map(|(b, d)| (*b, d.counted.clone()))
+            .collect();
         let resumed: Option<SyncDecision> = syncs
             .into_iter()
             .find(|(b, _)| *b == ballots.synced())
@@ -1395,6 +1418,7 @@ impl Follower {
             mark_next_admitted: false,
             mark_next_relayed: false,
             synced_selection: resumed.clone(),
+            durable_counted,
             resumed,
             early_sync: None,
             sync_behind_promise: None,
@@ -1650,6 +1674,7 @@ impl Follower {
             sync_behind_promise: None,
             sync_behind_rows: None,
             synced_selection: selection,
+            durable_counted: Vec::new(),
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -2786,14 +2811,16 @@ impl Follower {
                 // durable without its payload, which a later vote named
                 // and a selection then re-proposed with no supplier
                 // (protocol_sim row 21, five voters, seed 609).
+                // The row first (task-d121), as everywhere a record's
+                // rows go down together.
+                updates.push(self.dependency_row(command, demoted));
+                updates.extend(nothing_purge(command, demoted));
                 if self.payload_row(command).is_none()
                     && let Some(payload) = self.payloads.get(command)
                 {
                     updates.push(payload_write(&self.table, command, payload).expect("bounded"));
                     self.durable_payloads.push(barrier, *command);
                 }
-                updates.push(self.dependency_row(command, demoted));
-                updates.extend(nothing_purge(command, demoted));
                 self.ledger.stage(barrier, *command, demoted.clone());
             }
             self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
@@ -2854,7 +2881,7 @@ impl Follower {
     /// proposal that carries it so: a record it doesn't hold yet is made,
     /// and one below COMMIT under facts is replaced, its payload dropped
     /// as a release drops it. The payload row on disk goes with every
-    /// batch that writes the nothing's row ([`nothing_purge`]).
+    /// batch that writes the nothing's row ([`crate::rows::nothing_purge`]).
     ///
     /// A record at COMMIT or executed is left as it is: under facts, the
     /// nothing is a second decision, which the caller's admission check
@@ -3104,15 +3131,16 @@ impl Follower {
         for command in commands {
             let record = self.table.record(command).expect("held").clone();
             let dependencies = self.dependency_row(command, &record);
-            let mut rows = Vec::with_capacity(2);
-            // A nothing (task-d121) has no payload: its dependency row alone.
+            // The dependency row first: a store refuses a payload put while
+            // the command's latest row is a nothing (task-d121). A nothing
+            // has no payload: its dependency row alone.
+            let mut rows = alloc::vec![dependencies];
+            rows.extend(nothing_purge(command, &record));
             let payload = record.facts().is_some() && !self.served_payloads.contains(command);
             if payload {
                 let held = self.payloads.get(command).expect("writable");
                 rows.push(payload_write(&self.table, command, held).expect("bounded"));
             }
-            rows.push(dependencies);
-            rows.extend(nothing_purge(command, &record));
             let bytes: usize = rows.iter().map(row_bytes).sum();
             if !batch.updates.is_empty()
                 && (batch.bytes + bytes > COMMIT_ROWS_BATCH_BYTES
@@ -3224,6 +3252,21 @@ impl Follower {
         if entry.admission.is_some() && self.retired_unread(command) {
             return Some(*command);
         }
+        // Committed or executed here under other facts than the entry
+        // names: a second decision of one command, which `advance_sync`
+        // stops on. Nothing the entry waits for can change that, and held
+        // behind a dependency it never reported while the replica went on
+        // executing its own facts (Astra on #327).
+        if let (Some(selected), Some(held)) = (
+            entry.admission,
+            self.table
+                .record(command)
+                .filter(|r| r.phase >= Phase::Commit)
+                .and_then(|r| r.payload),
+        ) && held != selected
+        {
+            return None;
+        }
         let nothing = entry.admission.as_ref().is_some_and(is_nothing);
         if !nothing
             && (self.table.phase_of(command).is_none() || self.awaits_selected_facts(command))
@@ -3316,6 +3359,13 @@ impl Follower {
                 let entry = self.sync_pending.remove(&command).expect("ready");
                 self.note_sync(command);
                 if entry.admission.as_ref().is_some_and(is_nothing) {
+                    // Taken only where the selection's acceptance then
+                    // takes, so the nothing is in memory only with its row
+                    // (#327 review A3). Otherwise the entry is skipped as
+                    // one whose acceptance is refused below, facts intact.
+                    if !self.table.accepts(&command, &entry.deps) {
+                        continue;
+                    }
                     self.take_nothing(command);
                 }
                 if self.table.record(&command).is_none() {
@@ -3603,6 +3653,7 @@ impl Follower {
         let barrier = self.allocate();
         let mut updates = Vec::new();
         for c in payloads_due {
+            updates.extend(self.row_over_nothing(barrier, &c));
             let payload = self.payloads.get(&c).expect("held");
             updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
             self.durable_payloads.push(barrier, c);
@@ -3611,15 +3662,16 @@ impl Follower {
         for c in due {
             self.unwritten.remove(&c);
             let record = self.table.record(&c).expect("retained").clone();
-            let row = self.dependency_row(&c, &record);
+            // The row before the payload (task-d121): a store refuses a
+            // payload put while the command's latest row is a nothing.
+            updates.push(self.dependency_row(&c, &record));
+            updates.extend(nothing_purge(&c, &record));
             if record.payload.is_some()
                 && let Some(payload) = self.payloads.get(&c)
             {
                 updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
                 self.durable_payloads.push(barrier, c);
             }
-            updates.push(row);
-            updates.extend(nothing_purge(&c, &record));
             self.ledger.stage(barrier, c, record);
         }
         self.pending.insert(barrier, Pending::Carry(first));
@@ -4422,6 +4474,15 @@ impl Follower {
         core::mem::take(&mut self.fast_counts)
     }
 
+    /// Whether `command` executes as a decided nothing (task-d121): its
+    /// record holds the marker, so it has no payload, and the runtime
+    /// executes it as the canonical refusal rather than waiting for one.
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        self.table
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
+    }
+
     /// The durable payload of an initialized command.
     pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
         self.payloads.get(command)
@@ -5125,16 +5186,17 @@ impl Follower {
         let mut staged = Vec::new();
         for running in &self.catch_up.running {
             let command = running.command;
-            updates.push(
-                payload_write(&self.table, &command, &running.entry.payload).expect("bounded"),
-            );
             let record = self
                 .table
                 .record(&command)
                 .expect("committed until executed")
                 .clone();
+            // The row before the payload, as the installation writes them.
             updates.push(self.dependency_row(&command, &record));
             updates.extend(nothing_purge(&command, &record));
+            if let Some(payload) = &running.entry.payload {
+                updates.push(payload_write(&self.table, &command, payload).expect("bounded"));
+            }
             staged.push((command, record));
         }
         for (command, record) in staged {
@@ -5178,7 +5240,8 @@ impl Follower {
             };
         }
         let command = entry.command;
-        let digest = entry.payload.admission_digest();
+        // A nothing (task-d121) has no payload: its decided record says it.
+        let digest = entry.admission().expect("whole");
         let expected = DonorExecution {
             donor,
             ballot,
@@ -5273,7 +5336,12 @@ impl Follower {
                 .push(FollowerRejection::CatchUpNotInstalled(command));
             return Pulled::Stopped;
         }
-        if let Some(held) = held
+        if is_nothing(&digest) {
+            // Decided as nothing: it replaces what is held below COMMIT
+            // under facts, payload and all, as a Sync's entry does, and
+            // its batch deletes the payload row (task-d121).
+            self.take_nothing(command);
+        } else if let Some(held) = held
             && held != digest
         {
             self.table.rebind(&command, digest);
@@ -5302,10 +5370,10 @@ impl Follower {
         self.held.remove(&command);
         self.unkeep(&command);
         self.sync_pending.remove(&command);
-        self.bindings
-            .entry(entry.payload.retry_key)
-            .or_insert(command);
-        self.payloads.insert(command, entry.payload.clone());
+        if let Some(payload) = &entry.payload {
+            self.bindings.entry(payload.retry_key).or_insert(command);
+            self.payloads.insert(command, payload.clone());
+        }
         self.note_lacking(command);
         assert!(
             self.frame_batch.is_none(),
@@ -5314,9 +5382,15 @@ impl Follower {
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
         let barrier = *barrier;
-        updates.push(payload_write(&self.table, &command, &entry.payload).expect("bounded"));
         let record = self.table.record(&command).expect("installed").clone();
+        // The row before the payload: a store refuses a payload row put
+        // while the command's latest row is a nothing (task-d121), and
+        // facts pulled over a nothing held here replace it in this batch.
         updates.push(self.dependency_row(&command, &record));
+        updates.extend(nothing_purge(&command, &record));
+        if let Some(payload) = &entry.payload {
+            updates.push(payload_write(&self.table, &command, payload).expect("bounded"));
+        }
         self.ledger.stage(barrier, command, record);
         self.catch_up.running.push_back(Running {
             command,
@@ -6132,6 +6206,18 @@ impl Follower {
             .filter(|d| d.ballot == self.ballots.synced())
     }
 
+    /// The stores every Sync whose row became durable here since the last
+    /// call counted, with its ballot, in the order they became durable
+    /// (task-d121, C1): a superseded Sync's included, which
+    /// [`Follower::synced_selection`] never names. After a restart, every
+    /// durable Sync row's, as the rows were read. Learning them is
+    /// idempotent, so the order is not a rule.
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(Ballot, BTreeMap<ReplicaId, crate::recovery::CountedStore>)> {
+        core::mem::take(&mut self.durable_counted)
+    }
+
     /// Proposals held for a payload or lagging dependencies.
     pub fn held(&self) -> &BTreeMap<CommandId, HeldProposal> {
         &self.held
@@ -6483,6 +6569,22 @@ impl Follower {
             admission,
             ack_through,
         };
+        // A nothing (task-d121, #325). Decided, the submission is refused
+        // as `DecidedNothing`, which its collector takes as definite.
+        // Below COMMIT it is neither refused nor admitted: a later ballot
+        // can still recover the payload and commit the command. Its
+        // origin is remembered as a duplicate's is (task-d100), the
+        // answer is the command's release, and the payload isn't taken.
+        if self.table.decided_nothing(&command) {
+            self.rejections
+                .push(FollowerRejection::DecidedNothing(command));
+            return self.refuse(command, SubmissionRefusal::DecidedNothing);
+        }
+        if self.table.undecided_nothing(&command) {
+            self.rejections
+                .push(FollowerRejection::HeldOverNothing(command));
+            return Vec::new();
+        }
         match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 let bound = *bound;
@@ -6651,9 +6753,10 @@ impl Follower {
             .clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
+        // The row first (task-d121), as a rebind writes them.
         let mut updates = alloc::vec![
-            payload_write(&self.table, &command, &payload).expect("bounded"),
-            row
+            row,
+            payload_write(&self.table, &command, &payload).expect("bounded")
         ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
@@ -6739,6 +6842,19 @@ impl Follower {
         let command = proposal.command;
         let seqnum = proposal.seqnum.unwrap_or(u64::MAX);
         let held = self.held.contains_key(&command);
+        // Facts proposed over a nothing held below COMMIT (task-d121): the
+        // proposal is held for its payload, and the payload this copy
+        // brought is that payload. `take_relayed_payload` finds the
+        // command known and leaves it to the proposal path, so it rebinds
+        // below, as a `PayloadResponse` has it rebind. Dropped, it was
+        // asked for again (Astra on #327).
+        let over_nothing = (takes
+            && !is_nothing(&proposal.admission)
+            && self.table.phase_of(&command) < Some(Phase::Commit)
+            && holds_nothing(&self.table, &command)
+            && !self.payloads.contains_key(&command))
+        .then(|| payload.clone());
+        let mut known = false;
         let mut kept = None;
         let took = if takes {
             match self.take_relayed_payload(&proposal, payload, false) {
@@ -6748,6 +6864,7 @@ impl Follower {
                 }
                 Relayed::Known => {
                     self.relayed_known = self.relayed_known.saturating_add(1);
+                    known = true;
                     false
                 }
                 Relayed::Mismatch => {
@@ -6778,6 +6895,9 @@ impl Follower {
         // row 1 at 3 voters, seed 11).
         if took && held {
             effects.extend(self.advance_pending());
+        }
+        if let Some(payload) = over_nothing.filter(|_| known) {
+            effects.extend(self.on_payload(command, payload));
         }
         effects
     }
@@ -6989,6 +7109,30 @@ impl Follower {
         (self.kept.len(), self.kept_bytes)
     }
 
+    /// Whether a proposal of `command` under `admission` meets it decided
+    /// here, at COMMIT or executed, with a nothing against facts either
+    /// way round (task-d121): a second decision of one command. Reported,
+    /// and this replica stops.
+    fn stops_on_decided(&mut self, command: CommandId, admission: Digest32) -> bool {
+        let Some(accepted) = self.table.record(&command).and_then(|r| r.payload) else {
+            return false;
+        };
+        if accepted == admission
+            || self.table.phase_of(&command) < Some(Phase::Commit)
+            || !(is_nothing(&admission) || is_nothing(&accepted))
+        {
+            return false;
+        }
+        self.rejections
+            .push(FollowerRejection::IncompatibleAdmission {
+                command,
+                held: accepted,
+                selected: admission,
+            });
+        self.halted = Some(command);
+        true
+    }
+
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
         if let Some(transition) = self.ballots.seal_held() {
             self.rejections
@@ -7012,6 +7156,14 @@ impl Follower {
         let command = proposal.command;
         if self.held.contains_key(&command) {
             // Duplicate proposal of one still held: nothing acknowledged yet.
+            return Vec::new();
+        }
+        // A nothing against what this replica decided, either way round,
+        // stops it before anything is acknowledged again, a duplicate of
+        // an adoption included: replayed, the acknowledgement reported the
+        // old facts and the replica went on executing them (Astra on
+        // #327).
+        if self.stops_on_decided(command, proposal.admission) {
             return Vec::new();
         }
         if self.adopted.contains_key(&command) {
@@ -7099,23 +7251,9 @@ impl Follower {
         // holds below COMMIT at adoption, payload and all: Paxos lets a
         // ballot's proposal replace an acceptance at a lower one. At
         // COMMIT or executed, a nothing against facts either way round is
-        // a second decision of one command, and this replica stops, as at
-        // a Sync's installation.
+        // a second decision of one command, and this replica stopped
+        // above, as at a Sync's installation (`stops_on_decided`).
         let nothing = is_nothing(&proposal.admission);
-        if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
-            && accepted != proposal.admission
-            && self.table.phase_of(&command) >= Some(Phase::Commit)
-            && (nothing || is_nothing(&accepted))
-        {
-            self.rejections
-                .push(FollowerRejection::IncompatibleAdmission {
-                    command,
-                    held: accepted,
-                    selected: proposal.admission,
-                });
-            self.halted = Some(command);
-            return Vec::new();
-        }
         if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
             && accepted != proposal.admission
             && !nothing
@@ -7240,13 +7378,17 @@ impl Follower {
                 let Some(barrier) = self.barrier_outside_frame(&mut effects) else {
                     return effects;
                 };
+                let mut updates: Vec<StoreUpdate> = self
+                    .row_over_nothing(barrier, &proposal.command)
+                    .into_iter()
+                    .collect();
                 let payload = &self.payloads[&proposal.command];
+                updates
+                    .push(payload_write(&self.table, &proposal.command, payload).expect("bounded"));
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
                     base: None,
-                    updates: alloc::vec![
-                        payload_write(&self.table, &proposal.command, payload).expect("bounded")
-                    ],
+                    updates,
                 }));
                 self.durable_payloads.push(barrier, proposal.command);
                 alloc::vec![barrier]
@@ -7346,12 +7488,12 @@ impl Follower {
                 continue;
             }
             let record = record.clone();
-            let row = self.dependency_row(&d, &record);
+            // The row before the payload (task-d121).
+            updates.push(self.dependency_row(&d, &record));
+            updates.extend(nothing_purge(&d, &record));
             if let Some(payload) = payload {
                 updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
             }
-            updates.push(row);
-            updates.extend(nothing_purge(&d, &record));
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
         }
@@ -7363,6 +7505,36 @@ impl Follower {
     /// installation and its demotions, a carried commit's rows, a stale
     /// record's, a vote's and an adoption's, the rows a batch carries for
     /// what it names, a window's, a submission's and a rebinding's.
+    /// The dependency row a payload row of `command` goes after in the
+    /// batch at `barrier`, staged there: the record the table holds, where
+    /// a row written of it here, durable or in flight, is a decided
+    /// nothing (task-d121, #328 review). The store refuses a payload row
+    /// put while the command's latest dependency row is the marker,
+    /// reading the batch's own rows first, so a payload over one never
+    /// goes alone: a rebind whose batch failed leaves the facts in memory
+    /// and the marker on disk, and the payload's next writer would be
+    /// refused at every attempt and at every replay.
+    fn row_over_nothing(&mut self, barrier: BarrierId, command: &CommandId) -> Option<StoreUpdate> {
+        let over = self
+            .ledger
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
+            || self
+                .ledger
+                .newest(command)
+                .is_some_and(CommandRecord::is_nothing);
+        if !over {
+            return None;
+        }
+        let record = self.table.record(command)?.clone();
+        if record.is_nothing() {
+            return None;
+        }
+        let row = self.dependency_row(command, &record);
+        self.ledger.stage(barrier, *command, record);
+        Some(row)
+    }
+
     fn dependency_row(&self, command: &CommandId, record: &CommandRecord) -> StoreUpdate {
         dependency_update(self.config.identity.epoch, command, record).expect("bounded")
     }
@@ -7576,6 +7748,11 @@ impl Follower {
                 // A nothing replaces what is held below COMMIT, and its
                 // payload row goes in this adoption's batch (task-d121).
                 if is_nothing(&held.proposal.admission) {
+                    // As a Sync's entry (#327 review A3): replaced only
+                    // where the adoption below then takes.
+                    if !self.table.accepts(&command, &held.proposal.deps) {
+                        continue;
+                    }
                     self.take_nothing(command);
                 }
                 // The proposal asserts the admission it was ordered under.
@@ -7862,6 +8039,10 @@ impl Follower {
                     // not this ballot is still the one to activate: the
                     // table follows its rows.
                     self.ledger.durable(barrier, *journal_seq);
+                    if !decision.counted.is_empty() {
+                        self.durable_counted
+                            .push((decision.ballot, decision.counted.clone()));
+                    }
                     if self.ballots.synced() == decision.ballot {
                         self.synced_selection = Some(decision.clone());
                     }
@@ -7965,7 +8146,10 @@ impl Follower {
                     for running in &mut self.catch_up.running {
                         if running.barrier == barrier {
                             running.durable = true;
-                            self.served_payloads.insert(running.command);
+                            // A nothing has no payload to serve (task-d121).
+                            if running.entry.payload.is_some() {
+                                self.served_payloads.insert(running.command);
+                            }
                         }
                     }
                     // The evidence this replica produced is a fact now.
@@ -8516,10 +8700,15 @@ impl Follower {
         self.note_lacking(command);
         let barrier = self.allocate();
         self.durable_payloads.push(barrier, command);
+        let mut updates: Vec<StoreUpdate> = self
+            .row_over_nothing(barrier, &command)
+            .into_iter()
+            .collect();
+        updates.push(payload_write(&self.table, &command, &payload).expect("bounded"));
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
-            updates: alloc::vec![payload_write(&self.table, &command, &payload).expect("bounded")],
+            updates,
         })];
         // A proposal held for this payload is adopted now, its
         // acknowledgement waiting on this batch (task-d90).
@@ -8559,9 +8748,12 @@ impl Follower {
         let record = self.table.record(&command).expect("rebound").clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
+        // The row first: a store refuses a payload put while the record
+        // it holds is a decided nothing (task-d121), and a rebind may be
+        // over one.
         let mut updates = alloc::vec![
-            payload_write(&self.table, &command, &payload).expect("bounded"),
-            row
+            row,
+            payload_write(&self.table, &command, &payload).expect("bounded")
         ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
@@ -8618,19 +8810,27 @@ impl Follower {
 
 /// Whether a pulled command is whole (task-d08): its payload rehashes to
 /// the identity it claims, and the decided record that came with it, if
-/// any, is bound to that payload's admission.
+/// any, is bound to that payload's admission. A command decided as
+/// nothing (task-d121) comes with no payload, and is whole only with a
+/// decided record that is a nothing: nothing else says it has none.
 fn pulled_entry_is_whole(entry: &CatchUpEntry) -> bool {
+    let Some(payload) = &entry.payload else {
+        return entry
+            .decided
+            .as_ref()
+            .is_some_and(CommandRecord::is_nothing);
+    };
     let request: Result<(coord_types::logical_v1::LogicalRequest, &[u8]), _> =
-        postcard::take_from_bytes(&entry.payload.logical);
+        postcard::take_from_bytes(&payload.logical);
     let identity = request
         .ok()
         .filter(|(_, rest)| rest.is_empty())
-        .and_then(|(r, _)| CommandId::derive(&entry.payload.retry_key, &r).ok());
+        .and_then(|(r, _)| CommandId::derive(&payload.retry_key, &r).ok());
     identity == Some(entry.command)
         && entry
             .decided
             .as_ref()
-            .is_none_or(|r| r.payload == Some(entry.payload.admission_digest()))
+            .is_none_or(|r| r.payload == Some(payload.admission_digest()))
 }
 
 /// The admission digest a selection names for each of its entries.
@@ -8640,20 +8840,6 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .iter()
         .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
         .collect()
-}
-
-/// The deletion of `command`'s payload row, for every batch that writes
-/// the dependency row of a nothing (task-d121). A nothing has no payload,
-/// and the record under facts it replaced below COMMIT may have left its
-/// payload row on disk. Every such batch carries the deletion, not only
-/// the first: that batch can fail, and the one that writes the row again
-/// (a Sync's installation resumed, a stale record's, a carried one's)
-/// left the payload row beside the nothing, which a restart recovers
-/// (#327 review). Deleting a row that is not there changes nothing.
-fn nothing_purge(command: &CommandId, record: &CommandRecord) -> Option<StoreUpdate> {
-    record
-        .is_nothing()
-        .then(|| crate::rows::payload_delete(command))
 }
 
 /// A selection's entries and their dependency edges, one unit each.

@@ -46,8 +46,8 @@ use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
 use crate::role::RecoveredState;
 use crate::rows::{
-    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, payload_update,
-    proposal_update,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, nothing_purge,
+    payload_update, proposal_update,
 };
 use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
@@ -149,6 +149,13 @@ pub enum Rejection {
         /// The transition the seal is for.
         transition: crate::handoff::Transition,
     },
+    /// A submission of a command decided here as nothing (task-d121):
+    /// refused as [`SubmissionRefusal::DecidedNothing`].
+    DecidedNothing(CommandId),
+    /// A submission of a command this leader holds as nothing below
+    /// COMMIT (task-d121): neither refused nor admitted, and answered by
+    /// the command's release.
+    HeldOverNothing(CommandId),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -1426,6 +1433,10 @@ impl Leader {
             )
             .expect("bounded"),
         ];
+        // A record this voter took as nothing while it followed, whose
+        // batch failed before it won (task-d121, #327 review A1): the
+        // payload row of the facts it replaced goes with this one.
+        updates.extend(nothing_purge(&command, &record));
         // The payload row too, where it is not durable here yet (task-d90):
         // the batch is this leader's acceptance, and the acceptance has to
         // rest on a payload a recovery can re-execute from. A payload
@@ -2164,6 +2175,15 @@ impl Leader {
     pub fn table_waits(&self) -> crate::TableWaits {
         self.table
             .waits(|c| self.proposals.get(c).map(|p| p.seqnum))
+    }
+
+    /// Whether `command` executes as a decided nothing (task-d121): its
+    /// record holds the marker, so it has no payload, and the runtime
+    /// executes it as the canonical refusal rather than waiting for one.
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        self.table
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
     }
 
     /// The durable payload of a proposed command.
@@ -3101,6 +3121,20 @@ impl Leader {
             admission,
             ack_through,
         };
+        // A nothing (task-d121, #325). Decided, the submission is refused
+        // as `DecidedNothing`, which its collector takes as definite.
+        // Below COMMIT it is neither refused nor admitted: a later ballot
+        // can still recover the payload and commit the command. Its
+        // origin is remembered as a duplicate's is (task-d100), the
+        // answer is the command's release, and the payload isn't taken.
+        if self.table.decided_nothing(&command) {
+            self.rejections.push(Rejection::DecidedNothing(command));
+            return self.refuse(command, SubmissionRefusal::DecidedNothing);
+        }
+        if self.table.undecided_nothing(&command) {
+            self.rejections.push(Rejection::HeldOverNothing(command));
+            return Vec::new();
+        }
         // Identity: one retry key binds one payload, first presentation
         // wins. The same identity again is a duplicate only if the facts
         // beside it -- the attested admission and the acknowledged floor
@@ -3216,6 +3250,9 @@ impl Leader {
             .expect("just initialized")
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
+        // A submission over a nothing is refused or held before this
+        // (task-d121), so the record holds the submitted facts.
+        debug_assert!(!record.is_nothing(), "a proposal of facts over a nothing");
         let updates: Vec<StoreUpdate> = alloc::vec![
             payload_row,
             dependency_update(epoch, &command, &record).expect("bounded"),
@@ -3846,9 +3883,13 @@ impl Leader {
                     effects.push(Effect::Persist(PersistBatch {
                         barrier,
                         base: None,
-                        updates: alloc::vec![
-                            dependency_update(epoch, &command, &record).expect("bounded")
-                        ],
+                        // As every batch writing a nothing's row (task-d121,
+                        // #327 review A1).
+                        updates: core::iter::once(
+                            dependency_update(epoch, &command, &record).expect("bounded"),
+                        )
+                        .chain(nothing_purge(&command, &record))
+                        .collect(),
                     }));
                     self.adopt_own(command, barrier);
                 }

@@ -232,12 +232,15 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
         .iter()
         .map(|u| Collection::from_id(u.collection).unwrap())
         .collect();
+    // The dependency row before the payload, as every writer orders them
+    // (task-d121, #328 review): a store refuses a payload put while the
+    // command's latest row is a nothing.
     assert_eq!(
         collections,
-        vec![Collection::PayloadV1, Collection::ProtocolV1]
+        vec![Collection::ProtocolV1, Collection::PayloadV1]
     );
-    assert_eq!(batch.updates[1].key, dependency_key(epoch(), &c1));
-    let row = decode_dependency(batch.updates[1].value.as_ref().unwrap()).unwrap();
+    assert_eq!(batch.updates[0].key, dependency_key(epoch(), &c1));
+    let row = decode_dependency(batch.updates[0].value.as_ref().unwrap()).unwrap();
     assert_eq!(row.phase, Phase::PreAccept);
     assert_eq!(
         fast.pending_sends(),
@@ -3745,7 +3748,7 @@ fn a_catch_up_page_that_installs_a_kept_command_drops_its_kept_copy() {
                 .unwrap();
             coord_consensus::CatchUpEntry {
                 command: *c,
-                payload: p.clone(),
+                payload: Some(p.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: l.deps,

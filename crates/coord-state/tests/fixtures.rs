@@ -90,7 +90,7 @@ fn vector(name: &str, revision: u64, outcome: Outcome) -> ResponseVector {
 /// order. Adding a reason upstream without extending this list fails
 /// `every_rejection_reason_is_covered` rather than silently shipping an
 /// encoding no adapter can read.
-const REJECTIONS: [(&str, RejectionReason); 14] = [
+const REJECTIONS: [(&str, RejectionReason); 15] = [
     ("err-rejected-invalid", RejectionReason::Invalid),
     (
         "err-rejected-namespace-mismatch",
@@ -135,6 +135,10 @@ const REJECTIONS: [(&str, RejectionReason); 14] = [
         "err-rejected-admission-mismatch",
         RejectionReason::AdmissionMismatch,
     ),
+    (
+        "err-rejected-decided-nothing",
+        RejectionReason::DecidedNothing,
+    ),
 ];
 
 /// The reason table above is exhaustive. The match is over a value this
@@ -158,7 +162,8 @@ fn every_rejection_reason_is_covered() {
             | RejectionReason::RetryOutOfWindow
             | RejectionReason::SessionInvalid
             | RejectionReason::RetryUnauthorized
-            | RejectionReason::AdmissionMismatch => {}
+            | RejectionReason::AdmissionMismatch
+            | RejectionReason::DecidedNothing => {}
         }
     }
     let mut names: Vec<&str> = REJECTIONS.iter().map(|(n, _)| *n).collect();
@@ -305,6 +310,14 @@ fn kine_response_vectors_are_frozen() {
     for (name, reason) in REJECTIONS {
         vectors.push(vector(name, 20, Outcome::ErrRejected { reason }));
     }
+    // A decided nothing's one response (task-d121): revision zero, so a
+    // reader sees zero on this refusal and on no other.
+    let canonical = Response::decided_nothing();
+    vectors.push(vector(
+        "decided-nothing-canonical",
+        canonical.revision.get(),
+        canonical.outcome,
+    ));
     write_or_compare(
         "kine_responses_v1.json",
         &ResponseFixture {

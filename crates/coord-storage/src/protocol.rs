@@ -56,7 +56,8 @@ pub struct RecoveredProtocol {
     /// Bound Sync selections, in key (ballot number, leader) order.
     pub syncs: Vec<(Ballot, SyncDecision)>,
     /// Payloads of the recovered commands (a recovered command whose
-    /// payload row is missing is a corrupt projection, reported as such).
+    /// payload row is missing is a corrupt projection, reported as such,
+    /// except a decided nothing, which has none: task-d121).
     pub payloads: Vec<(CommandId, PayloadRecordV1)>,
     /// Executed identities with their positions, in position order.
     ///
@@ -285,7 +286,17 @@ pub fn read_protocol<V: OrderedRead>(
     let mut executed = Vec::new();
     for (command, record) in &records {
         let position = executions.get(command).copied();
-        if record.payload.is_some() {
+        if record.is_nothing() {
+            // A decided nothing (task-d121) has no payload by decision: a
+            // payload row beside it is two values of one command.
+            let row = match position {
+                Some(position) => view.get(Collection::PayloadV1.id(), &position_key(position))?,
+                None => pending.get(command).cloned(),
+            };
+            if row.is_some() {
+                return Err(corrupt("a decided nothing recovered with a payload row"));
+            }
+        } else if record.payload.is_some() {
             let bytes = match position {
                 Some(position) => view.get(Collection::PayloadV1.id(), &position_key(position))?,
                 None => pending.get(command).cloned(),
@@ -592,10 +603,6 @@ pub fn catch_up_entry_at<V: OrderedRead>(
         revision,
         result_digest,
     } = executed;
-    let Some(payload) = view.get(Collection::PayloadV1.id(), &position_key(position))? else {
-        return Ok(None);
-    };
-    let payload = decode_payload(&payload)?;
     // The decided record moved to `decided_v1` at the command's execution
     // (the bound), under the same position: served only in its own epoch,
     // as the epoch's dependency row was.
@@ -609,6 +616,19 @@ pub fn catch_up_entry_at<V: OrderedRead>(
             }
         }
         None => None,
+    };
+    let payload = match view.get(Collection::PayloadV1.id(), &position_key(position))? {
+        Some(bytes) => Some(decode_payload(&bytes)?),
+        // A command decided as nothing executed with none (task-d121): it
+        // is served without one, on its decided record and the canonical
+        // refusal's digest together. Short of both, a missing payload is
+        // one this donor can't serve.
+        None if decided.as_ref().is_some_and(CommandRecord::is_nothing)
+            && result_digest == crate::retry::decided_nothing_digest() =>
+        {
+            None
+        }
+        None => return Ok(None),
     };
     Ok(Some(CatchUpEntry {
         command: *command,

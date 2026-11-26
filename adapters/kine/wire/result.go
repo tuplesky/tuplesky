@@ -56,6 +56,10 @@ const (
 	RejectedSessionInvalid
 	RejectedRetryUnauthorized
 	RejectedAdmissionMismatch
+	// RejectedDecidedNothing: consensus decided the command's slot as
+	// nothing (task-d121), so it never executed as submitted. Its one
+	// response carries revision zero.
+	RejectedDecidedNothing
 	rejectedBeyond
 )
 
@@ -90,6 +94,8 @@ func (r RejectionReason) String() string {
 		return "retry key not this session's"
 	case RejectedAdmissionMismatch:
 		return "admission mismatch"
+	case RejectedDecidedNothing:
+		return "decided as nothing; it never executed"
 	default:
 		return "unknown reason"
 	}

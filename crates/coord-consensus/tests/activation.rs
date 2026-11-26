@@ -199,6 +199,16 @@ struct Cluster {
     /// Fail, once, the next batch of this node that deletes a payload
     /// row (task-d121).
     fail_payload_delete: Option<usize>,
+    /// Fail, once, the next batch of this node that puts a payload row
+    /// (task-d121, #328 review).
+    fail_payload_put: Option<usize>,
+    /// Fail, once, the next batch of this node that writes a dependency
+    /// row of this command (task-d121, #328 review).
+    fail_row_of: Option<(usize, CommandId)>,
+    /// Fail every batch of this node that deletes a payload row while it
+    /// follows (task-d121, #327 review A1): what a follower writes again
+    /// fails, so only what it writes once it leads can land.
+    fail_follower_payload_deletes: Option<usize>,
     /// The command whose batch `reject_unpublished` refused.
     rejected: Option<CommandId>,
     /// Whether `settle` runs in turns, as the daemon's loop does lowering
@@ -305,6 +315,9 @@ impl Cluster {
             proposed: Vec::new(),
             reject_unpublished: None,
             fail_payload_delete: None,
+            fail_payload_put: None,
+            fail_row_of: None,
+            fail_follower_payload_deletes: None,
             rejected: None,
             turns: false,
             committed_this_turn: BTreeMap::new(),
@@ -327,10 +340,44 @@ impl Cluster {
             match e {
                 Effect::Persist(batch) => {
                     let barrier = batch.barrier;
-                    if self.fail_payload_delete == Some(i)
-                        && batch.updates.iter().any(|u| {
-                            u.collection == Collection::PayloadV1.id() && u.value.is_none()
+                    let deletes_payload = batch
+                        .updates
+                        .iter()
+                        .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_none());
+                    let puts_payload = batch
+                        .updates
+                        .iter()
+                        .any(|u| u.collection == Collection::PayloadV1.id() && u.value.is_some());
+                    let writes_row_of = |c: &CommandId| {
+                        batch.updates.iter().any(|u| {
+                            u.collection == Collection::ProtocolV1.id()
+                                && u.key.len() == 41
+                                && u.key[8] == 0x01
+                                && u.key[9..] == c.0.0[..]
+                                && u.value.is_some()
                         })
+                    };
+                    let fails_row = self
+                        .fail_row_of
+                        .is_some_and(|(n, c)| n == i && writes_row_of(&c));
+                    let fails_put = puts_payload && self.fail_payload_put == Some(i);
+                    if fails_put || fails_row {
+                        if fails_put {
+                            self.fail_payload_put = None;
+                        } else {
+                            self.fail_row_of = None;
+                        }
+                        let more = self.nodes[i].step(Event::Storage(StorageEvent::Failed {
+                            barrier_id: barrier,
+                            error: coord_core::event::StorageError::NoSpace,
+                        }));
+                        self.handle(i, more);
+                        continue;
+                    }
+                    let following = matches!(self.nodes[i].role, Some(Role::Follower(_)));
+                    if deletes_payload
+                        && (self.fail_payload_delete == Some(i)
+                            || (following && self.fail_follower_payload_deletes == Some(i)))
                     {
                         self.fail_payload_delete = None;
                         let more = self.nodes[i].step(Event::Storage(StorageEvent::Failed {
@@ -358,6 +405,7 @@ impl Cluster {
                         continue;
                     }
                     let node = &mut self.nodes[i];
+                    refuse_payload_over_nothing(&node.storage, &batch);
                     node.storage.submit(batch);
                     node.storage.complete(barrier).unwrap();
                     let more = node.step(Event::Storage(StorageEvent::JournalDurable {
@@ -792,6 +840,37 @@ impl Cluster {
     fn campaign(&mut self, i: usize, b: Ballot) {
         let effects = self.nodes[i].follower_mut().campaign(b);
         self.handle(i, effects);
+    }
+}
+
+/// The store's refusal that the model doesn't make (task-d121,
+/// `coord-storage`'s `intake.rs`): a payload row put for a command whose
+/// latest dependency row is the nothing marker, the batch's own rows
+/// before it read first. Every batch a node here commits is checked
+/// (#328 review).
+fn refuse_payload_over_nothing(storage: &StorageModel, batch: &PersistBatch) {
+    let mut nothing: BTreeMap<CommandId, bool> = dependency_rows(storage)
+        .into_iter()
+        .map(|(c, r)| (c, r.is_nothing()))
+        .collect();
+    for update in &batch.updates {
+        let key = &update.key;
+        if update.collection == Collection::ProtocolV1.id() && key.len() == 41 && key[8] == 0x01 {
+            if let Some(value) = &update.value {
+                let command = CommandId(Digest32(key[9..].try_into().unwrap()));
+                nothing.insert(command, decode_dependency(value).unwrap().is_nothing());
+            }
+        } else if update.collection == Collection::PayloadV1.id()
+            && update.value.is_some()
+            && key.len() == 32
+        {
+            let command = CommandId(Digest32(key[..].try_into().unwrap()));
+            assert!(
+                !nothing.get(&command).copied().unwrap_or(false),
+                "a payload row put while {command:?}'s latest dependency row is a nothing: \
+                 the store refuses it"
+            );
+        }
     }
 }
 
@@ -2230,7 +2309,7 @@ fn pulled_past_the_window() -> PulledPastTheWindow {
         through: pos(73),
         entries: vec![coord_consensus::CatchUpEntry {
             command: id(73),
-            payload: commands[72].1.clone(),
+            payload: Some(commands[72].1.clone()),
             decided: Some(record(73)),
             position: pos(73),
             revision: None,
@@ -10698,7 +10777,7 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
         entries: vec![
             coord_consensus::CatchUpEntry {
                 command: first,
-                payload: first_payload.clone(),
+                payload: Some(first_payload.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: Vec::new(),
@@ -10714,7 +10793,7 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
             },
             coord_consensus::CatchUpEntry {
                 command: second,
-                payload: second_payload.clone(),
+                payload: Some(second_payload.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: Vec::new(),
@@ -11269,6 +11348,190 @@ fn a_nothing_whose_batch_failed_deletes_the_payload_row_when_written_again() {
     );
 }
 
+/// task-d121 (#327 review A1): as above, but the voter whose nothing's
+/// batch failed wins the next ballot before any event resumes the
+/// installation. Its record goes with it into leading, and the leader's
+/// own batch writing the nothing's row deletes the facts' payload row, as
+/// a follower's does. Before, a leader's row writes carried no deletion,
+/// and the payload row sat beside the nothing for a restart to recover.
+#[test]
+fn a_nothing_whose_batch_failed_deletes_the_payload_row_when_its_voter_leads() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(d, Phase::Accept, facts)],
+    );
+    cluster.fail_payload_delete = Some(1);
+    install_sync(
+        &mut cluster,
+        ballot(2, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    assert_eq!(
+        cluster.fail_payload_delete, None,
+        "the installation's batch deletes the payload row, and failed"
+    );
+    assert!(
+        payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "the facts' payload row is still on disk"
+    );
+    // Every event resumes the follower's installation, and its batch goes
+    // to disk first. That path is the test above; here it keeps failing,
+    // so what lands is the leader's.
+    cluster.fail_follower_payload_deletes = Some(1);
+    cluster.campaign(1, ballot(3, 1));
+    cluster.settle();
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing()),
+        "the leader wrote the nothing's row"
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "the leader's row went to disk beside the facts' payload row"
+    );
+}
+
+/// task-d121, C2b (#325): a submission of a command a voter holds as
+/// nothing below COMMIT is neither refused nor admitted. A later ballot
+/// can still recover its payload and commit it, so a refusal here would
+/// tell the caller "refused" for a write that may take effect. Its
+/// payload is not taken either. Once the nothing is committed, the same
+/// submission is refused as `DecidedNothing`, which its collector takes
+/// from this one voter as definite.
+#[test]
+fn a_submission_is_held_over_an_accepted_nothing_and_refused_over_a_committed_one() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    let refused_to = |cluster: &Cluster| {
+        cluster
+            .frontend
+            .iter()
+            .filter_map(|(from, m)| match m {
+                ProtocolMessage::Refused {
+                    command, refusal, ..
+                } if *command == d => Some((*from, *refusal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    cluster.frontend.clear();
+    let _ = cluster.nodes[1].follower_mut().take_rejections();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    assert_eq!(
+        cluster.nodes[1].follower_mut().take_rejections(),
+        vec![FollowerRejection::HeldOverNothing(d)]
+    );
+    assert!(refused_to(&cluster).is_empty(), "held, not refused");
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert!(record.is_nothing() && record.phase == Phase::Accept);
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "no payload row is written under the nothing"
+    );
+
+    install_sync(
+        &mut cluster,
+        ballot(2, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    cluster.frontend.clear();
+    let _ = cluster.nodes[1].follower_mut().take_rejections();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    assert_eq!(
+        cluster.nodes[1].follower_mut().take_rejections(),
+        vec![FollowerRejection::DecidedNothing(d)]
+    );
+    assert_eq!(
+        refused_to(&cluster),
+        vec![(r(1), coord_consensus::SubmissionRefusal::DecidedNothing)]
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
+    );
+}
+
+/// task-d121, C2b (#325): the same at a leader. A voter holding a
+/// committed nothing wins a campaign; a submission of the command to it
+/// as the leader is refused as `DecidedNothing`, and nothing is proposed.
+#[test]
+fn a_leader_refuses_a_submission_of_a_decided_nothing() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle_resending(3);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    assert!(l.table().decided_nothing(&d), "{:?}", l.table().record(&d));
+    let _ = l.take_rejections();
+    cluster.frontend.clear();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    let rejections = l.take_rejections();
+    assert_eq!(
+        rejections,
+        vec![coord_consensus::Rejection::DecidedNothing(d)]
+    );
+    assert!(
+        cluster.frontend.iter().any(|(from, m)| *from == r(1)
+            && matches!(
+                m,
+                ProtocolMessage::Refused {
+                    command,
+                    refusal: coord_consensus::SubmissionRefusal::DecidedNothing,
+                    ..
+                } if *command == d
+            )),
+        "{:?}",
+        cluster.frontend
+    );
+}
+
 /// task-d121, C2: a voter that holds nothing of a command adopts a
 /// proposal of a nothing for it at once.
 #[test]
@@ -11419,14 +11682,27 @@ fn a_retired_commands_entry_under_its_own_facts_passes_after_the_row_read() {
 /// task-d121, C2: a payload arriving for a command this voter holds as
 /// nothing, with nothing waiting on facts, is not taken: no payload row is
 /// written under a nothing.
+///
+/// A nothing a Sync carried is refused by the selection's named
+/// admission (task-d14), kept past installation and resumed at a
+/// restart, before the nothing's own check is reached. One adopted from a
+/// proposal is named by no selection: after a restart its record is its
+/// row alone, and only the nothing's own check in `on_payload` stands
+/// between its payload and a payload row (#327 review).
 #[test]
 fn a_late_payload_for_a_nothing_writes_no_payload_row() {
     let mut cluster = Cluster::new(3);
     let d = cluster.admit_at(1, 1, &[1]);
-    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
-        .into_iter()
-        .find(|(c, _)| *c == d)
-        .expect("the submission's payload row");
+    let e = cluster.admit_at(2, 2, &[1]);
+    let payload_of = |cluster: &Cluster, c: CommandId| {
+        payload_rows(&cluster.nodes[1].storage)
+            .into_iter()
+            .find(|(x, _)| *x == c)
+            .expect("the submission's payload row")
+            .1
+    };
+    let payload = payload_of(&cluster, d);
+    let payload_e = payload_of(&cluster, e);
     install_sync(
         &mut cluster,
         ballot(1, 2),
@@ -11436,11 +11712,17 @@ fn a_late_payload_for_a_nothing_writes_no_payload_row() {
             coord_consensus::NOTHING_ADMISSION,
         )],
     );
+    propose(
+        &mut cluster,
+        ballot(1, 2),
+        e,
+        coord_consensus::NOTHING_ADMISSION,
+    );
     let effects = cluster.nodes[1].step(peer_event(
         r(2),
         ProtocolMessage::PayloadResponse {
             command: d,
-            payload,
+            payload: payload.clone(),
         },
     ));
     cluster.handle(1, effects);
@@ -11458,6 +11740,44 @@ fn a_late_payload_for_a_nothing_writes_no_payload_row() {
             .iter()
             .any(|(c, _)| *c == d)
     );
+
+    // Restarted: each nothing is its dependency row. The resumed Sync
+    // names D's; nothing names E's.
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(1, 2)));
+    for (c, payload) in [(d, payload), (e, payload_e)] {
+        assert!(
+            cluster.nodes[1]
+                .follower()
+                .table()
+                .record(&c)
+                .unwrap()
+                .is_nothing()
+        );
+        let effects = cluster.nodes[1].step(peer_event(
+            r(2),
+            ProtocolMessage::PayloadResponse {
+                command: c,
+                payload,
+            },
+        ));
+        cluster.handle(1, effects);
+        assert!(
+            cluster.nodes[1]
+                .follower()
+                .table()
+                .record(&c)
+                .unwrap()
+                .is_nothing()
+        );
+        assert!(cluster.nodes[1].follower().payload(&c).is_none());
+        assert!(
+            !payload_rows(&cluster.nodes[1].storage)
+                .iter()
+                .any(|(x, _)| *x == c),
+            "a payload row under the nothing after the restart"
+        );
+    }
 }
 
 /// task-d121, C2: a candidate whose selection carries a command as
@@ -11574,6 +11894,207 @@ fn a_proposal_under_facts_over_a_nothing_rebinds_on_the_payload() {
         r(2),
         ProtocolMessage::PayloadResponse {
             command: d,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert_eq!(record.payload, Some(facts), "{record:?}");
+    assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
+}
+
+/// task-d121 (#328 review): a rebind over a durable nothing whose batch
+/// fails leaves the facts in memory and the marker on disk. The payload's
+/// next writer, the next event that is not a failure, writes the facts'
+/// dependency row before it: a payload row alone is refused by the store
+/// at every attempt, and at every replay of the journal after a restart.
+/// The cluster's storage refuses it as the store does.
+#[test]
+fn a_failed_rebind_over_a_nothing_writes_the_facts_row_before_the_payload_again() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, r)| *c == d && r.is_nothing()),
+        "the nothing is durable"
+    );
+    let b2 = ballot(2, 2);
+    install_sync_reproposing(&mut cluster, b2, vec![], BTreeSet::from([d]));
+    // The rebind's batch, the facts' row and payload, fails, and so does
+    // the adoption's after it, the facts' row alone: the marker stays the
+    // newest durable row.
+    cluster.fail_payload_put = Some(1);
+    cluster.fail_row_of = Some((1, d));
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::RelayedProposal {
+            vote: coord_consensus::FastAck {
+                replica: b2.leader,
+                ballot: b2,
+                command: d,
+                deps: vec![],
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission: facts,
+                seqnum: Some(0),
+            },
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.fail_payload_put, None, "the rebind's batch failed");
+    assert_eq!(cluster.fail_row_of, None, "the adoption's batch failed");
+    assert!(
+        dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == d)
+            .is_some_and(|(_, r)| r.is_nothing()),
+        "the marker is still the newest durable row"
+    );
+    assert_eq!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .payload,
+        Some(facts),
+        "memory holds the facts"
+    );
+    // The next event that is not a failure: the leader's announcement.
+    let executed = cluster.nodes[1].executed_through();
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed,
+        },
+    ));
+    cluster.handle(1, effects);
+    let rows = dependency_rows(&cluster.nodes[1].storage);
+    let durable = rows.iter().rev().find(|(c, _)| *c == d).expect("a row");
+    assert_eq!(durable.1.payload, Some(facts), "{:?}", durable.1);
+    assert!(
+        payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, p)| *c == d && p.admission_digest() == facts),
+        "the facts' payload row is durable"
+    );
+}
+
+/// task-d121, C2: a Sync entry carrying a command committed here under
+/// facts as nothing stops the voter at once, a dependency it has not
+/// accepted notwithstanding: nothing the entry could wait for makes the
+/// two decisions one, and waiting, the voter went on executing its own
+/// facts (Astra on #327).
+#[test]
+fn a_nothing_sync_entry_over_a_commit_stops_before_its_dependencies() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    let facts = facts_of(&cluster.nodes[1], &d).expect("its payload row");
+    // Never submitted anywhere: no voter knows it.
+    let e = cluster.admit_at(2, 2, &[]);
+    let mut entry = sync_entry(d, Phase::Commit, coord_consensus::NOTHING_ADMISSION);
+    entry.deps = vec![e];
+    let rejections = install_sync(&mut cluster, ballot(1, 2), vec![entry]);
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, held, selected }
+                if *command == d
+                    && *held == facts
+                    && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+}
+
+/// task-d121, C2: a proposal of a nothing for a command this voter
+/// adopted and committed under facts in the same ballot stops it, rather
+/// than replaying the acknowledgement it kept (Astra on #327).
+#[test]
+fn a_duplicate_nothing_proposal_of_an_adopted_commit_stops() {
+    let mut cluster = Cluster::new(3);
+    cluster.no_execute = vec![1];
+    let d = cluster.admit(1, 1);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&d),
+        Some(Phase::Commit)
+    );
+    let facts = facts_of(&cluster.nodes[1], &d).expect("its payload row");
+    propose(
+        &mut cluster,
+        ballot(0, 0),
+        d,
+        coord_consensus::NOTHING_ADMISSION,
+    );
+    let rejections = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(|r| matches!(
+            r,
+            FollowerRejection::IncompatibleAdmission { command, held, selected }
+                if *command == d
+                    && *held == facts
+                    && *selected == coord_consensus::NOTHING_ADMISSION
+        )),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(d));
+}
+
+/// task-d121, C2: facts proposed over a nothing held below COMMIT, with
+/// their payload relayed in the proposal, rebind on that copy, as on a
+/// `PayloadResponse`, and nothing is left missing (Astra on #327).
+#[test]
+fn a_relayed_proposal_under_facts_over_a_nothing_rebinds_on_its_payload() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    // The next ballot re-proposes D under facts, relaying its payload.
+    let b2 = ballot(2, 2);
+    install_sync_reproposing(&mut cluster, b2, vec![], BTreeSet::from([d]));
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    let effects = cluster.nodes[1].step(peer_event(
+        b2.leader,
+        ProtocolMessage::RelayedProposal {
+            vote: coord_consensus::FastAck {
+                replica: b2.leader,
+                ballot: b2,
+                command: d,
+                deps: vec![],
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission: facts,
+                seqnum: Some(0),
+            },
             payload,
         },
     ));

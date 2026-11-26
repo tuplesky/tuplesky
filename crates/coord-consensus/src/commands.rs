@@ -283,6 +283,14 @@ pub struct CommandTable {
     /// fetch, a table filling with history. So that answer is kept for
     /// every command, at the cost of one identity each.
     history: DigestSet<CommandId>,
+    /// The commands of `history` whose record was a nothing when they
+    /// retired (task-d121): the tombstone a submission of one is refused
+    /// from as decided. Written only at the retirement of an executed
+    /// nothing, so it says only what was decided. A command whose rows
+    /// were gone at a restart is history without it, and a submission of
+    /// it is answered `Forgotten`; its collector settles from its node's
+    /// executed row instead.
+    nothing_retired: DigestSet<CommandId>,
     /// The last `capacity` commands retired, in the order they were: the
     /// window a recovery report still names (task-d05).
     ///
@@ -380,6 +388,7 @@ impl CommandTable {
             executed: digest::set(),
             retired: VecDeque::new(),
             history: digest::set(),
+            nothing_retired: digest::set(),
             recent: VecDeque::new(),
             recent_set: digest::set(),
             capacity: None,
@@ -406,6 +415,7 @@ impl CommandTable {
             executed: digest::set(),
             retired: VecDeque::new(),
             history: digest::set(),
+            nothing_retired: digest::set(),
             recent: VecDeque::new(),
             recent_set: digest::set(),
             capacity: Some(capacity),
@@ -439,6 +449,7 @@ impl CommandTable {
             executed: digest::set(),
             retired: VecDeque::new(),
             history: digest::set(),
+            nothing_retired: digest::set(),
             recent: VecDeque::new(),
             recent_set: digest::set(),
             capacity,
@@ -1330,6 +1341,17 @@ impl CommandTable {
         Ok(())
     }
 
+    /// Whether [`CommandTable::accept`] of `command` under `deps` would
+    /// take: the record is past ACCEPT, or every dependency is accepted
+    /// here. Read before a replacement that only the acceptance after it
+    /// makes durable (task-d121, #327 review A3): a nothing taken over facts
+    /// in memory, with the acceptance then refused, has no row written for
+    /// it, and writing one would record an acceptance no ballot made.
+    pub fn accepts(&self, command: &CommandId, deps: &[CommandId]) -> bool {
+        self.phase_of(command).is_some_and(|p| p > Phase::Accept)
+            || guard_accept(deps, |c| self.phase_of(c)).is_ok()
+    }
+
     /// Mark a learned command (COMMIT), under the source guard. Idempotent
     /// for a command already committed or executed.
     pub fn commit(&mut self, command: CommandId) -> Result<(), GuardViolation> {
@@ -1537,12 +1559,12 @@ impl CommandTable {
     /// command a leader can still name. An unbounded table keeps them all,
     /// which is what unbounded means.
     pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
-        let keys = match self.records.get(command) {
+        let (keys, nothing) = match self.records.get(command) {
             None => return Err(RetireError::Unknown),
             Some(r) if r.phase != Phase::Executed => {
                 return Err(RetireError::NotExecuted(r.phase));
             }
-            Some(r) => r.keys.clone(),
+            Some(r) => (r.keys.clone(), r.is_nothing()),
         };
         self.records.remove(command);
         // Reclaiming retires from the front and catch-up right after
@@ -1562,6 +1584,9 @@ impl CommandTable {
             }
         }
         self.history.insert(*command);
+        if nothing {
+            self.nothing_retired.insert(*command);
+        }
         if self.executed.insert(*command) {
             self.retired.push_back(*command);
         }
@@ -1613,6 +1638,27 @@ impl CommandTable {
     /// binding says so any more.
     pub fn retired(&self, command: &CommandId) -> bool {
         !self.records.contains_key(command) && self.history.contains(command)
+    }
+
+    /// Whether `command` is decided here as nothing (task-d121, #325): its
+    /// record a nothing at COMMIT or executed, or retired as one. At a
+    /// leader, COMMIT is its count of a slow quorum; at a follower, the
+    /// commit frontier, a Sync entry at COMMIT or a catch-up decided
+    /// record. An acceptance is not a decision, whoever's it is.
+    pub fn decided_nothing(&self, command: &CommandId) -> bool {
+        match self.records.get(command) {
+            Some(r) => r.is_nothing() && r.phase >= Phase::Commit,
+            None => self.history.contains(command) && self.nothing_retired.contains(command),
+        }
+    }
+
+    /// Whether `command`'s record here is a nothing below COMMIT
+    /// (task-d121): accepted or demoted, and not decided. A later ballot
+    /// can still recover the command's payload and commit it.
+    pub fn undecided_nothing(&self, command: &CommandId) -> bool {
+        self.records
+            .get(command)
+            .is_some_and(|r| r.is_nothing() && r.phase < Phase::Commit)
     }
 
     /// Whether this replica executed `command` and retired it longer ago
