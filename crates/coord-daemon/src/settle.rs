@@ -182,7 +182,14 @@ impl RecordReads {
                 Ok(Some(record)) if record.command_id == command => {
                     out.records.push((command, record));
                 }
-                Ok(Some(record)) => out.conflicts.push((command, record.command_id)),
+                // The key's record is another command's. A decided nothing
+                // writes none under its key, so a later command may take
+                // it; the nothing's own execution still answers it (Astra
+                // on #328).
+                Ok(Some(record)) => match nothing_record(&gated, &command) {
+                    Some(nothing) => out.records.push((command, nothing)),
+                    None => out.conflicts.push((command, record.command_id)),
+                },
                 Ok(None) => match nothing_record(&gated, &command) {
                     Some(record) => out.records.push((command, record)),
                     None => {
