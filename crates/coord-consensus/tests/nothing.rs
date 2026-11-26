@@ -173,3 +173,46 @@ fn a_carried_nothing_is_checked_against_the_candidates_executions() {
         assert_eq!(decision.entries[&d].admission, Some(NOTHING_ADMISSION));
     }
 }
+
+/// task-d121, C2b (#325): a submission meets a nothing as decided only
+/// from a decision. Accepted, the nothing is not one: a later ballot can
+/// still recover the payload. Committed, executed, or retired as nothing
+/// (the tombstone), it is. A command retired under facts leaves no
+/// tombstone, and neither does a nothing that never executed.
+#[test]
+fn a_nothing_is_decided_from_commit_on_and_its_tombstone_outlives_the_record() {
+    let mut t = coord_consensus::CommandTable::new();
+    let key = vec![b"k".to_vec()];
+    let (d, other) = (command(1), command(2));
+    t.initialize(d, NOTHING_ADMISSION, key.clone()).unwrap();
+    t.initialize(other, FACTS, key.clone()).unwrap();
+    assert!(t.undecided_nothing(&d) && !t.decided_nothing(&d));
+    t.accept(d, t.record(&d).unwrap().deps.clone()).unwrap();
+    assert!(
+        t.undecided_nothing(&d) && !t.decided_nothing(&d),
+        "an acceptance is not a decision"
+    );
+    t.commit(d).unwrap();
+    assert!(t.decided_nothing(&d) && !t.undecided_nothing(&d));
+    t.execute(d).unwrap();
+    assert!(t.decided_nothing(&d));
+    t.retire(&d).unwrap();
+    assert!(t.record(&d).is_none() && t.retired(&d));
+    assert!(
+        t.decided_nothing(&d),
+        "the tombstone answers once the record is gone"
+    );
+    assert!(!t.undecided_nothing(&d));
+    // Facts retire with no tombstone.
+    t.accept(other, t.record(&other).unwrap().deps.clone())
+        .unwrap();
+    t.commit(other).unwrap();
+    t.execute(other).unwrap();
+    t.retire(&other).unwrap();
+    assert!(t.retired(&other) && !t.decided_nothing(&other));
+    // Executed as far as the table knows from a row alone, with no record
+    // to say what it was: history, and no tombstone.
+    let trimmed = command(3);
+    t.restore_executed(&trimmed);
+    assert!(t.retired(&trimmed) && !t.decided_nothing(&trimmed));
+}

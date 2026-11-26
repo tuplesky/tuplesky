@@ -613,6 +613,24 @@ impl Machine {
         Some((selection.ballot, &selection.counted))
     }
 
+    /// The stores each Sync whose row became durable since the last call
+    /// counted, a superseded one's included (task-d121, C1); none for a
+    /// leader, whose own selection [`Machine::synced_counted`] names.
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.take_durable_counted(),
+        }
+    }
+
     /// The ballot configuration this replica works under: the one it
     /// leads, or the one it follows or campaigns in.
     pub fn configuration(&self) -> &coord_consensus::BallotConfiguration {
@@ -732,6 +750,14 @@ impl Machine {
         match self {
             Machine::Leader(m) => m.payload(command).is_some(),
             Machine::Follower(m) => m.payload(command).is_some(),
+        }
+    }
+
+    /// Whether `command` executes as a decided nothing (task-d121).
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(m) => m.executes_as_nothing(command),
+            Machine::Follower(m) => m.executes_as_nothing(command),
         }
     }
 
@@ -962,6 +988,16 @@ pub struct Node<P: Persistence> {
     features: Option<crate::feature::Features>,
     /// The store each peer voter spoke from (task-d121, C1).
     peer_stores: Option<crate::peer_store::PeerStores>,
+    /// What [`Machine::take_durable_counted`] gave up at a role change,
+    /// for the voter to learn (task-d121, C1): the follower that held it
+    /// is gone by the time the voter looks.
+    durable_counted: Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )>,
     /// Whether this node reads `Feature::AnswerOnRelease` active
     /// (task-d100, step A): the collector beside it marks its
     /// submissions as answered on the leader's release alone.
@@ -1081,6 +1117,7 @@ impl<P: Persistence> Node<P> {
             early_without_activation: false,
             features: None,
             peer_stores: None,
+            durable_counted: Vec::new(),
             answer_on_release: false,
             batched_round: false,
             sent_bytes: coord_consensus::SentBytes::default(),
@@ -1099,13 +1136,16 @@ impl<P: Persistence> Node<P> {
         node
     }
 
-    /// Whether a command's turn has come and this replica holds its
-    /// payload: whether [`Node::execute`] would apply something now.
+    /// Whether a command's turn has come and this replica can apply it:
+    /// it holds the command's payload, or the command is a decided
+    /// nothing (task-d121), which has none to wait for. Whether
+    /// [`Node::execute`] would apply something now, and so whether the
+    /// runtime owes a flush (Astra on #328).
     pub fn can_execute(&self) -> bool {
         let machine = self.machine();
-        machine
-            .next_executable()
-            .is_some_and(|command| machine.holds_payload(&command))
+        machine.next_executable().is_some_and(|command| {
+            machine.holds_payload(&command) || machine.executes_as_nothing(&command)
+        })
     }
 
     /// Whether this node lowers in groups ([`Node::lower_in_groups`]).
@@ -1527,6 +1567,8 @@ impl<P: Persistence> Node<P> {
     /// commands it had learned and not released are not timed: the role
     /// that would release them is going.
     fn leave_role(&mut self) {
+        let counted = self.machine_mut().take_durable_counted();
+        self.durable_counted.extend(counted);
         let counts = self.machine_mut().take_fast_path_counts();
         self.fast_path.add(&counts);
         // A follower's catch-up counts start again with the role: kept
@@ -2005,6 +2047,22 @@ impl<P: Persistence> Node<P> {
             _ => Outbound::default(),
         };
         Ok(Some((check, out)))
+    }
+
+    /// The stores each Sync whose row became durable here counted, a
+    /// superseded one's included, since the last call (task-d121, C1).
+    pub fn take_durable_counted(
+        &mut self,
+    ) -> Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        let mut out = core::mem::take(&mut self.durable_counted);
+        out.extend(self.machine_mut().take_durable_counted());
+        out
     }
 
     /// Record the stores an installed Sync from `leader` counted
@@ -2678,11 +2736,18 @@ impl<P: Persistence> Node<P> {
                 }
                 break;
             };
+            // A decided nothing (task-d121) has no payload to wait for: it
+            // executes as its canonical refusal.
+            let nothing = self.machine().executes_as_nothing(&command);
             // A command whose turn has come but whose payload this
             // replica does not hold is not something to skip past: the
             // order is the whole of the guarantee, and going on would
             // apply a later command first.
-            let Some(payload) = self.machine().payload(&command) else {
+            let payload = if nothing {
+                None
+            } else if let Some(payload) = self.machine().payload(&command) {
+                Some(payload)
+            } else {
                 // Not something to skip past -- the order is the whole
                 // of the guarantee -- and not a fault either. A replica
                 // learns a command's identity from evidence and its
@@ -2716,7 +2781,10 @@ impl<P: Persistence> Node<P> {
             let applier = &mut self.applier;
             let outcome =
                 match Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
-                    applier.apply(command, &payload)
+                    match &payload {
+                        Some(payload) => applier.apply(command, payload),
+                        None => applier.apply_nothing(command),
+                    }
                 }) {
                     // The group and the protocol's queued batches leave no
                     // room for this command's batch: lower them, and apply

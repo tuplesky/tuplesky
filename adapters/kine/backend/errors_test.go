@@ -31,6 +31,7 @@ func TestRejectionReasonsMapToActionableStatuses(t *testing.T) {
 		wire.RejectedSessionInvalid:    codes.Unauthenticated,
 		wire.RejectedRetryUnauthorized: codes.PermissionDenied,
 		wire.RejectedAdmissionMismatch: codes.PermissionDenied,
+		wire.RejectedDecidedNothing:    codes.Aborted,
 	}
 	for reason, code := range want {
 		err := mapOutcomeError(wire.Result{Kind: wire.OutcomeErrRejected, Reason: reason})
@@ -48,8 +49,8 @@ func TestRejectionReasonsMapToActionableStatuses(t *testing.T) {
 			t.Fatalf("reason %s: message %q does not name it", reason, s.Message())
 		}
 	}
-	if len(want) != 14 {
-		t.Fatalf("the reason table has %d entries; wire names 14", len(want))
+	if len(want) != 15 {
+		t.Fatalf("the reason table has %d entries; wire names 15", len(want))
 	}
 	// And the outcome is named rather than reported as a number.
 	if got := outcomeName(wire.OutcomeErrRejected); got != "ErrRejected" {

@@ -879,6 +879,31 @@ fn the_turns_read_finds_a_record_once_the_projection_has_committed_it() {
     assert_eq!(reads.read(applier, half).records.len(), 1);
 }
 
+/// task-d121 (#325): a key with no record is read by command id for a
+/// decided nothing's executed row, and only such a row is taken. An
+/// ordinary execution's row, looked up under a key that holds no record
+/// of it, settles nothing: its digest is not the nothing's.
+#[test]
+fn the_turns_read_takes_no_ordinary_execution_as_a_nothing() {
+    let mut w = Cluster::new(256);
+    w.run_to_half_held(1);
+    let applier = w.voters[0].node().applier();
+    let command = w.command(1);
+    assert_eq!(
+        RecordReads::default()
+            .read(applier, [(command, retry_key(1))])
+            .records
+            .len(),
+        1,
+        "executed here, with its record under its own key"
+    );
+    let read = RecordReads::default().read(applier, [(command, retry_key(9))]);
+    assert!(
+        read.records.is_empty() && read.conflicts.is_empty(),
+        "an ordinary execution was settled as a nothing: {read:?}"
+    );
+}
+
 /// What the turn's read remembers is bounded by what is still half held
 /// (Codex review of #168). Over a store that commits nothing, as a
 /// frontend-only node's, the completed frontier never moves, so without

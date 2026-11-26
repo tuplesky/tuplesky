@@ -627,3 +627,209 @@ fn only_a_traced_collector_keeps_its_trace() {
     assert!(taken.len() >= 3, "{taken:?}");
     assert!(traced.trace().is_empty());
 }
+
+/// task-d121 (#325): a voter's answer from a decided nothing settles the
+/// entry at once, from that one voter, marked or not. It is the one
+/// refusal that does: a voter gives it only from a decision. The caller
+/// gets the nothing's canonical refusal, what a release of it would have
+/// handed over, and the entry no longer waits on a record an executed
+/// nothing never writes under its key.
+#[test]
+fn a_decided_nothing_from_one_voter_ends_the_entry_with_the_canonical_refusal() {
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        let Progress::Released(release) = c
+            .on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing))
+            .unwrap()
+        else {
+            panic!("not settled");
+        };
+        assert_eq!(release.command, command);
+        assert!(!release.speculative && !release.fast);
+        match &release.response.outcome {
+            OutcomeV1::Ok {
+                revision: None,
+                result,
+            } => assert_eq!(
+                result.as_slice(),
+                coord_storage::retry::decided_nothing_response().as_slice()
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(c.half_established().is_empty());
+        assert!(c.trace().iter().any(|e| matches!(
+            e,
+            CollectorEvent::SettledFromRecord { corroborated, .. } if corroborated == "decided-nothing"
+        )));
+        // Another voter's answer finds the command answered.
+        assert!(matches!(
+            c.on_evidence(from(0), refused(command, SubmissionRefusal::DecidedNothing)),
+            Ok(Progress::Settled)
+        ));
+    }
+}
+
+/// The answer one voter's `DecidedNothing` settles is kept for the
+/// caller (Astra on #328): a caller whose reply was lost resolves the
+/// same invocation, or sends it again, and gets the canonical refusal,
+/// not `Unknown` or new work. The leader's late release of the nothing
+/// agrees with it whatever position it names, since the refusal names
+/// none; a late release of anything else does not.
+#[test]
+fn a_decided_nothing_from_one_voter_is_kept_for_resolution() {
+    use coord_collector::Resolution;
+    use coord_types::wire_v1::ResolveRequestV1;
+    let nothing = coord_storage::retry::decided_nothing_response();
+    let digest = coord_storage::retry::decided_nothing_digest();
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let (command, request) = admitted(1);
+        assert!(matches!(
+            c.submit(MonotonicMillis::ZERO, &request),
+            Ok(Submitted::FanOut(_))
+        ));
+        let Progress::Released(answer) = c
+            .on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing))
+            .unwrap()
+        else {
+            panic!("not settled");
+        };
+        let resolve = ResolveRequestV1 {
+            retry_key: answer.retry_key,
+            command_id: command,
+        };
+        match c.resolve(&resolve) {
+            Resolution::Outcome(response) => assert_eq!(response, answer.response),
+            other => panic!("marked {marked}: {other:?}"),
+        }
+        match c.submit(MonotonicMillis::ZERO, &request) {
+            Ok(Submitted::Resolved(response)) => assert_eq!(response, answer.response),
+            other => panic!("marked {marked}: {other:?}"),
+        }
+        assert!(matches!(
+            release(&mut c, command, digest, nothing.clone()),
+            Ok(Progress::Settled)
+        ));
+        assert!(matches!(
+            release(&mut c, command, Digest32([9; 32]), vec![0xaa]),
+            Err(EvidenceError::AnsweredOtherwise(_))
+        ));
+    }
+}
+
+/// The leader releases `command` at position one with `digest` and
+/// `response`, final.
+fn release(
+    c: &mut Collector,
+    command: CommandId,
+    digest: Digest32,
+    response: Vec<u8>,
+) -> Result<Progress, EvidenceError> {
+    use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: epoch(),
+            ballot: ballot(0, 0),
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: digest,
+            revision: None,
+            fast_path: false,
+        })
+        .unwrap(),
+        response,
+        false,
+    );
+    c.on_release(from(0), released)
+}
+
+/// task-d121 (#325): a submission voters held while its command was a
+/// nothing below COMMIT is answered by the release. No voter voted for
+/// it, and a marked entry's release names the marker, not the admission
+/// it was submitted under, so neither release rule held it answerable:
+/// it waited for the caller to retry into a voter's `DecidedNothing`. The
+/// leader's final release of the canonical refusal now settles it, marked
+/// or not. A release of anything else, without votes, still waits.
+#[test]
+fn a_decided_nothings_release_answers_an_entry_no_voter_voted_for() {
+    let nothing = coord_storage::retry::decided_nothing_response();
+    let digest = coord_storage::retry::decided_nothing_digest();
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        let Progress::Released(answer) = release(&mut c, command, digest, nothing.clone()).unwrap()
+        else {
+            panic!("not settled, marked {marked}");
+        };
+        assert_eq!(answer.command, command);
+        assert!(!answer.speculative);
+        match &answer.response.outcome {
+            OutcomeV1::Ok {
+                revision: None,
+                result,
+            } => assert_eq!(result.as_slice(), nothing.as_slice()),
+            other => panic!("{other:?}"),
+        }
+
+        // The control: another execution's release, with no votes.
+        let other = submit(&mut c, 2);
+        let held = release(&mut c, other, Digest32([9; 32]), vec![0xaa]).unwrap();
+        assert!(
+            matches!(held, Progress::Held(_)),
+            "marked {marked}: {held:?}"
+        );
+        // Each half of the clause alone (#328 review): the canonical
+        // digest with other bytes, and other digest with the canonical
+        // bytes, are held as any release without votes.
+        let half = submit(&mut c, 3);
+        let held = release(&mut c, half, digest, vec![0xaa]).unwrap();
+        assert!(
+            matches!(held, Progress::Held(_)),
+            "marked {marked}: {held:?}"
+        );
+        let half = submit(&mut c, 4);
+        let held = release(&mut c, half, Digest32([9; 32]), nothing.clone()).unwrap();
+        assert!(
+            matches!(held, Progress::Held(_)),
+            "marked {marked}: {held:?}"
+        );
+    }
+}
+
+/// A voter's `DecidedNothing` against a final release of other facts the
+/// entry holds is a divergence, not an answer (#328 review): refused as a
+/// release mismatch, and the entry stays pending. The control: a held
+/// release of the nothing itself, which settles.
+#[test]
+fn a_decided_nothing_against_a_held_release_of_facts_is_refused() {
+    use coord_collector::Resolution;
+    use coord_types::wire_v1::ResolveRequestV1;
+    let (command, request) = admitted(1);
+    let mut c = collector(4);
+    assert!(matches!(
+        c.submit(MonotonicMillis::ZERO, &request),
+        Ok(Submitted::FanOut(_))
+    ));
+    let held = release(&mut c, command, Digest32([9; 32]), vec![0xaa]).unwrap();
+    assert!(matches!(held, Progress::Held(_)), "{held:?}");
+    assert_eq!(
+        c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)),
+        Err(EvidenceError::ReleaseMismatch)
+    );
+    let resolve = ResolveRequestV1 {
+        retry_key: RetryKey {
+            cluster_id: CLUSTER,
+            domain_id: DOMAIN,
+            session_id: SESSION,
+            client_instance_id: CLIENT,
+            request_sequence: RequestSequence::new(1).unwrap(),
+        },
+        command_id: command,
+    };
+    assert!(matches!(c.resolve(&resolve), Resolution::Pending));
+}

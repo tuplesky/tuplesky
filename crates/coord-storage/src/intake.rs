@@ -57,7 +57,10 @@
 //! * rule (a): a payload put for a command the executed part holds writes
 //!   nothing, since its payload has moved;
 //! * rule (b): an executed row with no pending payload to move is refused,
-//!   so `payload_v1` has no hole at a position.
+//!   so `payload_v1` has no hole at a position, except at a command
+//!   decided as nothing (task-d121), whose record holds the marker and
+//!   which has no payload by decision. A payload put under such a record
+//!   is refused.
 //!
 //! **The bound** (the lead on #237, #240's proposal): the same transaction
 //! deletes the command's dependency rows, and the leader's proposal rows,
@@ -73,7 +76,7 @@ use std::collections::BTreeSet;
 use std::ops::Bound;
 
 use coord_consensus::digest::DigestMap;
-use coord_consensus::rows::{DEPENDENCY_TAG, PROPOSAL_TAG};
+use coord_consensus::rows::{DEPENDENCY_TAG, PROPOSAL_TAG, decode_dependency};
 use coord_core::effect::{CollectionId, StoreUpdate};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::{Collection, meta_fields};
@@ -874,6 +877,27 @@ impl<'a> Assigner<'a> {
         Ok(value.map(|value| (order, value)))
     }
 
+    /// Whether `command`'s latest dependency row here holds the nothing
+    /// marker (task-d121), read at the state the record's earlier updates
+    /// have left. The latest epoch's row is the record, as at the bound.
+    fn holds_nothing(
+        &self,
+        command: &CommandId,
+        read: &mut impl FnMut(CollectionId, &[u8]) -> Result<Option<Vec<u8>>, EngineError>,
+    ) -> Result<bool, EngineError> {
+        let protocol = Collection::ProtocolV1.id();
+        for row in self.rows(command).iter().rev() {
+            if row.tag != DEPENDENCY_TAG {
+                continue;
+            }
+            let key = intake_key(row.epoch_bytes(), row.tag, row.order(), command);
+            if let Some(value) = read(protocol, &key)? {
+                return Ok(decode_dependency(&value)?.is_nothing());
+            }
+        }
+        Ok(false)
+    }
+
     /// At `command`'s execution at `position` (the bound): delete its
     /// dependency and proposal rows, and write the latest epoch's
     /// dependency row to `decided_v1` under the position. Its pending
@@ -1061,6 +1085,18 @@ impl<'a> Assigner<'a> {
             // never takes an executed command's payload.
             return Ok(Assigned::Skip);
         }
+        // A payload is never put under a decided nothing (task-d121): its
+        // record has no payload, and one written here would be served,
+        // fetched and moved as if consensus had decided its facts. The
+        // machine asserts the same; a store refuses it whatever wrote it.
+        // A rebind over a nothing writes its dependency row under the
+        // facts before the payload, in the same record.
+        if update.value.is_some() && self.holds_nothing(&command, read)? {
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                "a payload row put for a command whose record is a decided nothing (task-d121)",
+            ));
+        }
         // Only the key is needed: a rewrite or a delete takes the row's
         // key from the index.
         let found = self.row_of(epoch, tag, &command);
@@ -1138,6 +1174,11 @@ impl<'a> Assigner<'a> {
         };
         let executed = decode_executed(value)?;
         let position = executed.position;
+        // A decided nothing's execution (task-d121): the canonical
+        // refusal's digest, which no other execution produces, and no
+        // revision, as the donor requires (#328 review).
+        let nothing = executed.result_digest == crate::retry::decided_nothing_digest()
+            && executed.revision.is_none();
         let key = position_key(position).to_vec();
         let row = StoreUpdate {
             collection: execution,
@@ -1149,6 +1190,16 @@ impl<'a> Assigner<'a> {
             return Ok(Assigned::Writes(vec![row]));
         }
         let Some((order, payload)) = self.pending_of(&command, read)? else {
+            if nothing && self.holds_nothing(&command, read)? {
+                // A decided nothing (task-d121) executes with no payload:
+                // `payload_v1` has no row at its position, by decision. Its
+                // execution carries the canonical digest, or it is no
+                // nothing's (#328 review).
+                self.delta.execute((prefix(&command), position.get()));
+                let mut writes = vec![row];
+                writes.extend(self.move_decided(&command, position, read)?);
+                return Ok(Assigned::Writes(writes));
+            }
             return Err(EngineError::new(
                 ErrorClass::Corrupt,
                 format!(
@@ -1158,6 +1209,19 @@ impl<'a> Assigner<'a> {
                 ),
             ));
         };
+        if nothing {
+            // A nothing's execution beside a pending payload: the payload
+            // is no decision's, since every batch writing a nothing's row
+            // deletes it (#328 review).
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                format!(
+                    "a decided nothing executed at position {} beside a pending payload \
+                     (task-d121)",
+                    position.get()
+                ),
+            ));
+        }
         self.delta.execute((prefix(&command), position.get()));
         let mut writes = vec![
             row,
@@ -1335,6 +1399,23 @@ mod tests {
         }
     }
 
+    /// The executed row of a decided nothing at `position`: the canonical
+    /// refusal's digest.
+    fn executed_nothing(command: &CommandId, position: u64) -> StoreUpdate {
+        StoreUpdate {
+            collection: Collection::ExecutedV1.id(),
+            key: crate::codecs::executed_key(command),
+            value: Some(
+                crate::codecs::encode_executed(&crate::codecs::ExecutedRecordV1 {
+                    position: ExecutionPosition::new(position).unwrap(),
+                    revision: None,
+                    result_digest: crate::retry::decided_nothing_digest(),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
     fn executed(command: &CommandId, position: u64) -> StoreUpdate {
         StoreUpdate {
             collection: Collection::ExecutedV1.id(),
@@ -1440,6 +1521,114 @@ mod tests {
         rows.assign(&mut assigner, 1, 1, executed(&cmd(2), 5))
             .unwrap();
         assert_eq!(rows.of(Collection::ExecutionV1), 1);
+    }
+
+    /// A dependency row of `command` in `epoch` holding `admission`, as the
+    /// machine writes it.
+    fn record_row(epoch: u64, command: &CommandId, admission: Digest32) -> StoreUpdate {
+        let record = coord_consensus::CommandRecord {
+            phase: coord_consensus::Phase::Commit,
+            deps: Vec::new(),
+            keys: Vec::new(),
+            payload: Some(admission),
+            paths: Vec::new(),
+            synced_seq: None,
+            path: Digest32([0; 32]),
+        };
+        coord_consensus::rows::dependency_update(
+            coord_types::ids::ConfigurationEpoch::new(epoch).unwrap(),
+            command,
+            &record,
+        )
+        .unwrap()
+    }
+
+    /// Rule (b) takes the marker (task-d121): a command whose record is a
+    /// decided nothing executes with no pending payload, its record moving
+    /// to `decided_v1` and no payload row written at its position. The
+    /// negative control is the refusal above: under facts, the same
+    /// execution is refused.
+    #[test]
+    fn a_decided_nothing_executes_with_no_payload() {
+        use coord_consensus::commands::NOTHING_ADMISSION;
+        let base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let mut assigner = Assigner::new(&base);
+        let c = cmd(8);
+        rows.assign(&mut assigner, 1, 0, record_row(1, &c, NOTHING_ADMISSION))
+            .unwrap();
+        // Not with another execution's digest (#328 review): only the
+        // canonical refusal's is a nothing's.
+        let err = rows
+            .assign(&mut assigner, 2, 0, executed(&c, 3))
+            .unwrap_err();
+        assert!(err.diagnostic.contains("rule (b)"), "{}", err.diagnostic);
+        rows.assign(&mut assigner, 2, 1, executed_nothing(&c, 3))
+            .unwrap();
+        let at = position_key(ExecutionPosition::new(3).unwrap());
+        assert_eq!(rows.of(Collection::ExecutionV1), 1);
+        assert_eq!(
+            rows.of(Collection::PayloadV1),
+            0,
+            "no payload at its position"
+        );
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 0);
+        assert_eq!(rows.of(Collection::ProtocolV1), 0, "its record moved");
+        assert!(rows.get(Collection::DecidedV1.id(), &at).is_some());
+
+        // Under facts, the same execution is refused.
+        let d = cmd(9);
+        rows.assign(&mut assigner, 3, 0, record_row(1, &d, Digest32([7; 32])))
+            .unwrap();
+        let err = rows
+            .assign(&mut assigner, 4, 0, executed_nothing(&d, 4))
+            .unwrap_err();
+        assert!(err.diagnostic.contains("rule (b)"), "{}", err.diagnostic);
+
+        // A nothing's execution beside a pending payload is refused
+        // (#328 review): the payload is no decision's.
+        let e = cmd(11);
+        rows.assign(&mut assigner, 5, 0, payload(&e, Some(1)))
+            .unwrap();
+        let err = rows
+            .assign(&mut assigner, 6, 0, executed_nothing(&e, 5))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Corrupt);
+        assert!(
+            err.diagnostic.contains("beside a pending payload"),
+            "{}",
+            err.diagnostic
+        );
+    }
+
+    /// No payload is put under a decided nothing (task-d121, #312's
+    /// condition): the store refuses it whatever wrote it. A rebind over
+    /// the nothing writes the record under its facts first, and its payload
+    /// is then taken; a delete is always taken.
+    #[test]
+    fn a_payload_under_a_decided_nothing_is_refused() {
+        use coord_consensus::commands::NOTHING_ADMISSION;
+        let base = IntakeIndex::default();
+        let mut rows = Rows::default();
+        let mut assigner = Assigner::new(&base);
+        let c = cmd(10);
+        rows.assign(&mut assigner, 1, 0, record_row(1, &c, NOTHING_ADMISSION))
+            .unwrap();
+        let err = rows
+            .assign(&mut assigner, 2, 0, payload(&c, Some(1)))
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Corrupt);
+        assert!(err.diagnostic.contains("task-d121"), "{}", err.diagnostic);
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 0);
+        rows.assign(&mut assigner, 2, 1, payload(&c, None)).unwrap();
+
+        // The record rewritten under facts, as a rebind writes it before
+        // its payload: the payload is taken.
+        rows.assign(&mut assigner, 3, 0, record_row(1, &c, Digest32([7; 32])))
+            .unwrap();
+        rows.assign(&mut assigner, 3, 1, payload(&c, Some(1)))
+            .unwrap();
+        assert_eq!(rows.of(Collection::PendingPayloadV1), 1);
     }
 
     /// A payload delete takes a pending row, and nothing of an executed

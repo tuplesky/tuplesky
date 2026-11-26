@@ -7208,7 +7208,9 @@ fn answer_policy<P: Persistence>(
 /// never saw the request, was `Unknown` while this node held the executed
 /// record. A resolve names no request, and a result is gated against the
 /// request it answers; this node's payload row says what the request was
-/// while it keeps one. Without it, only a retirement is answered here.
+/// while it keeps one. Without it, only a retirement is answered here,
+/// or an executed nothing's canonical refusal, which reads no state
+/// (task-d121).
 fn retained_answer<P: Persistence>(
     frontend: &mut BoundFrontend,
     store: &P,
@@ -7236,7 +7238,7 @@ fn retained_answer<P: Persistence>(
     if !binding.active(health) || binding.session != key.session_id {
         return None;
     }
-    let (logical, resolved, executed, below_floor) = {
+    let (logical, resolved, executed, below_floor, nothing) = {
         let gated = store.reader().snapshot().ok()?;
         let view = gated.view();
         let logical = logical.or_else(|| requested(view, key, command));
@@ -7248,6 +7250,9 @@ fn retained_answer<P: Persistence>(
             // for a session that may no longer execute.
             None => match resolve_retained_unread(view, key, command).ok()?? {
                 known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
+                // An executed nothing keeps no payload row: a resolve its
+                // record leaves pending is looked up by command id below.
+                Resolution::Pending if resolving => Resolution::Pending,
                 _ => return None,
             },
         };
@@ -7269,7 +7274,15 @@ fn retained_answer<P: Persistence>(
             && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
                 .ok()
                 .is_some_and(|floor| key.request_sequence <= floor.floor);
-        (logical, resolved, executed, below_floor)
+        // An executed nothing (task-d121) writes no record under its key
+        // and keeps no payload row, so its record reads as pending. Found
+        // by command id, its canonical refusal answers a resolve (Astra
+        // on #328). The session's checks have run: `Pending` is a live
+        // session's, above its floor.
+        let nothing = resolving
+            && matches!(resolved, Resolution::Pending)
+            && coord_daemon::settle::nothing_record(&gated, &command).is_some();
+        (logical, resolved, executed, below_floor, nothing)
     };
     // A stale voter's store may not hold what the domain's policy says
     // now (#320): a result it reads as unauthorized may be permitted, and
@@ -7288,6 +7301,22 @@ fn retained_answer<P: Persistence>(
         return MessageV1::Response(coord_collector::codes::pending_response(command))
             .encode()
             .ok();
+    }
+    // The canonical refusal reads no state, so it is not gated: the
+    // collector answers a resolve with it ungated as well.
+    if nothing {
+        return MessageV1::Response(coord_types::wire_v1::ResponseV1 {
+            command_id: command,
+            outcome: coord_types::wire_v1::OutcomeV1::Ok {
+                revision: None,
+                result: coord_types::wire_v1::BoundedBytes::new(
+                    coord_storage::retry::decided_nothing_response(),
+                )
+                .ok()?,
+            },
+        })
+        .encode()
+        .ok();
     }
     let record = match resolved {
         Resolution::Result(record) => record,
@@ -8200,6 +8229,61 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
         write(&mut store, executed(key3, command3, false));
         assert_eq!(
             answer(&mut frontend, &store, &resolve_frame(key3, command3)),
+            None
+        );
+        // An executed nothing (task-d121) writes no record under its key
+        // and has no payload row to gate against. Found by command id, its
+        // canonical refusal is the answer to a resolve: it reads no state,
+        // and the same bytes are every voter's (Astra on #328). A request
+        // of the invocation goes on to admission, where the voters' gate
+        // answers it.
+        let (key7, command7) = invocation(7);
+        write(
+            &mut store,
+            vec![
+                coord_consensus::rows::dependency_update(
+                    coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+                    &command7,
+                    &coord_consensus::CommandRecord {
+                        phase: coord_consensus::Phase::Commit,
+                        deps: Vec::new(),
+                        keys: Vec::new(),
+                        payload: Some(coord_consensus::commands::NOTHING_ADMISSION),
+                        paths: Vec::new(),
+                        synced_seq: None,
+                        path: coord_types::identity::Digest32([0; 32]),
+                    },
+                )
+                .unwrap(),
+            ],
+        );
+        write(
+            &mut store,
+            vec![
+                coord_storage::retry::executed_update(
+                    &command7,
+                    coord_types::ids::ExecutionPosition::new(7).unwrap(),
+                    None,
+                    coord_storage::retry::decided_nothing_digest(),
+                )
+                .unwrap(),
+            ],
+        );
+        match answer(&mut frontend, &store, &resolve_frame(key7, command7)) {
+            Some(OutcomeV1::Ok {
+                revision: None,
+                result,
+            }) => assert_eq!(
+                result.as_slice(),
+                coord_storage::retry::decided_nothing_response().as_slice()
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(answer(&mut frontend, &store, &request_frame(key7)), None);
+        // Another command's resolve under that key is not this nothing's.
+        let (_, command8) = invocation(8);
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key7, command8)),
             None
         );
         // Past the retirement floor: retired, not unknown.

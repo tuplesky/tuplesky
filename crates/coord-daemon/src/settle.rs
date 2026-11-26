@@ -183,14 +183,44 @@ impl RecordReads {
                     out.records.push((command, record));
                 }
                 Ok(Some(record)) => out.conflicts.push((command, record.command_id)),
-                Ok(None) => {
-                    self.absent.insert(command);
-                }
+                Ok(None) => match nothing_record(&gated, &command) {
+                    Some(record) => out.records.push((command, record)),
+                    None => {
+                        self.absent.insert(command);
+                    }
+                },
                 Err(_) => {}
             }
         }
         out
     }
+}
+
+/// The record of `command` executed here as a decided nothing (task-d121,
+/// #325), found by command id through the index's executed part, for a
+/// key with no retry record: an executed nothing writes none under its
+/// key, so a caller held at ACCEPT whose release was lost would wait
+/// after the outcome was final.
+///
+/// The executed row proves it by its result digest, the canonical
+/// response's ([`coord_storage::retry::decided_nothing_digest`]), which
+/// no other execution produces: an ordinary refusal's covers the
+/// revision it ran at. A row with any other digest settles nothing. The
+/// record handed on holds the canonical response, at the row's position.
+///
+/// `coordd` answers a resolve its record leaves pending from it too.
+pub fn nothing_record<V: coord_store_api::OrderedRead>(
+    gated: &coord_storage::GatedView<V>,
+    command: &CommandId,
+) -> Option<RetryRecordV1> {
+    let row = coord_storage::protocol::executed_record(gated, command).ok()??;
+    (row.result_digest == coord_storage::retry::decided_nothing_digest()).then(|| RetryRecordV1 {
+        command_id: *command,
+        position: row.position,
+        revision: row.revision,
+        response: coord_storage::retry::decided_nothing_response(),
+        result_digest: row.result_digest,
+    })
 }
 
 /// What one turn of settling from records sends, or the command that

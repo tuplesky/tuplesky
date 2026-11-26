@@ -2252,3 +2252,264 @@ fn a_retried_page_waits_once_behind_its_store_row() {
     assert_eq!(counts.recorded, 1);
     assert_eq!(counts.duplicates, 2);
 }
+
+/// A committed nothing executes at a voter as its canonical refusal
+/// (task-d121, C2b): the runtime waits for no payload, the command takes
+/// the next position, and its executed row holds the one digest a decided
+/// nothing's row holds, with no payload row at its position. Here the
+/// nothing reaches the follower as a Sync entry at COMMIT.
+#[test]
+fn a_committed_nothing_executes_as_its_canonical_refusal() {
+    use coord_store_api::engine::OrderedRead as _;
+    use coord_store_api::registry::Collection;
+    let mut voter = stamped(2);
+    let before = voter.node().machine().executed_through();
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    new_leader(&mut voter, 1, candidate);
+    let nothing = coord_types::CommandId(Digest32([0x4e; 32]));
+    let decision = coord_consensus::SyncDecision {
+        ballot: candidate,
+        source_ballot: ballot(),
+        entries: [(
+            nothing,
+            coord_consensus::SyncEntry {
+                command: nothing,
+                phase: coord_consensus::Phase::Commit,
+                deps: Vec::new(),
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: Some(coord_consensus::commands::NOTHING_ADMISSION),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        reproposed: BTreeSet::new(),
+        counted: Default::default(),
+        nothing: Default::default(),
+    };
+    install(
+        &mut voter,
+        vec![coord_consensus::ProtocolMessage::Sync(decision).encode()],
+    );
+    let after = voter.node().machine().executed_through();
+    assert_eq!(
+        after.get(),
+        before.get() + 1,
+        "the nothing took one position"
+    );
+    let gated = voter
+        .node()
+        .applier()
+        .store()
+        .inner
+        .reader()
+        .snapshot()
+        .unwrap();
+    let at = coord_storage::codecs::position_key(after);
+    let bytes = gated
+        .view()
+        .get(Collection::ExecutionV1.id(), &at)
+        .unwrap()
+        .expect("executed");
+    let execution = coord_storage::codecs::decode_execution(&bytes).unwrap();
+    assert_eq!(execution.command, nothing);
+    assert_eq!(execution.executed.revision, None);
+    assert_eq!(
+        execution.executed.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    assert!(
+        gated
+            .view()
+            .get(Collection::PayloadV1.id(), &at)
+            .unwrap()
+            .is_none()
+    );
+    // Its collector settles it from this row by command id (#325): an
+    // executed nothing writes no record under its key.
+    let key = |sequence: u64| RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([3; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(sequence).unwrap(),
+    };
+    let mut reads = coord_daemon::settle::RecordReads::default();
+    let read = reads.read(voter.node().applier(), [(nothing, key(900))]);
+    assert!(read.conflicts.is_empty());
+    let [(settled, record)] = read.records.as_slice() else {
+        panic!("{:?}", read.records);
+    };
+    assert_eq!(*settled, nothing);
+    assert_eq!(record.command_id, nothing);
+    assert_eq!(record.position, after);
+    assert_eq!(record.revision, None);
+    assert_eq!(
+        record.response,
+        coord_storage::retry::decided_nothing_response()
+    );
+    assert_eq!(
+        record.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    // The executed-row read the retired-command tripwire and a campaign's
+    // execution check go through finds the nothing's decided record. In
+    // C2a it found none, the donor serving no command without a payload
+    // row, so the tripwire passed it and a campaign saw an execution
+    // without its row (#327 review).
+    let rows =
+        coord_daemon::catch_up::executed_rows(voter.node().applier(), epoch(), vec![nothing]);
+    let [(read, Some(decided))] = rows.as_slice() else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(*read, nothing);
+    assert!(decided.is_nothing());
+}
+
+/// A committed nothing is owed a flush (Astra on #328): a voter lowering
+/// in groups is flushed by the runtime only while
+/// [`Voter::owes_flush`] says so, and a decided nothing whose turn has
+/// come is something to apply though no payload is held for it. Driven
+/// here as the runtime drives it, with no flush it does not owe.
+#[test]
+fn a_committed_nothing_is_owed_the_flush_that_executes_it() {
+    let mut voter = stamped(2);
+    voter.node_mut().lower_in_groups();
+    let before = voter.node().machine().executed_through();
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    new_leader(&mut voter, 1, candidate);
+    let nothing = coord_types::CommandId(Digest32([0x4e; 32]));
+    let decision = coord_consensus::SyncDecision {
+        ballot: candidate,
+        source_ballot: ballot(),
+        entries: [(
+            nothing,
+            coord_consensus::SyncEntry {
+                command: nothing,
+                phase: coord_consensus::Phase::Commit,
+                deps: Vec::new(),
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: Some(coord_consensus::commands::NOTHING_ADMISSION),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        reproposed: BTreeSet::new(),
+        counted: Default::default(),
+        nothing: Default::default(),
+    };
+    voter
+        .on_peer(
+            PeerProvenance::from_local_voter(r(1), inc()),
+            coord_consensus::ProtocolMessage::Sync(decision).encode(),
+        )
+        .expect("stepped");
+    let mut turns = 0;
+    while voter.owes_flush() {
+        turns += 1;
+        assert!(turns <= 16, "a flush owed for ever");
+        voter.flush().expect("flushed");
+        voter.finish().expect("finished");
+    }
+    assert_eq!(
+        voter.node().machine().next_executable(),
+        None,
+        "nothing left to apply once no flush is owed"
+    );
+    assert_eq!(
+        voter.node().machine().executed_through().get(),
+        before.get() + 1,
+        "the nothing took one position"
+    );
+}
+
+/// A Sync whose row becomes durable in the flush that also installs a
+/// higher Sync, cached ahead of its `NewLeader`, is never the selection
+/// this voter is synchronized to when it learns, and the stores it
+/// counted are learned all the same (Astra's five-voter case on #326,
+/// again on #327).
+#[test]
+fn a_sync_superseded_in_its_own_flush_still_teaches_the_counted_stores() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let higher = Ballot {
+        epoch: campaigned.epoch,
+        number: campaigned.number + 1,
+        leader: r(0),
+    };
+    // The next leader's Sync, counting its own store.
+    let later: Vec<Vec<u8>> = syncs
+        .iter()
+        .filter_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
+            Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                decision.ballot = higher;
+                decision.counted = std::collections::BTreeMap::from([(
+                    r(0),
+                    coord_consensus::recovery::CountedStore {
+                        incarnation: inc(),
+                        store: coord_types::ids::StoreInstanceId(r(0).0),
+                    },
+                )]);
+                Some(coord_consensus::ProtocolMessage::Sync(decision).encode())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!later.is_empty());
+    peer.node_mut().applier_mut().store_mut().hold = true;
+    for frame in syncs {
+        peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    for frame in later {
+        peer.on_peer(PeerProvenance::from_local_voter(r(0), inc()), frame)
+            .expect("stepped");
+    }
+    new_leader(&mut peer, 0, higher);
+    let held = core::mem::take(&mut peer.node_mut().applier_mut().store_mut().held);
+    assert!(!held.is_empty(), "the first Sync's row is held");
+    peer.node_mut().applier_mut().store_mut().hold = false;
+    let at = peer.ballot();
+    for (seq, barrier) in held.into_iter().enumerate() {
+        peer.node_mut()
+            .on_storage(
+                coord_core::event::StorageEvent::JournalDurable {
+                    barrier_id: barrier,
+                    journal_seq: coord_types::ids::LocalJournalSeq::new(seq as u64 + 1000)
+                        .expect("a sequence"),
+                },
+                &at,
+            )
+            .expect("a storage fact");
+    }
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    assert!(
+        peer.node().machine().synchronized_at(&higher),
+        "the higher Sync is the selection"
+    );
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "the superseded Sync's store"
+    );
+    assert_eq!(
+        durable_row(&peer, r(0), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(0).0)),
+        "the installed Sync's store"
+    );
+}
