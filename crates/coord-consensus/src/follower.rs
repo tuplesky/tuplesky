@@ -3901,6 +3901,19 @@ impl Follower {
             self.missing_payloads_walked(),
             "the missing payloads read from the indexes"
         );
+        // No payload is asked for under a nothing (task-d121): one held as
+        // nothing is asked for only as facts a selection or a held
+        // proposal names over it.
+        debug_assert!(
+            out.iter().all(|c| {
+                !proposes_nothing(&self.held, c)
+                    && !carries_nothing(&self.sync_pending, c)
+                    && (!holds_nothing(&self.table, c)
+                        || self.awaits_selected_facts(c)
+                        || self.awaits_rebind(c))
+            }),
+            "a payload asked for under a nothing"
+        );
         out
     }
 
