@@ -1904,6 +1904,46 @@ fn a_voter_resuming_an_installed_sync_learns_the_stores_it_counted() {
     );
 }
 
+/// A voter that restarts after its Sync became durable and before the
+/// stores it counted did restores them before it admits a peer's frame
+/// (from Codex's review of C1): the first promise that comes from a
+/// wiped peer's new store is refused, not recorded in place of the store
+/// the Sync counted.
+#[test]
+fn a_resumed_voter_restores_the_counted_stores_before_a_promise() {
+    let mut peer = stamped(2);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    assert_eq!(durable_row(&peer, r(1), inc()), None, "nothing learned");
+    keep_peer_stores(&mut peer);
+    let wiped = coord_types::ids::StoreInstanceId([0xee; 16]);
+    let promise = coord_consensus::ProtocolMessage::Promise {
+        ballot: campaigned,
+        synced: campaigned,
+        replica: r(1),
+        store: wiped,
+    };
+    peer.on_peer(
+        PeerProvenance::from_local_voter(r(1), inc()),
+        promise.encode(),
+    )
+    .expect("stepped");
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused, 1, "the wiped store is refused");
+    assert_eq!(counts.recorded, 0);
+    assert_eq!(counts.learned, 1);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "the store the Sync counted"
+    );
+}
+
 /// A Sync that counted another store for a voter than the one this voter
 /// recorded is installed all the same, and the row is kept; the
 /// disagreement is logged and counted (task-d121, C1).

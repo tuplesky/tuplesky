@@ -476,13 +476,15 @@ impl<P: Persistence> Voter<P> {
         boot: BootId,
         incarnation: coord_types::ids::ReplicaIncarnation,
     ) -> Result<Outbound, DriveError> {
-        self.node.on_event(
+        let mut out = self.node.on_event(
             Event::Boot {
                 boot_id: boot,
                 incarnation,
             },
             &self.ballot,
-        )
+        )?;
+        out.absorb(self.learn_counted()?);
+        Ok(out)
     }
 
     /// An authenticated frame from a peer.
@@ -529,7 +531,10 @@ impl<P: Persistence> Voter<P> {
             Some(coord_consensus::ProtocolMessage::ReportPage(page)) => Some(page.store),
             _ => None,
         };
-        let mut out = Outbound::default();
+        // The stores the installed Sync counted are known before a frame
+        // is checked against them: a voter restarted before it learned
+        // them would otherwise record a wiped peer's new store first.
+        let mut out = self.learn_counted()?;
         if let Some(store) = store
             && let Some((check, persisted)) = self.node.check_peer_store(
                 provenance.from(),
@@ -558,9 +563,10 @@ impl<P: Persistence> Voter<P> {
 
     /// Learn the stores the Sync this voter installed counted, once it is
     /// synchronized at a ballot it has not learned them for (task-d121,
-    /// C1): it records each one it has no row for. Without its peer
-    /// stores kept, or before the row is readable, it tries again at the
-    /// next step.
+    /// C1): it records each one it has no row for. It runs at boot,
+    /// before any peer frame is checked, and after every step that can
+    /// complete an install. Without its peer stores kept, or before the
+    /// row is readable, it tries again at the next step.
     fn learn_counted(&mut self) -> Result<Outbound, DriveError> {
         let Some(synced) = self.node.machine().synchronized_ballot() else {
             return Ok(Outbound::default());
