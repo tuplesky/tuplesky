@@ -5080,6 +5080,28 @@ The order check can't tell whether `A` ran before `D`, so it drops `C`, and the 
 - **task-d121 waits for this.** Where task-d121 is on, a selection decides nothing only once this wait has passed, so a holder that is up but unread is read, not refused to its submitter. The wait covers task-d121's `HalfInitialized` and payload-wait cases too, not only `Behind`.
 - **Five voters (open measurement).** task-d119's traces are all three-voter runs, where a second give-up costs at most one more election. At five voters, each up voter that lacks the dependency can give up once before a holder's election leads: up to three more elections. Trace the five-voter give-ups when this task is built.
 
+**How it is built.**
+- **The wait.** `Follower::refuse_or_wait` takes the place of `refuse_campaign` at both of the selection's checks, at selection and before binding. On a `Behind` refusal, while some voter hasn't answered, `Campaign::wait_for_reports` drops the selection and its awaited payloads and records the dependency. The campaign is kept, so the runtime's paced asks (`request_report_pages`) go on: `Campaign::unpromised` and `Campaign::missing_pages` ask nothing only while a selection is held. A report that completes, a promise that arrives, or a payload, selects again from every report in hand (`try_select_decided`'s assembly count moves). Refused again, it waits again, timed from the first refusal.
+- **Its end.** The machine has no clock. `Follower::report_wait` names the ballot and dependency, and the runtime times the wait from when it first sees it. Once the bound passes it calls `Follower::end_report_wait`, which selects once more from the reports in hand; a refusal now gives the campaign up as before. `coordd`'s serving loop ends it at `election::PATIENCE` (1 s), checked on the page asks' interval (250 ms). The simulator ends it after `PATIENCE / TIMER_EVERY` timer passes. A campaign whose every voter has answered doesn't wait at all.
+- **A report whose promise was lost.** It isn't counted on its own: the candidate asks for the promise again (task-d82), which the wait makes possible, since nothing is asked once a selection is held. When the promise arrives, the report held since its pages came is counted. Counting a report without its promise would also need the promise's store and incarnation, which C1's counted stores take from the promise.
+- **task-d121's cases.** `Campaign::report_wait_passed` says the bound has passed. C5 starts the same wait at the `HalfInitialized` and payload-wait points, and decides a command as nothing only once it has passed.
+- **Switch and counts.** `Follower::set_report_wait(false)` gives up at once, as before; the simulator's `PROTOCOL_SIM_NO_REPORT_WAIT=1` sets it, for the count without the wait. `Follower::report_waits` counts the campaigns that waited, and the simulator's stats line carries it as `report waits`.
+- **Section 4.9** states the wait and why a selection may read more than a majority.
+
+**What the runs show.** Row 10, campaigns given up as `Behind` on a command no voter executed, without the wait and with it; no run failed in either:
+
+| Runs | Without | With (campaigns that waited) |
+| --- | --- | --- |
+| The sweep's eight settings, 1,000 seeds each, three voters | 22 | 0 (25) |
+| The same, five voters | 10 | 0 (8) |
+| task-d119's targeted schedule, 10,000 seeds, three voters | 68 | 2 (82) |
+| The same, five voters | 69 | 0 (80) |
+
+- **Five voters (the open measurement).** Without the wait, five voters give up about as often as three under the targeted schedule (69 against 68); with it, none did.
+- **The two left at three voters** are seeds 880 and 9857 of the targeted schedule. Neither reached task-d121's holders-gone mark, so at each give-up a holder was up or a voter led. Not traced yet.
+- **The unreported drops count rises with the wait** (the three-voter sweep 14 to 71, the targeted three-voter runs 19 to 31): each selection made again during a wait is counted, so one campaign can count more than once.
+- **The pinned seed 2135** (`a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leader`) was found before the wait and runs without it (`Knobs::no_report_wait`): with the wait, its campaign waits instead of giving up while every holder is down, and the run never reaches the moment it destroys the holder.
+
 **What a give-up costs while no holder comes back.** A voter that gave up as `Behind` doesn't campaign again this boot: `Follower::behind` is cleared only by a restart. It still votes for others.
 - **A holder down for a while:** the voters that gave up wait for it. A holder hasn't given up on that dependency, so once back it campaigns, its own report holds the dependency, and it leads.
 - **A holder gone for good, and every live voter that could campaign given up:** the domain depends on restarts.
