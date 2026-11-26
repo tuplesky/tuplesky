@@ -1796,6 +1796,65 @@ fn a_voter_that_installs_a_sync_learns_the_stores_it_counted() {
     assert_eq!(durable_row(&peer, r(2), inc()), None, "no row for itself");
 }
 
+/// A voter that lowers in groups, as `coordd` does, installs a Sync only
+/// once a later flush makes its batch durable. It still learns the stores
+/// the Sync counted, then (Codex on #326).
+#[test]
+fn a_voter_that_installs_a_sync_in_groups_learns_the_stores_it_counted() {
+    let mut peer = stamped(2);
+    peer.node_mut().lower_in_groups();
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    for frame in syncs {
+        peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
+            .expect("stepped");
+    }
+    assert!(
+        !peer.node().machine().synchronized_at(&campaigned),
+        "the install waits for a flush"
+    );
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.learned, 1, "learned once the install completed");
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+}
+
+/// A voter that installed a Sync and stopped before the counted stores'
+/// rows were written learns them from the durable Sync it resumes at boot
+/// (task-d121, C1; Codex on #326): here, a voter that kept no rows when
+/// it installed it.
+#[test]
+fn a_voter_resuming_an_installed_sync_learns_the_stores_it_counted() {
+    let mut peer = stamped(2);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let counted = syncs
+        .iter()
+        .find_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
+            Ok(coord_consensus::ProtocolMessage::Sync(d)) => Some(d.counted),
+            _ => None,
+        })
+        .expect("a Sync");
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    assert_eq!(durable_row(&peer, r(1), inc()), None, "nothing learned");
+    keep_peer_stores(&mut peer);
+    peer.resume_counted(campaigned, counted);
+    peer.flush().expect("flushed");
+    peer.finish().expect("finished");
+    assert_eq!(peer.node().peer_stores().expect("kept").counts.learned, 1);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+}
+
 /// A Sync that counted another store for a voter than the one this voter
 /// recorded is installed all the same, and the row is kept; the
 /// disagreement is logged and counted (task-d121, C1).

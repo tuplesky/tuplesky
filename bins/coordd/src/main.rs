@@ -1766,6 +1766,17 @@ fn voter(
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
+    // The stores the Sync this voter synchronized to counted are learned
+    // again: a stop between its install and their rows' batch would
+    // otherwise lose them (task-d121, C1). Rows it holds are kept.
+    if let Some((synced, decision)) = recovered
+        .syncs
+        .iter()
+        .rev()
+        .find(|(b, _)| voter.node().machine().synchronized_at(b))
+    {
+        voter.resume_counted(*synced, decision.counted.clone());
+    }
     // From here a round's batches wait for the loop's flush, and are
     // lowered with the events after it as one group (task-d47). The boot
     // record above was lowered on its own.

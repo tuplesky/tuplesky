@@ -156,7 +156,17 @@ pub struct Voter<P: Persistence> {
     /// Promises and reports waiting for their peer's store row to be
     /// durable (task-d121, C1), under its batch, in the order they came.
     held_peers: crate::peer_store::HeldFrames,
+    /// The stores a Sync counted (task-d121, C1), kept until this voter
+    /// has installed it: a voter lowering in groups installs it only once
+    /// a later flush makes its batch durable (Codex on #326).
+    counted: Option<(Ballot, CountedStores)>,
 }
+
+/// The stores a Sync's leader counted, by voter (task-d121, C1).
+type CountedStores = std::collections::BTreeMap<
+    coord_types::ids::ReplicaId,
+    coord_consensus::recovery::CountedStore,
+>;
 
 /// A marked command's release waiting to be published again (task-d100,
 /// step A).
@@ -211,6 +221,7 @@ impl<P: Persistence> Voter<P> {
             release_again_seen_at: None,
             release_again_lookups: 0,
             held_peers: crate::peer_store::HeldFrames::default(),
+            counted: None,
         }
     }
 
@@ -544,33 +555,54 @@ impl<P: Persistence> Voter<P> {
         }
         // A Sync names the stores its leader counted (task-d121, C1):
         // once this voter installed it, it records those it has no row for.
-        let counted = match &message {
-            Some(coord_consensus::ProtocolMessage::Sync(decision))
-                if !decision.counted.is_empty() && provenance.from() == decision.ballot.leader =>
-            {
-                Some((decision.ballot, decision.counted.clone()))
-            }
-            _ => None,
-        };
-        out.absorb(self.deliver_peer(provenance, frame, message)?);
-        if let Some((ballot, counted)) = counted
-            && self.node.machine().synchronized_at(&ballot)
+        if let Some(coord_consensus::ProtocolMessage::Sync(decision)) = &message
+            && !decision.counted.is_empty()
+            && provenance.from() == decision.ballot.leader
         {
-            out.absorb(
-                self.node
-                    .learn_peer_stores(ballot.leader, &counted, &self.ballot)?,
-            );
+            self.resume_counted(decision.ballot, decision.counted.clone());
         }
+        out.absorb(self.deliver_peer(provenance, frame, message)?);
         out.absorb(self.release_peers()?);
         Ok(out)
+    }
+
+    /// Learn the stores the Sync of `ballot` counted once this voter has
+    /// installed it (task-d121, C1). `coordd` calls this at boot with the
+    /// durable Sync of the ballot it synchronized to, so a restart between
+    /// the install and the rows' batch learns them again. Only the Sync
+    /// of the highest ballot is kept: one of a lower ballot is not
+    /// installed over it.
+    pub fn resume_counted(&mut self, ballot: Ballot, counted: CountedStores) {
+        if self.counted.as_ref().is_none_or(|(held, _)| {
+            held.compare_same_epoch(&ballot) != Some(core::cmp::Ordering::Greater)
+        }) {
+            self.counted = Some((ballot, counted));
+        }
+    }
+
+    /// The counted stores of a Sync this voter has now installed, learned
+    /// (task-d121, C1).
+    fn learn_counted(&mut self) -> Result<Outbound, DriveError> {
+        let Some((ballot, _)) = &self.counted else {
+            return Ok(Outbound::default());
+        };
+        if !self.node.machine().synchronized_at(ballot) {
+            return Ok(Outbound::default());
+        }
+        let Some((ballot, counted)) = self.counted.take() else {
+            return Ok(Outbound::default());
+        };
+        self.node
+            .learn_peer_stores(ballot.leader, &counted, &self.ballot)
     }
 
     /// Hand on the promises and reports held behind their peer's store
     /// row (task-d121, C1) once its batch is durable, in the order they
     /// came; drop those whose batch failed; the peer's next one is
-    /// recorded again.
+    /// recorded again. Every step that can complete a Sync's install ends
+    /// here, so the stores it counted are learned here too.
     fn release_peers(&mut self) -> Result<Outbound, DriveError> {
-        let mut out = Outbound::default();
+        let mut out = self.learn_counted()?;
         if self.held_peers.is_empty()
             && !self
                 .node
