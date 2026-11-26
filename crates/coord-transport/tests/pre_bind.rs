@@ -770,3 +770,43 @@ async fn a_bind_the_runtime_lets_go_of_unacknowledged_is_refused_and_its_place_f
         TransportEvent::Connected { .. }
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_not_written_whole_closes_the_connection() {
+    let f = fixture(&[PeerRole::Voter]);
+    let mut t = acceptor(&f, limits());
+    CountingGate::install(&t);
+
+    // The caller stops the bind's answer stream before the runtime
+    // acknowledges the bind. The acknowledgement is not written, and the
+    // connection, raised to its lane for it, is closed rather than left
+    // open at the lane's limits without one (#334 review).
+    let dialed = anonymous(&f, &t).await;
+    let mut recv = dialed.send(&bind_frame(GOOD)).await;
+    recv.stop(quinn::VarInt::from_u32(0)).unwrap();
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+    let responder = match next_negotiated(&mut t).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    // The stop reaches the acceptor before the answer is written.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        responder
+            .respond(encode_frame(KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION, b"ack").unwrap())
+            .await
+            .is_err(),
+        "the acknowledgement was written to a stopped stream"
+    );
+    assert_eq!(
+        dialed.closed(Duration::from_secs(3)).await,
+        (REJECTED, BIND_UNAVAILABLE.as_bytes().to_vec())
+    );
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Closed { .. }
+    ));
+}

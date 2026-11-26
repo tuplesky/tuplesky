@@ -2572,7 +2572,7 @@ At the leader a stall longer than the 5 s allowance makes every follower stale, 
 
 **The gate** (the lead's option (A) on #312).
 - **A cap and a deadline.** A connection whose TLS handshake shows no certificate takes a place under `Limits::max_unbound` (64) or is closed at once with code 2. One deadline, `Limits::bind_deadline` (5 s) from the handshake, covers its `Hello`, its bind stream and its bind; at it the connection is closed with code 3 and its place freed. The places are counted under `max_connections` as well, so certificate holders and bound callers always have the rest.
-- **The floor until the `BindAck`.** Its lane's limits are applied when the runtime's `BindAck` is written on the bind stream, not at `Hello`. Until then it has the floor every accepted connection starts at: four bidirectional streams and a 4 MiB connection window.
+- **The floor until the `BindAck`.** Its lane's limits are applied when the runtime's `BindAck` is written on the bind stream, not at `Hello`. Until then it has the floor every accepted connection starts at: four bidirectional streams and a 4 MiB connection window. An acknowledgement that is not written whole (its budget, the write or the finish fails, the deadline passes, or the caller stopped the stream) closes the connection with code 2 and "bind unavailable": the lane's limits are raised just before the write, so the caller's next stream finds them, and must not outlive an acknowledgement the caller never read.
 - **One stream, one small `Bind`, from its header.** Its first stream must carry exactly one frame whose header names `Bind`, at most `SESSION_BIND_MAX_FRAME` (8,208 bytes, length field included). Anything else is refused from the header, before any payload is read, and no receive budget is taken for it. A second stream before the `BindAck` closes the connection. So a connection costs at most one token check.
 - **The check, before the loop.** A bind from a node that does not take binds now closes with code 2 and "bind unavailable" before the token is read: the loop publishes, once a pass, a "fresh until" instant (`Transport::publish_fresh_until`), its allowance after the last freshness answer its store reached, or none where it has no voter. Otherwise the injected `BindGate` checks the token as the frontend does (`coord_session::check_bind`: decode, ES256 signature, issuer, audience, expiry) on the connection's task. A refusal closes with code 2 and "bind refused". A bind that passes is announced to the runtime with its connection, and the runtime decides it as before.
 - **A bind the runtime lets go of.** The runtime ends a passed bind with a `BindAck`, or with a close carrying its own reason. If it instead writes some other answer, or drops the stream, the connection would hold its place with no deadline left. So the transport closes it as "bind refused" once that answer is written, or after `bind_deadline` from when the stream is dropped, unless the runtime closed it first.
@@ -2595,10 +2595,13 @@ The fresh-until instant can only be early: the loop's own check may find the pro
 - An oversized first control frame closes the connection.
 - Bind frames pipelined on one unbound connection cost at most one check.
 - A bind the runtime answers without a `BindAck`, or lets go of, is closed as "bind refused" and its place freed.
+- An acknowledgement that is not written whole closes the connection as "bind unavailable".
 - `retained_answer` asks for the binding before it decodes. No test observes a decode, so this one is by reading, and the gate keeps an anonymous connection's frames from the loop altogether.
 - The certificate-presence tests, `coord-session`'s binding and Kine interop tests, and `coordd`'s bind tests stay green.
 
 **Left over.** In places, the cap times the deadline; in memory, an unbound connection's floor; in CPU, one TLS handshake and one token check an attempt. No QUIC Retry and no limit per address: QUIC Retry is a separate follow-up.
+- **A flood holds the places.** A flood can still hold the 64 places and turn other certificate-less clients away for as long as it keeps them. QUIC Retry is the follow-up.
+- **`TokenGate` copies the JWKS.** It verifies with a clone of the frontend's binding configuration (its keys, issuer and audience), taken when `serve` installs the gate. A PR that rotates keys must replace both copies.
 
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report

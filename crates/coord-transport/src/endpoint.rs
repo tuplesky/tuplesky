@@ -289,31 +289,52 @@ impl Responder {
         // next stream once it reads it, and that stream must find the
         // lane's limits.
         //
+        // An acknowledgement that is not written whole (its budget, the
+        // write or the finish fails, the deadline passes, or the caller
+        // stopped the stream) closes the connection: the caller never
+        // read it, and the lane's limits must not outlive it (#334 review).
+        //
         // Any other answer to a first bind leaves the connection unbound,
         // and it is closed once the answer is written (see [`BindHold`]).
-        let _unacknowledged = match self.binding.peer.take() {
+        let (acknowledged, _unacknowledged) = match self.binding.peer.take() {
             Some(peer) if frame.get(4..6) == Some(&KIND_SESSION_BIND_ACK.to_be_bytes()[..]) => {
                 peer.mark_bound();
-                None
+                (Some(peer), None)
             }
-            peer => Some(BindHold {
-                peer,
-                grace: self.binding.grace,
-            }),
+            peer => (
+                None,
+                Some(BindHold {
+                    peer,
+                    grace: self.binding.grace,
+                }),
+            ),
         };
         let bytes = frame.len();
-        let (dest, node) = self.admit(bytes).await?;
-        timeout(self.deadline, async {
-            self.send
-                .write_all(&frame)
-                .await
-                .map_err(|e| SendError::Stream(e.to_string()))?;
-            self.send
-                .finish()
-                .map_err(|e| SendError::Stream(e.to_string()))
-        })
-        .await
-        .map_err(|_| SendError::Timeout)??;
+        let written = async {
+            let held = self.admit(bytes).await?;
+            timeout(self.deadline, async {
+                self.send
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| SendError::Stream(e.to_string()))?;
+                self.send
+                    .finish()
+                    .map_err(|e| SendError::Stream(e.to_string()))
+            })
+            .await
+            .map_err(|_| SendError::Timeout)??;
+            Ok(held)
+        }
+        .await;
+        let (dest, node) = match written {
+            Ok(held) => held,
+            Err(e) => {
+                if let Some(peer) = acknowledged {
+                    peer.close_unacknowledged();
+                }
+                return Err(e);
+            }
+        };
         let stopped = self.send.stopped();
         tokio::spawn(async move {
             let _dest = dest;
@@ -619,6 +640,19 @@ impl Peer {
         lane::apply_to_connection(&self.conn, &unbound.lane);
         drop(unbound);
         self.bound.notify_one();
+    }
+
+    /// Close a connection whose `BindAck` was not written whole
+    /// (task-d122; #334 review). It was raised to its lane before the write,
+    /// so that the caller's next stream finds the lane's limits. The caller
+    /// never read the acknowledgement, so the connection must not stay open
+    /// at those limits. Its token passed, so the reason is the one a client
+    /// keeps its token under and binds again.
+    fn close_unacknowledged(&self) {
+        self.conn.close(
+            VarInt::from_u32(CloseCode::Rejected as u32),
+            BIND_UNAVAILABLE.as_bytes(),
+        );
     }
 
     /// Close a connection that has not bound, freeing its place at once
