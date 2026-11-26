@@ -1028,6 +1028,10 @@ pub struct Domain<P: Persistence> {
     /// When this voter's campaign last asked for the report pages it
     /// lacks (task-d28).
     pages_asked: Option<std::time::Instant>,
+    /// The ballot of this voter's campaign waiting for the reports it
+    /// hasn't read before giving up as `Behind`, and since when
+    /// (task-d120).
+    report_wait: Option<(coord_types::ids::Ballot, std::time::Instant)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -1996,6 +2000,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             features_started: false,
             resend_time: Default::default(),
             pages_asked: None,
+            report_wait: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             unreturned: coord_daemon::unreturned::Unreturned::new(
                 UNRETURNED_FRAMES,
@@ -3942,6 +3947,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // that have not arrived, paced like the re-send (task-d28).
         if voter.node().machine().campaigning() {
             let now = std::time::Instant::now();
+            // A campaign about to give up as `Behind` waits for the
+            // reports it hasn't read, asking again below, for the base
+            // election timeout before jitter and backoff (task-d120): it
+            // is then given up if a selection from every report in hand
+            // is still refused. Woken on the asks' interval.
+            match (voter.node().machine().report_wait(), self.report_wait) {
+                (Some((ballot, _)), Some((waiting, since))) if waiting == ballot => {
+                    if now.duration_since(since) >= crate::election::PATIENCE {
+                        self.report_wait = None;
+                        out.absorb(voter.end_report_wait()?);
+                    }
+                }
+                (Some((ballot, _)), _) => self.report_wait = Some((ballot, now)),
+                (None, _) => self.report_wait = None,
+            }
             if self
                 .pages_asked
                 .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
@@ -3951,6 +3971,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.pages_asked = None;
+            self.report_wait = None;
         }
         // A voter that holds work it does not execute, and has not moved
         // for a while, asks a peer for the commands it executed after
@@ -5074,12 +5095,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     fn on_frame_from_voter(&mut self, provenance: PeerProvenance, frame: &Frame) {
         let delivered = match frame.kind {
             KIND_EVIDENCE => decode_evidence(frame).ok().and_then(|message| {
-                self.frontend
+                match self
+                    .frontend
                     .frontend
                     .dispatcher_mut()
                     .on_evidence(provenance, message)
-                    .ok()
-                    .flatten()
+                {
+                    Ok(delivery) => delivery,
+                    // A voter's `DecidedNothing` against a final release
+                    // held or answered from (task-d121): the same stop as
+                    // the release arriving second (Astra on #328).
+                    Err(coord_collector::collector::EvidenceError::AnsweredOtherwise(mismatch)) => {
+                        self.answered_otherwise = Some(mismatch);
+                        None
+                    }
+                    Err(_) => None,
+                }
             }),
             KIND_RELEASE => decode_release(frame).ok().and_then(|released| {
                 match self
@@ -6032,6 +6063,13 @@ fn describe_divergence(
             "own execution",
             "the execution of that command a peer served this node to catch up from",
             "that peer",
+        ),
+        MismatchCheck::DecidedNothingAgainstRelease => (
+            "a voter's word that the command was decided as nothing, against the final release \
+             or record this node held or answered from",
+            "decided nothing",
+            "the final release or record of that command",
+            "the voter",
         ),
     };
     let why = if mismatch.differs.position {
@@ -7250,17 +7288,20 @@ fn retained_answer<P: Persistence>(
             // for a session that may no longer execute.
             None => match resolve_retained_unread(view, key, command).ok()?? {
                 known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
-                // An executed nothing keeps no payload row: a resolve its
-                // record leaves pending is looked up by command id below.
-                Resolution::Pending if resolving => Resolution::Pending,
+                // An executed nothing keeps no payload row, and writes no
+                // record under its key, which a later command may then
+                // take (Astra on #328): a resolve its record leaves
+                // pending, or names another command for, is looked up by
+                // command id.
+                other @ (Resolution::Pending | Resolution::Conflict { .. })
+                    if resolving
+                        && coord_daemon::settle::nothing_record(&gated, &command).is_some() =>
+                {
+                    other
+                }
                 _ => return None,
             },
         };
-        let executed = matches!(resolved, Resolution::NoSession)
-            && coord_storage::retry::lookup(view, &key)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.command_id == command);
         // A session that may no longer execute is answered `NoSession`
         // before its floor is read, and retirement deleted the rows it
         // covered. The floor row is still durable, and a sequence at or
@@ -7269,18 +7310,32 @@ fn retained_answer<P: Persistence>(
         // sequence at or below the floor never executes again (`admit`
         // answers it `TooOld`), and one that did executed with its row
         // deleted, so `NOT_ADMITTED` could name a command that ran.
+        // Read first: a decided nothing's execution row is kept by
+        // command id after its sequence is acknowledged, so a covered
+        // sequence is retired even when that row is still there (Astra
+        // on #330).
         let below_floor = matches!(resolved, Resolution::NoSession)
-            && !executed
             && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
                 .ok()
                 .is_some_and(|floor| key.request_sequence <= floor.floor);
+        // Executed here, above the floor, by its record under the key or,
+        // for a decided nothing, which writes none, by its command id
+        // (Astra on #328).
+        let executed = matches!(resolved, Resolution::NoSession)
+            && !below_floor
+            && (coord_storage::retry::lookup(view, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.command_id == command)
+                || coord_daemon::settle::nothing_record(&gated, &command).is_some());
         // An executed nothing (task-d121) writes no record under its key
-        // and keeps no payload row, so its record reads as pending. Found
-        // by command id, its canonical refusal answers a resolve (Astra
-        // on #328). The session's checks have run: `Pending` is a live
-        // session's, above its floor.
+        // and keeps no payload row, so its record reads as pending, or as
+        // another command's once a later one takes the key. Found by
+        // command id, its canonical refusal answers a resolve (Astra on
+        // #328). The session's checks have run: `Pending` and `Conflict`
+        // are a live session's, above its floor.
         let nothing = resolving
-            && matches!(resolved, Resolution::Pending)
+            && matches!(resolved, Resolution::Pending | Resolution::Conflict { .. })
             && coord_daemon::settle::nothing_record(&gated, &command).is_some();
         (logical, resolved, executed, below_floor, nothing)
     };
@@ -8286,6 +8341,20 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             answer(&mut frontend, &store, &resolve_frame(key7, command8)),
             None
         );
+        // A nothing writes no record under its key, so a later command
+        // may take it (Astra on #328): the nothing's resolve is still
+        // answered from its own execution.
+        write(&mut store, executed(key7, command8, false));
+        match answer(&mut frontend, &store, &resolve_frame(key7, command7)) {
+            Some(OutcomeV1::Ok {
+                revision: None,
+                result,
+            }) => assert_eq!(
+                result.as_slice(),
+                coord_storage::retry::decided_nothing_response().as_slice()
+            ),
+            other => panic!("{other:?}"),
+        }
         // Past the retirement floor: retired, not unknown.
         write(
             &mut store,
@@ -8331,6 +8400,95 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 &store,
                 &resolve_frame(key5, command5)
             )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // And an executed nothing, which writes no record under its key,
+        // found by its command id (Astra on #328): withheld, not "not
+        // admitted" and not left to the collector.
+        let (key9, command9) = invocation(9);
+        write(
+            &mut store,
+            vec![
+                coord_consensus::rows::dependency_update(
+                    coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+                    &command9,
+                    &coord_consensus::CommandRecord {
+                        phase: coord_consensus::Phase::Commit,
+                        deps: Vec::new(),
+                        keys: Vec::new(),
+                        payload: Some(coord_consensus::commands::NOTHING_ADMISSION),
+                        paths: Vec::new(),
+                        synced_seq: None,
+                        path: coord_types::identity::Digest32([0; 32]),
+                    },
+                )
+                .unwrap(),
+                coord_storage::retry::executed_update(
+                    &command9,
+                    coord_types::ids::ExecutionPosition::new(9).unwrap(),
+                    None,
+                    coord_storage::retry::decided_nothing_digest(),
+                )
+                .unwrap(),
+            ],
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key9))),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key9, command9)
+            )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A nothing executed at or below the floor keeps its execution
+        // row by command id after acknowledgement, but its sequence is
+        // retired: retired to a request and to a resolve, not withheld
+        // (Astra on #330). The nothing above the floor stays withheld.
+        let (key1, command1) = invocation(1);
+        write(
+            &mut store,
+            vec![
+                coord_consensus::rows::dependency_update(
+                    coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+                    &command1,
+                    &coord_consensus::CommandRecord {
+                        phase: coord_consensus::Phase::Commit,
+                        deps: Vec::new(),
+                        keys: Vec::new(),
+                        payload: Some(coord_consensus::commands::NOTHING_ADMISSION),
+                        paths: Vec::new(),
+                        synced_seq: None,
+                        path: coord_types::identity::Digest32([0; 32]),
+                    },
+                )
+                .unwrap(),
+                coord_storage::retry::executed_update(
+                    &command1,
+                    coord_types::ids::ExecutionPosition::new(1).unwrap(),
+                    None,
+                    coord_storage::retry::decided_nothing_digest(),
+                )
+                .unwrap(),
+            ],
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key1))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key1, command1)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key9))),
             Some(coord_collector::codes::OUTPUT_WITHHELD)
         );
         // A session that may no longer execute is refused before its
@@ -9311,6 +9469,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             wif_rules: vec![serde_json::json!({ "issuer": "test" })],
             admin: hex(&[0xa; 16]),
             protocol_version: 1,
+            features: Vec::new(),
         };
         coord_membership::membership::Membership::from_genesis(&manifest).expect("membership")
     }
@@ -9761,6 +9920,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
             MismatchCheck::HeldReleaseAgainstRecord,
             MismatchCheck::LateReleaseAgainstAnswer,
             MismatchCheck::CatchUpAgainstDonor,
+            MismatchCheck::DecidedNothingAgainstRelease,
         ] {
             let m = divergence::mismatch(check, |own| own.response_len += 1);
             let said = divergence::describe(&m);

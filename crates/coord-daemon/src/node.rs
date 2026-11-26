@@ -456,6 +456,24 @@ impl Machine {
         }
     }
 
+    /// The ballot of this replica's campaign while it waits for the
+    /// reports it hasn't read before giving up as `Behind`, and the
+    /// dependency it would give up on (task-d120).
+    pub fn report_wait(&self) -> Option<(Ballot, coord_types::CommandId)> {
+        match self {
+            Machine::Leader(_) => None,
+            Machine::Follower(m) => m.report_wait(),
+        }
+    }
+
+    /// The bound on that wait passed (task-d120).
+    pub fn end_report_wait(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.end_report_wait(),
+        }
+    }
+
     /// What this replica executed through.
     pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
         match self {
@@ -1028,6 +1046,10 @@ pub struct Node<P: Persistence> {
     /// payload rows and forgetting only what its journal holds, and an
     /// older build in the domain does neither.
     release_at_execution: bool,
+    /// Whether the domain has `DecidedNothing` active (task-d121): with
+    /// `release_at_execution`, it turns on the selection rule that decides
+    /// as nothing a command whose payload no report holds.
+    decided_nothing: bool,
     /// The commands this node held unexecuted when the rule was switched
     /// on. They keep the group's release: one may have been learned over
     /// a vote an older build cast before its voter upgraded.
@@ -1126,6 +1148,7 @@ impl<P: Persistence> Node<P> {
             relay_before: coord_consensus::RelayTaken::default(),
             release: crate::learned::ReleaseTiming::default(),
             release_at_execution: false,
+            decided_nothing: false,
             release_held: std::collections::BTreeSet::new(),
             unordered_since: std::collections::BTreeMap::new(),
         };
@@ -1615,6 +1638,20 @@ impl<P: Persistence> Node<P> {
         counts
     }
 
+    /// Whether the domain has `DecidedNothing` active (task-d121). The
+    /// selection rule it gates is on only where release at execution is
+    /// too ([`Node::selection_rules`]).
+    pub fn set_decided_nothing(&mut self, on: bool) {
+        if on == self.decided_nothing {
+            return;
+        }
+        self.decided_nothing = on;
+        let rules = self.selection_rules();
+        if let Machine::Follower(f) = self.machine_mut() {
+            f.set_selection_rules(rules);
+        }
+    }
+
     /// Release a leader's results as their commands execute, rather than
     /// at their execution group's `JournalDurable` (task-d90, design
     /// Section 4.5): for a domain that activated it, which every voter's
@@ -1639,10 +1676,14 @@ impl<P: Persistence> Node<P> {
     /// The rules this node's campaigns select under: under the release
     /// rule's activation, a re-proposal no reporter holds a payload row for
     /// is left out (`SelectionRules::leave_out_unheld`, #197 review), since
-    /// it rests on what the release does, point 4 at every voter.
+    /// it rests on what the release does, point 4 at every voter. Under
+    /// both that and `DecidedNothing`, a selection may decide a nothing
+    /// (`SelectionRules::decide_nothing`, task-d121): the rule rests on
+    /// the same premise.
     pub const fn selection_rules(&self) -> coord_consensus::SelectionRules {
         coord_consensus::SelectionRules {
             leave_out_unheld: self.release_at_execution,
+            decide_nothing: self.release_at_execution && self.decided_nothing,
         }
     }
 
@@ -1819,11 +1860,15 @@ impl<P: Persistence> Node<P> {
         let batched_round = features
             .active()
             .contains(&coord_types::formats::Feature::BatchedRound);
+        let decided_nothing = features
+            .active()
+            .contains(&coord_types::formats::Feature::DecidedNothing);
         self.set_early_holders(Some(holders));
         if on != self.early_proposal {
             self.set_early_proposal(on);
         }
         self.set_release_at_execution(release);
+        self.set_decided_nothing(decided_nothing);
         self.answer_on_release = answer_on_release;
         self.batched_round = answer_on_release && batched_round;
         self.apply_turn_settings();
@@ -2199,6 +2244,13 @@ impl<P: Persistence> Node<P> {
     /// pages that have not arrived (task-d28).
     pub fn request_report_pages(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let effects = self.machine_mut().request_report_pages();
+        self.carry_out(effects, ballot)
+    }
+
+    /// End this replica's campaign's wait for the reports it hasn't read
+    /// (task-d120): the runtime's bound passed.
+    pub fn end_report_wait(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().end_report_wait();
         self.carry_out(effects, ballot)
     }
 

@@ -99,6 +99,7 @@ fn membership(voters: &[&Voter], domain: DomainId) -> Membership {
         wif_rules: vec![serde_json::json!({ "issuer": "test" })],
         admin: hex_id(&[9; 16]),
         protocol_version: 1,
+        features: Vec::new(),
     };
     Membership::from_genesis(&manifest).expect("membership")
 }
@@ -269,6 +270,7 @@ fn a_manifest_of_two_or_four_voters_is_refused() {
             wif_rules: vec![serde_json::json!({ "issuer": "test" })],
             admin: hex_id(&[9; 16]),
             protocol_version: 1,
+            features: Vec::new(),
         };
         let placed = Membership::from_genesis(&manifest);
         match count {

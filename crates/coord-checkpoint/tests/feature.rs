@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use coord_checkpoint::feature::{
     ACTIVE_KEY, ActivateError, ActiveFeaturesV1, AdmitError, FeatureRows, FeatureSupportV1,
-    InstallActivationError, PrepareError, activate_feature, active_features, admit,
+    InstallActivationError, PrepareError, activate_feature, active_features, admit, genesis_rows,
     install_activation, own_support, prepare_feature, prepared, promotion_missing,
     published_activation, read_support, record_support, support_key,
 };
@@ -560,4 +560,109 @@ fn a_learner_without_an_active_feature_is_not_promoted() {
         vec![Feature::EarlyProposal]
     );
     assert!(promotion_missing(&active, &active).is_empty());
+}
+
+/// A genesis manifest's features (task-d121): every voter's `init` writes
+/// the same activation record, each feature with its marker, and its own
+/// support row, so the store holds them active and prepared with no
+/// activation round, an install between voters finds nothing to change,
+/// and a later activation keeps them.
+#[test]
+fn genesis_features_are_active_and_prepared_with_no_activation_round() {
+    let voters = voters(3);
+    let named: BTreeSet<Feature> = [Feature::ReleaseAtExecution, Feature::DecidedNothing]
+        .into_iter()
+        .collect();
+    let mut engines: Vec<ModelEngine> = Vec::new();
+    for voter in 1..=3 {
+        let mut engine = ModelEngine::new();
+        let rows = genesis_rows(CLUSTER, DOMAIN, &voters, replica(voter), &named).unwrap();
+        assert_eq!(rows.len(), 2, "the support row and the record");
+        apply_all(&mut engine, rows);
+        engines.push(engine);
+    }
+    let records: Vec<ActiveFeaturesV1> = engines
+        .iter()
+        .map(|e| {
+            published_activation(&e.reader().snapshot().unwrap())
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert!(records.iter().all(|r| *r == records[0]), "voters differ");
+    let record = &records[0];
+    assert_eq!(record.turned_on().unwrap(), named);
+    assert_eq!(
+        record.features,
+        vec![
+            Feature::ReleaseAtExecution.id(),
+            Feature::ReleaseAtExecutionPrepared.id(),
+            Feature::DecidedNothing.id(),
+            Feature::DecidedNothingPrepared.id(),
+        ]
+    );
+    assert_eq!(record.reporters, vec![replica(1), replica(2), replica(3)]);
+    assert_eq!(record.configuration, voters.epoch());
+
+    let view = engines[1].reader().snapshot().unwrap();
+    assert_eq!(admit(&view).unwrap(), named);
+    for feature in &named {
+        assert!(prepared(&view, &replica(2), *feature).unwrap());
+    }
+    // Another voter's record changes nothing here.
+    assert_eq!(install_activation(&view, &replica(2), record), Ok(None));
+
+    // A later activation keeps the genesis features and their markers.
+    let mut engine = engines.remove(0);
+    for voter in 2..=3 {
+        let view = engine.reader().snapshot().unwrap();
+        let update = record_support(&view, &voters, &report(voter)).unwrap();
+        drop(view);
+        apply(&mut engine, update);
+    }
+    let view = engine.reader().snapshot().unwrap();
+    let later = activate_feature(
+        &view,
+        &voters,
+        CLUSTER,
+        DOMAIN,
+        Feature::EarlyProposal,
+        &limits(),
+    )
+    .unwrap();
+    drop(view);
+    apply(&mut engine, later);
+    let view = engine.reader().snapshot().unwrap();
+    let after = published_activation(&view).unwrap().unwrap();
+    assert!(named.iter().all(|f| after.turned_on().unwrap().contains(f)));
+    assert!(
+        after
+            .features
+            .contains(&Feature::DecidedNothingPrepared.id())
+    );
+
+    // A replica that is no voter writes the record alone.
+    let learner = genesis_rows(CLUSTER, DOMAIN, &voters, replica(9), &named).unwrap();
+    assert_eq!(learner.len(), 1);
+    assert_eq!(learner[0].key, ACTIVE_KEY.to_vec());
+    // None named: no rows, today's store.
+    assert!(
+        genesis_rows(CLUSTER, DOMAIN, &voters, replica(1), &BTreeSet::new())
+            .unwrap()
+            .is_empty()
+    );
+    // A feature activated by its own path has no marker, and isn't
+    // made active here.
+    assert_eq!(
+        genesis_rows(
+            CLUSTER,
+            DOMAIN,
+            &voters,
+            replica(1),
+            &[Feature::CheckpointFloor].into_iter().collect()
+        ),
+        Err(PrepareError::NotActivatable {
+            feature: Feature::CheckpointFloor
+        })
+    );
 }
