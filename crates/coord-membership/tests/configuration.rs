@@ -11,7 +11,8 @@ use coord_membership::configuration::{
     GenesisAnchor, HintDecision, Installed, sign_message, verify_signature,
 };
 use coord_membership::genesis::{
-    GenesisManifest, SignedGenesis, VoterSeed, b64url, hex_id, sign_genesis, verify_genesis,
+    GenesisManifest, SUPPORTED_PROTOCOL_VERSIONS, SignedGenesis, VoterSeed, b64url, hex_id,
+    sign_genesis, verify_genesis,
 };
 use coord_types::config_v1::{
     ActivationEvidenceV1, BallotConfigurationV1, BootstrapResponseV1, ConfigurationHintV1,
@@ -319,7 +320,7 @@ impl World {
         // The manifest is what deployment trust delivers: verify it the
         // production way before anchoring.
         let signed: SignedGenesis = sign_genesis(&manifest, &admin.enc).unwrap();
-        let verified = verify_genesis(&signed, &admin.dec, PROTOCOL).unwrap();
+        let verified = verify_genesis(&signed, &admin.dec, SUPPORTED_PROTOCOL_VERSIONS).unwrap();
         let anchor = GenesisAnchor::new(&verified, admin.dec.clone()).unwrap();
         let root = root_record(&admin, CLUSTER, DOMAIN, &verified, &initial);
         World {
@@ -343,7 +344,8 @@ impl World {
         let initial = [self.n(1), self.n(2), self.n(3)];
         let manifest = manifest(cluster, domain, &initial);
         let signed: SignedGenesis = sign_genesis(&manifest, &self.admin.enc).unwrap();
-        let verified = verify_genesis(&signed, &self.admin.dec, PROTOCOL).unwrap();
+        let verified =
+            verify_genesis(&signed, &self.admin.dec, SUPPORTED_PROTOCOL_VERSIONS).unwrap();
         Sibling {
             anchor: GenesisAnchor::new(&verified, self.admin.dec.clone()).unwrap(),
             root: root_record(&self.admin, cluster, domain, &verified, &initial),

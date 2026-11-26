@@ -75,6 +75,28 @@ fn pinned(admin: &AdminKey) -> DecodingKey {
     DecodingKey::from_ec_components(&admin.x, &admin.y).unwrap()
 }
 
+/// The genesis protocol versions a node built from this source reads.
+const THIS_BUILD: &[u32] = coord_membership::SUPPORTED_PROTOCOL_VERSIONS;
+
+/// The versions a build from before `features` reads.
+const BEFORE_FEATURES: &[u32] = &[coord_membership::PROTOCOL_VERSION];
+
+/// `manifest` signed as a signer that applies no version rule would:
+/// the claims `sign_genesis` writes, without its `check_protocol`. What a
+/// verifier makes of a manifest this build's signer refuses to issue.
+fn sign_unchecked(manifest: &GenesisManifest, key: &EncodingKey) -> SignedGenesis {
+    let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
+    header.typ = Some("genesis+jwt".into());
+    let mut claims = serde_json::to_value(manifest).unwrap();
+    if let serde_json::Value::Object(map) = &mut claims {
+        map.insert("iss".into(), "tuplesky-genesis".into());
+        map.insert("sub".into(), manifest.cluster.clone().into());
+        map.insert("aud".into(), manifest.domain.clone().into());
+        map.insert("exp".into(), (u64::MAX / 2).into());
+    }
+    SignedGenesis(jsonwebtoken::encode(&header, &claims, key).unwrap())
+}
+
 // ---- the WIF issuer that mints node certificates ---------------------------
 
 struct Issuer {
@@ -333,20 +355,20 @@ fn a_signed_genesis_initializes_pinned_membership() {
     let signed = sign_genesis(&manifest, &admin.enc).unwrap();
     // Verified against the pinned key; a different key or a tampered
     // token is refused.
-    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
     assert_eq!(verified, manifest);
     let other = admin_key();
     assert_eq!(
-        verify_genesis(&signed, &pinned(&other), 1),
+        verify_genesis(&signed, &pinned(&other), THIS_BUILD),
         Err(GenesisError::Signature)
     );
     let mut tampered = signed.0.clone();
     tampered.pop();
     tampered.push(if signed.0.ends_with('a') { 'b' } else { 'a' });
-    assert!(verify_genesis(&SignedGenesis(tampered), &pinned(&admin), 1).is_err());
+    assert!(verify_genesis(&SignedGenesis(tampered), &pinned(&admin), THIS_BUILD).is_err());
     // An unsupported protocol version.
     assert!(matches!(
-        verify_genesis(&signed, &pinned(&admin), 2),
+        verify_genesis(&signed, &pinned(&admin), &[2]),
         Err(GenesisError::UnsupportedProtocol { version: 1 })
     ));
     // First boot pins; a returning boot with the same manifest re-opens;
@@ -376,7 +398,7 @@ fn a_signed_genesis_initializes_pinned_membership() {
         });
     }
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
-    let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
+    let other_verified = verify_genesis(&other_signed, &pinned(&admin), THIS_BUILD).unwrap();
     assert!(matches!(
         initialize(&other_verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::DigestMismatch { .. })
@@ -697,7 +719,7 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
     let mut issuer = build_issuer();
     let (manifest, _certs) = manifest_with_voters(&mut issuer, &admin);
     let signed = sign_genesis(&manifest, &admin.enc).unwrap();
-    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
 
     let mut store = CrashOnPin::default();
     assert_eq!(
@@ -967,7 +989,7 @@ fn a_manifest_signed_from_a_pem_key_verifies_against_its_public_pem() {
     let signed = coord_membership::sign_genesis_pem(&manifest, private.as_bytes()).unwrap();
     let verifying = coord_membership::admin_key_from_pem(public.as_bytes()).unwrap();
     assert_eq!(
-        verify_genesis(&signed, &verifying, coord_membership::PROTOCOL_VERSION).unwrap(),
+        verify_genesis(&signed, &verifying, THIS_BUILD).unwrap(),
         manifest
     );
 
@@ -977,7 +999,7 @@ fn a_manifest_signed_from_a_pem_key_verifies_against_its_public_pem() {
         verify_genesis(
             &signed,
             &coord_membership::admin_key_from_pem(other_public.as_bytes()).unwrap(),
-            coord_membership::PROTOCOL_VERSION
+            THIS_BUILD
         ),
         Err(GenesisError::Signature)
     );
@@ -1048,7 +1070,7 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
         b64url(br#"{"alg":"none","typ":"JWT"}"#)
     ));
     assert!(matches!(
-        verify_genesis(&none, &pinned(&admin), coord_membership::PROTOCOL_VERSION),
+        verify_genesis(&none, &pinned(&admin), THIS_BUILD),
         Err(GenesisError::Algorithm | GenesisError::Malformed)
     ));
 
@@ -1058,11 +1080,7 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
         jsonwebtoken::encode(&header, &manifest, &admin.enc).unwrap(),
     );
     assert_eq!(
-        verify_genesis(
-            &pointed,
-            &pinned(&admin),
-            coord_membership::PROTOCOL_VERSION
-        ),
+        verify_genesis(&pointed, &pinned(&admin), THIS_BUILD),
         Err(GenesisError::Algorithm)
     );
 }
@@ -1096,7 +1114,7 @@ fn a_manifest_naming_no_features_keeps_its_digest() {
     named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
     assert_ne!(named.digest(), manifest.digest());
     let signed = sign_genesis(&named, &admin.enc).unwrap();
-    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
     assert_eq!(verified, named);
     assert_eq!(
         verified.genesis_features().unwrap(),
@@ -1121,7 +1139,7 @@ fn a_feature_that_cannot_be_active_from_genesis_is_refused() {
         named.features = names.iter().map(|n| (*n).to_owned()).collect();
         named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
         let signed = sign_genesis(&named, &admin.enc).unwrap();
-        match verify_genesis(&signed, &pinned(&admin), 1) {
+        match verify_genesis(&signed, &pinned(&admin), THIS_BUILD) {
             Err(GenesisError::Feature { name, reason }) => (name, reason),
             other => panic!("{names:?} was not refused: {other:?}"),
         }
@@ -1151,30 +1169,53 @@ fn a_feature_that_cannot_be_active_from_genesis_is_refused() {
     alone.features = vec!["release-at-execution".into()];
     alone.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
     let signed = sign_genesis(&alone, &admin.enc).unwrap();
-    assert!(verify_genesis(&signed, &pinned(&admin), 1).is_ok());
-    // Features at the version a build without them accepts: refused, so
-    // no build reads them as a featureless manifest (#329 review).
+    assert!(verify_genesis(&signed, &pinned(&admin), THIS_BUILD).is_ok());
+    // Features at the version a build without them accepts: the signer
+    // won't issue it, and a verifier refuses one signed elsewhere, so no
+    // build reads them as a featureless manifest (#329 review).
     let mut old_version = alone.clone();
     old_version.protocol_version = coord_membership::PROTOCOL_VERSION;
-    let signed = sign_genesis(&old_version, &admin.enc).unwrap();
-    match verify_genesis(&signed, &pinned(&admin), 1) {
+    let at_one = |e: Result<_, GenesisError>| match e {
         Err(GenesisError::Feature { name, reason }) => {
             assert_eq!(name, "release-at-execution");
             assert!(reason.contains("protocol version 2"), "{reason}");
         }
         other => panic!("features at version 1 were not refused: {other:?}"),
-    }
-    // And the features' version with none named is no version this build
-    // has. That is also what a build from before the field reads in a
-    // manifest naming features: it drops the unknown key, and the version
-    // left is one it refuses, so it pins nothing (#329 review).
+    };
+    at_one(sign_genesis(&old_version, &admin.enc).map(|_| ()));
+    let signed = sign_unchecked(&old_version, &admin.enc);
+    at_one(verify_genesis(&signed, &pinned(&admin), THIS_BUILD).map(|_| ()));
+    // The features' version with none named: each version has one
+    // meaning, so the signer and the verifier both refuse it (#329
+    // review, 61bf620c).
     let mut bare = manifest.clone();
     bare.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
-    let signed = sign_genesis(&bare, &admin.enc).unwrap();
+    let without = GenesisError::VersionWithoutFeatures {
+        version: coord_membership::FEATURES_PROTOCOL_VERSION,
+    };
+    assert_eq!(sign_genesis(&bare, &admin.enc), Err(without.clone()));
+    let signed = sign_unchecked(&bare, &admin.enc);
     assert_eq!(
-        verify_genesis(&signed, &pinned(&admin), 1),
-        Err(GenesisError::UnsupportedProtocol {
-            version: coord_membership::FEATURES_PROTOCOL_VERSION
-        })
+        verify_genesis(&signed, &pinned(&admin), THIS_BUILD),
+        Err(without)
     );
+    // A build from before the field reads version 2 as no version it has.
+    // That is also what it reads in a manifest naming features: it drops
+    // the unknown key, and the version left is one it refuses, so it pins
+    // nothing (#329 review).
+    let unsupported = Err(GenesisError::UnsupportedProtocol {
+        version: coord_membership::FEATURES_PROTOCOL_VERSION,
+    });
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), BEFORE_FEATURES),
+        unsupported
+    );
+    let signed = sign_genesis(&alone, &admin.enc).unwrap();
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), BEFORE_FEATURES),
+        unsupported
+    );
+    // The caller's versions are read on every branch: a feature-bearing
+    // manifest is refused by a caller that doesn't read its version.
+    assert_eq!(verify_genesis(&signed, &pinned(&admin), &[99]), unsupported);
 }

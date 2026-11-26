@@ -133,7 +133,7 @@ fn read_genesis(dir: &Path) -> coord_membership::GenesisManifest {
             std::fs::read_to_string(dir.join("genesis.json")).expect("read"),
         ),
         &admin,
-        coord_membership::PROTOCOL_VERSION,
+        coord_membership::SUPPORTED_PROTOCOL_VERSIONS,
     )
     .expect("the fixture is signed")
 }
@@ -149,12 +149,38 @@ fn resign(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let manifest = coord_membership::verify_genesis(
         &coord_membership::SignedGenesis(signed),
         &admin,
-        coord_membership::PROTOCOL_VERSION,
+        coord_membership::SUPPORTED_PROTOCOL_VERSIONS,
     )
     .expect("the fixture is signed");
     let mut value = serde_json::to_value(&manifest).expect("json");
     edit(&mut value);
     write_genesis(dir, &value);
+}
+
+/// Re-sign this directory's manifest after `edit` as a signer that
+/// applies no version rule would: the claims `sign_genesis` writes, with
+/// no `check_protocol` (#329 review). What `init` makes of a manifest
+/// this build's signer refuses to issue.
+fn resign_unchecked(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut value = serde_json::to_value(read_genesis(dir)).expect("json");
+    edit(&mut value);
+    let cluster = value["cluster"].clone();
+    let domain = value["domain"].clone();
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert("iss".into(), "tuplesky-genesis".into());
+        map.insert("sub".into(), cluster);
+        map.insert("aud".into(), domain);
+        map.insert("exp".into(), (u64::MAX / 2).into());
+    }
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.typ = Some("genesis+jwt".into());
+    let der = <rustls_pki_types::PrivatePkcs8KeyDer<'_> as rustls_pki_types::pem::PemObject>::from_pem_slice(
+        &admin_key(dir),
+    )
+    .expect("admin key");
+    let key = jsonwebtoken::EncodingKey::from_ec_der(der.secret_pkcs8_der());
+    let token = jsonwebtoken::encode(&header, &value, &key).expect("signed");
+    std::fs::write(dir.join("genesis.json"), token).expect("write manifest");
 }
 
 /// The same manifest with `count` committed voters.
@@ -754,9 +780,20 @@ fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
     // Features at the version a build without them accepts are refused
     // too: such a build would drop them and pin another digest, so a
     // manifest naming any carries the version it refuses (#329 review).
+    // This build's signer won't issue one (#329 review, 61bf620c); one
+    // from a signer that doesn't check is refused at `init`.
     let old = workspace("init-features-old-version");
     let old_config = config(&old);
-    resign(&old, |m| {
+    let mut features_at_one = read_genesis(&old);
+    features_at_one.features = vec!["release-at-execution".into(), "decided-nothing".into()];
+    assert!(
+        matches!(
+            coord_membership::sign_genesis_pem(&features_at_one, &admin_key(&old)),
+            Err(coord_membership::GenesisError::Feature { .. })
+        ),
+        "the signer issued features at protocol version 1"
+    );
+    resign_unchecked(&old, |m| {
         m["features"] = serde_json::json!(["release-at-execution", "decided-nothing"]);
     });
     let refused = run(&old_config, &["init"]);
@@ -767,6 +804,30 @@ fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
         refused.err
     );
     assert!(!old.join("state").join("gen-000001").exists());
+
+    // The features' version naming none: refused by the signer, and at
+    // `init` by the same rule `verify_genesis` applies (#329 review).
+    let bare = workspace("init-features-version-bare");
+    let bare_config = config(&bare);
+    let mut bare_manifest = read_genesis(&bare);
+    bare_manifest.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    assert_eq!(
+        coord_membership::sign_genesis_pem(&bare_manifest, &admin_key(&bare)),
+        Err(coord_membership::GenesisError::VersionWithoutFeatures {
+            version: coord_membership::FEATURES_PROTOCOL_VERSION
+        })
+    );
+    resign_unchecked(&bare, |m| {
+        m["protocol_version"] = coord_membership::FEATURES_PROTOCOL_VERSION.into();
+    });
+    let refused = run(&bare_config, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("VersionWithoutFeatures"),
+        "the refusal does not say why: {}",
+        refused.err
+    );
+    assert!(!bare.join("state").join("gen-000001").exists());
 }
 
 /// An initialization that failed before it finished can be run again,
@@ -3477,7 +3538,7 @@ fn a_manifest_the_admin_did_not_sign_is_refused_at_init_and_at_start() {
             &std::fs::read(dir.join("genesis-admin.pem")).expect("admin key"),
         )
         .expect("key"),
-        coord_membership::PROTOCOL_VERSION,
+        coord_membership::SUPPORTED_PROTOCOL_VERSIONS,
     )
     .expect("the fixture is signed");
     let plain = serde_json::to_vec_pretty(&manifest).expect("json");
