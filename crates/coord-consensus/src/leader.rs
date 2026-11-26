@@ -149,6 +149,13 @@ pub enum Rejection {
         /// The transition the seal is for.
         transition: crate::handoff::Transition,
     },
+    /// A submission of a command decided here as nothing (task-d121):
+    /// refused as [`SubmissionRefusal::DecidedNothing`].
+    DecidedNothing(CommandId),
+    /// A submission of a command this leader holds as nothing below
+    /// COMMIT (task-d121): neither refused nor admitted, and answered by
+    /// the command's release.
+    HeldOverNothing(CommandId),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -3110,6 +3117,20 @@ impl Leader {
             admission,
             ack_through,
         };
+        // A nothing (task-d121, #325). Decided, the submission is refused
+        // as `DecidedNothing`, which its collector takes as definite.
+        // Below COMMIT it is neither refused nor admitted: a later ballot
+        // can still recover the payload and commit the command. Its
+        // origin is remembered as a duplicate's is (task-d100), the
+        // answer is the command's release, and the payload isn't taken.
+        if self.table.decided_nothing(&command) {
+            self.rejections.push(Rejection::DecidedNothing(command));
+            return self.refuse(command, SubmissionRefusal::DecidedNothing);
+        }
+        if self.table.undecided_nothing(&command) {
+            self.rejections.push(Rejection::HeldOverNothing(command));
+            return Vec::new();
+        }
         // Identity: one retry key binds one payload, first presentation
         // wins. The same identity again is a duplicate only if the facts
         // beside it -- the attested admission and the acknowledged floor

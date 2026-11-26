@@ -1520,6 +1520,7 @@ impl Collector {
             SubmissionRefusal::OtherFacts { .. } => "other-facts",
             SubmissionRefusal::Forgotten => "forgotten",
             SubmissionRefusal::NotLeading => "not-leading",
+            SubmissionRefusal::DecidedNothing => "decided-nothing",
         };
         if !self.config.quorum.voters().contains(&sender) {
             record(&mut self.trace, || {

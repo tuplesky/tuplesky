@@ -11269,6 +11269,130 @@ fn a_nothing_whose_batch_failed_deletes_the_payload_row_when_written_again() {
     );
 }
 
+/// task-d121, C2b (#325): a submission of a command a voter holds as
+/// nothing below COMMIT is neither refused nor admitted. A later ballot
+/// can still recover its payload and commit it, so a refusal here would
+/// tell the caller "refused" for a write that may take effect. Its
+/// payload is not taken either. Once the nothing is committed, the same
+/// submission is refused as `DecidedNothing`, which its collector takes
+/// from this one voter as definite.
+#[test]
+fn a_submission_is_held_over_an_accepted_nothing_and_refused_over_a_committed_one() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    let refused_to = |cluster: &Cluster| {
+        cluster
+            .frontend
+            .iter()
+            .filter_map(|(from, m)| match m {
+                ProtocolMessage::Refused {
+                    command, refusal, ..
+                } if *command == d => Some((*from, *refusal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    cluster.frontend.clear();
+    let _ = cluster.nodes[1].follower_mut().take_rejections();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    assert_eq!(
+        cluster.nodes[1].follower_mut().take_rejections(),
+        vec![FollowerRejection::HeldOverNothing(d)]
+    );
+    assert!(refused_to(&cluster).is_empty(), "held, not refused");
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert!(record.is_nothing() && record.phase == Phase::Accept);
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d),
+        "no payload row is written under the nothing"
+    );
+
+    install_sync(
+        &mut cluster,
+        ballot(2, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    cluster.frontend.clear();
+    let _ = cluster.nodes[1].follower_mut().take_rejections();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    assert_eq!(
+        cluster.nodes[1].follower_mut().take_rejections(),
+        vec![FollowerRejection::DecidedNothing(d)]
+    );
+    assert_eq!(
+        refused_to(&cluster),
+        vec![(r(1), coord_consensus::SubmissionRefusal::DecidedNothing)]
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
+    );
+}
+
+/// task-d121, C2b (#325): the same at a leader. A voter holding a
+/// committed nothing wins a campaign; a submission of the command to it
+/// as the leader is refused as `DecidedNothing`, and nothing is proposed.
+#[test]
+fn a_leader_refuses_a_submission_of_a_decided_nothing() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle_resending(3);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    assert!(l.table().decided_nothing(&d), "{:?}", l.table().record(&d));
+    let _ = l.take_rejections();
+    cluster.frontend.clear();
+    assert_eq!(cluster.admit_at(1, 1, &[1]), d);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    let rejections = l.take_rejections();
+    assert_eq!(
+        rejections,
+        vec![coord_consensus::Rejection::DecidedNothing(d)]
+    );
+    assert!(
+        cluster.frontend.iter().any(|(from, m)| *from == r(1)
+            && matches!(
+                m,
+                ProtocolMessage::Refused {
+                    command,
+                    refusal: coord_consensus::SubmissionRefusal::DecidedNothing,
+                    ..
+                } if *command == d
+            )),
+        "{:?}",
+        cluster.frontend
+    );
+}
+
 /// task-d121, C2: a voter that holds nothing of a command adopts a
 /// proposal of a nothing for it at once.
 #[test]

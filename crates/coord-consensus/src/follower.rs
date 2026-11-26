@@ -285,6 +285,13 @@ pub enum FollowerRejection {
     /// decided dependencies are not executed here (task-d08). The rest of
     /// the page is dropped and asked for again.
     CatchUpNotInstalled(CommandId),
+    /// A submission of a command decided here as nothing (task-d121):
+    /// refused as [`SubmissionRefusal::DecidedNothing`].
+    DecidedNothing(CommandId),
+    /// A submission of a command this replica holds as nothing below
+    /// COMMIT (task-d121): neither refused nor admitted, and answered by
+    /// the command's release.
+    HeldOverNothing(CommandId),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -6492,6 +6499,22 @@ impl Follower {
             admission,
             ack_through,
         };
+        // A nothing (task-d121, #325). Decided, the submission is refused
+        // as `DecidedNothing`, which its collector takes as definite.
+        // Below COMMIT it is neither refused nor admitted: a later ballot
+        // can still recover the payload and commit the command. Its
+        // origin is remembered as a duplicate's is (task-d100), the
+        // answer is the command's release, and the payload isn't taken.
+        if self.table.decided_nothing(&command) {
+            self.rejections
+                .push(FollowerRejection::DecidedNothing(command));
+            return self.refuse(command, SubmissionRefusal::DecidedNothing);
+        }
+        if self.table.undecided_nothing(&command) {
+            self.rejections
+                .push(FollowerRejection::HeldOverNothing(command));
+            return Vec::new();
+        }
         match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 let bound = *bound;
