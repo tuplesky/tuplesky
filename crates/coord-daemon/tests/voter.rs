@@ -1941,6 +1941,116 @@ fn a_sync_whose_leader_was_wiped_is_refused() {
     assert!(peer.node().machine().synchronized_at(&campaigned));
 }
 
+/// A Sync held to install later is checked again when this voter records
+/// its leader's store (task-d121, C4; #332 review). Here it is held ahead of
+/// the voter's promise. It arrived before any row named its leader, and a
+/// Sync installed since counted another store for that leader. It is refused,
+/// logged and counted, and the promise that would have installed it installs
+/// nothing.
+#[test]
+fn a_held_sync_is_refused_once_its_leader_is_recorded_under_another_store() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let decision = syncs
+        .iter()
+        .find_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
+            Ok(coord_consensus::ProtocolMessage::Sync(d)) => Some(d),
+            _ => None,
+        })
+        .expect("a Sync");
+    let recorded = coord_types::ids::StoreInstanceId([0x0e; 16]);
+    // r0's Sync of a higher ballot, counting its own store as another one,
+    // arrives ahead of its NewLeader. No row names r0, so it is held.
+    let higher = Ballot {
+        number: campaigned.number + 1,
+        leader: r(0),
+        ..campaigned
+    };
+    let mut held = decision;
+    held.ballot = higher;
+    held.counted.insert(
+        r(0),
+        coord_consensus::CountedStore {
+            incarnation: inc(),
+            store: coord_types::ids::StoreInstanceId([0x0f; 16]),
+        },
+    );
+    peer.on_peer(
+        PeerProvenance::from_local_voter(r(0), inc()),
+        coord_consensus::ProtocolMessage::Sync(held).encode(),
+    )
+    .expect("stepped");
+    assert_eq!(
+        peer.node()
+            .peer_stores()
+            .expect("kept")
+            .counts
+            .refused_syncs,
+        0,
+        "held, not refused, as it arrived"
+    );
+    // Candidate 1's Sync counts r0 under `recorded`: installed, it records it.
+    let counting = syncs
+        .iter()
+        .map(
+            |frame| match coord_consensus::ProtocolMessage::decode(frame) {
+                Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                    decision.counted.insert(
+                        r(0),
+                        coord_consensus::CountedStore {
+                            incarnation: inc(),
+                            store: recorded,
+                        },
+                    );
+                    coord_consensus::ProtocolMessage::Sync(decision).encode()
+                }
+                _ => frame.clone(),
+            },
+        )
+        .collect();
+    install(&mut peer, counting);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    assert_eq!(durable_row(&peer, r(0), inc()), Some(recorded));
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused_syncs, 1, "{counts:?}");
+    let rejections = peer.take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r.contains("a Sync counting the store of its leader") && r.contains("refused")),
+        "{rejections:?}"
+    );
+    // r0's NewLeader naming the store recorded is promised, and the promise
+    // installs nothing.
+    let mut sent = messages(
+        &peer
+            .on_peer(
+                PeerProvenance::from_local_voter(r(0), inc()),
+                coord_consensus::ProtocolMessage::NewLeader {
+                    ballot: higher,
+                    executed: coord_types::ids::ExecutionPosition::ZERO,
+                    store: recorded,
+                }
+                .encode(),
+            )
+            .expect("stepped"),
+    );
+    for _ in 0..4 {
+        sent.extend(messages(&peer.flush().expect("flushed")));
+        sent.extend(messages(&peer.finish().expect("finished")));
+    }
+    assert!(
+        sent.iter().any(|(to, m)| *to == r(0)
+            && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == higher)),
+        "r0 was promised: {sent:?}"
+    );
+    assert!(
+        !peer.node().machine().synchronized_at(&higher),
+        "the held Sync was installed"
+    );
+}
+
 /// A Sync's counted entry that names no voter of the epoch is skipped
 /// unread (#326 review): a Sync costs at most one row per voter.
 #[test]
