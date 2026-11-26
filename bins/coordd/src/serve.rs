@@ -10782,6 +10782,7 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                     payload: coord_consensus::ProtocolMessage::NewLeader {
                         ballot: higher,
                         executed: coord_types::ids::ExecutionPosition::ZERO,
+                        store: coord_types::ids::StoreInstanceId([0; 16]),
                     }
                     .encode(),
                 },

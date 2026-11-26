@@ -2049,6 +2049,30 @@ impl<P: Persistence> Node<P> {
         Ok(Some((check, out)))
     }
 
+    /// Whether a candidate's `NewLeader`, or a Sync counting its own
+    /// leader's store, that names `store` for `leader` under `incarnation`
+    /// is refused because this voter recorded another store for it
+    /// (task-d121, C4). Nothing is recorded. False where this node keeps
+    /// no check.
+    pub fn refuses_leader_store(
+        &mut self,
+        leader: coord_types::ids::ReplicaId,
+        incarnation: coord_types::ids::ReplicaIncarnation,
+        store: coord_types::ids::StoreInstanceId,
+        named: crate::peer_store::Named,
+    ) -> Result<bool, DriveError> {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(false);
+        };
+        let applier = &self.applier;
+        let refused = stores
+            .check_leader(leader, incarnation, store, named, || {
+                durable_peer_store(applier, &leader, incarnation)
+            })
+            .map_err(DriveError::Engine)?;
+        Ok(refused.is_some())
+    }
+
     /// The stores each Sync whose row became durable here counted, a
     /// superseded one's included, since the last call (task-d121, C1).
     pub fn take_durable_counted(

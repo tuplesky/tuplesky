@@ -734,6 +734,7 @@ fn new_leader(voter: &mut Voter<Stamped>, from: u8, ballot: Ballot) -> coord_dae
             coord_consensus::ProtocolMessage::NewLeader {
                 ballot,
                 executed: coord_types::ids::ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId(r(from).0),
             }
             .encode(),
         )
@@ -842,6 +843,7 @@ fn a_frame_on_a_non_voter_link_moves_nothing_though_it_names_a_voter() {
     let campaign = coord_consensus::ProtocolMessage::NewLeader {
         ballot: candidate,
         executed: coord_types::ids::ExecutionPosition::ZERO,
+        store: coord_types::ids::StoreInstanceId(r(1).0),
     }
     .encode();
     let ask = coord_consensus::ProtocolMessage::CatchUpRequest {
@@ -1049,6 +1051,7 @@ fn a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on() {
             coord_consensus::ProtocolMessage::NewLeader {
                 ballot: candidate,
                 executed: coord_types::ids::ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId(r(1).0),
             }
             .encode(),
         )
@@ -1776,6 +1779,164 @@ fn install(voter: &mut Voter<Stamped>, frames: Vec<Vec<u8>>) {
     }
 }
 
+/// The candidate's `NewLeader` names its own store (task-d121, C4).
+#[test]
+fn a_new_leader_names_its_candidates_store() {
+    let mut candidate = stamped(1);
+    let (campaigned, out) = candidate
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    let mut sent = messages(&out);
+    for _ in 0..4 {
+        sent.extend(messages(&candidate.flush().expect("flushed")));
+        sent.extend(messages(&candidate.finish().expect("finished")));
+    }
+    let stores: Vec<_> = sent
+        .iter()
+        .filter_map(|(_, m)| match m {
+            coord_consensus::ProtocolMessage::NewLeader { ballot, store, .. }
+                if *ballot == campaigned =>
+            {
+                Some(*store)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!stores.is_empty(), "the candidate asked: {sent:?}");
+    assert!(
+        stores
+            .iter()
+            .all(|s| *s == coord_types::ids::StoreInstanceId(r(1).0)),
+        "{stores:?}"
+    );
+}
+
+/// A candidate wiped and initialized again under its identity asks for
+/// promises naming its new store (task-d121, C4): a voter that recorded
+/// its old store refuses to promise, logs and counts it, and doesn't
+/// take up the ballot. The same ask from the store it recorded is
+/// promised. This is the plan's wiped-candidate schedule at the voter
+/// the campaign needs: `f2` learned `f1`'s store, and `f1` comes back
+/// empty and campaigns.
+#[test]
+fn a_wiped_candidate_is_refused_a_promise() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+    let _ = peer.take_rejections();
+    let again = Ballot {
+        number: campaigned.number + 1,
+        ..campaigned
+    };
+    let ask = |store: [u8; 16]| {
+        coord_consensus::ProtocolMessage::NewLeader {
+            ballot: again,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId(store),
+        }
+        .encode()
+    };
+    let promised = |out: &[(ReplicaId, coord_consensus::ProtocolMessage)]| {
+        out.iter().any(|(to, m)| {
+            *to == r(1)
+                && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == again)
+        })
+    };
+    let mut sent = messages(
+        &peer
+            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), ask([0xee; 16]))
+            .expect("stepped"),
+    );
+    for _ in 0..4 {
+        sent.extend(messages(&peer.flush().expect("flushed")));
+        sent.extend(messages(&peer.finish().expect("finished")));
+    }
+    assert!(!promised(&sent), "a wiped candidate was promised: {sent:?}");
+    assert_eq!(peer.ballot(), campaigned, "the ballot was not taken up");
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused_candidates, 1);
+    assert_eq!(counts.refused, 0, "no promise or report was refused");
+    let rejections = peer.take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r.contains("a NewLeader") && r.contains("wiped")),
+        "{rejections:?}"
+    );
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "the row is kept"
+    );
+    // The same ask from the store recorded is promised.
+    let mut sent = messages(
+        &peer
+            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), ask(r(1).0))
+            .expect("stepped"),
+    );
+    for _ in 0..4 {
+        sent.extend(messages(&peer.flush().expect("flushed")));
+        sent.extend(messages(&peer.finish().expect("finished")));
+    }
+    assert!(promised(&sent), "the recorded store was refused: {sent:?}");
+}
+
+/// A Sync whose leader this voter recorded under another store than the
+/// one the Sync counts as its own is refused before the machine sees it
+/// (task-d121, C4), as that leader's `NewLeader` is; it was installed, and
+/// the disagreement only logged, before. The same Sync as its leader
+/// sent it is installed.
+#[test]
+fn a_sync_whose_leader_was_wiped_is_refused() {
+    let mut peer = stamped(2);
+    // The peer recorded the candidate's store earlier: from its promise,
+    // or from a Sync that counted it.
+    write_store_row(&mut peer, r(1), r(1).0);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let wiped = syncs
+        .iter()
+        .map(
+            |frame| match coord_consensus::ProtocolMessage::decode(frame) {
+                Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                    decision
+                        .counted
+                        .get_mut(&r(1))
+                        .expect("the Sync counts its leader")
+                        .store = coord_types::ids::StoreInstanceId([0xee; 16]);
+                    coord_consensus::ProtocolMessage::Sync(decision).encode()
+                }
+                _ => frame.clone(),
+            },
+        )
+        .collect();
+    install(&mut peer, wiped);
+    assert!(
+        !peer.node().machine().synchronized_at(&campaigned),
+        "a wiped leader's Sync was installed"
+    );
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert!(counts.refused_syncs >= 1, "{counts:?}");
+    assert_eq!(counts.disagreed, 0, "refused, not installed and logged");
+    let rejections = peer.take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r.contains("a Sync counting the store of its leader") && r.contains("refused")),
+        "{rejections:?}"
+    );
+    // The Sync as its leader sent it is installed.
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+}
+
 /// A Sync's counted entry that names no voter of the epoch is skipped
 /// unread (#326 review): a Sync costs at most one row per voter.
 #[test]
@@ -2154,9 +2315,30 @@ fn a_superseded_sync_still_teaches_the_counted_stores() {
 #[test]
 fn a_sync_that_counted_another_store_is_installed_and_the_row_kept() {
     let mut peer = stamped(2);
-    write_store_row(&mut peer, r(1), [0xee; 16]);
+    // A voter other than the Sync's leader: a disagreement over the
+    // leader's own store refuses the Sync (C4,
+    // `a_sync_whose_leader_was_wiped_is_refused`).
+    write_store_row(&mut peer, r(0), [0xee; 16]);
     keep_peer_stores(&mut peer);
     let (campaigned, syncs) = won_with(&mut peer);
+    let syncs = syncs
+        .into_iter()
+        .map(
+            |frame| match coord_consensus::ProtocolMessage::decode(&frame) {
+                Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                    decision.counted.insert(
+                        r(0),
+                        coord_consensus::recovery::CountedStore {
+                            incarnation: inc(),
+                            store: coord_types::ids::StoreInstanceId(r(0).0),
+                        },
+                    );
+                    coord_consensus::ProtocolMessage::Sync(decision).encode()
+                }
+                _ => frame,
+            },
+        )
+        .collect();
     install(&mut peer, syncs);
     assert!(
         peer.node().machine().synchronized_at(&campaigned),
@@ -2164,7 +2346,8 @@ fn a_sync_that_counted_another_store_is_installed_and_the_row_kept() {
     );
     let counts = peer.node().peer_stores().expect("kept").counts;
     assert_eq!(counts.disagreed, 1);
-    assert_eq!(counts.learned, 0);
+    assert_eq!(counts.learned, 1, "the leader's own store");
+    assert_eq!(counts.refused_syncs, 0);
     let rejections = peer.take_rejections();
     assert!(
         rejections
@@ -2173,7 +2356,7 @@ fn a_sync_that_counted_another_store_is_installed_and_the_row_kept() {
         "the disagreement is logged: {rejections:?}"
     );
     assert_eq!(
-        durable_row(&peer, r(1), inc()),
+        durable_row(&peer, r(0), inc()),
         Some(coord_types::ids::StoreInstanceId([0xee; 16])),
         "the row is never overwritten"
     );

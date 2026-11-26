@@ -3347,6 +3347,7 @@ fn a_synchronized_ballot_is_durable_before_anything_of_the_new_one() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -3425,6 +3426,7 @@ fn a_sync_sent_again_while_its_marker_is_written_waits_for_the_marker() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -3813,6 +3815,7 @@ fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -3899,6 +3902,7 @@ fn a_sync_installs_the_selected_per_key_evidence_not_only_the_combined_digest() 
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -4152,6 +4156,7 @@ fn a_report_after_a_sync_never_omits_a_selected_command_it_still_owes() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -4195,6 +4200,7 @@ fn a_report_after_a_sync_never_omits_a_selected_command_it_still_owes() {
         ProtocolMessage::NewLeader {
             ballot: later,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     let report = f.report(later);
@@ -4429,6 +4435,7 @@ fn a_sync_leaves_no_acceptance_of_an_earlier_ballot() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -4524,6 +4531,7 @@ fn a_sync_takes_the_path_from_a_pre_acceptance_it_re_proposes() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -4607,6 +4615,7 @@ fn a_payload_recorded_after_a_higher_promise_carries_no_path() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -4694,6 +4703,7 @@ fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -4792,6 +4802,7 @@ fn a_fresh_proposal_follows_the_tail_not_an_executed_reproposal() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     c.handle(2, effects);
@@ -4841,6 +4852,7 @@ fn a_reproposal_with_no_entry_to_follow_follows_the_executed_tail() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     c.handle(2, effects);
@@ -4911,6 +4923,7 @@ fn a_restarted_candidate_with_no_entries_chains_after_what_it_executed() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     c.handle(2, effects);
@@ -4978,6 +4991,7 @@ fn a_new_leader_chains_after_what_it_committed_and_has_not_executed() {
             ProtocolMessage::NewLeader {
                 ballot: new,
                 executed: coord_types::ids::ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ));
         c.handle(2, effects);
@@ -5070,6 +5084,7 @@ fn a_command_that_comes_back_unexecuted_does_not_restart_the_chain() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     c.handle(2, effects);
@@ -5155,6 +5170,7 @@ fn a_commit_below_the_source_ballot_is_selected_with_its_dependencies() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     c.handle(2, effects);
@@ -5423,6 +5439,7 @@ fn a_voter_handed_other_facts_for_a_command_it_committed_stops() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: own,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, promised);
@@ -5517,6 +5534,7 @@ fn a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones() {
             ProtocolMessage::NewLeader {
                 ballot: ballot(1, 2),
                 executed: own,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -5538,6 +5556,7 @@ fn a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones() {
             ProtocolMessage::NewLeader {
                 ballot: ballot(2, 0),
                 executed: own,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -5612,6 +5631,7 @@ fn a_voter_handed_other_facts_for_a_command_it_retired_stops() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: own,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, promised);
@@ -5695,6 +5715,7 @@ fn a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting() {
             ProtocolMessage::NewLeader {
                 ballot: ballot(1, 2),
                 executed: own,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -5706,6 +5727,7 @@ fn a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting() {
             ProtocolMessage::NewLeader {
                 ballot: ballot(2, 0),
                 executed: own,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -5788,6 +5810,7 @@ fn a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise() {
         ProtocolMessage::NewLeader {
             ballot: ballot(3, 0),
             executed: ExecutionPosition::new(1).unwrap(),
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     let mut batches = Vec::new();
@@ -5866,6 +5889,7 @@ fn promise_model_messages() -> Vec<(ReplicaId, ProtocolMessage)> {
             ProtocolMessage::NewLeader {
                 ballot: ballot(1, 2),
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -5873,6 +5897,7 @@ fn promise_model_messages() -> Vec<(ReplicaId, ProtocolMessage)> {
             ProtocolMessage::NewLeader {
                 ballot: ballot(3, 0),
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (
@@ -6342,6 +6367,7 @@ fn follower_with_x_promised(b: Ballot) -> (Follower, CommandId) {
         ProtocolMessage::NewLeader {
             ballot: b,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&effects) {
@@ -6379,6 +6405,7 @@ fn a_sync_demotes_an_acceptance_it_carries_with_other_dependencies() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -6584,6 +6611,7 @@ fn an_older_syncs_pending_entry_does_not_install_after_a_newer_sync() {
             ProtocolMessage::NewLeader {
                 ballot: b2,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -6629,6 +6657,7 @@ fn an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync()
             ProtocolMessage::NewLeader {
                 ballot: b2,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -6646,6 +6675,7 @@ fn an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync()
         ProtocolMessage::NewLeader {
             ballot: b3,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&promise) {
@@ -6702,6 +6732,7 @@ fn a_superseded_sync_still_has_its_selection_reported() {
         ProtocolMessage::NewLeader {
             ballot: b2,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     // The higher promise lands first, then the Sync row.
@@ -6748,6 +6779,7 @@ fn a_report_names_the_selected_facts_and_no_payload_held_under_others() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -7010,6 +7042,7 @@ fn a_command_committed_at_a_deposed_leader_waits_for_its_payload_row() {
         ProtocolMessage::NewLeader {
             ballot: b2,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&promised) {
@@ -7086,6 +7119,7 @@ fn a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 1),
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&effects) {
@@ -7237,6 +7271,7 @@ fn a_voter_behind_across_failed_ballots_reports_one_ballots_worth() {
             ProtocolMessage::NewLeader {
                 ballot: b,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ));
         for e in durable_events(&effects) {
@@ -7360,6 +7395,7 @@ fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
         ProtocolMessage::NewLeader {
             ballot: b,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&effects) {
@@ -7461,6 +7497,7 @@ fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
         ProtocolMessage::NewLeader {
             ballot: b2,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&promised) {
@@ -7795,6 +7832,7 @@ fn fenced_off_reproposal_a_sync_entry_names() -> FencedOffReproposal {
         ProtocolMessage::NewLeader {
             ballot: b,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     // r2's re-proposal of d arrives while r1's promise is in flight.
@@ -7958,6 +7996,7 @@ fn a_voter_that_promised_a_later_ballot_does_not_ask_for_a_reproposal() {
         ProtocolMessage::NewLeader {
             ballot: ballot(2, 0),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     assert_eq!(
@@ -8038,6 +8077,7 @@ fn a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them() {
             ProtocolMessage::NewLeader {
                 ballot: b,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -8130,6 +8170,7 @@ fn records_decided_nowhere_are_released_by_the_next_sync() {
             ProtocolMessage::NewLeader {
                 ballot: b,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -8222,6 +8263,7 @@ fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
             ProtocolMessage::NewLeader {
                 ballot: b,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -8333,6 +8375,7 @@ fn a_sync_installs_in_time_linear_in_its_entries() {
         ProtocolMessage::NewLeader {
             ballot: new,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_events(&promise) {
@@ -8791,6 +8834,7 @@ fn a_released_command_whose_row_was_in_flight_is_not_reported() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     );
     cluster.handle(1, effects);
@@ -8826,6 +8870,7 @@ fn a_released_command_whose_row_was_in_flight_is_not_reported() {
         ProtocolMessage::NewLeader {
             ballot: b2,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     );
     cluster.handle(1, effects);
@@ -8988,6 +9033,7 @@ fn a_campaign_superseded_by_a_promise_is_dropped() {
         ProtocolMessage::NewLeader {
             ballot: ballot(2, 1),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(2, effects);
@@ -9013,6 +9059,7 @@ fn a_promise_to_a_leader_ahead_leaves_history_to_fetch() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 1),
             executed: ExecutionPosition::new(5).unwrap(),
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(2, effects);
@@ -9137,6 +9184,7 @@ fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
             ProtocolMessage::NewLeader {
                 ballot: b2,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -9204,6 +9252,7 @@ fn a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing() {
             ProtocolMessage::NewLeader {
                 ballot: b2,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -9437,6 +9486,7 @@ fn a_sync_sent_again_after_its_marker_failed_still_releases() {
             ProtocolMessage::NewLeader {
                 ballot: b,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -9747,6 +9797,7 @@ fn a_candidate_whose_own_acceptance_is_unbacked_waits_for_a_sync() {
         ProtocolMessage::NewLeader {
             ballot: b3,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     pending.push_back(peer_event(
@@ -9869,6 +9920,7 @@ fn a_commit_a_later_sync_leaves_out_survives_its_installation_and_a_restart() {
         ProtocolMessage::NewLeader {
             ballot: next,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     pending.push_back(peer_event(
@@ -10026,6 +10078,7 @@ fn a_voter_holding_more_commits_than_a_sync_row_takes_still_installs_the_next_sy
             ProtocolMessage::NewLeader {
                 ballot: next,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         peer_event(r(0), ProtocolMessage::Sync(sync)),
@@ -10148,6 +10201,7 @@ fn a_carried_sync_past_its_row_is_refused_with_what_was_carried() {
             ProtocolMessage::NewLeader {
                 ballot: next,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         peer_event(r(0), ProtocolMessage::Sync(sync)),
@@ -10269,6 +10323,7 @@ fn voter_holding_commits_with(held: u64, large: &BTreeSet<u64>, padding: usize) 
         ProtocolMessage::NewLeader {
             ballot: ballot(2, 0),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for e in durable_events(&out) {
@@ -10821,6 +10876,7 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
             ProtocolMessage::NewLeader {
                 ballot: b3,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
     );
@@ -10933,6 +10989,7 @@ fn a_command_recorded_under_other_facts_after_its_sync_is_asked_for_under_the_na
             ProtocolMessage::NewLeader {
                 ballot: ballot(1, 2),
                 executed: own,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             },
         ),
         (r(2), ProtocolMessage::Sync(decision)),
@@ -11068,6 +11125,7 @@ fn install_sync_reproposing(
         ProtocolMessage::NewLeader {
             ballot: b,
             executed,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -11323,6 +11381,7 @@ fn a_nothing_whose_batch_failed_deletes_the_payload_row_when_written_again() {
         ProtocolMessage::NewLeader {
             ballot: ballot(2, 2),
             executed,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);
@@ -11978,6 +12037,7 @@ fn a_failed_rebind_over_a_nothing_writes_the_facts_row_before_the_payload_again(
         ProtocolMessage::NewLeader {
             ballot: b2,
             executed,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     cluster.handle(1, effects);

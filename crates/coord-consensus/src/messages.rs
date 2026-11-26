@@ -186,6 +186,13 @@ pub enum ProtocolMessage {
         /// What the candidate executed through (task-d10): a voter more
         /// than a table ahead of it refuses to promise.
         executed: ExecutionPosition,
+        /// The candidate's store (task-d121, C4): a voter that recorded
+        /// another store for the candidate, under the incarnation it
+        /// speaks from, refuses to promise. A candidate wiped and
+        /// initialized again under its identity is not the voter its
+        /// peers counted, and its own empty report would be counted as
+        /// that voter's.
+        store: StoreInstanceId,
     },
     /// A voter's promise (`MNewLeaderAckN` header): it will vote in no
     /// ballot below `ballot`, and its state is that of `synced`. The

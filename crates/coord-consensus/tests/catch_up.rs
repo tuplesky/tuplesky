@@ -1185,6 +1185,7 @@ fn a_failed_window_runs_over_its_rows_after_a_new_ballot_is_activated() {
             ProtocolMessage::NewLeader {
                 ballot: b1,
                 executed: ExecutionPosition::ZERO,
+                store: coord_types::ids::StoreInstanceId([0; 16]),
             }
             .encode(),
         );
@@ -1552,6 +1553,7 @@ fn a_pulled_decision_is_reported_over_the_selection_the_voter_held() {
         ProtocolMessage::NewLeader {
             ballot: b1,
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         }
         .encode(),
     );

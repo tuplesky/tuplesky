@@ -1708,6 +1708,7 @@ impl Leader {
         // frontier this leader executed through, which a late joiner has
         // to fetch (task-d33). Its promise is answered with the Sync.
         let executed = self.learner.executed_through();
+        let store = self.ballots.identity().store;
         for voter in &self.config.identity.voters {
             if self.joined.contains(voter) {
                 continue;
@@ -1719,7 +1720,12 @@ impl Leader {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::NewLeader { ballot, executed }.encode(),
+                frame: ProtocolMessage::NewLeader {
+                    ballot,
+                    executed,
+                    store,
+                }
+                .encode(),
             });
         }
         if sends.is_empty() {
@@ -4013,7 +4019,9 @@ impl Leader {
             return Vec::new();
         };
         match message {
-            ProtocolMessage::NewLeader { ballot, executed } => {
+            ProtocolMessage::NewLeader {
+                ballot, executed, ..
+            } => {
                 let outstanding = self.cut();
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();

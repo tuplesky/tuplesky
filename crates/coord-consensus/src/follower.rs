@@ -1860,6 +1860,7 @@ impl Follower {
                 frame: ProtocolMessage::NewLeader {
                     ballot,
                     executed: self.learner.executed_through(),
+                    store: self.ballots.identity().store,
                 }
                 .encode(),
             });
@@ -1898,6 +1899,7 @@ impl Follower {
         let ballot = campaign.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let executed = self.learner.executed_through();
+        let store = self.ballots.identity().store;
         let outbox = self.outbox.as_mut().expect("booted");
         for voter in unpromised {
             outbox.publish(PendingSend {
@@ -1907,7 +1909,12 @@ impl Follower {
                     replica: voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::NewLeader { ballot, executed }.encode(),
+                frame: ProtocolMessage::NewLeader {
+                    ballot,
+                    executed,
+                    store,
+                }
+                .encode(),
             });
         }
         for (voter, pages) in asks {
@@ -8256,7 +8263,9 @@ impl Follower {
             return Vec::new();
         };
         match message {
-            ProtocolMessage::NewLeader { ballot, executed } => {
+            ProtocolMessage::NewLeader {
+                ballot, executed, ..
+            } => {
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();
                 };
