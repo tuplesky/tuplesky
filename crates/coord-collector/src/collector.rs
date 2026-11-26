@@ -1693,7 +1693,18 @@ impl Collector {
         let Some(entry) = self.pending.get(&command) else {
             return Progress::Settled;
         };
-        if entry.marked && entry.votes.learned().is_none() {
+        // A decided nothing's final release (task-d121, #325): the answer
+        // to a submission voters held while the command was a nothing
+        // below COMMIT. They never voted for it, so no learning predicate
+        // holds, and the release names the marker rather than the
+        // admission it was submitted under. Its response is the canonical
+        // refusal, which no other execution produces: it is definite from
+        // the leader alone, as one voter's `DecidedNothing` is.
+        let nothing = entry
+            .released
+            .as_ref()
+            .is_some_and(|(_, released)| releases_a_nothing(released));
+        if (entry.marked || nothing) && entry.votes.learned().is_none() {
             let Some((sender, released)) = entry.released.clone() else {
                 record(&mut self.trace, || CollectorEvent::Held {
                     command: command_hex(&command),
@@ -1701,7 +1712,8 @@ impl Collector {
                 });
                 return Progress::Held(HoldReason::AwaitingRelease);
             };
-            if released.speculative() || released.admission() != Some(entry.admission) {
+            if !nothing && (released.speculative() || released.admission() != Some(entry.admission))
+            {
                 record(&mut self.trace, || CollectorEvent::Held {
                     command: command_hex(&command),
                     reason: "release-not-answerable".into(),
@@ -2241,4 +2253,13 @@ fn evidence_event(
         accepted,
         reason,
     }
+}
+
+/// Whether `released` is a decided nothing's final release (task-d121):
+/// the canonical refusal's bytes under its digest, which no other
+/// execution's result reaches.
+fn releases_a_nothing(released: &ReleasedResult) -> bool {
+    !released.speculative()
+        && released.established().result_digest() == coord_storage::retry::decided_nothing_digest()
+        && released.response() == coord_storage::retry::decided_nothing_response().as_slice()
 }

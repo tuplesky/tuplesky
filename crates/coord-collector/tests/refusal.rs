@@ -670,3 +670,69 @@ fn a_decided_nothing_from_one_voter_ends_the_entry_with_the_canonical_refusal() 
         );
     }
 }
+
+/// The leader releases `command` at position one with `digest` and
+/// `response`, final.
+fn release(
+    c: &mut Collector,
+    command: CommandId,
+    digest: Digest32,
+    response: Vec<u8>,
+) -> Result<Progress, EvidenceError> {
+    use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: epoch(),
+            ballot: ballot(0, 0),
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: digest,
+            revision: None,
+            fast_path: false,
+        })
+        .unwrap(),
+        response,
+        false,
+    );
+    c.on_release(from(0), released)
+}
+
+/// task-d121 (#325): a submission voters held while its command was a
+/// nothing below COMMIT is answered by the release. No voter voted for
+/// it, and a marked entry's release names the marker, not the admission
+/// it was submitted under, so neither release rule held it answerable:
+/// it waited for the caller to retry into a voter's `DecidedNothing`. The
+/// leader's final release of the canonical refusal now settles it, marked
+/// or not. A release of anything else, without votes, still waits.
+#[test]
+fn a_decided_nothings_release_answers_an_entry_no_voter_voted_for() {
+    let nothing = coord_storage::retry::decided_nothing_response();
+    let digest = coord_storage::retry::decided_nothing_digest();
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        let Progress::Released(answer) = release(&mut c, command, digest, nothing.clone()).unwrap()
+        else {
+            panic!("not settled, marked {marked}");
+        };
+        assert_eq!(answer.command, command);
+        assert!(!answer.speculative);
+        match &answer.response.outcome {
+            OutcomeV1::Ok {
+                revision: None,
+                result,
+            } => assert_eq!(result.as_slice(), nothing.as_slice()),
+            other => panic!("{other:?}"),
+        }
+
+        // The control: another execution's release, with no votes.
+        let other = submit(&mut c, 2);
+        let held = release(&mut c, other, Digest32([9; 32]), vec![0xaa]).unwrap();
+        assert!(
+            matches!(held, Progress::Held(_)),
+            "marked {marked}: {held:?}"
+        );
+    }
+}
