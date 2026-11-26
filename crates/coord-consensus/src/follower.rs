@@ -5867,6 +5867,15 @@ impl Follower {
         &self.ballots
     }
 
+    /// The selection of the ballot this replica is synchronized at, once
+    /// its Sync row is journal-durable or was read back at a restart
+    /// (task-d121, C1): the Sync it installed, ahead of the projection.
+    pub fn synced_selection(&self) -> Option<&SyncDecision> {
+        self.synced_selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+    }
+
     /// Proposals held for a payload or lagging dependencies.
     pub fn held(&self) -> &BTreeMap<CommandId, HeldProposal> {
         &self.held

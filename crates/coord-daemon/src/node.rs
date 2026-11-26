@@ -600,6 +600,28 @@ impl Machine {
         }
     }
 
+    /// The ballot this replica is synchronized at and the stores its Sync
+    /// counted, from the selection the machine installed (task-d121, C1):
+    /// `None` while it is not synchronized or holds no selection of that
+    /// ballot. Never read from the projection, which a pipelined
+    /// materializer leaves behind the journal.
+    pub fn synced_counted(
+        &self,
+    ) -> Option<(
+        Ballot,
+        &std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )> {
+        let ballot = self.synchronized_ballot()?;
+        let selection = match self {
+            Machine::Leader(m) => m.selection(),
+            Machine::Follower(m) => m.synced_selection(),
+        }?;
+        (selection.ballot == ballot).then_some((ballot, &selection.counted))
+    }
+
     /// Whether this replica is synchronized at `ballot`: it leads it, or
     /// it follows it and installed its Sync (task-d08).
     pub fn synchronized_at(&self, ballot: &Ballot) -> bool {
@@ -2024,44 +2046,6 @@ impl<P: Persistence> Node<P> {
             return Ok(Outbound::default());
         }
         self.carry_out(effects, ballot)
-    }
-
-    /// The stores the durable Sync row of `ballot` counted (task-d121,
-    /// C1): `None` while the row isn't readable yet. A Sync is written to
-    /// its row before it is installed, so the row of the ballot this
-    /// replica is synchronized at is the selection it installed.
-    pub fn synced_counted(
-        &self,
-        ballot: &Ballot,
-    ) -> Result<
-        Option<
-            std::collections::BTreeMap<
-                coord_types::ids::ReplicaId,
-                coord_consensus::recovery::CountedStore,
-            >,
-        >,
-        DriveError,
-    > {
-        use coord_store_api::engine::OrderedRead;
-        let gated = self
-            .applier
-            .store()
-            .reader()
-            .snapshot()
-            .map_err(|e| DriveError::Engine(format!("the Sync row cannot be read: {e:?}")))?;
-        let Some(value) = gated
-            .view()
-            .get(
-                coord_store_api::registry::Collection::ProtocolV1.id(),
-                &coord_consensus::sync_key(ballot.epoch, ballot),
-            )
-            .map_err(|e| DriveError::Engine(format!("the Sync row cannot be read: {e:?}")))?
-        else {
-            return Ok(None);
-        };
-        let record = coord_consensus::decode_sync(&value)
-            .map_err(|e| DriveError::Engine(format!("the Sync row cannot be decoded: {e:?}")))?;
-        Ok(Some(record.decision.counted))
     }
 
     /// Count a promise or report the voter did not hold behind its

@@ -1944,6 +1944,114 @@ fn a_resumed_voter_restores_the_counted_stores_before_a_promise() {
     );
 }
 
+/// The stores a Sync counted are learned from the selection the machine
+/// installed, not from the projection, which a pipelined materializer
+/// can leave behind the journal (from Codex's review of C1): with the
+/// Sync row not visible, a wiped peer's promise is still refused.
+#[test]
+fn a_sync_row_not_yet_visible_still_teaches_the_counted_stores() {
+    let mut peer = stamped(2);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    // The projection without the Sync row, as a materializer behind the
+    // journal leaves it.
+    {
+        let inner = &mut peer.node_mut().applier_mut().store_mut().inner;
+        inner
+            .submit(coord_core::effect::PersistBatch {
+                barrier: BarrierAllocator::new(inc(), BootId([7; 16]))
+                    .for_runtime()
+                    .allocate(),
+                base: None,
+                updates: vec![coord_core::effect::StoreUpdate {
+                    collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                    key: coord_consensus::sync_key(campaigned.epoch, &campaigned),
+                    value: None,
+                }],
+            })
+            .expect("taken");
+        inner.flush().expect("flushed");
+    }
+    keep_peer_stores(&mut peer);
+    let promise = coord_consensus::ProtocolMessage::Promise {
+        ballot: campaigned,
+        synced: campaigned,
+        replica: r(1),
+        store: coord_types::ids::StoreInstanceId([0xee; 16]),
+    };
+    peer.on_peer(
+        PeerProvenance::from_local_voter(r(1), inc()),
+        promise.encode(),
+    )
+    .expect("stepped");
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused, 1, "the wiped store is refused");
+    assert_eq!(counts.recorded, 0);
+    assert_eq!(counts.learned, 1);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
+}
+
+/// A learned row whose batch fails is learned again before the next peer
+/// frame is checked (from Codex's review of C1): the Sync is still
+/// installed, and a wiped peer's promise is refused.
+#[test]
+fn a_learned_row_that_fails_is_learned_again() {
+    let mut peer = stamped(2);
+    let (campaigned, syncs) = won_with(&mut peer);
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    keep_peer_stores(&mut peer);
+    peer.node_mut().applier_mut().store_mut().hold = true;
+    peer.flush().expect("flushed");
+    assert_eq!(peer.node().peer_stores().expect("kept").counts.learned, 1);
+    let store = peer.node_mut().applier_mut().store_mut();
+    store.hold = false;
+    let barrier = *store.held.last().expect("the learned row was taken");
+    let at = peer.ballot();
+    peer.node_mut()
+        .on_storage(
+            coord_core::event::StorageEvent::Failed {
+                barrier_id: barrier,
+                error: coord_core::event::StorageError::DefinitelyNotCommitted,
+            },
+            &at,
+        )
+        .expect("a failed row is a storage fact");
+    peer.flush().expect("flushed");
+    let promise = coord_consensus::ProtocolMessage::Promise {
+        ballot: campaigned,
+        synced: campaigned,
+        replica: r(1),
+        store: coord_types::ids::StoreInstanceId([0xee; 16]),
+    };
+    peer.on_peer(
+        PeerProvenance::from_local_voter(r(1), inc()),
+        promise.encode(),
+    )
+    .expect("stepped");
+    for _ in 0..4 {
+        peer.flush().expect("flushed");
+        peer.finish().expect("finished");
+    }
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.refused, 1, "the wiped store is refused");
+    assert_eq!(counts.recorded, 0);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0)),
+        "learned again"
+    );
+}
+
 /// A Sync that counted another store for a voter than the one this voter
 /// recorded is installed all the same, and the row is kept; the
 /// disagreement is logged and counted (task-d121, C1).

@@ -565,18 +565,21 @@ impl<P: Persistence> Voter<P> {
     /// synchronized at a ballot it has not learned them for (task-d121,
     /// C1): it records each one it has no row for. It runs at boot,
     /// before any peer frame is checked, and after every step that can
-    /// complete an install. Without its peer stores kept, or before the
-    /// row is readable, it tries again at the next step.
+    /// complete an install, and again after a failed row batch. The
+    /// stores come from the selection the machine installed, which is
+    /// ahead of the projection. Without its peer stores kept it tries
+    /// again at the next step.
     fn learn_counted(&mut self) -> Result<Outbound, DriveError> {
-        let Some(synced) = self.node.machine().synchronized_ballot() else {
-            return Ok(Outbound::default());
-        };
-        if self.learned_sync == Some(synced) || self.node.peer_stores().is_none() {
+        if self.node.peer_stores().is_none() {
             return Ok(Outbound::default());
         }
-        let Some(counted) = self.node.synced_counted(&synced)? else {
+        let Some((synced, counted)) = self.node.machine().synced_counted() else {
             return Ok(Outbound::default());
         };
+        if self.learned_sync == Some(synced) {
+            return Ok(Outbound::default());
+        }
+        let counted = counted.clone();
         self.learned_sync = Some(synced);
         if counted.is_empty() {
             return Ok(Outbound::default());
@@ -601,6 +604,13 @@ impl<P: Persistence> Voter<P> {
             return Ok(out);
         }
         let settled = self.node.settle_peer_stores();
+        if !settled.failed.is_empty() {
+            // A failed batch can be a learned row's: the Sync is still
+            // installed, so its stores are learned again before anything
+            // is checked against them.
+            self.learned_sync = None;
+            out.absorb(self.learn_counted()?);
+        }
         for (provenance, frame) in self.held_peers.release(&settled) {
             let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
             out.absorb(self.deliver_peer(provenance, frame, message)?);

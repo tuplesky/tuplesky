@@ -884,6 +884,12 @@ impl Leader {
         self.config.quorum.clone()
     }
 
+    /// The selection this leader leads from, when it won a campaign
+    /// (task-d121, C1).
+    pub fn selection(&self) -> Option<&SyncDecision> {
+        self.selection.as_ref()
+    }
+
     /// The Sync received while still holding the leader role, if any.
     pub fn pending_sync(&self) -> Option<&(ReplicaId, SyncDecision)> {
         self.pending_sync.as_ref()
