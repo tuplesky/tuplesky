@@ -188,7 +188,7 @@ pub fn read_manifest(
     coord_membership::genesis::verify_genesis(
         &signed,
         &admin,
-        coord_membership::genesis::PROTOCOL_VERSION,
+        coord_membership::genesis::SUPPORTED_PROTOCOL_VERSIONS,
     )
     .map_err(|e| match e {
         coord_membership::genesis::GenesisError::Signature
