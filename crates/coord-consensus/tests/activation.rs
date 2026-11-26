@@ -2230,7 +2230,7 @@ fn pulled_past_the_window() -> PulledPastTheWindow {
         through: pos(73),
         entries: vec![coord_consensus::CatchUpEntry {
             command: id(73),
-            payload: commands[72].1.clone(),
+            payload: Some(commands[72].1.clone()),
             decided: Some(record(73)),
             position: pos(73),
             revision: None,
@@ -10698,7 +10698,7 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
         entries: vec![
             coord_consensus::CatchUpEntry {
                 command: first,
-                payload: first_payload.clone(),
+                payload: Some(first_payload.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: Vec::new(),
@@ -10714,7 +10714,7 @@ fn a_window_stopped_for_a_left_ballot_leaves_the_next_ask_at_the_frontier() {
             },
             coord_consensus::CatchUpEntry {
                 command: second,
-                payload: second_payload.clone(),
+                payload: Some(second_payload.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: Vec::new(),

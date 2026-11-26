@@ -579,7 +579,7 @@ impl Cluster {
                     .map(|(_, _, v)| coord_consensus::decode_dependency(v).unwrap());
                 CatchUpEntry {
                     command: *c,
-                    payload,
+                    payload: Some(payload),
                     decided,
                     position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                     revision: None,
@@ -2651,4 +2651,63 @@ fn a_window_whose_batch_failed_is_written_again_in_one_batch() {
             );
         }
     }
+}
+
+/// task-d121, C2b: a command decided as nothing comes in a page with no
+/// payload, on its decided record alone. Installed, it is committed here
+/// as nothing, its dependency row written with no payload row. An entry
+/// with no payload whose decided record is under facts is not whole, and
+/// installs nothing: nothing but a decided nothing says a command has no
+/// payload.
+#[test]
+fn a_pulled_nothing_installs_without_a_payload_on_its_decided_record_only() {
+    let (mut cluster, _) = left_behind(11);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let mut page = cluster.page(0, ballot0(), after);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+        unreachable!()
+    };
+    entries.truncate(1);
+    let first = entries[0].command;
+    entries[0].payload = None;
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert!(
+        cluster.follower(4).table().phase_of(&first) < Some(Phase::Commit),
+        "installed with no payload under facts"
+    );
+    assert_eq!(cluster.follower(4).executed_through(), after);
+
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+        unreachable!()
+    };
+    entries[0]
+        .decided
+        .as_mut()
+        .expect("the donor's record")
+        .payload = Some(coord_consensus::NOTHING_ADMISSION);
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    let f = cluster.follower(4);
+    assert!(
+        f.table().phase_of(&first) >= Some(Phase::Commit),
+        "{:?}",
+        f.table().record(&first)
+    );
+    assert!(
+        cluster
+            .dependency_rows(4)
+            .iter()
+            .any(|(c, r)| *c == first && r.is_nothing()),
+        "the nothing's row is durable"
+    );
+    assert!(
+        !cluster.nodes[4]
+            .storage
+            .durable_rows()
+            .iter()
+            .any(|(k, key, _)| *k == Collection::PayloadV1.id().0 && key == first.as_bytes()),
+        "a payload row was written for a nothing"
+    );
 }

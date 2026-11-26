@@ -134,7 +134,9 @@ pub struct CatchUpEntry {
     /// Command.
     pub command: CommandId,
     /// Its payload, which the receiver rehashes against the identity.
-    pub payload: PayloadRecordV1,
+    /// `None` only for a command decided as nothing (task-d121), which
+    /// has none: its decided record says so, and nothing else does.
+    pub payload: Option<PayloadRecordV1>,
     /// The donor's dependency row of the command: the dependencies it was
     /// decided with. `None` when the donor keeps no row for it.
     pub decided: Option<CommandRecord>,
@@ -147,6 +149,21 @@ pub struct CatchUpEntry {
 }
 
 impl CatchUpEntry {
+    /// The admission the command executed under: its payload's, or the
+    /// nothing's where it has none and its decided record is a nothing
+    /// (task-d121). `None` for an entry that is neither, which is not
+    /// whole.
+    pub fn admission(&self) -> Option<Digest32> {
+        match &self.payload {
+            Some(payload) => Some(payload.admission_digest()),
+            None => self
+                .decided
+                .as_ref()
+                .filter(|r| r.is_nothing())
+                .map(|_| crate::commands::NOTHING_ADMISSION),
+        }
+    }
+
     /// The length of its encoding: what it costs a page against
     /// [`MAX_CATCH_UP_BYTES`].
     pub fn encoded_len(&self) -> usize {

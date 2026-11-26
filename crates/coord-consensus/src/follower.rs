@@ -5141,16 +5141,17 @@ impl Follower {
         let mut staged = Vec::new();
         for running in &self.catch_up.running {
             let command = running.command;
-            updates.push(
-                payload_write(&self.table, &command, &running.entry.payload).expect("bounded"),
-            );
             let record = self
                 .table
                 .record(&command)
                 .expect("committed until executed")
                 .clone();
+            // The row before the payload, as the installation writes them.
             updates.push(self.dependency_row(&command, &record));
             updates.extend(nothing_purge(&command, &record));
+            if let Some(payload) = &running.entry.payload {
+                updates.push(payload_write(&self.table, &command, payload).expect("bounded"));
+            }
             staged.push((command, record));
         }
         for (command, record) in staged {
@@ -5194,7 +5195,8 @@ impl Follower {
             };
         }
         let command = entry.command;
-        let digest = entry.payload.admission_digest();
+        // A nothing (task-d121) has no payload: its decided record says it.
+        let digest = entry.admission().expect("whole");
         let expected = DonorExecution {
             donor,
             ballot,
@@ -5289,7 +5291,12 @@ impl Follower {
                 .push(FollowerRejection::CatchUpNotInstalled(command));
             return Pulled::Stopped;
         }
-        if let Some(held) = held
+        if is_nothing(&digest) {
+            // Decided as nothing: it replaces what is held below COMMIT
+            // under facts, payload and all, as a Sync's entry does, and
+            // its batch deletes the payload row (task-d121).
+            self.take_nothing(command);
+        } else if let Some(held) = held
             && held != digest
         {
             self.table.rebind(&command, digest);
@@ -5318,10 +5325,10 @@ impl Follower {
         self.held.remove(&command);
         self.unkeep(&command);
         self.sync_pending.remove(&command);
-        self.bindings
-            .entry(entry.payload.retry_key)
-            .or_insert(command);
-        self.payloads.insert(command, entry.payload.clone());
+        if let Some(payload) = &entry.payload {
+            self.bindings.entry(payload.retry_key).or_insert(command);
+            self.payloads.insert(command, payload.clone());
+        }
         self.note_lacking(command);
         assert!(
             self.frame_batch.is_none(),
@@ -5330,9 +5337,15 @@ impl Follower {
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
         let barrier = *barrier;
-        updates.push(payload_write(&self.table, &command, &entry.payload).expect("bounded"));
         let record = self.table.record(&command).expect("installed").clone();
+        // The row before the payload: a store refuses a payload row put
+        // while the command's latest row is a nothing (task-d121), and
+        // facts pulled over a nothing held here replace it in this batch.
         updates.push(self.dependency_row(&command, &record));
+        updates.extend(nothing_purge(&command, &record));
+        if let Some(payload) = &entry.payload {
+            updates.push(payload_write(&self.table, &command, payload).expect("bounded"));
+        }
         self.ledger.stage(barrier, command, record);
         self.catch_up.running.push_back(Running {
             command,
@@ -7997,7 +8010,10 @@ impl Follower {
                     for running in &mut self.catch_up.running {
                         if running.barrier == barrier {
                             running.durable = true;
-                            self.served_payloads.insert(running.command);
+                            // A nothing has no payload to serve (task-d121).
+                            if running.entry.payload.is_some() {
+                                self.served_payloads.insert(running.command);
+                            }
                         }
                     }
                     // The evidence this replica produced is a fact now.
@@ -8653,19 +8669,27 @@ impl Follower {
 
 /// Whether a pulled command is whole (task-d08): its payload rehashes to
 /// the identity it claims, and the decided record that came with it, if
-/// any, is bound to that payload's admission.
+/// any, is bound to that payload's admission. A command decided as
+/// nothing (task-d121) comes with no payload, and is whole only with a
+/// decided record that is a nothing: nothing else says it has none.
 fn pulled_entry_is_whole(entry: &CatchUpEntry) -> bool {
+    let Some(payload) = &entry.payload else {
+        return entry
+            .decided
+            .as_ref()
+            .is_some_and(CommandRecord::is_nothing);
+    };
     let request: Result<(coord_types::logical_v1::LogicalRequest, &[u8]), _> =
-        postcard::take_from_bytes(&entry.payload.logical);
+        postcard::take_from_bytes(&payload.logical);
     let identity = request
         .ok()
         .filter(|(_, rest)| rest.is_empty())
-        .and_then(|(r, _)| CommandId::derive(&entry.payload.retry_key, &r).ok());
+        .and_then(|(r, _)| CommandId::derive(&payload.retry_key, &r).ok());
     identity == Some(entry.command)
         && entry
             .decided
             .as_ref()
-            .is_none_or(|r| r.payload == Some(entry.payload.admission_digest()))
+            .is_none_or(|r| r.payload == Some(payload.admission_digest()))
 }
 
 /// The admission digest a selection names for each of its entries.

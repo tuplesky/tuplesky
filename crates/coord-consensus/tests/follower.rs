@@ -3745,7 +3745,7 @@ fn a_catch_up_page_that_installs_a_kept_command_drops_its_kept_copy() {
                 .unwrap();
             coord_consensus::CatchUpEntry {
                 command: *c,
-                payload: p.clone(),
+                payload: Some(p.clone()),
                 decided: Some(CommandRecord {
                     phase: Phase::Commit,
                     deps: l.deps,

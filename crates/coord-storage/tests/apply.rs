@@ -706,6 +706,25 @@ fn a_decided_nothing_executes_as_its_canonical_refusal() {
     );
     assert!(recovered.executed.contains(&(nothing, outcome.position)));
     assert!(recovered.payloads.iter().all(|(c, _)| *c != nothing));
+    // A donor serves it in a catch-up page with no payload, on its decided
+    // record and the canonical digest together. The write before it comes
+    // with its payload.
+    let epoch = ConfigurationEpoch::new(1).unwrap();
+    let entry = coord_storage::protocol::catch_up_entry(&gated, epoch, &nothing)
+        .unwrap()
+        .expect("a donor serves an executed nothing");
+    assert_eq!(entry.payload, None);
+    assert!(entry.decided.as_ref().is_some_and(|r| r.is_nothing()));
+    assert_eq!(entry.position, outcome.position);
+    assert_eq!(
+        entry.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    assert_eq!(entry.admission(), Some(NOTHING_ADMISSION));
+    let ordinary = coord_storage::protocol::catch_up_entry(&gated, epoch, &first)
+        .unwrap()
+        .expect("served");
+    assert!(ordinary.payload.is_some());
     drop(gated);
 
     // The revision did not move: the next write takes the one after the

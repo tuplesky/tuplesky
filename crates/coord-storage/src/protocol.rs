@@ -603,10 +603,6 @@ pub fn catch_up_entry_at<V: OrderedRead>(
         revision,
         result_digest,
     } = executed;
-    let Some(payload) = view.get(Collection::PayloadV1.id(), &position_key(position))? else {
-        return Ok(None);
-    };
-    let payload = decode_payload(&payload)?;
     // The decided record moved to `decided_v1` at the command's execution
     // (the bound), under the same position: served only in its own epoch,
     // as the epoch's dependency row was.
@@ -620,6 +616,19 @@ pub fn catch_up_entry_at<V: OrderedRead>(
             }
         }
         None => None,
+    };
+    let payload = match view.get(Collection::PayloadV1.id(), &position_key(position))? {
+        Some(bytes) => Some(decode_payload(&bytes)?),
+        // A command decided as nothing executed with none (task-d121): it
+        // is served without one, on its decided record and the canonical
+        // refusal's digest together. Short of both, a missing payload is
+        // one this donor can't serve.
+        None if decided.as_ref().is_some_and(CommandRecord::is_nothing)
+            && result_digest == crate::retry::decided_nothing_digest() =>
+        {
+            None
+        }
+        None => return Ok(None),
     };
     Ok(Some(CatchUpEntry {
         command: *command,
