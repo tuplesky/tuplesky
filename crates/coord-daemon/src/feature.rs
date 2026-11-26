@@ -142,7 +142,9 @@ pub enum ActivateRefusal {
     /// Another activation is in progress.
     Busy(Feature),
     /// A feature that is activated only after another, which isn't
-    /// active yet (`BatchedRound` after `AnswerOnRelease`, task-d102).
+    /// active yet ([`Feature::requires`]: `BatchedRound` after
+    /// `AnswerOnRelease`, task-d102; `DecidedNothing` after
+    /// `ReleaseAtExecution`, task-d121).
     Requires {
         /// The feature asked for.
         feature: Feature,
@@ -152,14 +154,10 @@ pub enum ActivateRefusal {
 }
 
 /// The feature that has to be active before `feature` is activated, if
-/// any. A relayed command is marked and answered on the leader's release
-/// alone, so the relay (`BatchedRound`) comes after `AnswerOnRelease`
-/// (task-d100's step B, design Section 4.3's B3).
+/// any: [`Feature::requires`], the table a genesis manifest is checked
+/// against too, so the two ways a feature is turned on agree.
 pub const fn requires(feature: Feature) -> Option<Feature> {
-    match feature {
-        Feature::BatchedRound => Some(Feature::AnswerOnRelease),
-        _ => None,
-    }
+    feature.requires()
 }
 
 impl core::fmt::Display for ActivateRefusal {

@@ -727,6 +727,60 @@ pub fn prepared<V: OrderedRead>(
     Ok(supported && marked)
 }
 
+/// The rows a voter's `init` writes for the features its genesis manifest
+/// makes active (task-d121, design Section 10.2), or none where it names
+/// none.
+///
+/// The record a running domain's activation writes, with the manifest in
+/// place of the reports: each feature with its prepare marker, at the
+/// genesis configuration, with every genesis voter as a reporter, since
+/// the signed manifest is what made it unanimous. Every voter writes the
+/// same record from the same manifest, so no install between them finds
+/// it diverged, and a later activation keeps these features. `me`'s own
+/// support row goes with it where it is a voter, as a prepare writes it,
+/// so an activation installed later finds the features it names prepared
+/// (`installed_record`).
+pub fn genesis_rows(
+    cluster: ClusterId,
+    domain: DomainId,
+    voters: &EpochVoters,
+    me: ReplicaId,
+    features: &BTreeSet<Feature>,
+) -> Result<Vec<StoreUpdate>, PrepareError> {
+    let refused = |e: EngineError| PrepareError::Refused(format!("{e:?}"));
+    if features.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for feature in features {
+        let Some(marker) = feature.prepare_marker() else {
+            return Err(PrepareError::NotActivatable { feature: *feature });
+        };
+        if !Supported::supports(*feature) {
+            return Err(PrepareError::Unsupported { feature: *feature });
+        }
+        ids.push(feature.id());
+        ids.push(marker.id());
+    }
+    ids.sort_unstable();
+    let record = ActiveFeaturesV1 {
+        cluster,
+        domain,
+        configuration: voters.epoch(),
+        features: ids,
+        reporters: voters.voters().iter().copied().collect(),
+    };
+    let mut updates = Vec::new();
+    if voters.is_voter(&me) {
+        let offered = FeatureSupportV1::of_this_build(me, cluster, domain, voters.epoch());
+        check_support(None, voters, &offered)
+            .map_err(|e| PrepareError::Refused(format!("{e:?}")))?;
+        updates.push(offered.update().map_err(refused)?);
+    }
+    updates.push(record.update().map_err(refused)?);
+    Ok(updates)
+}
+
 /// Why an activation record was not installed (task-d99).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallActivationError {

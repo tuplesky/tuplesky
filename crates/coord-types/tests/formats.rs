@@ -162,3 +162,32 @@ fn a_prepare_marker_names_its_feature_and_is_never_reported() {
         Feature::ALL.iter().filter(|f| !f.is_marker()).count()
     );
 }
+
+/// task-d121's feature: its frozen ids, its marker, and the feature it
+/// rests on, which a genesis manifest must name beside it.
+#[test]
+fn decided_nothing_has_a_marker_and_rests_on_release_at_execution() {
+    assert_eq!(Feature::DecidedNothing.id(), 0x000C);
+    assert_eq!(Feature::DecidedNothingPrepared.id(), 0x000D);
+    assert_eq!(Feature::DecidedNothing.name(), "decided-nothing");
+    assert_eq!(
+        Feature::DecidedNothing.prepare_marker(),
+        Some(Feature::DecidedNothingPrepared)
+    );
+    assert_eq!(
+        Feature::DecidedNothing.requires(),
+        Some(Feature::ReleaseAtExecution)
+    );
+    // The one table genesis and live activation both read (#329 review).
+    assert_eq!(
+        Feature::BatchedRound.requires(),
+        Some(Feature::AnswerOnRelease)
+    );
+    for feature in Feature::ALL {
+        if let Some(required) = feature.requires() {
+            assert!(!required.is_marker() && !feature.is_marker());
+            assert!(required.requires().is_none(), "one level only");
+        }
+    }
+    assert!(Supported::reported().any(|f| f == Feature::DecidedNothing));
+}

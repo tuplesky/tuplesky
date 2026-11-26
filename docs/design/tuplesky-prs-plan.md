@@ -5369,6 +5369,14 @@ Condition 2 is not redundant. A voter that executed `D` can report it executed w
   - a `Feature` id, and a prepare marker (`Feature::prepare_marker`) so that task-d99's running path can activate it;
   - at `init`, the rows a genesis feature needs: its support and prepared rows as well as the active set. Later activation records keep the genesis features, since an install checks every active feature against the prepared ones (`InstallActivationError::NotPrepared`, `Diverged`);
   - `Node::selection_rules` turns the rule's field on only where both features are active.
+- **How C3 builds it** (the defaults proposed on #312):
+  - `Feature::DecidedNothing` (`0x000C`, `decided-nothing`) and its marker `DecidedNothingPrepared` (`0x000D`). `Feature::requires` names `release-at-execution` as the feature it rests on.
+  - `GenesisManifest.features` lists names, and is left out of the serialized manifest when empty, so a manifest naming none keeps its digest. Verifying a manifest refuses an unknown name, a marker, a feature with no prepare marker, a name given twice, and a feature named without the one it rests on, so `init` and every start refuse it.
+  - A manifest naming a feature carries protocol version 2 (`FEATURES_PROTOCOL_VERSION`), and one naming none keeps version 1 (#329 review). A build from before the field accepts only version 1, so it refuses such a manifest instead of dropping the list and pinning another digest beside voters that kept it.
+  - `Feature::requires` is the one prerequisite table: a live activation reads it too (`coord_daemon::feature::requires`), so `decided-nothing` isn't activated before `release-at-execution` and a manifest naming `batched-round` needs `answer-on-release` (#329 review).
+  - `init`, and `restore`, which finishes as `init` does, write the rows in the genesis-policy batch, before the pin (`feature::genesis_rows`): the activation record every voter writes alike from the manifest (each feature with its marker, the genesis epoch, every genesis voter as a reporter), and this voter's own support row.
+  - `SelectionRules::decide_nothing` is on only where both features are active. Nothing reads it until the rule's step.
+  - No manifest the repository's harnesses and tests write names a feature yet, so `release-at-execution` and the rule stay off where they were.
 - **Carrying a nothing isn't behind the feature.** The selection, a Sync install and the demotion take a nothing wherever one appears, since one can reach a voter whose own feature row isn't durable yet. Only deciding a new nothing is.
 - **task-d99's activation in a running domain stays,** for a domain created before that format. There the rule is on only where every voter activated it, after `release-at-execution`, while all were up.
 

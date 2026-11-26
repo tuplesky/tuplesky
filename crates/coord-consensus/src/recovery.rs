@@ -500,6 +500,14 @@ pub struct SelectionRules {
     /// activated `ReleaseAtExecution` (task-d99), whose activation every
     /// voter prepared durably on such a build and cannot roll back from.
     pub leave_out_unheld: bool,
+    /// Decide as nothing a command whose payload no report holds, once
+    /// every voter that held it is gone for good (task-d121, design
+    /// Section 4.9). On only where `leave_out_unheld` is: the rule rests
+    /// on the same premise, and on a domain that activated
+    /// `DecidedNothing` as well. Nothing reads it yet: the rule's step
+    /// (task-d121's C5) waits on task-d120's bounded wait, and until then
+    /// a selection is made as if it were off.
+    pub decide_nothing: bool,
 }
 
 /// [`select_decided`] under `rules`.

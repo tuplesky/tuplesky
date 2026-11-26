@@ -737,6 +737,7 @@ struct Node {
 /// is (task-d90).
 const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
     leave_out_unheld: true,
+    decide_nothing: false,
 };
 
 /// What a node is handed in one step: an event, or a step of storage
