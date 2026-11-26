@@ -1311,6 +1311,7 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
             .collect(),
         reproposed: BTreeSet::new(),
         counted: Default::default(),
+        nothing: Default::default(),
     };
     voter
         .on_peer(

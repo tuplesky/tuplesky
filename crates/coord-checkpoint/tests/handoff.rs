@@ -108,6 +108,7 @@ fn selection(commands: &[u8]) -> SyncDecision {
             .collect(),
         reproposed: BTreeSet::new(),
         counted: Default::default(),
+        nothing: Default::default(),
     }
 }
 

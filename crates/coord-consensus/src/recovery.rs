@@ -34,7 +34,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation, StoreInstanceId};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::CommandRecord;
+use crate::commands::{CommandRecord, NOTHING_ADMISSION, is_nothing};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::vote::same_set;
@@ -147,6 +147,12 @@ pub struct SyncDecision {
     /// Empty in a Sync selected before the campaign counted it, and in
     /// one read from a version 3 row.
     pub counted: BTreeMap<ReplicaId, CountedStore>,
+    /// The re-proposals its leader proposes as nothing, never under
+    /// facts (task-d121): a subset of `reproposed`. A voter that installs
+    /// the Sync keeps such a command's record demoted, with its payload
+    /// row, until the proposal replaces it. Empty until a selection
+    /// decides a nothing, and in a Sync read from a row of version 4 or 3.
+    pub nothing: BTreeSet<CommandId>,
 }
 
 /// Why no Sync was selected.
@@ -610,11 +616,12 @@ pub(crate) fn select_counted(
     }
     // A payload supplies the command only under the facts the reporters
     // name for it: one under other facts is another presentation, and
-    // fetching it would not let the candidate bind (task-d14).
+    // fetching it would not let the candidate bind (task-d14). A nothing
+    // supplies itself: it has no payload to fetch (task-d121).
     for r in &by_replica {
         for e in &r.entries {
             if e.phase >= Phase::Accept
-                && e.payload_present
+                && (e.payload_present || e.admission.as_ref().is_some_and(is_nothing))
                 && named
                     .get(&e.command)
                     .is_none_or(|d| e.admission == Some(*d))
@@ -776,6 +783,31 @@ pub(crate) fn select_counted(
     // executed precedes every command that rule keeps, at a fast-set
     // member that executed it and forgot it too (#169 review).
     let mut unread = Vec::new();
+    // A nothing the selection carries, against the candidate's own
+    // executions (task-d121): one it executed under facts is a second
+    // decision of one command, and the selection stops; one whose row it
+    // has not read yet waits for the read, so no nothing is carried past
+    // an execution the candidate hasn't read. Its execution of the
+    // nothing itself passes, and so does one it keeps no row of, which
+    // can't tell: the check is on the premises, not part of the argument.
+    for (command, entry) in &entries {
+        if !entry.admission.as_ref().is_some_and(is_nothing) {
+            continue;
+        }
+        match decided.executed(command) {
+            ExecutedFacts::No | ExecutedFacts::WithoutRow => {}
+            ExecutedFacts::Unread => unread.push(*command),
+            ExecutedFacts::With(record) => {
+                if let Some(facts) = record.facts() {
+                    return Err(RecoveryError::IncompatibleAdmission {
+                        command: *command,
+                        first: NOTHING_ADMISSION,
+                        second: facts,
+                    });
+                }
+            }
+        }
+    }
     for command in &reproposed {
         if entries.contains_key(command) {
             continue;
@@ -876,6 +908,7 @@ pub(crate) fn select_counted(
         entries,
         reproposed,
         counted: Default::default(),
+        nothing: Default::default(),
     })
 }
 

@@ -8569,6 +8569,7 @@ mod tests {
             entries,
             reproposed: BTreeSet::new(),
             counted: Default::default(),
+            nothing: Default::default(),
         };
         let follower = Follower::recover_with_syncs(
             config,
@@ -8611,6 +8612,7 @@ mod tests {
             entries,
             reproposed: BTreeSet::new(),
             counted: Default::default(),
+            nothing: Default::default(),
         };
         let mut follower =
             Follower::recover_with_syncs(config, None, None, [], [], [], ExecutionPosition::ZERO);
