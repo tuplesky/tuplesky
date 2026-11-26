@@ -178,6 +178,11 @@ fn decided_nothing_has_a_marker_and_rests_on_release_at_execution() {
         Feature::DecidedNothing.requires(),
         Some(Feature::ReleaseAtExecution)
     );
+    // The one table genesis and live activation both read (#329 review).
+    assert_eq!(
+        Feature::BatchedRound.requires(),
+        Some(Feature::AnswerOnRelease)
+    );
     for feature in Feature::ALL {
         if let Some(required) = feature.requires() {
             assert!(!required.is_marker() && !feature.is_marker());

@@ -457,11 +457,19 @@ impl Feature {
     }
 
     /// The feature this one rests on, which must be active wherever this
-    /// one is turned on, or `None`. A genesis manifest naming this one
-    /// without it is refused.
+    /// one is turned on, or `None`. The one table both ways a feature is
+    /// turned on read: a genesis manifest naming this one without it is
+    /// refused, and so is an activation of this one while it isn't active.
+    ///
+    /// - `DecidedNothing` rests on `ReleaseAtExecution`, the premise it
+    ///   shares with `leave_out_unheld` (task-d121).
+    /// - `BatchedRound` comes after `AnswerOnRelease`: a relayed command
+    ///   is marked and answered on the leader's release alone (task-d100's
+    ///   step B, design Section 4.3's B3).
     pub const fn requires(self) -> Option<Feature> {
         match self {
             Feature::DecidedNothing => Some(Feature::ReleaseAtExecution),
+            Feature::BatchedRound => Some(Feature::AnswerOnRelease),
             _ => None,
         }
     }

@@ -1617,7 +1617,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             issuer_roots: vec!["AAAA".into()],
             wif_rules: vec![serde_json::json!({ "issuer": "test" })],
             admin: hex(&[0xa; 16]),
-            protocol_version: 1,
+            protocol_version: coord_membership::FEATURES_PROTOCOL_VERSION,
             features: vec!["release-at-execution".into(), "decided-nothing".into()],
         };
         let rows = crate::genesis_feature_rows(&manifest, REPLICA).expect("rows");

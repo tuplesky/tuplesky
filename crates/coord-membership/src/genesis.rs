@@ -67,6 +67,12 @@ pub struct GenesisManifest {
     /// voter's `init` records it active with no activation round. Left
     /// out of the serialized manifest when empty, so a manifest naming
     /// none keeps the digest it had before this field existed.
+    ///
+    /// A manifest that names one carries [`FEATURES_PROTOCOL_VERSION`].
+    /// A build from before this field drops it when it parses the
+    /// manifest, and would verify the rest and pin another digest. That
+    /// build accepts only [`PROTOCOL_VERSION`], so it refuses such a
+    /// manifest at `init` and at start instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
 }
@@ -100,6 +106,13 @@ pub enum GenesisError {
 
 /// The protocol version this build's genesis manifests carry.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The protocol version a genesis manifest naming features carries
+/// (task-d121). A build that predates `features` accepts only
+/// [`PROTOCOL_VERSION`], so it refuses such a manifest rather than drop
+/// the features and pin another digest; a manifest naming none keeps
+/// [`PROTOCOL_VERSION`], with its encoding and pin unchanged.
+pub const FEATURES_PROTOCOL_VERSION: u32 = 2;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -212,7 +225,21 @@ impl GenesisManifest {
                 return Err(GenesisError::Invalid);
             }
         }
-        if self.protocol_version != supported_protocol {
+        // A manifest naming features carries the version a build without
+        // them refuses; one naming none, the version it always had.
+        if let Some(first) = self.features.first() {
+            if self.protocol_version != FEATURES_PROTOCOL_VERSION {
+                return Err(GenesisError::Feature {
+                    name: first.clone(),
+                    reason: format!(
+                        "a manifest naming a feature carries protocol version \
+                         {FEATURES_PROTOCOL_VERSION}, which a build without features \
+                         refuses; this one carries {}",
+                        self.protocol_version
+                    ),
+                });
+            }
+        } else if self.protocol_version != supported_protocol {
             return Err(GenesisError::UnsupportedProtocol {
                 version: self.protocol_version,
             });

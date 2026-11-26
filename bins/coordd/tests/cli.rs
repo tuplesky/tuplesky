@@ -719,6 +719,7 @@ fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
     let named_config = config(&named);
     resign(&named, |m| {
         m["features"] = serde_json::json!(["release-at-execution", "decided-nothing"]);
+        m["protocol_version"] = coord_membership::FEATURES_PROTOCOL_VERSION.into();
     });
     let named_run = run(&named_config, &["init"]);
     assert_eq!(
@@ -739,6 +740,7 @@ fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
     let alone_config = config(&alone);
     resign(&alone, |m| {
         m["features"] = serde_json::json!(["decided-nothing"]);
+        m["protocol_version"] = coord_membership::FEATURES_PROTOCOL_VERSION.into();
     });
     let refused = run(&alone_config, &["init"]);
     assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
@@ -748,6 +750,23 @@ fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
         refused.err
     );
     assert!(!alone.join("state").join("gen-000001").exists());
+
+    // Features at the version a build without them accepts are refused
+    // too: such a build would drop them and pin another digest, so a
+    // manifest naming any carries the version it refuses (#329 review).
+    let old = workspace("init-features-old-version");
+    let old_config = config(&old);
+    resign(&old, |m| {
+        m["features"] = serde_json::json!(["release-at-execution", "decided-nothing"]);
+    });
+    let refused = run(&old_config, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("protocol version 2"),
+        "the refusal does not say which version: {}",
+        refused.err
+    );
+    assert!(!old.join("state").join("gen-000001").exists());
 }
 
 /// An initialization that failed before it finished can be run again,
