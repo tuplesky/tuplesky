@@ -13,9 +13,9 @@
 use std::collections::BTreeSet;
 
 use coord_collector::{
-    Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, MonotonicMillis,
-    OfferOutcome, Offered, Progress, RELAY_FALLBACK_MILLIS, SOLICIT_AFTER_MILLIS, SettleError,
-    SubmitRefusal, Submitted,
+    Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, MismatchCheck,
+    MonotonicMillis, OfferOutcome, Offered, Progress, RELAY_FALLBACK_MILLIS, SOLICIT_AFTER_MILLIS,
+    SettleError, SubmitRefusal, Submitted,
 };
 use coord_consensus::{BallotConfiguration, ProtocolMessage, SubmissionRefusal};
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -717,6 +717,16 @@ fn a_decided_nothing_from_one_voter_is_kept_for_resolution() {
             release(&mut c, command, Digest32([9; 32]), vec![0xaa]),
             Err(EvidenceError::AnsweredOtherwise(_))
         ));
+        // The first final release fixed the position (Astra on #328): the
+        // same refusal at another position is another execution.
+        assert!(matches!(
+            release_at(&mut c, command, digest, nothing.clone(), 2),
+            Err(EvidenceError::AnsweredOtherwise(_))
+        ));
+        assert!(matches!(
+            release(&mut c, command, digest, nothing.clone()),
+            Ok(Progress::Settled)
+        ));
     }
 }
 
@@ -728,13 +738,25 @@ fn release(
     digest: Digest32,
     response: Vec<u8>,
 ) -> Result<Progress, EvidenceError> {
+    release_at(c, command, digest, response, 1)
+}
+
+/// The leader releases `command` at `position` with `digest` and
+/// `response`, final.
+fn release_at(
+    c: &mut Collector,
+    command: CommandId,
+    digest: Digest32,
+    response: Vec<u8>,
+    position: u64,
+) -> Result<Progress, EvidenceError> {
     use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
     let released = ReleasedResult::from_gate(
         EstablishedResult::establish(EstablishmentEvidence {
             command,
             epoch: epoch(),
             ballot: ballot(0, 0),
-            position: ExecutionPosition::new(1).unwrap(),
+            position: ExecutionPosition::new(position).unwrap(),
             closed_predecessors: vec![],
             result_digest: digest,
             revision: None,
@@ -775,6 +797,11 @@ fn a_decided_nothings_release_answers_an_entry_no_voter_voted_for() {
             } => assert_eq!(result.as_slice(), nothing.as_slice()),
             other => panic!("{other:?}"),
         }
+        // A voter's `DecidedNothing` after it agrees with the answer.
+        assert_eq!(
+            c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)),
+            Ok(Progress::Settled)
+        );
 
         // The control: another execution's release, with no votes.
         let other = submit(&mut c, 2);
@@ -802,9 +829,8 @@ fn a_decided_nothings_release_answers_an_entry_no_voter_voted_for() {
 }
 
 /// A voter's `DecidedNothing` against a final release of other facts the
-/// entry holds is a divergence, not an answer (#328 review): refused as a
-/// release mismatch, and the entry stays pending. The control: a held
-/// release of the nothing itself, which settles.
+/// entry holds is a divergence, not an answer (#328 reviews): the stop a
+/// release gives when it comes second, and the entry stays pending.
 #[test]
 fn a_decided_nothing_against_a_held_release_of_facts_is_refused() {
     use coord_collector::Resolution;
@@ -817,10 +843,14 @@ fn a_decided_nothing_against_a_held_release_of_facts_is_refused() {
     ));
     let held = release(&mut c, command, Digest32([9; 32]), vec![0xaa]).unwrap();
     assert!(matches!(held, Progress::Held(_)), "{held:?}");
-    assert_eq!(
-        c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)),
-        Err(EvidenceError::ReleaseMismatch)
-    );
+    match c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)) {
+        Err(EvidenceError::AnsweredOtherwise(mismatch)) => {
+            assert_eq!(mismatch.check, MismatchCheck::DecidedNothingAgainstRelease);
+            assert_eq!(mismatch.command, command);
+            assert!(mismatch.differs.result_digest && mismatch.differs.response);
+        }
+        other => panic!("{other:?}"),
+    }
     let resolve = ResolveRequestV1 {
         retry_key: RetryKey {
             cluster_id: CLUSTER,
@@ -832,4 +862,40 @@ fn a_decided_nothing_against_a_held_release_of_facts_is_refused() {
         command_id: command,
     };
     assert!(matches!(c.resolve(&resolve), Resolution::Pending));
+}
+
+/// A voter's `DecidedNothing` after this collector answered from a
+/// record of other facts is the same divergence (Astra on #328): before,
+/// the answered command read as settled and nothing was compared. A
+/// voter's `DecidedNothing` before the release is compared by the late
+/// release, in `a_decided_nothing_from_one_voter_is_kept_for_resolution`.
+#[test]
+fn a_decided_nothing_after_an_answer_of_facts_is_a_divergence() {
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        assert_eq!(
+            c.on_evidence(from(0), refused(command, SubmissionRefusal::Forgotten))
+                .unwrap(),
+            Progress::Held(HoldReason::AwaitingRecord)
+        );
+        assert!(matches!(
+            c.settle_from_record(
+                command,
+                Digest32([1; 32]),
+                ExecutionPosition::new(1).unwrap(),
+                None,
+                b"done",
+            ),
+            Ok(Progress::Released(_))
+        ));
+        match c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)) {
+            Err(EvidenceError::AnsweredOtherwise(mismatch)) => {
+                assert_eq!(mismatch.check, MismatchCheck::DecidedNothingAgainstRelease);
+                assert!(mismatch.differs.result_digest, "marked {marked}");
+            }
+            other => panic!("marked {marked}: {other:?}"),
+        }
+    }
 }
