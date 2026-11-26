@@ -74,7 +74,7 @@ pub fn verified_genesis(
     coord_membership::verify_genesis(
         &coord_membership::SignedGenesis(token.trim().to_owned()),
         &admin,
-        coord_membership::PROTOCOL_VERSION,
+        coord_membership::SUPPORTED_PROTOCOL_VERSIONS,
     )
     .map_err(|e| std::io::Error::other(format!("genesis: {e:?}")))
 }
