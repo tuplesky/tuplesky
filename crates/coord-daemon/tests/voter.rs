@@ -1826,35 +1826,50 @@ fn a_voter_that_installs_a_sync_in_groups_learns_the_stores_it_counted() {
     );
 }
 
-/// A Sync of a higher ballot that arrives while one of a lower ballot
-/// waits for its flush, and is never installed, doesn't cost the lower
-/// one its counted stores (task-d121, C1; Codex on #326).
+/// Syncs of higher ballots that arrive while one of a lower ballot waits
+/// for its flush, ahead of their NewLeader and never installed, don't
+/// cost the lower one its counted stores, however many arrive (task-d121,
+/// C1; Codex on #326).
 #[test]
-fn a_higher_sync_never_installed_leaves_the_pending_one_learned() {
+fn higher_syncs_never_installed_leave_the_installed_one_learned() {
     let mut peer = stamped(2);
     peer.node_mut().lower_in_groups();
     keep_peer_stores(&mut peer);
     let (campaigned, syncs) = won_with(&mut peer);
+    let decision = syncs
+        .iter()
+        .find_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
+            Ok(coord_consensus::ProtocolMessage::Sync(d)) => Some(d),
+            _ => None,
+        })
+        .expect("a Sync");
     for frame in syncs {
         peer.on_peer(PeerProvenance::from_local_voter(r(1), inc()), frame)
             .expect("stepped");
     }
     assert!(!peer.node().machine().synchronized_at(&campaigned));
-    // A higher ballot's Sync, ahead of its NewLeader: kept, not installed.
-    let higher = Ballot {
-        number: campaigned.number + 1,
-        leader: r(0),
-        ..campaigned
-    };
-    let mut other = std::collections::BTreeMap::new();
-    other.insert(
-        r(0),
-        coord_consensus::CountedStore {
-            incarnation: inc(),
-            store: coord_types::ids::StoreInstanceId([0x0f; 16]),
-        },
-    );
-    peer.resume_counted(higher, other);
+    // Five higher ballots' Syncs from r0, each counting another store for
+    // r0, none of whose NewLeader ever arrives.
+    for n in 1..=5 {
+        let mut higher = decision.clone();
+        higher.ballot = Ballot {
+            number: campaigned.number + n,
+            leader: r(0),
+            ..campaigned
+        };
+        higher.counted.insert(
+            r(0),
+            coord_consensus::CountedStore {
+                incarnation: inc(),
+                store: coord_types::ids::StoreInstanceId([0x0f; 16]),
+            },
+        );
+        peer.on_peer(
+            PeerProvenance::from_local_voter(r(0), inc()),
+            coord_consensus::ProtocolMessage::Sync(higher).encode(),
+        )
+        .expect("stepped");
+    }
     for _ in 0..4 {
         peer.flush().expect("flushed");
         peer.finish().expect("finished");
@@ -1868,26 +1883,18 @@ fn a_higher_sync_never_installed_leaves_the_pending_one_learned() {
     assert_eq!(durable_row(&peer, r(0), inc()), None, "never installed");
 }
 
-/// A voter that installed a Sync and stopped before the counted stores'
-/// rows were written learns them from the durable Sync it resumes at boot
-/// (task-d121, C1; Codex on #326): here, a voter that kept no rows when
-/// it installed it.
+/// A voter that installed a Sync before it kept its peer stores, as a
+/// voter does that stopped between the install and the rows' batch,
+/// learns the stores it counted from the Sync's durable row at its next
+/// step (task-d121, C1; Codex on #326).
 #[test]
 fn a_voter_resuming_an_installed_sync_learns_the_stores_it_counted() {
     let mut peer = stamped(2);
     let (campaigned, syncs) = won_with(&mut peer);
-    let counted = syncs
-        .iter()
-        .find_map(|f| match coord_consensus::ProtocolMessage::decode(f) {
-            Ok(coord_consensus::ProtocolMessage::Sync(d)) => Some(d.counted),
-            _ => None,
-        })
-        .expect("a Sync");
     install(&mut peer, syncs);
     assert!(peer.node().machine().synchronized_at(&campaigned));
     assert_eq!(durable_row(&peer, r(1), inc()), None, "nothing learned");
     keep_peer_stores(&mut peer);
-    peer.resume_counted(campaigned, counted);
     peer.flush().expect("flushed");
     peer.finish().expect("finished");
     assert_eq!(peer.node().peer_stores().expect("kept").counts.learned, 1);
