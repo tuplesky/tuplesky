@@ -2403,6 +2403,183 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The manifest a pinned fixture is initialized under: this test
+    /// node's cluster, domain and replica.
+    fn pinned_manifest() -> coord_membership::genesis::GenesisManifest {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        coord_membership::genesis::GenesisManifest {
+            cluster: hex(&CLUSTER.0),
+            domain: hex(&DOMAIN.0),
+            epoch: 1,
+            voters: vec![coord_membership::genesis::VoterSeed {
+                node: hex(&REPLICA.0),
+                incarnation: 1,
+                public_key: coord_membership::genesis::b64url(&[1; 32]),
+            }],
+            issuer_roots: vec!["AAAA".into()],
+            wif_rules: vec![serde_json::json!({ "issuer": "test" })],
+            admin: hex(&[0xa; 16]),
+            protocol_version: 1,
+        }
+    }
+
+    /// The selected generation, opened on its own.
+    fn selected_generation_opened(config: &Config) -> Generation {
+        Generation::open_existing(
+            &config.state.root_path(&config.state_directory),
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: REPLICA,
+                incarnation: incarnation(1),
+            },
+            OpenOptions::default(),
+        )
+        .expect("open")
+    }
+
+    /// [`a_node_with_a_baseline`], pinned to [`pinned_manifest`] before
+    /// the first boot, as `init` pins it, so `state-before` and the
+    /// baseline's image both hold the pin. Returns the store identity.
+    fn a_pinned_node_with_a_baseline(
+        config: &Config,
+        dir: &Path,
+    ) -> coord_types::ids::StoreInstanceId {
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        let mut reopened = serve(config, 1).expect("reopen");
+        let pinned = crate::genesis::check(
+            &mut reopened.generation,
+            &pinned_manifest(),
+            crate::genesis::Intent::Initialize,
+        )
+        .expect("pinned");
+        drop(reopened);
+        copy_tree(&dir.join("state"), &dir.join("state-before"));
+        let mut storage = serve(config, 1).expect("serve").attach().expect("attach");
+        storage
+            .domain
+            .publish_local(
+                &storage.checkpoints,
+                &coord_checkpoint::LocalLimits::default(),
+            )
+            .expect("publish")
+            .expect("something to represent");
+        pinned
+    }
+
+    /// A start's store identity (task-d121's C1) is the one pinned on the
+    /// generation it attaches, read by the same check `main` runs in the
+    /// open's `before_attach` and in the attach's reinstall (lead on
+    /// #212). On the invalid path the generation the open selects holds
+    /// another identity than the reinstall's image, so keeping the first
+    /// one read, or reading it from the discarded generation, fails here.
+    #[test]
+    fn a_start_reads_its_store_identity_from_the_generation_it_attaches() {
+        let manifest = pinned_manifest();
+        // Run a start's two checks as `main` does, keeping every identity
+        // each read, and return what the start keeps and what the
+        // generation it attached holds.
+        let start = |config: &Config| {
+            let mut pin = crate::genesis::PinCheck::new(&manifest, "test".into());
+            let mut read = Vec::new();
+            let opened = open_storage_with(
+                config,
+                Intent::Serve,
+                CLUSTER,
+                DOMAIN,
+                REPLICA,
+                incarnation(1),
+                |engine| {
+                    let checked = pin.check(engine);
+                    read.push(pin.store_instance);
+                    checked
+                },
+            )
+            .expect("open");
+            let storage = opened
+                .attach_checked(|engine| {
+                    let checked = pin.check(engine);
+                    read.push(pin.store_instance);
+                    checked
+                })
+                .expect("attach");
+            drop(storage);
+            let attached = crate::genesis::check_engine(
+                selected_generation_opened(config).engine(),
+                &manifest,
+                crate::genesis::Intent::Serve,
+            )
+            .expect("the attached generation is pinned");
+            (pin.store_instance, read, attached)
+        };
+
+        // An ordinary start: the open's check, on the selected generation.
+        let dir = workspace("identity-ordinary");
+        let ordinary = config(&dir);
+        let pinned = a_pinned_node_with_a_baseline(&ordinary, &dir);
+        let (kept, read, attached) = start(&ordinary);
+        assert_eq!(read, vec![Some(pinned)], "one check, at the open");
+        assert_eq!((kept, attached), (Some(pinned), pinned));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An unreadable projection: the open's check runs on its staged
+        // reinstall, and the attach has nothing left to reinstall.
+        let dir = workspace("identity-unreadable");
+        let mut unreadable = config(&dir);
+        unreadable.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let pinned = a_pinned_node_with_a_baseline(&unreadable, &dir);
+        lose(&unreadable, &dir, Loss::Garbage);
+        let (kept, read, attached) = start(&unreadable);
+        assert_eq!(read, vec![Some(pinned)], "one check, on the staging");
+        assert_eq!((kept, attached), (Some(pinned), pinned));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A projection behind its baseline, holding another identity than
+        // the baseline's image: the open's check reads the one it selects,
+        // the attach discards that generation and reinstalls the image,
+        // and the start keeps the image's.
+        let dir = workspace("identity-invalid");
+        let mut invalid = config(&dir);
+        invalid.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let pinned = a_pinned_node_with_a_baseline(&invalid, &dir);
+        lose(&invalid, &dir, Loss::Stale);
+        let other =
+            coord_types::ids::StoreInstanceId([0x0e; coord_types::ids::StoreInstanceId::LEN]);
+        assert_ne!(other, pinned);
+        {
+            let mut generation = selected_generation_opened(&invalid);
+            let engine = generation.engine();
+            let mut txn = engine.begin_write().expect("write");
+            txn.put(
+                Collection::MetaV1.id(),
+                coord_store_api::registry::meta_fields::STORE_INSTANCE,
+                other.as_bytes(),
+            )
+            .expect("identity");
+            txn.commit_durable().expect("commit");
+        }
+        let (kept, read, attached) = start(&invalid);
+        assert_eq!(
+            read,
+            vec![Some(other), Some(pinned)],
+            "the open's check on the selected generation, then the attach's on its reinstall"
+        );
+        assert_eq!(attached, pinned, "the reinstall was not attached");
+        assert_eq!(kept, Some(pinned), "the start kept a discarded identity");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A reinstall keeps the generation it discarded, as evidence, and
     /// removes every earlier one: repeated reinstalls leave the selected
     /// generation and the last one discarded (#212 review).

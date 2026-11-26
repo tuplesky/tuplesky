@@ -1043,16 +1043,14 @@ fn main() -> ExitCode {
     // it reinstalls for an unreadable projection, or the one the attach
     // reinstalls for an invalid one. Each runs the check on its own
     // engine before it is selected, and the last to run names it.
-    let mut refused_genesis = None;
-    let mut store_instance = None;
-    let refusal = |e: &genesis::GenesisError| store::StoreError::Refused {
-        root: config
+    let mut pin = genesis::PinCheck::new(
+        &placed.manifest,
+        config
             .state
             .root_path(&config.state_directory)
             .display()
             .to_string(),
-        reason: e.to_string(),
-    };
+    );
     let opened = store::open_storage_with(
         &config,
         store::Intent::Serve,
@@ -1060,27 +1058,17 @@ fn main() -> ExitCode {
         placed.membership.domain(),
         placed.replica,
         placed.incarnation,
-        |engine| match genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve) {
-            Ok(id) => {
-                store_instance = Some(id);
-                Ok(())
-            }
-            Err(e) => {
-                let refused = refusal(&e);
-                refused_genesis = Some(e);
-                Err(refused)
-            }
-        },
+        |engine| pin.check(engine),
     );
     let opened = match opened {
         Ok(o) => o,
         Err(e) => {
-            let reason = refused_genesis.as_ref().map_or(
+            let reason = pin.refused.as_ref().map_or(
                 QuarantineReason::Disk,
                 genesis::GenesisError::quarantine_reason,
             );
             lifecycle.quarantine(reason);
-            match refused_genesis {
+            match &pin.refused {
                 Some(genesis) => eprintln!("{genesis}"),
                 None => eprintln!("{e}"),
             }
@@ -1088,27 +1076,15 @@ fn main() -> ExitCode {
         }
     };
     let attaching = std::time::Instant::now();
-    let storage = match opened.attach_checked(|engine| {
-        match genesis::check_engine(engine, &placed.manifest, genesis::Intent::Serve) {
-            Ok(id) => {
-                store_instance = Some(id);
-                Ok(())
-            }
-            Err(e) => {
-                let refused = refusal(&e);
-                refused_genesis = Some(e);
-                Err(refused)
-            }
-        }
-    }) {
+    let storage = match opened.attach_checked(|engine| pin.check(engine)) {
         Ok(s) => s,
         Err(e) => {
-            let reason = refused_genesis.as_ref().map_or(
+            let reason = pin.refused.as_ref().map_or(
                 QuarantineReason::Disk,
                 genesis::GenesisError::quarantine_reason,
             );
             lifecycle.quarantine(reason);
-            match refused_genesis {
+            match &pin.refused {
                 Some(genesis) => eprintln!("{genesis}"),
                 None => eprintln!("{e}"),
             }
@@ -1116,7 +1092,7 @@ fn main() -> ExitCode {
         }
     };
     // Every serve path ran the check on the generation it selects.
-    let Some(store_instance) = store_instance else {
+    let Some(store_instance) = pin.store_instance else {
         lifecycle.quarantine(QuarantineReason::Disk);
         eprintln!("the store's identity was not read from its genesis pin");
         return ExitCode::from(2);

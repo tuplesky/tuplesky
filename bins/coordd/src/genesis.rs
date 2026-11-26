@@ -194,6 +194,53 @@ pub fn check_engine(
     Ok(initialized.store_instance)
 }
 
+/// The genesis check a start runs on each generation the open or the
+/// attach would select (`store::open_storage_with`'s `before_attach`,
+/// `store::Opened::attach_checked`), and what it found.
+///
+/// Each check that passes replaces the store identity, so once the attach
+/// returns it is the one pinned on the generation attached: the selected
+/// one, or the reinstall the open or the attach staged and then selected
+/// (task-d121's C1; the lead on #212).
+pub struct PinCheck<'a> {
+    manifest: &'a GenesisManifest,
+    root: String,
+    /// The refusal, where a check refused.
+    pub refused: Option<GenesisError>,
+    /// The store identity the last check that passed read.
+    pub store_instance: Option<StoreInstanceId>,
+}
+
+impl<'a> PinCheck<'a> {
+    /// A check against `manifest`, naming `root` in a refusal.
+    pub const fn new(manifest: &'a GenesisManifest, root: String) -> Self {
+        PinCheck {
+            manifest,
+            root,
+            refused: None,
+            store_instance: None,
+        }
+    }
+
+    /// Check `engine`'s pin, keeping its store identity or the refusal.
+    pub fn check(&mut self, engine: &mut RedbEngine) -> Result<(), crate::store::StoreError> {
+        match check_engine(engine, self.manifest, Intent::Serve) {
+            Ok(id) => {
+                self.store_instance = Some(id);
+                Ok(())
+            }
+            Err(e) => {
+                let refused = crate::store::StoreError::Refused {
+                    root: self.root.clone(),
+                    reason: e.to_string(),
+                };
+                self.refused = Some(e);
+                Err(refused)
+            }
+        }
+    }
+}
+
 fn short(bytes: &[u8]) -> String {
     bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
