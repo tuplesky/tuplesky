@@ -456,6 +456,24 @@ impl Machine {
         }
     }
 
+    /// The ballot of this replica's campaign while it waits for the
+    /// reports it hasn't read before giving up as `Behind`, and the
+    /// dependency it would give up on (task-d120).
+    pub fn report_wait(&self) -> Option<(Ballot, coord_types::CommandId)> {
+        match self {
+            Machine::Leader(_) => None,
+            Machine::Follower(m) => m.report_wait(),
+        }
+    }
+
+    /// The bound on that wait passed (task-d120).
+    pub fn end_report_wait(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.end_report_wait(),
+        }
+    }
+
     /// What this replica executed through.
     pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
         match self {
@@ -2250,6 +2268,13 @@ impl<P: Persistence> Node<P> {
     /// pages that have not arrived (task-d28).
     pub fn request_report_pages(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let effects = self.machine_mut().request_report_pages();
+        self.carry_out(effects, ballot)
+    }
+
+    /// End this replica's campaign's wait for the reports it hasn't read
+    /// (task-d120): the runtime's bound passed.
+    pub fn end_report_wait(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().end_report_wait();
         self.carry_out(effects, ballot)
     }
 

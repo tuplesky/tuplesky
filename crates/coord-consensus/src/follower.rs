@@ -835,6 +835,12 @@ pub struct Follower {
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
+    /// Whether a campaign about to be given up as `Behind` first waits
+    /// for the reports it hasn't read (task-d120). On unless a test
+    /// switches it off.
+    report_wait: bool,
+    /// Waits counted by [`Follower::report_waits`].
+    report_waits: u64,
     /// Set when a selection failed on this replica's own acceptance of a
     /// command with no payload anywhere, every voter answered (task-d79);
     /// cleared when it installs a Sync.
@@ -1397,6 +1403,8 @@ impl Follower {
             retired_wanted: BTreeSet::new(),
             retired_proposals: BTreeMap::new(),
             behind: None,
+            report_wait: true,
+            report_waits: 0,
             unbacked: None,
             behind_voters: None,
             report_due: None,
@@ -1641,6 +1649,8 @@ impl Follower {
             retired_wanted: BTreeSet::new(),
             retired_proposals: BTreeMap::new(),
             behind: None,
+            report_wait: true,
+            report_waits: 0,
             unbacked: None,
             behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
@@ -1768,6 +1778,41 @@ impl Follower {
     /// The campaign in progress.
     pub const fn campaign_state(&self) -> Option<&Campaign> {
         self.campaign.as_ref()
+    }
+
+    /// Switch task-d120's wait for the unread reports on or off. On by
+    /// default; off, a campaign refused as `Behind` is given up at once,
+    /// as before the wait.
+    pub const fn set_report_wait(&mut self, on: bool) {
+        self.report_wait = on;
+    }
+
+    /// The ballot and dependency of a campaign waiting for the reports
+    /// it hasn't read before it gives up as `Behind` (task-d120). The
+    /// runtime times the wait from when it first sees it, and calls
+    /// [`Follower::end_report_wait`] once the bound passes.
+    pub fn report_wait(&self) -> Option<(Ballot, CommandId)> {
+        let c = self.campaign.as_ref()?;
+        Some((c.ballot(), c.report_wait()?))
+    }
+
+    /// Campaigns that waited for the reports they hadn't read rather than
+    /// give up as `Behind` at once (task-d120): each wait counted once.
+    pub const fn report_waits(&self) -> u64 {
+        self.report_waits
+    }
+
+    /// The bound on the wait for the unread reports passed (task-d120):
+    /// select once more from the reports in hand, and give the campaign
+    /// up as `Behind` if the selection is still refused.
+    pub fn end_report_wait(&mut self) -> Vec<Effect> {
+        let Some(c) = self.campaign.as_mut() else {
+            return Vec::new();
+        };
+        if !c.end_report_wait() {
+            return Vec::new();
+        }
+        self.advance_campaign()
     }
 
     /// Start a campaign for `ballot` (this replica must be its leader):
@@ -2143,7 +2188,7 @@ impl Follower {
                 // The gap, the conflicts, the order and what is missing.
                 self.campaign_selection_reads += 4;
                 if let Some(refusal) = Self::refusal(table, payloads, decision, true) {
-                    return self.refuse_campaign(refusal);
+                    return self.refuse_or_wait(refusal);
                 }
                 let missing = Self::selection_missing(table, payloads, decision).collect();
                 campaign.await_payloads(missing);
@@ -2166,7 +2211,7 @@ impl Follower {
                     // What the check at selection found nothing in, read
                     // again against the state the binding rests on: the
                     // table moved while the payloads were fetched.
-                    return self.refuse_campaign(refusal);
+                    return self.refuse_or_wait(refusal);
                 }
             }
             // A selected command this replica never stored (it was down
@@ -4146,6 +4191,38 @@ impl Follower {
             return Some(CampaignRefusal::Cycle(cycle));
         }
         None
+    }
+
+    /// [`Follower::refuse_campaign`], except that a campaign refused as
+    /// `Behind` while a voter's report is still unread waits for it
+    /// first (task-d120).
+    ///
+    /// The refusal reads the selection, and a selection reads only the
+    /// reports in hand. In task-d119's traces most give-ups had a voter
+    /// up that held the dependency, whose report the selection never
+    /// read: in seed 754 its pages reached the candidate and its promise
+    /// was lost, so [`Campaign::reports`] left them out. The candidate
+    /// then never campaigned again this boot. Waiting drops the unbound
+    /// selection, so the campaign asks again for the promises and pages
+    /// it lacks (task-d82, task-d28), and selects again with each report
+    /// that completes. The wait ends when every voter has answered, or
+    /// when the runtime's bound passes ([`Follower::end_report_wait`]),
+    /// and the campaign is then given up as before.
+    ///
+    /// A selection from more reports than a quorum is as sound as one
+    /// from a quorum: design Section 4.9 says why.
+    fn refuse_or_wait(&mut self, refusal: CampaignRefusal) -> Vec<Effect> {
+        if let CampaignRefusal::Behind(missing) = refusal
+            && self.report_wait
+            && let Some(c) = self.campaign.as_mut()
+        {
+            let first = !c.waited();
+            if c.wait_for_reports(missing) {
+                self.report_waits = self.report_waits.saturating_add(u64::from(first));
+                return Vec::new();
+            }
+        }
+        self.refuse_campaign(refusal)
     }
 
     /// Give the campaign up for `refusal`.
@@ -8461,7 +8538,16 @@ impl Follower {
                     && let Err(e) = c.page(page)
                 {
                     self.rejections.push(FollowerRejection::Page(e));
-                    return Vec::new();
+                    // A verified page that names its report past the bound
+                    // is that voter's answer, as a last page is: the
+                    // campaign is asked again, so one waiting for reports
+                    // (task-d120) ends once every voter has answered,
+                    // whichever of its promise and its pages came last
+                    // (#331 review). Asked again on a later page of the
+                    // same report, the campaign assembles nothing new.
+                    if e != PageError::PastBound {
+                        return Vec::new();
+                    }
                 }
                 self.advance_campaign()
             }

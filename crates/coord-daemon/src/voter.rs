@@ -1401,6 +1401,12 @@ impl<P: Persistence> Voter<P> {
         self.node.request_report_pages(&self.ballot)
     }
 
+    /// End this voter's campaign's wait for the reports it hasn't read
+    /// (task-d120): `coordd`'s bound passed.
+    pub fn end_report_wait(&mut self) -> Result<Outbound, DriveError> {
+        self.node.end_report_wait(&self.ballot)
+    }
+
     /// Ask a peer for the commands it executed after this voter's
     /// frontier, when `pacer` says it is time (task-d08): the leader
     /// first, then the other voters in turn.

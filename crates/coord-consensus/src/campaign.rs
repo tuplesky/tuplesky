@@ -88,6 +88,16 @@ pub struct Campaign {
     /// Of those, whether that command is one the candidate doesn't hold
     /// decided either.
     selected_past_undecided: bool,
+    /// The dependency a selection was refused as `Behind` on while a
+    /// voter's report was still unread (task-d120): the campaign waits
+    /// for the reports it hasn't read and selects again as each one
+    /// completes.
+    report_wait: Option<CommandId>,
+    /// Whether that wait has ended: the runtime's bound passed, and the
+    /// next refusal gives the campaign up.
+    report_wait_over: bool,
+    /// Whether this campaign has waited so at all.
+    waited: bool,
 }
 
 impl Campaign {
@@ -120,6 +130,9 @@ impl Campaign {
             unreported_undecided: 0,
             selected_past_unreported: false,
             selected_past_undecided: false,
+            report_wait: None,
+            report_wait_over: false,
+            waited: false,
         }
     }
 
@@ -419,6 +432,72 @@ impl Campaign {
         self.decision.is_some() && self.selected_past_unreported
     }
 
+    /// Whether every voter of the ballot has answered: its promise is in
+    /// and its report is complete or past the page bound, the
+    /// candidate's own included. No other report can arrive.
+    pub fn all_reported(&self) -> bool {
+        let others = self
+            .assembler
+            .all_pages_held()
+            .chain(self.assembler.past_bound().keys())
+            .filter(|r| self.promised.contains(r))
+            .collect::<BTreeSet<_>>()
+            .len();
+        others + usize::from(self.own.is_some()) >= self.config.voters().len()
+    }
+
+    /// Wait for the reports not read yet, rather than give the campaign
+    /// up as `Behind` on `missing` (task-d120). The selection is dropped:
+    /// it was never bound, so selecting again costs only the payload asks
+    /// it made. While it is dropped the campaign asks again for the
+    /// promises and report pages that haven't arrived
+    /// ([`Campaign::unpromised`], [`Campaign::missing_pages`]), and the
+    /// next report that completes is selected from with every other.
+    ///
+    /// `false`, and nothing changes, once every voter has answered or the
+    /// wait has ended: the campaign is then given up as before.
+    pub fn wait_for_reports(&mut self, missing: CommandId) -> bool {
+        if self.report_wait_over || self.bound.is_some() || self.durable || self.all_reported() {
+            return false;
+        }
+        self.report_wait = Some(missing);
+        self.waited = true;
+        self.decision = None;
+        self.awaited = None;
+        true
+    }
+
+    /// Whether this campaign has waited for the other reports at all
+    /// (task-d120).
+    pub const fn waited(&self) -> bool {
+        self.waited
+    }
+
+    /// The dependency the campaign waits on the other reports for, while
+    /// it does (task-d120).
+    pub const fn report_wait(&self) -> Option<CommandId> {
+        self.report_wait
+    }
+
+    /// Whether the wait for the other reports has ended: the runtime's
+    /// bound passed (task-d120). Where task-d121's rule is on, a selection
+    /// decides a command as nothing only once it has (C5).
+    pub const fn report_wait_passed(&self) -> bool {
+        self.report_wait_over
+    }
+
+    /// End the wait: the runtime's bound passed. The selection is made
+    /// again from the reports in hand, and a refusal now gives the
+    /// campaign up. Whether it was waiting.
+    pub fn end_report_wait(&mut self) -> bool {
+        self.report_wait_over = true;
+        let waited = self.report_wait.take().is_some();
+        if waited {
+            self.supply_moved = true;
+        }
+        waited
+    }
+
     /// Whether the selection this campaign holds dropped a possible-fast
     /// candidate whose dependencies reach a command no report holds and
     /// the candidate doesn't hold decided (task-d119).
@@ -633,6 +712,8 @@ impl Campaign {
             })
             .collect();
         self.decision = Some(decision);
+        // A new selection: refused as `Behind` again, it waits again.
+        self.report_wait = None;
         Ok(self.decision.as_ref())
     }
 
