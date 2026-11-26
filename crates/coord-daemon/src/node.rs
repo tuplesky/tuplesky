@@ -927,6 +927,8 @@ pub struct Node<P: Persistence> {
     early_without_activation: bool,
     /// This voter's part in activating features (task-d99).
     features: Option<crate::feature::Features>,
+    /// The store each peer voter spoke from (task-d121, C1).
+    peer_stores: Option<crate::peer_store::PeerStores>,
     /// Whether this node reads `Feature::AnswerOnRelease` active
     /// (task-d100, step A): the collector beside it marks its
     /// submissions as answered on the leader's release alone.
@@ -1045,6 +1047,7 @@ impl<P: Persistence> Node<P> {
             early_holders: None,
             early_without_activation: false,
             features: None,
+            peer_stores: None,
             answer_on_release: false,
             batched_round: false,
             sent_bytes: coord_consensus::SentBytes::default(),
@@ -1917,11 +1920,64 @@ impl<P: Persistence> Node<P> {
         counts
     }
 
-    /// Take what the machine refused since the last call, rendered.
+    /// Take what the machine refused since the last call, rendered, and
+    /// the promises and reports the peer store check refused.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        let (rendered, table_full) = self.machine_mut().take_rejections_counted();
+        let (mut rendered, table_full) = self.machine_mut().take_rejections_counted();
         self.table_full += table_full;
+        if let Some(stores) = self.peer_stores.as_mut() {
+            rendered.extend(stores.take_rejections());
+        }
         rendered
+    }
+
+    /// Check the store each peer voter speaks from (task-d121, C1).
+    pub fn keep_peer_stores(&mut self, stores: crate::peer_store::PeerStores) {
+        self.peer_stores = Some(stores);
+    }
+
+    /// This voter's peer store check, when it keeps one.
+    pub const fn peer_stores(&self) -> Option<&crate::peer_store::PeerStores> {
+        self.peer_stores.as_ref()
+    }
+
+    /// Check a peer's promise or report page naming `store`, journaling
+    /// the peer's row where it is the first. `None` where this node keeps
+    /// no check: the message goes on as before.
+    pub fn check_peer_store(
+        &mut self,
+        voter: coord_types::ids::ReplicaId,
+        incarnation: coord_types::ids::ReplicaIncarnation,
+        store: coord_types::ids::StoreInstanceId,
+        ballot: &Ballot,
+    ) -> Result<Option<(crate::peer_store::Check, Outbound)>, DriveError> {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return Ok(None);
+        };
+        let check = stores
+            .check(voter, incarnation, store)
+            .map_err(DriveError::Engine)?;
+        let out = match &check {
+            crate::peer_store::Check::Record { barrier, updates } => self.carry_out(
+                vec![Effect::Persist(PersistBatch {
+                    barrier: *barrier,
+                    base: None,
+                    updates: updates.clone(),
+                })],
+                ballot,
+            )?,
+            _ => Outbound::default(),
+        };
+        Ok(Some((check, out)))
+    }
+
+    /// What became of the peer store rows' batches since the last call.
+    pub fn settle_peer_stores(&mut self) -> crate::peer_store::Settled {
+        let Some(stores) = self.peer_stores.as_mut() else {
+            return crate::peer_store::Settled::default();
+        };
+        let outbox = &self.outbox;
+        stores.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b))
     }
 
     /// Times this node's machine found its table full, since boot, as of

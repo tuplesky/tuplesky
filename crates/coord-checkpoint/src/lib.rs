@@ -71,6 +71,7 @@ pub mod install;
 pub mod local;
 pub mod maintain;
 pub mod manifest;
+pub mod peer_store;
 pub mod restore;
 pub mod store;
 pub mod trim;

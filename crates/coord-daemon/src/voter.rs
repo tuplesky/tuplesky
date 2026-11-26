@@ -153,6 +153,9 @@ pub struct Voter<P: Persistence> {
     /// How many snapshots the waiting releases were looked up in
     /// (diagnostic).
     release_again_lookups: u64,
+    /// Promises and reports waiting for their peer's store row to be
+    /// durable (task-d121, C1), under its batch, in the order they came.
+    held_peers: Vec<(coord_core::effect::BarrierId, PeerProvenance, Vec<u8>)>,
 }
 
 /// A marked command's release waiting to be published again (task-d100,
@@ -207,6 +210,7 @@ impl<P: Persistence> Voter<P> {
             release_again: std::collections::BTreeMap::new(),
             release_again_seen_at: None,
             release_again_lookups: 0,
+            held_peers: Vec::new(),
         }
     }
 
@@ -498,7 +502,6 @@ impl<P: Persistence> Voter<P> {
         if !provenance.is_voter() {
             return Ok(Outbound::default());
         }
-        let before = self.ballot;
         // What this voter acts on itself is below, and a leader's proposal
         // frame is none of it: the frame goes to the machine undecoded,
         // and the follower decodes it once (cost pass row 11). It is the
@@ -508,6 +511,84 @@ impl<P: Persistence> Voter<P> {
         } else {
             coord_consensus::ProtocolMessage::decode(&frame).ok()
         };
+        // A promise or report names the store it came from (task-d121,
+        // C1): the first from a peer under an incarnation is recorded, and
+        // waits for its row to be durable; one from another store than the
+        // one recorded is refused, and nothing below sees it.
+        let store = match &message {
+            Some(coord_consensus::ProtocolMessage::Promise { store, .. }) => Some(*store),
+            Some(coord_consensus::ProtocolMessage::ReportPage(page)) => Some(page.store),
+            _ => None,
+        };
+        let mut out = Outbound::default();
+        if let Some(store) = store
+            && let Some((check, persisted)) = self.node.check_peer_store(
+                provenance.from(),
+                provenance.incarnation(),
+                store,
+                &self.ballot,
+            )?
+        {
+            out.absorb(persisted);
+            match check {
+                crate::peer_store::Check::Pass => {}
+                crate::peer_store::Check::Refused { .. } => return Ok(out),
+                crate::peer_store::Check::Wait(barrier)
+                | crate::peer_store::Check::Record { barrier, .. } => {
+                    self.held_peers.push((barrier, provenance, frame));
+                    out.absorb(self.release_peers()?);
+                    return Ok(out);
+                }
+            }
+        }
+        out.absorb(self.deliver_peer(provenance, frame, message)?);
+        out.absorb(self.release_peers()?);
+        Ok(out)
+    }
+
+    /// Hand on the promises and reports held behind their peer's store
+    /// row (task-d121, C1) once its batch is durable, in the order they
+    /// came; drop those whose batch failed; the peer's next one is
+    /// recorded again.
+    fn release_peers(&mut self) -> Result<Outbound, DriveError> {
+        let mut out = Outbound::default();
+        if self.held_peers.is_empty() {
+            return Ok(out);
+        }
+        let settled = self.node.settle_peer_stores();
+        if !settled.failed.is_empty() {
+            self.held_peers
+                .retain(|(barrier, ..)| !settled.failed.contains(barrier));
+        }
+        if settled.durable.is_empty() {
+            return Ok(out);
+        }
+        let (ready, waiting): (Vec<_>, Vec<_>) = core::mem::take(&mut self.held_peers)
+            .into_iter()
+            .partition(|(barrier, ..)| settled.durable.contains(barrier));
+        self.held_peers = waiting;
+        for (_, provenance, frame) in ready {
+            let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+            out.absorb(self.deliver_peer(provenance, frame, message)?);
+        }
+        Ok(out)
+    }
+
+    /// Promises and reports held behind their peer's store row
+    /// (task-d121, C1).
+    pub fn held_peers(&self) -> usize {
+        self.held_peers.len()
+    }
+
+    /// A voter's frame past the store check: what this voter acts on
+    /// itself, then the machine.
+    fn deliver_peer(
+        &mut self,
+        provenance: PeerProvenance,
+        frame: Vec<u8>,
+        message: Option<coord_consensus::ProtocolMessage>,
+    ) -> Result<Outbound, DriveError> {
+        let before = self.ballot;
         if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
@@ -1237,20 +1318,25 @@ impl<P: Persistence> Voter<P> {
         // group's results by [`Voter::finish`] after it.
         let mut out = self.node.stage(&self.ballot)?;
         out.absorb(self.node.flush(&self.ballot)?);
+        out.absorb(self.release_peers()?);
         Ok(out)
     }
 
     /// Materialize the execution group a [`Voter::flush`] staged and hand
     /// out its results (task-d47).
     pub fn finish(&mut self) -> Result<Outbound, DriveError> {
-        self.node.finish(&self.ballot)
+        let mut out = self.node.finish(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 
     /// Take back what a pipelined store's materializer has committed and
     /// hand out what it released (task-d52, [`Node::settle`]). The runtime
     /// calls this when the materializer's waker fires.
     pub fn settle(&mut self) -> Result<Outbound, DriveError> {
-        self.node.settle(&self.ballot)
+        let mut out = self.node.settle(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 
     /// Whether [`Voter::flush`] has anything to do: batches queued, a
@@ -1283,7 +1369,9 @@ impl<P: Persistence> Voter<P> {
 
     /// Apply every command whose turn has come.
     pub fn execute(&mut self) -> Result<Outbound, DriveError> {
-        self.node.execute(&self.ballot)
+        let mut out = self.node.execute(&self.ballot)?;
+        out.absorb(self.release_peers()?);
+        Ok(out)
     }
 }
 
