@@ -7281,14 +7281,6 @@ fn retained_answer<P: Persistence>(
                 _ => return None,
             },
         };
-        // Executed here, by its record under the key or, for a decided
-        // nothing, which writes none, by its command id (Astra on #328).
-        let executed = matches!(resolved, Resolution::NoSession)
-            && (coord_storage::retry::lookup(view, &key)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.command_id == command)
-                || coord_daemon::settle::nothing_record(&gated, &command).is_some());
         // A session that may no longer execute is answered `NoSession`
         // before its floor is read, and retirement deleted the rows it
         // covered. The floor row is still durable, and a sequence at or
@@ -7297,11 +7289,24 @@ fn retained_answer<P: Persistence>(
         // sequence at or below the floor never executes again (`admit`
         // answers it `TooOld`), and one that did executed with its row
         // deleted, so `NOT_ADMITTED` could name a command that ran.
+        // Read first: a decided nothing's execution row is kept by
+        // command id after its sequence is acknowledged, so a covered
+        // sequence is retired even when that row is still there (Astra
+        // on #330).
         let below_floor = matches!(resolved, Resolution::NoSession)
-            && !executed
             && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
                 .ok()
                 .is_some_and(|floor| key.request_sequence <= floor.floor);
+        // Executed here, above the floor, by its record under the key or,
+        // for a decided nothing, which writes none, by its command id
+        // (Astra on #328).
+        let executed = matches!(resolved, Resolution::NoSession)
+            && !below_floor
+            && (coord_storage::retry::lookup(view, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.command_id == command)
+                || coord_daemon::settle::nothing_record(&gated, &command).is_some());
         // An executed nothing (task-d121) writes no record under its key
         // and keeps no payload row, so its record reads as pending, or as
         // another command's once a later one takes the key. Found by
@@ -8416,6 +8421,53 @@ unserved_order_above=25 unserved_no_snapshot=26 unserved_first_row=27";
                 &store,
                 &resolve_frame(key9, command9)
             )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A nothing executed at or below the floor keeps its execution
+        // row by command id after acknowledgement, but its sequence is
+        // retired: retired to a request and to a resolve, not withheld
+        // (Astra on #330). The nothing above the floor stays withheld.
+        let (key1, command1) = invocation(1);
+        write(
+            &mut store,
+            vec![
+                coord_consensus::rows::dependency_update(
+                    coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+                    &command1,
+                    &coord_consensus::CommandRecord {
+                        phase: coord_consensus::Phase::Commit,
+                        deps: Vec::new(),
+                        keys: Vec::new(),
+                        payload: Some(coord_consensus::commands::NOTHING_ADMISSION),
+                        paths: Vec::new(),
+                        synced_seq: None,
+                        path: coord_types::identity::Digest32([0; 32]),
+                    },
+                )
+                .unwrap(),
+                coord_storage::retry::executed_update(
+                    &command1,
+                    coord_types::ids::ExecutionPosition::new(1).unwrap(),
+                    None,
+                    coord_storage::retry::decided_nothing_digest(),
+                )
+                .unwrap(),
+            ],
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key1))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key1, command1)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key9))),
             Some(coord_collector::codes::OUTPUT_WITHHELD)
         );
         // A session that may no longer execute is refused before its
