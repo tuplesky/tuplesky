@@ -489,6 +489,7 @@ mod tests {
             wif_rules: vec![serde_json::json!({ "issuer": "test" })],
             admin: hex_id(&[9; 16]),
             protocol_version: 1,
+            features: Vec::new(),
         })
         .expect("membership")
     }

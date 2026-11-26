@@ -270,6 +270,7 @@ fn manifest_with_voter_keys(
         })],
         admin: hex(&PrincipalId([0xa; 16]).0),
         protocol_version: 1,
+        features: Vec::new(),
     };
     (manifest, certs, keys)
 }
@@ -1064,4 +1065,78 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
         ),
         Err(GenesisError::Algorithm)
     );
+}
+
+/// A manifest naming no features serializes as it did before the field
+/// existed, so its pinned digest is unchanged; one naming them is another
+/// manifest (task-d121).
+#[test]
+fn a_manifest_naming_no_features_keeps_its_digest() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    assert!(manifest.features.is_empty());
+    let value = serde_json::to_value(&manifest).unwrap();
+    assert!(
+        value.get("features").is_none(),
+        "an empty list is serialized, and every pinned digest moves"
+    );
+    // As a manifest from before the field reads: no key at all.
+    let read: GenesisManifest = serde_json::from_value(value).unwrap();
+    assert_eq!(read, manifest);
+    assert_eq!(read.digest(), manifest.digest());
+
+    let mut named = manifest.clone();
+    named.features = vec!["release-at-execution".into(), "decided-nothing".into()];
+    assert_ne!(named.digest(), manifest.digest());
+    let signed = sign_genesis(&named, &admin.enc).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    assert_eq!(verified, named);
+    assert_eq!(
+        verified.genesis_features().unwrap(),
+        [
+            coord_types::formats::Feature::ReleaseAtExecution,
+            coord_types::formats::Feature::DecidedNothing,
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// A feature that can't be active from genesis is refused when the
+/// manifest is verified, so `init` and every start refuse it too.
+#[test]
+fn a_feature_that_cannot_be_active_from_genesis_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let refused = |names: &[&str]| {
+        let mut named = manifest.clone();
+        named.features = names.iter().map(|n| (*n).to_owned()).collect();
+        let signed = sign_genesis(&named, &admin.enc).unwrap();
+        match verify_genesis(&signed, &pinned(&admin), 1) {
+            Err(GenesisError::Feature { name, reason }) => (name, reason),
+            other => panic!("{names:?} was not refused: {other:?}"),
+        }
+    };
+    assert_eq!(refused(&["no-such-feature"]).0, "no-such-feature");
+    assert!(refused(&["decided-nothing-prepared"]).1.contains("marker"));
+    assert!(
+        refused(&["checkpoint-floor"])
+            .1
+            .contains("no prepare marker")
+    );
+    assert!(
+        refused(&["release-at-execution", "release-at-execution"])
+            .1
+            .contains("twice")
+    );
+    let (name, reason) = refused(&["decided-nothing"]);
+    assert_eq!(name, "decided-nothing");
+    assert!(reason.contains("release-at-execution"), "{reason}");
+    // Its prerequisite alone is a manifest the design allows.
+    let mut alone = manifest.clone();
+    alone.features = vec!["release-at-execution".into()];
+    let signed = sign_genesis(&alone, &admin.enc).unwrap();
+    assert!(verify_genesis(&signed, &pinned(&admin), 1).is_ok());
 }

@@ -1184,7 +1184,8 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         )
         .expect("init");
         let mut storage = opened.attach().expect("attach");
-        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1), Vec::new())
+            .expect("policy");
         drop(storage);
         let generation = selected_generation(config);
         let before = dir.join("projection-before");
@@ -1324,6 +1325,86 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         }
     }
 
+    /// The features a genesis manifest names are written in `init`'s
+    /// genesis-policy batch (task-d121), and the next start admits them
+    /// active with no activation round.
+    #[test]
+    fn genesis_features_are_written_at_init_and_active_at_start() {
+        use coord_types::formats::Feature;
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let manifest = coord_membership::genesis::GenesisManifest {
+            cluster: hex(&CLUSTER.0),
+            domain: hex(&DOMAIN.0),
+            epoch: 1,
+            voters: [1u8, 2, 3]
+                .iter()
+                .map(|n| coord_membership::genesis::VoterSeed {
+                    node: hex(&[*n; 16]),
+                    incarnation: 1,
+                    public_key: "AAAA".into(),
+                })
+                .collect(),
+            issuer_roots: vec!["AAAA".into()],
+            wif_rules: vec![serde_json::json!({ "issuer": "test" })],
+            admin: hex(&[0xa; 16]),
+            protocol_version: 1,
+            features: vec!["release-at-execution".into(), "decided-nothing".into()],
+        };
+        let rows = crate::genesis_feature_rows(&manifest, REPLICA).expect("rows");
+        assert_eq!(rows.len(), 2, "this voter's support row and the record");
+        assert_eq!(
+            crate::genesis_feature_rows(&manifest, ReplicaId([9; 16]))
+                .expect("rows")
+                .len(),
+            1,
+            "a replica that is no genesis voter writes the record alone"
+        );
+        let none = coord_membership::genesis::GenesisManifest {
+            features: Vec::new(),
+            ..manifest.clone()
+        };
+        assert!(
+            crate::genesis_feature_rows(&none, REPLICA)
+                .expect("rows")
+                .is_empty()
+        );
+        let alone = coord_membership::genesis::GenesisManifest {
+            features: vec!["decided-nothing".into()],
+            ..manifest.clone()
+        };
+        assert!(crate::genesis_feature_rows(&alone, REPLICA).is_err());
+
+        let dir = workspace("genesis-features");
+        let config = config(&dir);
+        let opened = open_storage(
+            &config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(&config, &mut storage, incarnation(1), rows.clone())
+            .expect("policy");
+        // An `init` run again over the same store writes nothing new.
+        crate::write_genesis_policy(&config, &mut storage, incarnation(1), rows).expect("again");
+        drop(storage);
+        let storage = serve(&config, 2)
+            .and_then(Opened::attach)
+            .unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!(
+            storage.active,
+            std::collections::BTreeSet::from([
+                Feature::ReleaseAtExecution,
+                Feature::DecidedNothing
+            ])
+        );
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn serve(config: &Config, at: u64) -> Result<Opened, StoreError> {
         open_storage(
             config,
@@ -1362,7 +1443,8 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             )
             .expect("init");
             let mut storage = opened.attach().expect("attach");
-            crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
+            crate::write_genesis_policy(&config, &mut storage, incarnation(1), Vec::new())
+                .expect("policy");
             storage
                 .domain
                 .store()
@@ -1538,7 +1620,8 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         )
         .expect("init");
         let mut storage = opened.attach().expect("attach");
-        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1), Vec::new())
+            .expect("policy");
         drop(storage);
         if at > 1 {
             let opened = serve(config, at).expect("serve");

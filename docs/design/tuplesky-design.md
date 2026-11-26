@@ -1276,7 +1276,7 @@ Intact-storage restart can rotate credentials without resetting history. Lost st
 <a id="s10-2"></a>
 ### 10.2 Genesis
 
-Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping, protocol/version policy and the replicated features active from genesis (task-d121). Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
+Create one signed immutable genesis manifest binding cluster ID, initial voter IDs and key/generation, issuer roots, initial WIF rules, admin principal mapping, protocol/version policy and the replicated features active from genesis (task-d121). The manifest names those features by their stable names, and only a feature activated through a prepare marker may be named, with every feature it rests on. Each voter's initialization records them active, each with its marker, at the genesis configuration with every genesis voter as a reporter, so no activation round runs, and a later activation keeps them. A manifest that names none serializes, and so pins, as it did before the list existed. Collect verified node identities/keys before signing and deliver the same manifest through deployment trust. No open enrollment, first-request admin or TOFU peer discovery.
 
 Provisioning signer authorization may use existing OIDC/cloud identity instead of a static API root token, but protected trust anchors and signing authority remain necessary.
 

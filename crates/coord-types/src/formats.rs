@@ -370,11 +370,25 @@ pub enum Feature {
     /// `BatchedRound`'s prepare marker, as `EarlyProposalPrepared` is
     /// `EarlyProposal`'s.
     BatchedRoundPrepared = 0x000B,
+    /// A selection decides as nothing a command whose payload no report
+    /// holds, when every voter that held it is gone for good (task-d121,
+    /// design Section 4.9). Only deciding a new nothing is gated: carrying
+    /// one, installing one and executing one as its canonical refusal are
+    /// not, since a nothing can reach a voter whose own row for this isn't
+    /// durable yet. The rule rests on `ReleaseAtExecution`'s premise, that
+    /// every vote rests on a payload row durable at the voter, so it is on
+    /// only where both are active (`SelectionRules::decide_nothing`). A
+    /// stalled domain has no leader to activate it, so a domain that wants
+    /// it names it in its genesis manifest.
+    DecidedNothing = 0x000C,
+    /// `DecidedNothing`'s prepare marker, as `EarlyProposalPrepared` is
+    /// `EarlyProposal`'s.
+    DecidedNothingPrepared = 0x000D,
 }
 
 impl Feature {
     /// Every feature, in identifier order.
-    pub const ALL: [Feature; 11] = [
+    pub const ALL: [Feature; 13] = [
         Feature::CheckpointFloor,
         Feature::SealedHandoff,
         Feature::LocalCheckpoint,
@@ -386,6 +400,8 @@ impl Feature {
         Feature::AnswerOnReleasePrepared,
         Feature::BatchedRound,
         Feature::BatchedRoundPrepared,
+        Feature::DecidedNothing,
+        Feature::DecidedNothingPrepared,
     ];
 
     /// The frozen identifier.
@@ -407,6 +423,8 @@ impl Feature {
             Feature::AnswerOnReleasePrepared => "answer-on-release-prepared",
             Feature::BatchedRound => "batched-round",
             Feature::BatchedRoundPrepared => "batched-round-prepared",
+            Feature::DecidedNothing => "decided-nothing",
+            Feature::DecidedNothingPrepared => "decided-nothing-prepared",
         }
     }
 
@@ -420,6 +438,7 @@ impl Feature {
             Feature::ReleaseAtExecution => Some(Feature::ReleaseAtExecutionPrepared),
             Feature::AnswerOnRelease => Some(Feature::AnswerOnReleasePrepared),
             Feature::BatchedRound => Some(Feature::BatchedRoundPrepared),
+            Feature::DecidedNothing => Some(Feature::DecidedNothingPrepared),
             _ => None,
         }
     }
@@ -432,6 +451,17 @@ impl Feature {
             Feature::ReleaseAtExecutionPrepared => Some(Feature::ReleaseAtExecution),
             Feature::AnswerOnReleasePrepared => Some(Feature::AnswerOnRelease),
             Feature::BatchedRoundPrepared => Some(Feature::BatchedRound),
+            Feature::DecidedNothingPrepared => Some(Feature::DecidedNothing),
+            _ => None,
+        }
+    }
+
+    /// The feature this one rests on, which must be active wherever this
+    /// one is turned on, or `None`. A genesis manifest naming this one
+    /// without it is refused.
+    pub const fn requires(self) -> Option<Feature> {
+        match self {
+            Feature::DecidedNothing => Some(Feature::ReleaseAtExecution),
             _ => None,
         }
     }
@@ -467,7 +497,7 @@ impl Supported {
     /// The features this build supports, in identifier order, prepare
     /// markers included: a marker is supported exactly when the feature
     /// it marks is, and `admit` reads one as a requirement on this set.
-    pub const fn features() -> [Feature; 11] {
+    pub const fn features() -> [Feature; 13] {
         Feature::ALL
     }
 

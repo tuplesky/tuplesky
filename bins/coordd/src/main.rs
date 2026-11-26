@@ -131,15 +131,19 @@ enum Command {
 /// by running `init` again: a row the projection already holds with the
 /// value it would write is not written a second time, so finishing
 /// writes exactly the rows that are missing.
+///
+/// `features` are the rows of the features the manifest makes active from
+/// genesis ([`genesis_feature_rows`]), written in the same batch.
 fn write_genesis_policy(
     config: &Config,
     storage: &mut store::Storage,
     incarnation: coord_types::ids::ReplicaIncarnation,
+    features: Vec<coord_core::effect::StoreUpdate>,
 ) -> Result<(), String> {
     use coord_storage::Persistence;
     use coord_store_api::engine::OrderedRead;
 
-    let mut updates = Vec::new();
+    let mut updates = features;
     if let Some(sts) = &config.sts {
         let rule = coord_daemon::config::identity_bytes(&sts.trust_rule)
             .ok_or("sts.trust_rule is not an identity")?;
@@ -225,6 +229,38 @@ fn write_genesis_policy(
     Ok(())
 }
 
+/// The rows of the features `manifest` makes active from genesis
+/// (task-d121, design Section 10.2): the activation record every voter
+/// writes alike, from the manifest's own voters and epoch, and this
+/// replica's support row where it is one of them. None where it names
+/// none.
+fn genesis_feature_rows(
+    manifest: &coord_membership::genesis::GenesisManifest,
+    replica: coord_types::ids::ReplicaId,
+) -> Result<Vec<coord_core::effect::StoreUpdate>, String> {
+    use coord_membership::genesis::GenesisManifest;
+    let features = manifest
+        .genesis_features()
+        .map_err(|e| format!("the genesis manifest's features: {e:?}"))?;
+    let (Some(cluster), Some(domain), Some(epoch)) = (
+        manifest.cluster_id(),
+        manifest.domain_id(),
+        manifest.config_epoch(),
+    ) else {
+        return Err("the genesis manifest does not name its domain".into());
+    };
+    let seeds = manifest
+        .voters
+        .iter()
+        .map(|seed| GenesisManifest::voter(seed).map(|(node, _, _)| node))
+        .collect::<Option<std::collections::BTreeSet<_>>>()
+        .ok_or("the genesis manifest names a voter it cannot parse")?;
+    let voters = coord_consensus::quorum::EpochVoters::new(epoch, seeds)
+        .ok_or("the genesis manifest names no voters")?;
+    coord_checkpoint::feature::genesis_rows(cluster, domain, &voters, replica, &features)
+        .map_err(|e| format!("the genesis features: {e}"))
+}
+
 /// Finish initializing `opened`: attach it, write the genesis policy
 /// that is missing, and pin the genesis manifest -- in that order.
 ///
@@ -248,7 +284,8 @@ fn finish_initialization(
 ) -> Result<std::path::PathBuf, String> {
     let directory = {
         let mut storage = opened.attach().map_err(|e| e.to_string())?;
-        write_genesis_policy(config, &mut storage, placed.incarnation)?;
+        let features = genesis_feature_rows(&placed.manifest, placed.replica)?;
+        write_genesis_policy(config, &mut storage, placed.incarnation, features)?;
         storage.generation
     };
     let mut reopened = store::open_storage(
