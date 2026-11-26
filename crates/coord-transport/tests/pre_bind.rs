@@ -489,7 +489,11 @@ async fn binds_pipelined_on_one_unbound_connection_cost_at_most_one_check() {
     // others are never read.
     let dialed = anonymous(&f, &t).await;
     for _ in 0..3 {
-        let (mut send, _recv) = dialed.conn.open_bi().await.unwrap();
+        // The acceptor can refuse the first and close the connection
+        // before a later stream opens (aarch64 CI): then none is opened.
+        let Ok((mut send, _recv)) = dialed.conn.open_bi().await else {
+            break;
+        };
         let _ = send.write_all(&bind_frame(b"forged")).await;
         let _ = send.finish();
     }
@@ -809,4 +813,133 @@ async fn an_acknowledgement_not_written_whole_closes_the_connection() {
         next_negotiated(&mut t).await,
         TransportEvent::Closed { .. }
     ));
+}
+
+/// A node budget that holds one 2 MiB reply and nothing beside it, and a
+/// frontend reply that holds it: written to a caller that never reads it,
+/// the reply stops at the caller's stream window with its budget admitted,
+/// and its future, left unpolled, never times out. A `BindAck` admitted
+/// after it waits for room (#334 review).
+async fn hold_the_node_budget(
+    f: &Fixture,
+    t: &mut Transport,
+) -> (
+    Dialed,
+    quinn::RecvStream,
+    std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), coord_transport::SendError>> + Send>,
+    >,
+) {
+    const HELD: usize = 2 * 1024 * 1024;
+    let mut frontend = tls(f, t, Some(&f.ids[1])).await;
+    frontend.negotiate(PeerRole::Frontend, Lane::Unary).await;
+    assert!(matches!(
+        next_negotiated(t).await,
+        TransportEvent::Connected { .. }
+    ));
+    let freshness = encode_frame(
+        KIND_COLLECTOR_FRESHNESS,
+        COLLECTOR_FRESHNESS_VERSION,
+        b"ask",
+    )
+    .unwrap();
+    let unread = frontend.send(&freshness).await;
+    let responder = match next_negotiated(t).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    let mut reply = Box::pin(responder.respond(vec![0u8; HELD]));
+    tokio::select! {
+        r = &mut reply => panic!("the reply was written whole: {r:?}"),
+        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    assert!(t.node_budget().0 >= HELD, "{:?}", t.node_budget());
+    (frontend, unread, reply)
+}
+
+fn held_budget_limits() -> Limits {
+    let mut l = limits();
+    l.budget.node_bytes = 2 * 1024 * 1024 + 8;
+    l.budget.control_reserve = 0;
+    l
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_waiting_for_room_ends_within_its_deadline_and_closes_the_connection() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut t = acceptor(&f, held_budget_limits());
+    CountingGate::install(&t);
+    let (_frontend, _unread, _reply) = hold_the_node_budget(&f, &mut t).await;
+
+    // The bind's acknowledgement finds no room. One deadline covers its
+    // admission and its write, so it ends within the frame deadline, and
+    // the connection, never raised, is closed as unavailable (#334 review).
+    let dialed = anonymous(&f, &t).await;
+    let _recv = dialed.send(&bind_frame(GOOD)).await;
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+    let responder = match next_negotiated(&mut t).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    let started = Instant::now();
+    let answered = timeout(
+        Duration::from_secs(10),
+        responder
+            .respond(encode_frame(KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION, b"ack").unwrap()),
+    )
+    .await
+    .expect("the acknowledgement ended within its deadline");
+    assert!(
+        matches!(answered, Err(coord_transport::SendError::Timeout)),
+        "{answered:?}"
+    );
+    assert!(
+        started.elapsed() < limits().frame_timeout + Duration::from_secs(1),
+        "the acknowledgement waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        dialed.closed(Duration::from_secs(3)).await,
+        (REJECTED, BIND_UNAVAILABLE.as_bytes().to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_dropped_while_it_waits_closes_the_connection() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut t = acceptor(&f, held_budget_limits());
+    CountingGate::install(&t);
+    let (_frontend, _unread, _reply) = hold_the_node_budget(&f, &mut t).await;
+
+    // The runtime gives up on the acknowledgement while it waits for room:
+    // its future is dropped, and the connection is closed as unavailable,
+    // as a returned error closes it (#334 review).
+    let dialed = anonymous(&f, &t).await;
+    let _recv = dialed.send(&bind_frame(GOOD)).await;
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+    let responder = match next_negotiated(&mut t).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        timeout(
+            Duration::from_millis(300),
+            responder.respond(
+                encode_frame(KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION, b"ack").unwrap()
+            ),
+        )
+        .await
+        .is_err(),
+        "the acknowledgement found room"
+    );
+    assert_eq!(
+        dialed.closed(Duration::from_secs(3)).await,
+        (REJECTED, BIND_UNAVAILABLE.as_bytes().to_vec())
+    );
 }
