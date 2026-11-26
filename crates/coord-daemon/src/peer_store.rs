@@ -14,11 +14,23 @@
 //! A voter that comes back through membership as a new generation
 //! (task-d41) does so under a new incarnation, which has no row yet.
 //!
+//! A candidate's `NewLeader` names its store too (C4). It is checked
+//! against the row and records none: a voter that recorded another store
+//! for the candidate refuses to promise, and one with no row promises as
+//! before. A candidate wiped and initialized again under its identity
+//! counts its own empty report as the voter it was, and no check on what
+//! it receives can see that. So the check covers a candidate whose store
+//! reached a voter the campaign needs, through the candidate's own
+//! promises and through the Syncs that counted them.
+//!
 //! A Sync names the store of each voter its leader counted. A voter that
 //! installs it records each one it has no row for, and never overwrites
 //! one: a counted store that disagrees with a row is logged and counted,
 //! and the Sync is installed all the same, since refusing it would stall
-//! the domain over a record this voter can't arbitrate.
+//! the domain over a record this voter can't arbitrate. The one
+//! exception is the leader's own store (C4): a Sync whose leader this
+//! voter recorded under another store is refused before the machine
+//! sees it, as that leader's `NewLeader` is.
 //!
 //! A row is read from the store by its key the first time its peer and
 //! incarnation come up after a boot, and kept. No history is read whole,
@@ -54,6 +66,12 @@ pub struct PeerStoreCounts {
     pub held: u64,
     /// A message from another store than the one recorded, refused.
     pub refused: u64,
+    /// A candidate's `NewLeader` from another store than the one
+    /// recorded, refused (C4).
+    pub refused_candidates: u64,
+    /// A Sync whose leader's own counted store is not the one recorded
+    /// for it, refused (C4).
+    pub refused_syncs: u64,
     /// A row's batch that failed: its held messages are dropped, and the
     /// peer's next message is recorded again.
     pub failed: u64,
@@ -65,6 +83,15 @@ pub struct PeerStoreCounts {
     pub duplicates: u64,
     /// A message dropped because the held messages were at a bound.
     pub shed: u64,
+}
+
+/// What names a leader's store, checked without recording it (C4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// A candidate's `NewLeader`.
+    Candidate,
+    /// A Sync, counting its leader's own store.
+    SyncLeader,
 }
 
 /// What to do with a peer's promise or report page.
@@ -215,6 +242,44 @@ impl PeerStores {
                 self.counts.recorded += 1;
                 Ok(Check::Record { barrier, updates })
             }
+        }
+    }
+
+    /// Check the store a candidate's `NewLeader`, or a Sync counting its
+    /// own leader, names for `leader` under `incarnation` (C4), recording
+    /// nothing. `Some(recorded)` where this voter recorded another store
+    /// for it, durable or not: the frame is refused, logged and counted.
+    /// Without a row it goes on, and a Sync's counted set is learned once
+    /// it is installed, as before.
+    pub fn check_leader(
+        &mut self,
+        leader: ReplicaId,
+        incarnation: ReplicaIncarnation,
+        store: StoreInstanceId,
+        named: Named,
+        durable: impl FnOnce() -> Result<Option<StoreInstanceId>, String>,
+    ) -> Result<Option<StoreInstanceId>, String> {
+        match self.row((leader, incarnation), durable)? {
+            Some((recorded, _)) if recorded != store => {
+                let what = match named {
+                    Named::Candidate => {
+                        self.counts.refused_candidates += 1;
+                        "a NewLeader from candidate"
+                    }
+                    Named::SyncLeader => {
+                        self.counts.refused_syncs += 1;
+                        "a Sync counting the store of its leader"
+                    }
+                };
+                self.rejections.push(format!(
+                    "{what} {leader:?} (incarnation {}) names store {store:?}, not the store \
+                     {recorded:?} recorded for it: refused, as a candidate wiped and \
+                     initialized again under its identity (task-d121)",
+                    incarnation.get()
+                ));
+                Ok(Some(recorded))
+            }
+            _ => Ok(None),
         }
     }
 
