@@ -100,63 +100,73 @@ impl core::fmt::Display for StoreError {
 
 impl core::error::Error for StoreError {}
 
-/// Open the projection `config` names, for `intent`.
-pub fn open(
-    config: &Config,
-    intent: Intent,
-    cluster: ClusterId,
-    domain: DomainId,
-    replica: ReplicaId,
-    incarnation: ReplicaIncarnation,
-) -> Result<(Generation, Option<ReplicaIncarnation>), StoreError> {
-    let root = config.state.root_path(&config.state_directory);
-    let identity = StoreIdentity {
-        cluster_id: cluster,
-        domain_id: domain,
-        replica_id: replica,
-        incarnation,
-    };
-    let options = OpenOptions {
-        cache_bytes: config.state.cache_bytes,
-    };
-    match intent {
-        Intent::Initialize => initialize(&root, identity, options, |_| Ok(())).map(|g| (g, None)),
-        Intent::Serve => {
-            // An authorized replacement keeps this node's durable state
-            // (task-58). `place` has already established that this
-            // certificate's generation is the *committed* voter's, so a
-            // root stamped with an earlier one belongs to this same
-            // replica before its key was replaced -- its journal,
-            // checkpoints and epoch metadata are exactly what the new
-            // generation comes back on. A root stamped *later* is the
-            // fencing case and is refused, so a clone restored from
-            // before a replacement still cannot serve.
-            //
-            // Nothing is adopted here. The generation is opened as it is
-            // stamped, and the adoption is only reported as pending: the
-            // genesis pin is checked on this generation before anything
-            // durable moves (`Opened::attach` carries the stream and then
-            // advances the manifest), so a manifest the node was not
-            // initialized under is refused while the store is still
-            // exactly as it was.
-            let not_there = |e| match e {
-                OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
-                    StoreError::NotInitialized { root: show(&root) }
-                }
-                other => StoreError::Refused {
-                    root: show(&root),
-                    reason: format!("{other:?}"),
-                },
-            };
-            let pending = Generation::adoption_pending(&root, identity).map_err(not_there)?;
-            let stamped = StoreIdentity {
-                incarnation: pending.unwrap_or(incarnation),
-                ..identity
-            };
-            let generation =
-                Generation::open_existing(&root, stamped, options).map_err(not_there)?;
-            Ok((generation, pending))
+/// What a serving start found at the projection root.
+enum Found {
+    /// The selected generation, and the incarnation an adoption is
+    /// pending from, if one is.
+    Opened(Generation, Option<ReplicaIncarnation>),
+    /// A selected generation whose database cannot be opened
+    /// ([`OpenError::is_unreadable_database`]): under the replay-backed
+    /// profile it is reinstalled from the local baseline
+    /// ([`reinstall_unreadable`]), and otherwise refused with `error`.
+    Unreadable {
+        /// The identity the root is stamped with.
+        stamped: StoreIdentity,
+        /// As for [`Found::Opened`].
+        pending: Option<ReplicaIncarnation>,
+        /// Why the database did not open.
+        error: OpenError,
+    },
+}
+
+/// Open the generation `root` selects to serve as `identity`.
+fn find_serving(
+    root: &Path,
+    identity: StoreIdentity,
+    options: OpenOptions,
+) -> Result<Found, StoreError> {
+    // An authorized replacement keeps this node's durable state
+    // (task-58). `place` has already established that this
+    // certificate's generation is the *committed* voter's, so a
+    // root stamped with an earlier one belongs to this same
+    // replica before its key was replaced -- its journal,
+    // checkpoints and epoch metadata are exactly what the new
+    // generation comes back on. A root stamped *later* is the
+    // fencing case and is refused, so a clone restored from
+    // before a replacement still cannot serve.
+    //
+    // Nothing is adopted here. The generation is opened as it is
+    // stamped, and the adoption is only reported as pending: the
+    // genesis pin is checked on this generation before anything
+    // durable moves (`Opened::attach` carries the stream and then
+    // advances the manifest), so a manifest the node was not
+    // initialized under is refused while the store is still
+    // exactly as it was.
+    let not_there = |e| match e {
+        OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+            StoreError::NotInitialized { root: show(root) }
         }
+        other => StoreError::Refused {
+            root: show(root),
+            reason: format!("{other:?}"),
+        },
+    };
+    let pending = Generation::adoption_pending(root, identity).map_err(not_there)?;
+    let stamped = StoreIdentity {
+        incarnation: pending.unwrap_or(identity.incarnation),
+        ..identity
+    };
+    match Generation::open_existing(root, stamped, options) {
+        Ok(generation) => {
+            report_rollback(&generation, root);
+            Ok(Found::Opened(generation, pending))
+        }
+        Err(error) if error.is_unreadable_database() => Ok(Found::Unreadable {
+            stamped,
+            pending,
+            error,
+        }),
+        Err(e) => Err(not_there(e)),
     }
 }
 
@@ -227,6 +237,20 @@ fn initialize(
         );
     }
     Ok(generation)
+}
+
+/// Say that the open rolled the projection back to the commit before its
+/// last, which failed its checksums (#212 review): a crash tore that
+/// commit or its pages were damaged. What remains is checked against the
+/// journal and carried forward from it like any other projection.
+fn report_rollback(generation: &Generation, root: &Path) {
+    if generation.rolled_back_last_commit() {
+        eprintln!(
+            "the projection under {} was rolled back to the commit before its last, which \
+             failed its checksums; the journal carries it forward again",
+            show(root)
+        );
+    }
 }
 
 fn show(path: &Path) -> String {
@@ -397,8 +421,9 @@ pub fn open_storage_with(
         },
     };
 
+    let mut before_attach = Some(before_attach);
     let mut phases = BootPhases::default();
-    let (generation, pending, journal) = match intent {
+    let (found, journal) = match intent {
         Intent::Initialize => {
             // Refused before anything is written if the journal is already
             // there, so a restore is not carried out in full only to be
@@ -435,7 +460,7 @@ pub fn open_storage_with(
                 &config.state.root_path(&config.state_directory),
                 identity_of_store,
                 options_of_store,
-                before_attach,
+                before_attach.take().expect("not yet run"),
             )?;
             // The journal is created only once the generation is selected.
             // A journal is what makes a root servable and what a second
@@ -455,7 +480,7 @@ pub fn open_storage_with(
                         .map_err(journal_error)?
                 }
             };
-            (generation, None, journal)
+            (Found::Opened(generation, None), journal)
         }
         Intent::Serve => {
             let opening = std::time::Instant::now();
@@ -463,11 +488,20 @@ pub fn open_storage_with(
                 .map_err(journal_error)?;
             phases.journal_open = opening.elapsed();
             let opening = std::time::Instant::now();
-            let (mut generation, pending) =
-                open(config, intent, cluster, domain_id, replica, incarnation)?;
+            let found = find_serving(
+                &config.state.root_path(&config.state_directory),
+                StoreIdentity {
+                    cluster_id: cluster,
+                    domain_id,
+                    replica_id: replica,
+                    incarnation,
+                },
+                OpenOptions {
+                    cache_bytes: config.state.cache_bytes,
+                },
+            )?;
             phases.projection_open = opening.elapsed();
-            before_attach(generation.engine())?;
-            (generation, pending, journal)
+            (found, journal)
         }
     };
 
@@ -519,6 +553,75 @@ pub fn open_storage_with(
     }
 
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
+    let (mut generation, pending) = match found {
+        Found::Opened(generation, pending) => {
+            // A staging a stopped reinstall left behind is unreferenced
+            // once a start finds the selection opens. Reclaiming it costs
+            // nothing a start reads, and failing to costs only disk.
+            match generation.prune_abandoned_stagings() {
+                Ok(removed) if !removed.is_empty() => {
+                    eprintln!("removed abandoned stagings {removed:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("abandoned stagings could not be removed: {e}"),
+            }
+            (generation, pending)
+        }
+        Found::Unreadable {
+            stamped,
+            pending,
+            error,
+        } => {
+            let root = config.state.root_path(&config.state_directory);
+            let stamped_incarnation = stamped.incarnation;
+            let mut staged = reinstall_unreadable(
+                &store,
+                &root,
+                &checkpoint_root,
+                domain_id,
+                stamped,
+                error,
+                OpenOptions {
+                    cache_bytes: config.state.cache_bytes,
+                },
+            )?;
+            // Everything that can refuse the start runs on the staged
+            // generation, and only then is it selected (#212 review): a
+            // refusal leaves `CURRENT` where it was, naming the unreadable
+            // generation, and removes the staging, which nothing names.
+            let directory = staged.directory().to_path_buf();
+            let checked = (|| {
+                if let Some(before_attach) = before_attach.take() {
+                    before_attach(staged.engine())?;
+                }
+                rollback_guard(staged.engine(), &directory)?;
+                // Over the stream the root is stamped with: an adoption
+                // the attach carries out later has not re-keyed it yet.
+                refuse_unapplied_activation(
+                    &store,
+                    domain_id,
+                    stamped_incarnation,
+                    staged.engine(),
+                    &journal_root,
+                    &directory,
+                )
+            })();
+            if let Err(refusal) = checked {
+                abandon(staged);
+                return Err(refusal);
+            }
+            let discarded = staged.previous().map(|m| m.generation);
+            let generation = staged.activate().map_err(|e| StoreError::Refused {
+                root: show(&root),
+                reason: format!("the reinstalled generation: {e}"),
+            })?;
+            prune_after_reinstall(&generation, discarded);
+            (generation, pending)
+        }
+    };
+    if let Some(before_attach) = before_attach.take() {
+        before_attach(generation.engine())?;
+    }
     let adoption = pending.map(|previous| Adoption {
         previous,
         root: config.state.root_path(&config.state_directory),
@@ -557,7 +660,19 @@ impl Opened {
     /// caught up with the journal has forgotten transitions this node
     /// already acknowledged.
     pub fn attach(self) -> Result<Storage, StoreError> {
-        self.attach_between(|| Ok(()))
+        self.attach_checked(|_| Ok(()))
+    }
+
+    /// [`Opened::attach`], running `pin` on a generation the attach
+    /// reinstalls for an invalid projection, before it is selected, as
+    /// `open_storage_with`'s `before_attach` runs on the generation the
+    /// open selects or reinstalls (#212 review). A start reads the store's
+    /// genesis pin, and its identity, from the generation it attaches.
+    pub fn attach_checked(
+        self,
+        pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
+    ) -> Result<Storage, StoreError> {
+        self.attach_between(|| Ok(()), pin)
     }
 
     /// [`Opened::attach`], running `between` after an adoption's first
@@ -566,6 +681,7 @@ impl Opened {
     fn attach_between(
         self,
         between: impl FnOnce() -> Result<(), StoreError>,
+        pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
     ) -> Result<Storage, StoreError> {
         let Opened {
             mut store,
@@ -588,23 +704,27 @@ impl Opened {
         // needs is "this node is too old for this cluster", not a
         // puzzling failure three steps later. A store with no activation
         // admits every build, which is what lets compatible binaries
-        // coexist before activation.
+        // coexist before activation. It runs again after the attach's
+        // replay, below.
         {
-            use coord_store_api::engine::{LocalEngine, SnapshotSource};
             let directory = generation.directory().to_path_buf();
-            let view =
-                generation
-                    .engine()
-                    .reader()
-                    .snapshot()
-                    .map_err(|e| StoreError::Refused {
-                        root: show(&directory),
-                        reason: format!("the activation record could not be read: {e}"),
-                    })?;
-            active = coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
-                root: show(&directory),
-                reason: format!("{e}"),
-            })?;
+            active = rollback_guard(generation.engine(), &directory)?;
+            let scanning = std::time::Instant::now();
+            // The same guard over what the attach would replay, before
+            // anything is adopted (#212 review). The stream is the one the
+            // root is stamped with, which an adoption still to come has
+            // not re-keyed. A projection the attach then reinstalls is
+            // scanned again, on the image, before it is selected.
+            let stamped = generation.manifest().incarnation;
+            refuse_unapplied_activation(
+                &store,
+                domain_id,
+                stamped,
+                generation.engine(),
+                &journal_root,
+                &directory,
+            )?;
+            phases.guard_scan = scanning.elapsed();
         }
         let generation = match adoption {
             None => generation,
@@ -645,65 +765,22 @@ impl Opened {
         };
         let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
         phases.baseline = reading.elapsed();
-        let mut generation = if store.projection_profile() == ProjectionProfile::Strict {
+        let generation = if store.projection_profile() == ProjectionProfile::Strict {
             refuse_if_invalid(&store, domain_id, generation, represented)?
         } else {
             reinstall_if_invalid(
                 &store,
+                &journal_root,
                 domain_id,
                 generation,
                 baseline.as_ref().zip(image.as_ref()),
                 represented,
                 options,
+                pin,
             )?
         };
         let directory = generation.directory().to_path_buf();
-        let scanning = std::time::Instant::now();
-        // The rollback guard over what the attach is about to replay (Codex
-        // on #98; #212 has the same). An activation is a journaled
-        // transition like any other, and the replay applies its rows
-        // without asking whether this build can do the feature: one
-        // journaled after the projection's stamp -- a replay-backed
-        // projection behind the journal, a strict one a crash cut before
-        // its commit, or a reinstalled baseline's image -- is not in the
-        // projection the first guard read. Refused here, before the replay
-        // writes a row or the boot record is appended, at the record that
-        // activates it.
-        {
-            let refusal = store
-                .scan_unapplied(domain_id, generation.engine(), |update| {
-                    (update.collection == coord_store_api::registry::Collection::CheckpointV1.id()
-                        && update.key == coord_checkpoint::feature::ACTIVE_KEY)
-                        .then(|| match &update.value {
-                            Some(bytes) => coord_checkpoint::feature::admit_encoded(bytes)
-                                .err()
-                                .map(|e| e.to_string()),
-                            None => Some("the activation record is deleted".to_owned()),
-                        })
-                        .flatten()
-                })
-                // A suffix the scan cannot read is left to the attach,
-                // which verifies the chain and refuses it with its own
-                // reason (a projection behind the retired prefix, a
-                // broken link). The guard after the attach still checks
-                // whatever a replay applied.
-                .unwrap_or_else(|e| {
-                    eprintln!("the journal's unapplied records could not be scanned: {e}");
-                    None
-                });
-            if let Some((seq, why)) = refusal {
-                return Err(StoreError::Refused {
-                    root: show(&directory),
-                    reason: format!(
-                        "{why}: activated by the journal's record {} that the projection has \
-                         not applied; nothing was replayed",
-                        seq.get()
-                    ),
-                });
-            }
-        }
         let (engine, _lock, _manifest) = generation.into_parts();
-        phases.guard_scan = scanning.elapsed();
 
         // Shard 0 for the single-domain preview; task-j07 is where a node
         // spreads domains over a shard set.
@@ -770,11 +847,34 @@ impl Opened {
     }
 }
 
+/// The rollback guard (task-60) over an engine's latest snapshot: the
+/// features its activation record names, or a refusal naming the ones this
+/// build cannot do.
+fn rollback_guard(
+    engine: &mut RedbEngine,
+    directory: &Path,
+) -> Result<std::collections::BTreeSet<coord_types::formats::Feature>, StoreError> {
+    use coord_store_api::engine::{LocalEngine, SnapshotSource};
+    let view = engine
+        .reader()
+        .snapshot()
+        .map_err(|e| StoreError::Refused {
+            root: show(directory),
+            reason: format!("the activation record could not be read: {e}"),
+        })?;
+    coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
+        root: show(directory),
+        reason: format!("{e}"),
+    })
+}
+
 /// Under the strict profile, refuse a projection that does not continue
-/// the journal before anything is attached (#211). Nothing rolls a strict
-/// projection back, so one behind the published baseline, or whose stamp
-/// names a record the journal does not hold where it says, is damage, and
-/// is not reinstalled. A projection stamped past the journal's head passes
+/// the journal before anything is attached (#211). The one rollback a
+/// strict projection takes is the open's, of a last commit that failed
+/// its checksums, which is reported (`report_rollback`); one behind the
+/// published baseline, or whose stamp names a record the journal does not
+/// hold where it says, is damage, rolled back or not, and is refused here,
+/// not reinstalled. A projection stamped past the journal's head passes
 /// this check; the attach refuses it ("materialized past the journal's
 /// durable head"), in both profiles.
 fn refuse_if_invalid(
@@ -813,8 +913,13 @@ fn refuse_if_invalid(
 /// node's own state at the baseline, and the attach then replays
 /// `(C, J]` onto it. Without a baseline there is nothing to install, and
 /// the node refuses to serve rather than guess.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the store, the generation, the baseline and the checks the reinstall runs"
+)]
 fn reinstall_if_invalid(
     store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    journal_root: &Path,
     domain_id: DomainId,
     mut generation: Generation,
     baseline: Option<(
@@ -823,6 +928,7 @@ fn reinstall_if_invalid(
     )>,
     represented: LocalJournalSeq,
     options: OpenOptions,
+    pin: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
 ) -> Result<Generation, StoreError> {
     let directory = generation.directory().to_path_buf();
     let refused = |reason: String| StoreError::Refused {
@@ -856,53 +962,214 @@ fn reinstall_if_invalid(
         replica_id: manifest.replica_id,
         incarnation: manifest.incarnation,
     };
-    let mut staged = generation
+    let staged = generation
         .stage_reinstall(identity, options)
         .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
-    coord_checkpoint::install_local(
+    let represented = pointer.represented;
+    let mut staged = install_baseline(staged, pointer, image, refused)?;
+    // The guards on what would be selected, before it is: the image's
+    // own activation (#227 review on the carry), and any the attach would
+    // replay onto it. A refusal removes the staging, which nothing selects
+    // (#231 review on the carry), so a start that keeps refusing leaves
+    // nothing behind.
+    let staged_directory = staged.directory().to_path_buf();
+    let in_the_image = |refusal: StoreError| match refusal {
+        StoreError::Refused { root, reason } => StoreError::Refused {
+            root,
+            reason: format!(
+                "{reason}: in the local checkpoint at {}; nothing was reinstalled",
+                represented.get()
+            ),
+        },
+        other => other,
+    };
+    // The genesis pin first, as on the open's reinstall: the identity a
+    // start serves under is read from the generation it attaches.
+    let checked = pin(staged.engine())
+        .and_then(|_| rollback_guard(staged.engine(), &staged_directory).map_err(in_the_image))
+        .and_then(|_| {
+            refuse_unapplied_activation(
+                store,
+                domain_id,
+                identity.incarnation,
+                staged.engine(),
+                journal_root,
+                &staged_directory,
+            )
+        });
+    if let Err(refusal) = checked {
+        abandon(staged);
+        return Err(refusal);
+    }
+    let discarded = staged.previous().map(|m| m.generation);
+    let generation = staged
+        .activate()
+        .map_err(|e| refused(format!("the reinstalled generation: {e}")))?;
+    prune_after_reinstall(&generation, discarded);
+    Ok(generation)
+}
+
+/// Once a reinstall is selected, keep the generation it discarded, as
+/// evidence of what was lost and why, and remove every earlier one, so
+/// repeated reinstalls do not pile up (#212 review). A failure to prune
+/// loses nothing and stops nothing; it is reported.
+fn prune_after_reinstall(generation: &Generation, discarded: Option<u64>) {
+    match generation.prune_unselected_except(discarded) {
+        Ok(removed) if !removed.is_empty() => {
+            eprintln!("removed earlier discarded generations {removed:?}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("earlier discarded generations could not be removed: {e}"),
+    }
+}
+
+/// The rollback guard over what the attach would replay onto `engine`
+/// (#212 review). An activation is a journaled transition like any other,
+/// and the replay applies its rows without asking whether this build can
+/// do the feature: one journaled after the projection's stamp -- a
+/// replay-backed projection behind the journal, a strict one a crash cut
+/// before its commit, or a reinstalled baseline's image -- is not in the
+/// projection the first guard read. Refused at the record that activates
+/// it, before a generation is selected, an adoption is carried out, the
+/// replay writes a row or the boot record is appended.
+fn refuse_unapplied_activation(
+    store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    domain_id: DomainId,
+    incarnation: ReplicaIncarnation,
+    engine: &RedbEngine,
+    journal_root: &Path,
+    directory: &Path,
+) -> Result<(), StoreError> {
+    let refusal = store
+        .scan_unapplied_of(domain_id, incarnation, engine, |update| {
+            (update.collection == coord_store_api::registry::Collection::CheckpointV1.id()
+                && update.key == coord_checkpoint::feature::ACTIVE_KEY)
+                .then(|| match &update.value {
+                    Some(bytes) => coord_checkpoint::feature::admit_encoded(bytes)
+                        .err()
+                        .map(|e| e.to_string()),
+                    None => Some("the activation record is deleted".to_owned()),
+                })
+                .flatten()
+        })
+        .map_err(|e| StoreError::Refused {
+            root: show(journal_root),
+            reason: format!("the journal's unapplied records could not be read: {e}"),
+        })?;
+    match refusal {
+        None => Ok(()),
+        Some((seq, why)) => Err(StoreError::Refused {
+            root: show(directory),
+            reason: format!(
+                "{why}: activated by the journal's record {} that the projection has not \
+                 applied; nothing was replayed",
+                seq.get()
+            ),
+        }),
+    }
+}
+
+/// Under the replay-backed profile (task-j05 step 3), a projection whose
+/// database cannot be opened at all -- absent, empty, refused by redb or
+/// failing its integrity check -- is the projection's loss, not the
+/// node's: the journal and the image of the local baseline rebuild it, as
+/// they rebuild one that does not continue the journal
+/// ([`reinstall_if_invalid`]). A generation holding the baseline's image is
+/// staged and filled, and returned unselected: the caller runs the genesis
+/// pin and the rollback guard on it and activates it last, and the attach
+/// then replays `(C, J]` onto it.
+///
+/// Under the strict profile the projection is the authority for what it
+/// committed, so the file is refused as it always was; and without a
+/// baseline there is nothing to install, so the node refuses to serve
+/// rather than guess. A database whose identity record names another
+/// node never reaches here: it is not unreadable, it is someone else's.
+fn reinstall_unreadable(
+    store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    root: &Path,
+    checkpoint_root: &Path,
+    domain_id: DomainId,
+    stamped: StoreIdentity,
+    error: OpenError,
+    options: OpenOptions,
+) -> Result<InactiveGeneration, StoreError> {
+    let refused = |reason: String| StoreError::Refused {
+        root: show(root),
+        reason,
+    };
+    if store.projection_profile() == ProjectionProfile::Strict {
+        return Err(refused(format!("{error:?}")));
+    }
+    // The stream the root is stamped with: before an authorized
+    // replacement's adoption, which `Opened::attach` carries out after
+    // this, the node's pointers are still in its predecessor's stream.
+    let baseline = store
+        .recovery_baseline_of(domain_id, stamped.incarnation)
+        .map_err(|e| {
+            refused(format!(
+                "the local recovery baseline could not be read: {e}"
+            ))
+        })?;
+    let Some(pointer) = baseline else {
+        return Err(refused(format!(
+            "the projection could not be opened ({error}) and no local checkpoint was \
+             published to reinstall it from"
+        )));
+    };
+    let checkpoints =
+        coord_checkpoint::LocalCheckpointStore::open(checkpoint_root).map_err(|e| {
+            StoreError::Refused {
+                root: show(checkpoint_root),
+                reason: format!("the local checkpoint directory could not be opened: {e}"),
+            }
+        })?;
+    let image = checkpoints
+        .load(&pointer)
+        .map_err(|e| StoreError::Refused {
+            root: show(checkpoint_root),
+            reason: format!("{e}"),
+        })?;
+    eprintln!(
+        "the projection could not be opened ({error}); reinstalling the local checkpoint at {}",
+        pointer.represented.get()
+    );
+    let staged = Generation::stage_reinstall_unreadable(root, stamped, options)
+        .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
+    install_baseline(staged, &pointer, &image, refused)
+}
+
+/// Remove a staging a refused start leaves unselected. Failing to costs
+/// only disk, and the next reinstall over the same selection removes it
+/// (`Generation::stage_reinstall_unreadable`).
+fn abandon(staged: InactiveGeneration) {
+    let directory = staged.directory().to_path_buf();
+    if let Err(e) = staged.abandon() {
+        eprintln!(
+            "the refused staging {} could not be removed: {e}",
+            directory.display()
+        );
+    }
+}
+
+/// Fill `staged` with the baseline's image and select it.
+fn install_baseline(
+    mut staged: InactiveGeneration,
+    pointer: &coord_journal_api::CheckpointPointerV1,
+    image: &coord_checkpoint::LocalCheckpointV1,
+    refused: impl Fn(String) -> StoreError,
+) -> Result<InactiveGeneration, StoreError> {
+    if let Err(e) = coord_checkpoint::install_local(
         staged.engine(),
         image,
         &pointer.origin,
         &coord_checkpoint::local::InstallLocalLimits::default(),
-    )
-    .map_err(|e| {
-        refused(format!(
+    ) {
+        abandon(staged);
+        return Err(refused(format!(
             "the local checkpoint could not be installed: {e:?}"
-        ))
-    })?;
-    // The rollback guard over the image just installed (#227 review). An
-    // activation inside the baseline image is in no journal record the
-    // scan before the attach reads, since that scan starts at the image's
-    // stamp. Checked here, before the reinstalled generation becomes the
-    // selected one, so a build that can't run it changes nothing.
-    let admitted = {
-        use coord_store_api::engine::{LocalEngine, SnapshotSource};
-        match staged.engine().reader().snapshot() {
-            Ok(view) => coord_checkpoint::feature::admit(&view)
-                .map(drop)
-                .map_err(|e| {
-                    format!(
-                        "{e}: activated in the local checkpoint at {}; nothing was reinstalled",
-                        pointer.represented.get()
-                    )
-                }),
-            Err(e) => Err(format!(
-                "the reinstalled image's activation record could not be read: {e}"
-            )),
-        }
-    };
-    if let Err(reason) = admitted {
-        // Never selected, so removed: a start that keeps refusing must
-        // not leave a staged generation behind each time (#231 review).
-        if let Err(e) = staged.abandon() {
-            eprintln!("the refused reinstall's staged generation could not be removed: {e}");
-        }
-        return Err(refused(reason));
+        )));
     }
-    let generation = staged
-        .activate()
-        .map_err(|e| refused(format!("the reinstalled generation: {e}")))?;
-    Ok(generation)
+    Ok(staged)
 }
 
 /// Carry out an authorized replacement's adoption: the journal's stream
@@ -968,7 +1235,9 @@ fn adopt(
             identity.incarnation.get()
         );
     }
-    Generation::open_existing(&root, identity, options).map_err(refused)
+    let generation = Generation::open_existing(&root, identity, options).map_err(refused)?;
+    report_rollback(&generation, &root);
+    Ok(generation)
 }
 
 /// The journal an initialization created before it stopped, or
@@ -1046,7 +1315,8 @@ pub(crate) fn root_path(state_directory: &str, root: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_checkpoint::LocalBaseline;
+    use coord_store_api::engine::{LocalEngine, SnapshotSource, WriteTxn};
     use coord_store_api::registry::Collection;
 
     /// A configuration whose store lives under `dir`, with a genesis
@@ -1374,12 +1644,15 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 
         let opened = serve(&config, 2).expect("open at the next generation");
         assert!(opened.adoption.is_some(), "no adoption was pending");
-        let stopped = opened.attach_between(|| {
-            Err(StoreError::Refused {
-                root: "test".into(),
-                reason: "stopped between the two writes".into(),
-            })
-        });
+        let stopped = opened.attach_between(
+            || {
+                Err(StoreError::Refused {
+                    root: "test".into(),
+                    reason: "stopped between the two writes".into(),
+                })
+            },
+            |_| Ok(()),
+        );
         assert!(
             matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
             "the start did not stop where this test stops it: {:?}",
@@ -1763,11 +2036,13 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             let image = checkpoints.load(&baseline).expect("image");
             let generation = reinstall_if_invalid(
                 &opened.store,
+                &opened.journal_root,
                 opened.domain_id,
                 opened.generation,
                 Some((&baseline, &image)),
                 baseline.represented,
                 opened.options,
+                |_| Ok(()),
             )
             .expect("reinstalled");
             // The process stops here: the reinstalled generation is
@@ -1784,6 +2059,797 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         assert_eq!(frontiers.materialized(), frontiers.durable());
         assert_eq!(frontiers.checkpoint().get(), represented);
         assert!(frontiers.durable().get() > durable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How a lost projection is lost (task-j05 step 3, `replay`'s case).
+    #[derive(Clone, Copy, Debug)]
+    enum Loss {
+        /// A fresh database: the projection holds nothing.
+        Empty,
+        /// The projection of an earlier boot, behind the baseline.
+        Stale,
+        /// A stamp naming a record the journal does not hold.
+        Foreign,
+        /// A file redb cannot open: garbage, empty, or gone.
+        Garbage,
+        ZeroLength,
+        Missing,
+    }
+
+    /// The selected generation's database file.
+    fn selected_database(config: &Config) -> PathBuf {
+        let root = config.state.root_path(&config.state_directory);
+        let current = std::fs::read_to_string(root.join("CURRENT")).expect("CURRENT");
+        root.join(current.trim()).join("domain.redb")
+    }
+
+    /// Lose the selected projection of a node that published a baseline,
+    /// in the way `loss` names.
+    fn lose(config: &Config, dir: &Path, loss: Loss) {
+        let database = selected_database(config);
+        match loss {
+            Loss::Empty => {
+                let scratch = dir.join("scratch");
+                let fresh = Generation::create(
+                    &scratch,
+                    StoreIdentity {
+                        cluster_id: CLUSTER,
+                        domain_id: DOMAIN,
+                        replica_id: REPLICA,
+                        incarnation: incarnation(1),
+                    },
+                    OpenOptions::default(),
+                )
+                .expect("a fresh generation");
+                let path = fresh.directory().join("domain.redb");
+                drop(fresh);
+                std::fs::copy(path, &database).expect("replace");
+                std::fs::remove_dir_all(scratch).expect("scratch");
+            }
+            Loss::Stale => {
+                std::fs::remove_dir_all(dir.join("state")).expect("remove");
+                copy_tree(&dir.join("state-before"), &dir.join("state"));
+            }
+            Loss::Foreign => {
+                let identity = StoreIdentity {
+                    cluster_id: CLUSTER,
+                    domain_id: DOMAIN,
+                    replica_id: REPLICA,
+                    incarnation: incarnation(1),
+                };
+                let root = config.state.root_path(&config.state_directory);
+                let mut generation =
+                    Generation::open_existing(&root, identity, OpenOptions::default())
+                        .expect("open");
+                let engine = generation.engine();
+                let meta = coord_storage::lowering::DurableMeta::read(
+                    &engine.reader().snapshot().expect("snapshot"),
+                )
+                .expect("meta");
+                let foreign = coord_storage::lowering::DurableMeta {
+                    stamp: coord_store_api::envelope::AppliedStamp::new(
+                        meta.stamp.store_seq(),
+                        coord_types::identity::Digest32([0xee; 32]),
+                    ),
+                    ..meta
+                };
+                let mut txn = engine.begin_write().expect("write");
+                foreign.write(&mut txn).expect("stamp");
+                txn.commit_durable().expect("commit");
+            }
+            Loss::Garbage => std::fs::write(&database, vec![0x5a; 64 << 10]).expect("garbage"),
+            Loss::ZeroLength => std::fs::write(&database, []).expect("truncate"),
+            Loss::Missing => std::fs::remove_file(&database).expect("remove"),
+        }
+    }
+
+    /// A node initialized, given its genesis policy and booted once more
+    /// to publish a baseline, with the state of the first boot kept in
+    /// `state-before`. Returns the baseline's represented sequence.
+    fn a_node_with_a_baseline(config: &Config, dir: &Path) -> u64 {
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        copy_tree(&dir.join("state"), &dir.join("state-before"));
+        let mut storage = serve(config, 1).expect("serve").attach().expect("attach");
+        let published = storage
+            .domain
+            .publish_local(
+                &storage.checkpoints,
+                &coord_checkpoint::LocalLimits::default(),
+            )
+            .expect("publish")
+            .expect("something to represent");
+        published.represented.get()
+    }
+
+    /// task-j05 step 3: a projection lost in any of the ways `replay`'s
+    /// case names -- empty, behind the baseline, stamped with a record the
+    /// journal does not hold, or a file redb cannot open -- stops a strict
+    /// node, and a replay-backed node discards it, installs its baseline
+    /// and replays the journal onto it, serving at the journal's head.
+    #[test]
+    fn a_lost_projection_is_reinstalled_under_replay_and_refused_under_strict() {
+        for loss in [
+            Loss::Empty,
+            Loss::Stale,
+            Loss::Foreign,
+            Loss::Garbage,
+            Loss::ZeroLength,
+            Loss::Missing,
+        ] {
+            let dir = workspace(&format!("lost-{loss:?}"));
+            let mut config = config(&dir);
+            let represented = a_node_with_a_baseline(&config, &dir);
+            assert!(represented > 0);
+            lose(&config, &dir, loss);
+
+            let refused = serve(&config, 1).and_then(Opened::attach);
+            assert!(
+                matches!(refused, Err(StoreError::Refused { .. })),
+                "{loss:?}: the strict profile served a lost projection: {:?}",
+                refused.map(|_| ()).map_err(|e| e.to_string())
+            );
+
+            config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+            let storage = serve(&config, 1)
+                .and_then(Opened::attach)
+                .unwrap_or_else(|e| panic!("{loss:?}: not reinstalled: {e}"));
+            let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+            assert_eq!(frontiers.materialized(), frontiers.durable(), "{loss:?}");
+            assert_eq!(frontiers.checkpoint().get(), represented, "{loss:?}");
+            drop(storage);
+            serve(&config, 1)
+                .and_then(Opened::attach)
+                .unwrap_or_else(|e| panic!("{loss:?}: the reinstalled generation: {e}"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An authorized replacement that starts with an unreadable
+    /// projection: the baseline is in the predecessor's stream, which the
+    /// adoption carries forward only after the reinstall. The reinstall
+    /// reads it from the stream the root is stamped with, and the
+    /// adoption then proceeds on the reinstalled generation (Codex review
+    /// on #212).
+    #[test]
+    fn an_unreadable_projection_is_reinstalled_before_a_pending_adoption() {
+        let dir = workspace("unreadable-adoption");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        lose(&config, &dir, Loss::Garbage);
+
+        let opened = serve(&config, 2).expect("an unreadable projection is reinstalled");
+        assert!(opened.adoption.is_some(), "no adoption was pending");
+        let storage = opened
+            .attach()
+            .expect("the adoption on the reinstalled generation");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        drop(storage);
+        assert_eq!(
+            coord_storage_redb::lifecycle::selected_manifest(
+                &config.state.root_path(&config.state_directory)
+            )
+            .expect("manifest")
+            .incarnation,
+            incarnation(2)
+        );
+        serve(&config, 2)
+            .and_then(Opened::attach)
+            .expect("the adopted generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An adoption stopped between its two writes (the stream re-keyed to
+    /// the new incarnation, the manifest not moved yet) and then an
+    /// unreadable projection: the baseline is still found, under the
+    /// stream's new key with the stamped origin, and reinstalled; the
+    /// adoption then finishes (#212 review).
+    #[test]
+    fn an_unreadable_projection_after_an_interrupted_adoption_is_reinstalled() {
+        let dir = workspace("unreadable-interrupted-adoption");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+
+        let opened = serve(&config, 2).expect("open at the next generation");
+        assert!(opened.adoption.is_some(), "no adoption was pending");
+        let stopped = opened.attach_between(
+            || {
+                Err(StoreError::Refused {
+                    root: "test".into(),
+                    reason: "stopped between the two writes".into(),
+                })
+            },
+            |_| Ok(()),
+        );
+        assert!(
+            matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
+            "{:?}",
+            stopped.err()
+        );
+        lose(&config, &dir, Loss::Garbage);
+
+        let opened = serve(&config, 2).expect("an unreadable projection is reinstalled");
+        assert!(opened.adoption.is_some(), "the adoption is still pending");
+        let storage = opened.attach().expect("the adoption finishes");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        drop(storage);
+        serve(&config, 2)
+            .and_then(Opened::attach)
+            .expect("the adopted generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checks that can refuse a start run on the staged reinstall,
+    /// and it is selected only after them (#212 review): a pin that
+    /// refuses leaves `CURRENT` naming the unreadable generation, whose
+    /// file is untouched, and the next start reinstalls again.
+    #[test]
+    fn a_reinstall_the_pin_refuses_is_never_selected() {
+        let dir = workspace("reinstall-pin-refuses");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        lose(&config, &dir, Loss::Garbage);
+        let database = selected_database(&config);
+
+        let refused = open_storage_with(
+            &config,
+            Intent::Serve,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+            |_| {
+                Err(StoreError::Refused {
+                    root: "test".into(),
+                    reason: "the pin refuses".into(),
+                })
+            },
+        );
+        assert!(
+            matches!(&refused, Err(StoreError::Refused { reason, .. }) if reason == "the pin refuses"),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            selected_database(&config),
+            database,
+            "the staging was selected"
+        );
+        assert_eq!(
+            std::fs::read(&database).expect("kept"),
+            vec![0x5a; 64 << 10]
+        );
+        serve(&config, 1)
+            .and_then(Opened::attach)
+            .expect("the next start reinstalls");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The attach's reinstall of an invalid projection runs the pin on the
+    /// staged generation before it is selected, as the open's does (#212
+    /// review), so a start reads its genesis, and its store identity, from
+    /// the generation it attaches: a refusal leaves `CURRENT` where it
+    /// was, a pin that passes runs once, on the staging, and an attach
+    /// with nothing to reinstall runs none.
+    #[test]
+    fn an_invalid_projections_reinstall_the_pin_refuses_is_never_selected() {
+        let dir = workspace("reinstall-invalid-pin");
+        let mut config = config(&dir);
+        a_projection_behind_its_baseline(&config, &dir, 1);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let database = selected_database(&config);
+
+        let refused = serve(&config, 1).expect("serve").attach_checked(|_| {
+            Err(StoreError::Refused {
+                root: "test".into(),
+                reason: "the pin refuses".into(),
+            })
+        });
+        assert!(
+            matches!(&refused, Err(StoreError::Refused { reason, .. }) if reason == "the pin refuses"),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            selected_database(&config),
+            database,
+            "the staging was selected"
+        );
+
+        let mut ran = 0;
+        drop(
+            serve(&config, 1)
+                .expect("serve")
+                .attach_checked(|_| {
+                    ran += 1;
+                    Ok(())
+                })
+                .expect("the reinstall"),
+        );
+        assert_eq!(ran, 1, "the pin ran on the staging");
+        assert_ne!(
+            selected_database(&config),
+            database,
+            "the reinstall was selected"
+        );
+
+        let mut ran = 0;
+        drop(
+            serve(&config, 1)
+                .expect("serve")
+                .attach_checked(|_| {
+                    ran += 1;
+                    Ok(())
+                })
+                .expect("serves"),
+        );
+        assert_eq!(ran, 0, "nothing was reinstalled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manifest a pinned fixture is initialized under: this test
+    /// node's cluster, domain and replica.
+    fn pinned_manifest() -> coord_membership::genesis::GenesisManifest {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        coord_membership::genesis::GenesisManifest {
+            cluster: hex(&CLUSTER.0),
+            domain: hex(&DOMAIN.0),
+            epoch: 1,
+            voters: vec![coord_membership::genesis::VoterSeed {
+                node: hex(&REPLICA.0),
+                incarnation: 1,
+                public_key: coord_membership::genesis::b64url(&[1; 32]),
+            }],
+            issuer_roots: vec!["AAAA".into()],
+            wif_rules: vec![serde_json::json!({ "issuer": "test" })],
+            admin: hex(&[0xa; 16]),
+            protocol_version: 1,
+        }
+    }
+
+    /// The selected generation, opened on its own.
+    fn selected_generation_opened(config: &Config) -> Generation {
+        Generation::open_existing(
+            &config.state.root_path(&config.state_directory),
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: REPLICA,
+                incarnation: incarnation(1),
+            },
+            OpenOptions::default(),
+        )
+        .expect("open")
+    }
+
+    /// [`a_node_with_a_baseline`], pinned to [`pinned_manifest`] before
+    /// the first boot, as `init` pins it, so `state-before` and the
+    /// baseline's image both hold the pin. Returns the store identity.
+    fn a_pinned_node_with_a_baseline(
+        config: &Config,
+        dir: &Path,
+    ) -> coord_types::ids::StoreInstanceId {
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        let mut reopened = serve(config, 1).expect("reopen");
+        let pinned = crate::genesis::check(
+            &mut reopened.generation,
+            &pinned_manifest(),
+            crate::genesis::Intent::Initialize,
+        )
+        .expect("pinned");
+        drop(reopened);
+        copy_tree(&dir.join("state"), &dir.join("state-before"));
+        let mut storage = serve(config, 1).expect("serve").attach().expect("attach");
+        storage
+            .domain
+            .publish_local(
+                &storage.checkpoints,
+                &coord_checkpoint::LocalLimits::default(),
+            )
+            .expect("publish")
+            .expect("something to represent");
+        pinned
+    }
+
+    /// A start's store identity (task-d121's C1) is the one pinned on the
+    /// generation it attaches, read by the same check `main` runs in the
+    /// open's `before_attach` and in the attach's reinstall (lead on
+    /// #212). On the invalid path the generation the open selects holds
+    /// another identity than the reinstall's image, so keeping the first
+    /// one read, or reading it from the discarded generation, fails here.
+    #[test]
+    fn a_start_reads_its_store_identity_from_the_generation_it_attaches() {
+        let manifest = pinned_manifest();
+        // Run a start's two checks as `main` does, keeping every identity
+        // each read, and return what the start keeps and what the
+        // generation it attached holds.
+        let start = |config: &Config| {
+            let mut pin = crate::genesis::PinCheck::new(&manifest, "test".into());
+            let mut read = Vec::new();
+            let opened = open_storage_with(
+                config,
+                Intent::Serve,
+                CLUSTER,
+                DOMAIN,
+                REPLICA,
+                incarnation(1),
+                |engine| {
+                    let checked = pin.check(engine);
+                    read.push(pin.store_instance);
+                    checked
+                },
+            )
+            .expect("open");
+            let storage = opened
+                .attach_checked(|engine| {
+                    let checked = pin.check(engine);
+                    read.push(pin.store_instance);
+                    checked
+                })
+                .expect("attach");
+            drop(storage);
+            let attached = crate::genesis::check_engine(
+                selected_generation_opened(config).engine(),
+                &manifest,
+                crate::genesis::Intent::Serve,
+            )
+            .expect("the attached generation is pinned");
+            (pin.store_instance, read, attached)
+        };
+
+        // An ordinary start: the open's check, on the selected generation.
+        let dir = workspace("identity-ordinary");
+        let ordinary = config(&dir);
+        let pinned = a_pinned_node_with_a_baseline(&ordinary, &dir);
+        let (kept, read, attached) = start(&ordinary);
+        assert_eq!(read, vec![Some(pinned)], "one check, at the open");
+        assert_eq!((kept, attached), (Some(pinned), pinned));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An unreadable projection: the open's check runs on its staged
+        // reinstall, and the attach has nothing left to reinstall.
+        let dir = workspace("identity-unreadable");
+        let mut unreadable = config(&dir);
+        unreadable.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let pinned = a_pinned_node_with_a_baseline(&unreadable, &dir);
+        lose(&unreadable, &dir, Loss::Garbage);
+        let (kept, read, attached) = start(&unreadable);
+        assert_eq!(read, vec![Some(pinned)], "one check, on the staging");
+        assert_eq!((kept, attached), (Some(pinned), pinned));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A projection behind its baseline, holding another identity than
+        // the baseline's image: the open's check reads the one it selects,
+        // the attach discards that generation and reinstalls the image,
+        // and the start keeps the image's.
+        let dir = workspace("identity-invalid");
+        let mut invalid = config(&dir);
+        invalid.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let pinned = a_pinned_node_with_a_baseline(&invalid, &dir);
+        lose(&invalid, &dir, Loss::Stale);
+        let other =
+            coord_types::ids::StoreInstanceId([0x0e; coord_types::ids::StoreInstanceId::LEN]);
+        assert_ne!(other, pinned);
+        {
+            let mut generation = selected_generation_opened(&invalid);
+            let engine = generation.engine();
+            let mut txn = engine.begin_write().expect("write");
+            txn.put(
+                Collection::MetaV1.id(),
+                coord_store_api::registry::meta_fields::STORE_INSTANCE,
+                other.as_bytes(),
+            )
+            .expect("identity");
+            txn.commit_durable().expect("commit");
+        }
+        let (kept, read, attached) = start(&invalid);
+        assert_eq!(
+            read,
+            vec![Some(other), Some(pinned)],
+            "the open's check on the selected generation, then the attach's on its reinstall"
+        );
+        assert_eq!(attached, pinned, "the reinstall was not attached");
+        assert_eq!(kept, Some(pinned), "the start kept a discarded identity");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reinstall keeps the generation it discarded, as evidence, and
+    /// removes every earlier one: repeated reinstalls leave the selected
+    /// generation and the last one discarded (#212 review).
+    #[test]
+    fn repeated_reinstalls_keep_only_the_last_discarded_generation() {
+        let dir = workspace("reinstall-prune");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        let root = config.state.root_path(&config.state_directory);
+        let generations = || {
+            let mut names: Vec<String> = std::fs::read_dir(&root)
+                .expect("root")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("gen-"))
+                .collect();
+            names.sort();
+            names
+        };
+        let mut discarded = Vec::new();
+        for _ in 0..3 {
+            let lost = selected_database(&config);
+            discarded.push(
+                lost.parent()
+                    .and_then(|d| d.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .expect("generation name"),
+            );
+            lose(&config, &dir, Loss::Garbage);
+            drop(
+                serve(&config, 1)
+                    .and_then(Opened::attach)
+                    .expect("reinstalled"),
+            );
+        }
+        let selected = selected_database(&config)
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .expect("generation name");
+        let mut expected = vec![discarded.last().expect("three").clone(), selected];
+        expected.sort();
+        assert_eq!(generations(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ordinary_start_removes_an_abandoned_staging_and_keeps_the_discarded_generation() {
+        let dir = workspace("prune-staging");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        let root = config.state.root_path(&config.state_directory);
+        let name_of = |path: &Path| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .expect("generation name")
+        };
+        let generations = || {
+            let mut names: Vec<String> = std::fs::read_dir(&root)
+                .expect("root")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("gen-"))
+                .collect();
+            names.sort();
+            names
+        };
+        // A reinstall leaves its discarded generation below the selection.
+        let discarded = name_of(selected_database(&config).parent().expect("generation"));
+        lose(&config, &dir, Loss::Garbage);
+        drop(
+            serve(&config, 1)
+                .and_then(Opened::attach)
+                .expect("reinstalled"),
+        );
+        let selected_dir = selected_database(&config)
+            .parent()
+            .expect("generation")
+            .to_path_buf();
+        let selected = name_of(&selected_dir);
+        // A stopped attempt left a filled staging above it, never selected.
+        let number: u64 = selected["gen-".len()..].parse().expect("number");
+        let staging = root.join(format!("gen-{:06}", number + 1));
+        std::fs::create_dir(&staging).expect("staging");
+        for entry in std::fs::read_dir(&selected_dir).expect("selected") {
+            let path = entry.expect("entry").path();
+            std::fs::copy(&path, staging.join(path.file_name().expect("name"))).expect("copy");
+        }
+        let mut before = vec![discarded.clone(), selected.clone(), name_of(&staging)];
+        before.sort();
+        assert_eq!(generations(), before);
+
+        drop(serve(&config, 1).and_then(Opened::attach).expect("served"));
+        let mut after = vec![discarded, selected];
+        after.sort();
+        assert_eq!(generations(), after, "the staging goes, the evidence stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same guard on a reinstall (#212 re-review 6760013204): a
+    /// replay-backed node that lost its projection, in each of the ways
+    /// `Loss` names, with an unknown activation journaled after its
+    /// baseline. The image is scanned before it is selected, so each
+    /// start refuses with `CURRENT`, the manifest and the journal as they
+    /// were. And a pending adoption is not carried out before the guard
+    /// refuses: the root stays stamped with the predecessor and the
+    /// stream keyed by it.
+    #[test]
+    fn an_activation_after_the_baseline_refuses_a_reinstall_before_it_is_selected() {
+        let cases = [
+            (Some(Loss::Empty), 1),
+            (Some(Loss::Stale), 1),
+            (Some(Loss::Foreign), 1),
+            (Some(Loss::Garbage), 1),
+            (Some(Loss::ZeroLength), 1),
+            (Some(Loss::Missing), 1),
+            (None, 2),
+            (Some(Loss::Garbage), 2),
+        ];
+        for (loss, at) in cases {
+            let dir = workspace(&format!("activation-reinstall-{loss:?}-{at}"));
+            let mut config = config(&dir);
+            config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+            a_node_with_a_baseline(&config, &dir);
+            // The projection from before the activation, put back: it
+            // continues the journal, so only the scan stands between the
+            // activation and the replay.
+            copy_tree(&dir.join("state"), &dir.join("state-baseline"));
+            journal_an_activation(&config, 1, vec![0x7fff]);
+            std::fs::remove_dir_all(dir.join("state")).expect("remove");
+            std::fs::rename(dir.join("state-baseline"), dir.join("state")).expect("put back");
+            if let Some(loss) = loss {
+                lose(&config, &dir, loss);
+            }
+            let root = config.state.root_path(&config.state_directory);
+            let current = std::fs::read(root.join("CURRENT")).expect("CURRENT");
+            let journal = root_path(&config.state_directory, &config.journal.root);
+            let journal_was = tree_bytes(&journal);
+            for start in 0..2 {
+                let case = format!("{loss:?} at {at}, start {start}");
+                match serve(&config, at).and_then(Opened::attach) {
+                    Err(StoreError::Refused { reason, .. }) => assert!(
+                        reason.contains("too old")
+                            && reason.contains("0x7fff")
+                            && reason.contains("nothing was replayed"),
+                        "{case}: {reason}"
+                    ),
+                    Err(other) => panic!("{case}: refused for another reason: {other}"),
+                    Ok(_) => panic!("{case}: served a store it cannot fully read"),
+                }
+                assert_eq!(
+                    std::fs::read(root.join("CURRENT")).expect("CURRENT"),
+                    current,
+                    "{case}: a generation was selected"
+                );
+                assert_eq!(
+                    coord_storage_redb::lifecycle::selected_manifest(&root)
+                        .expect("manifest")
+                        .incarnation,
+                    incarnation(1),
+                    "{case}: the adoption was carried out"
+                );
+                assert!(
+                    tree_bytes(&journal) == journal_was,
+                    "{case}: the journal changed"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Without a published baseline there is nothing to install: a
+    /// replay-backed node whose projection file cannot be opened refuses
+    /// to serve and says why, and the file is left where it was.
+    #[test]
+    fn an_unreadable_projection_without_a_baseline_is_refused() {
+        let dir = workspace("unreadable-no-baseline");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let opened = open_storage(
+            &config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        let database = selected_database(&config);
+        std::fs::write(&database, vec![0x5a; 64 << 10]).expect("garbage");
+
+        match serve(&config, 1) {
+            Err(StoreError::Refused { reason, .. }) => assert!(
+                reason.contains("no local checkpoint was published"),
+                "{reason}"
+            ),
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("an unreadable projection served with no baseline"),
+        }
+        assert_eq!(selected_database(&config), database, "nothing was staged");
+        assert_eq!(
+            std::fs::read(&database).expect("kept"),
+            vec![0x5a; 64 << 10]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A whole database redb won't open for a reason that says nothing
+    /// about its bytes -- here another opener holds its lock -- is not
+    /// unreadable: a replay-backed node with a baseline refuses it and
+    /// stages nothing, rather than discarding a projection that may be
+    /// healthy (#212 review, point 1).
+    #[test]
+    fn a_database_another_opener_holds_is_refused_not_reinstalled() {
+        let dir = workspace("database-held");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        let database = selected_database(&config);
+        let held = redb::Database::open(&database).expect("hold the database");
+        match serve(&config, 1) {
+            Err(StoreError::Refused { reason, .. }) => {
+                assert!(reason.contains("Database("), "{reason}");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("a held database was served or reinstalled over"),
+        }
+        assert_eq!(selected_database(&config), database, "nothing was staged");
+        drop(held);
+        serve(&config, 1)
+            .and_then(Opened::attach)
+            .expect("the same generation serves once released");
+        assert_eq!(selected_database(&config), database);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database whose identity record names another node is not
+    /// unreadable: it is someone else's, and even a replay-backed node
+    /// with a baseline refuses it rather than reinstalling over it.
+    #[test]
+    fn a_foreign_database_is_refused_even_with_a_baseline() {
+        let dir = workspace("foreign-database");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        a_node_with_a_baseline(&config, &dir);
+        let scratch = dir.join("scratch");
+        let other = Generation::create(
+            &scratch,
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: ReplicaId([2; 16]),
+                incarnation: incarnation(1),
+            },
+            OpenOptions::default(),
+        )
+        .expect("another node's generation");
+        let path = other.directory().join("domain.redb");
+        drop(other);
+        std::fs::copy(path, selected_database(&config)).expect("swap");
+        match serve(&config, 1) {
+            Err(StoreError::Refused { reason, .. }) => {
+                assert!(reason.contains("IdentityRecordMismatch"), "{reason}");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("another node's database was served or reinstalled over"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
