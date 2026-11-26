@@ -310,6 +310,20 @@ pub fn payload_delete(command: &CommandId) -> StoreUpdate {
     }
 }
 
+/// The deletion of `command`'s payload row, for every batch that writes
+/// the dependency row of a nothing (task-d121). A nothing has no payload,
+/// and the record under facts it replaced below COMMIT may have left its
+/// payload row on disk. Every such batch carries the deletion, not only
+/// the first: that batch can fail, and the one that writes the row again
+/// (a Sync's installation resumed, a stale record's, a carried one's)
+/// left the payload row beside the nothing, which a restart recovers
+/// (#327 review). The leader's batches carry it too: a voter that took a
+/// nothing as a follower and won keeps its record (#327 review, A1).
+/// Deleting a row that is not there changes nothing.
+pub fn nothing_purge(command: &CommandId, record: &CommandRecord) -> Option<StoreUpdate> {
+    record.is_nothing().then(|| payload_delete(command))
+}
+
 /// The leader's recoverable proposal state for a command.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProposalRecordV1 {

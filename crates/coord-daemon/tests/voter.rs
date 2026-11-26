@@ -2357,4 +2357,16 @@ fn a_committed_nothing_executes_as_its_canonical_refusal() {
         record.result_digest,
         coord_storage::retry::decided_nothing_digest()
     );
+    // The executed-row read the retired-command tripwire and a campaign's
+    // execution check go through finds the nothing's decided record. In
+    // C2a it found none, the donor serving no command without a payload
+    // row, so the tripwire passed it and a campaign saw an execution
+    // without its row (#327 review).
+    let rows =
+        coord_daemon::catch_up::executed_rows(voter.node().applier(), epoch(), vec![nothing]);
+    let [(read, Some(decided))] = rows.as_slice() else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(*read, nothing);
+    assert!(decided.is_nothing());
 }

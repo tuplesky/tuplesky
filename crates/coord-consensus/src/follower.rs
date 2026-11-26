@@ -57,7 +57,8 @@ use crate::recovery::{RecoveryReport, ReportEntry};
 use crate::role::RecoveredState;
 use crate::rows::promise_update;
 use crate::rows::{
-    PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, payload_update,
+    PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, nothing_purge,
+    payload_update,
 };
 use crate::summary::DurableLedger;
 use crate::summary::PageError;
@@ -2861,7 +2862,7 @@ impl Follower {
     /// proposal that carries it so: a record it doesn't hold yet is made,
     /// and one below COMMIT under facts is replaced, its payload dropped
     /// as a release drops it. The payload row on disk goes with every
-    /// batch that writes the nothing's row ([`nothing_purge`]).
+    /// batch that writes the nothing's row ([`crate::rows::nothing_purge`]).
     ///
     /// A record at COMMIT or executed is left as it is: under facts, the
     /// nothing is a second decision, which the caller's admission check
@@ -3323,6 +3324,13 @@ impl Follower {
                 let entry = self.sync_pending.remove(&command).expect("ready");
                 self.note_sync(command);
                 if entry.admission.as_ref().is_some_and(is_nothing) {
+                    // Taken only where the selection's acceptance then
+                    // takes, so the nothing is in memory only with its row
+                    // (#327 review A3). Otherwise the entry is skipped as
+                    // one whose acceptance is refused below, facts intact.
+                    if !self.table.accepts(&command, &entry.deps) {
+                        continue;
+                    }
                     self.take_nothing(command);
                 }
                 if self.table.record(&command).is_none() {
@@ -7621,6 +7629,11 @@ impl Follower {
                 // A nothing replaces what is held below COMMIT, and its
                 // payload row goes in this adoption's batch (task-d121).
                 if is_nothing(&held.proposal.admission) {
+                    // As a Sync's entry (#327 review A3): replaced only
+                    // where the adoption below then takes.
+                    if !self.table.accepts(&command, &held.proposal.deps) {
+                        continue;
+                    }
                     self.take_nothing(command);
                 }
                 // The proposal asserts the admission it was ordered under.
@@ -8699,20 +8712,6 @@ fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
         .iter()
         .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
         .collect()
-}
-
-/// The deletion of `command`'s payload row, for every batch that writes
-/// the dependency row of a nothing (task-d121). A nothing has no payload,
-/// and the record under facts it replaced below COMMIT may have left its
-/// payload row on disk. Every such batch carries the deletion, not only
-/// the first: that batch can fail, and the one that writes the row again
-/// (a Sync's installation resumed, a stale record's, a carried one's)
-/// left the payload row beside the nothing, which a restart recovers
-/// (#327 review). Deleting a row that is not there changes nothing.
-fn nothing_purge(command: &CommandId, record: &CommandRecord) -> Option<StoreUpdate> {
-    record
-        .is_nothing()
-        .then(|| crate::rows::payload_delete(command))
 }
 
 /// A selection's entries and their dependency edges, one unit each.

@@ -1341,6 +1341,17 @@ impl CommandTable {
         Ok(())
     }
 
+    /// Whether [`CommandTable::accept`] of `command` under `deps` would
+    /// take: the record is past ACCEPT, or every dependency is accepted
+    /// here. Read before a replacement that only the acceptance after it
+    /// makes durable (task-d121, #327 review A3): a nothing taken over facts
+    /// in memory, with the acceptance then refused, has no row written for
+    /// it, and writing one would record an acceptance no ballot made.
+    pub fn accepts(&self, command: &CommandId, deps: &[CommandId]) -> bool {
+        self.phase_of(command).is_some_and(|p| p > Phase::Accept)
+            || guard_accept(deps, |c| self.phase_of(c)).is_ok()
+    }
+
     /// Mark a learned command (COMMIT), under the source guard. Idempotent
     /// for a command already committed or executed.
     pub fn commit(&mut self, command: CommandId) -> Result<(), GuardViolation> {

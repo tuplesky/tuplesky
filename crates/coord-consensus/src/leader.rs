@@ -46,8 +46,8 @@ use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
 use crate::role::RecoveredState;
 use crate::rows::{
-    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, payload_update,
-    proposal_update,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, nothing_purge,
+    payload_update, proposal_update,
 };
 use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
@@ -1433,6 +1433,10 @@ impl Leader {
             )
             .expect("bounded"),
         ];
+        // A record this voter took as nothing while it followed, whose
+        // batch failed before it won (task-d121, #327 review A1): the
+        // payload row of the facts it replaced goes with this one.
+        updates.extend(nothing_purge(&command, &record));
         // The payload row too, where it is not durable here yet (task-d90):
         // the batch is this leader's acceptance, and the acceptance has to
         // rest on a payload a recovery can re-execute from. A payload
@@ -3246,6 +3250,9 @@ impl Leader {
             .expect("just initialized")
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
+        // A submission over a nothing is refused or held before this
+        // (task-d121), so the record holds the submitted facts.
+        debug_assert!(!record.is_nothing(), "a proposal of facts over a nothing");
         let updates: Vec<StoreUpdate> = alloc::vec![
             payload_row,
             dependency_update(epoch, &command, &record).expect("bounded"),
@@ -3876,9 +3883,13 @@ impl Leader {
                     effects.push(Effect::Persist(PersistBatch {
                         barrier,
                         base: None,
-                        updates: alloc::vec![
-                            dependency_update(epoch, &command, &record).expect("bounded")
-                        ],
+                        // As every batch writing a nothing's row (task-d121,
+                        // #327 review A1).
+                        updates: core::iter::once(
+                            dependency_update(epoch, &command, &record).expect("bounded"),
+                        )
+                        .chain(nothing_purge(&command, &record))
+                        .collect(),
                     }));
                     self.adopt_own(command, barrier);
                 }
