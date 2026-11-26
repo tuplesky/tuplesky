@@ -270,6 +270,7 @@ fn manifest_with_voter_keys(
         })],
         admin: hex(&PrincipalId([0xa; 16]).0),
         protocol_version: 1,
+        features: Vec::new(),
     };
     (manifest, certs, keys)
 }
@@ -1063,5 +1064,117 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
             coord_membership::PROTOCOL_VERSION
         ),
         Err(GenesisError::Algorithm)
+    );
+}
+
+/// A manifest naming no features serializes as it did before the field
+/// existed, so its pinned digest is unchanged; one naming them is another
+/// manifest (task-d121), at a protocol version a build without features
+/// refuses (#329 review).
+#[test]
+fn a_manifest_naming_no_features_keeps_its_digest() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    assert!(manifest.features.is_empty());
+    let value = serde_json::to_value(&manifest).unwrap();
+    assert!(
+        value.get("features").is_none(),
+        "an empty list is serialized, and every pinned digest moves"
+    );
+    // As a manifest from before the field reads: no key at all.
+    let read: GenesisManifest = serde_json::from_value(value).unwrap();
+    assert_eq!(read, manifest);
+    assert_eq!(read.digest(), manifest.digest());
+
+    assert_eq!(
+        manifest.protocol_version,
+        coord_membership::PROTOCOL_VERSION
+    );
+    let mut named = manifest.clone();
+    named.features = vec!["release-at-execution".into(), "decided-nothing".into()];
+    named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    assert_ne!(named.digest(), manifest.digest());
+    let signed = sign_genesis(&named, &admin.enc).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    assert_eq!(verified, named);
+    assert_eq!(
+        verified.genesis_features().unwrap(),
+        [
+            coord_types::formats::Feature::ReleaseAtExecution,
+            coord_types::formats::Feature::DecidedNothing,
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// A feature that can't be active from genesis is refused when the
+/// manifest is verified, so `init` and every start refuse it too.
+#[test]
+fn a_feature_that_cannot_be_active_from_genesis_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let refused = |names: &[&str]| {
+        let mut named = manifest.clone();
+        named.features = names.iter().map(|n| (*n).to_owned()).collect();
+        named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+        let signed = sign_genesis(&named, &admin.enc).unwrap();
+        match verify_genesis(&signed, &pinned(&admin), 1) {
+            Err(GenesisError::Feature { name, reason }) => (name, reason),
+            other => panic!("{names:?} was not refused: {other:?}"),
+        }
+    };
+    assert_eq!(refused(&["no-such-feature"]).0, "no-such-feature");
+    assert!(refused(&["decided-nothing-prepared"]).1.contains("marker"));
+    assert!(
+        refused(&["checkpoint-floor"])
+            .1
+            .contains("no prepare marker")
+    );
+    assert!(
+        refused(&["release-at-execution", "release-at-execution"])
+            .1
+            .contains("twice")
+    );
+    let (name, reason) = refused(&["decided-nothing"]);
+    assert_eq!(name, "decided-nothing");
+    assert!(reason.contains("release-at-execution"), "{reason}");
+    // The relay rests on answer-on-release, as its live activation does:
+    // one table for both (#329 review).
+    let (name, reason) = refused(&["batched-round"]);
+    assert_eq!(name, "batched-round");
+    assert!(reason.contains("answer-on-release"), "{reason}");
+    // Its prerequisite alone is a manifest the design allows.
+    let mut alone = manifest.clone();
+    alone.features = vec!["release-at-execution".into()];
+    alone.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    let signed = sign_genesis(&alone, &admin.enc).unwrap();
+    assert!(verify_genesis(&signed, &pinned(&admin), 1).is_ok());
+    // Features at the version a build without them accepts: refused, so
+    // no build reads them as a featureless manifest (#329 review).
+    let mut old_version = alone.clone();
+    old_version.protocol_version = coord_membership::PROTOCOL_VERSION;
+    let signed = sign_genesis(&old_version, &admin.enc).unwrap();
+    match verify_genesis(&signed, &pinned(&admin), 1) {
+        Err(GenesisError::Feature { name, reason }) => {
+            assert_eq!(name, "release-at-execution");
+            assert!(reason.contains("protocol version 2"), "{reason}");
+        }
+        other => panic!("features at version 1 were not refused: {other:?}"),
+    }
+    // And the features' version with none named is no version this build
+    // has. That is also what a build from before the field reads in a
+    // manifest naming features: it drops the unknown key, and the version
+    // left is one it refuses, so it pins nothing (#329 review).
+    let mut bare = manifest.clone();
+    bare.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    let signed = sign_genesis(&bare, &admin.enc).unwrap();
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), 1),
+        Err(GenesisError::UnsupportedProtocol {
+            version: coord_membership::FEATURES_PROTOCOL_VERSION
+        })
     );
 }

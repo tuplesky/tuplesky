@@ -114,6 +114,7 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
         })],
         admin: hex_id(&[9; 16]),
         protocol_version: PROTOCOL,
+        features: Vec::new(),
     }
 }
 
