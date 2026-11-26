@@ -10956,6 +10956,16 @@ fn install_sync(
     b: Ballot,
     entries: Vec<coord_consensus::SyncEntry>,
 ) -> Vec<FollowerRejection> {
+    install_sync_reproposing(cluster, b, entries, Default::default())
+}
+
+/// [`install_sync`] with `reproposed` re-proposed by the Sync.
+fn install_sync_reproposing(
+    cluster: &mut Cluster,
+    b: Ballot,
+    entries: Vec<coord_consensus::SyncEntry>,
+    reproposed: BTreeSet<CommandId>,
+) -> Vec<FollowerRejection> {
     let executed = cluster.nodes[1].executed_through();
     let effects = cluster.nodes[1].step(peer_event(
         b.leader,
@@ -10969,7 +10979,7 @@ fn install_sync(
         ballot: b,
         source_ballot: ballot(0, 0),
         entries: entries.into_iter().map(|e| (e.command, e)).collect(),
-        reproposed: Default::default(),
+        reproposed,
         counted: Default::default(),
         nothing: Default::default(),
     };
@@ -11364,4 +11374,127 @@ fn a_late_payload_for_a_nothing_writes_no_payload_row() {
             .iter()
             .any(|(c, _)| *c == d)
     );
+}
+
+/// task-d121, C2: a candidate whose selection carries a command as
+/// nothing, which it holds nothing of, binds the selection: there is no
+/// payload to fetch, and no voter could serve one.
+#[test]
+fn a_candidate_binds_a_selection_carrying_a_nothing_without_its_payload() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    assert_eq!(cluster.nodes[2].follower().table().phase_of(&d), None);
+    // The candidate's quorum is itself and the voter holding the nothing.
+    cluster.cut = vec![(0, 2), (2, 0)];
+    cluster.campaign(2, ballot(2, 2));
+    cluster.settle();
+    let decision = sync_rows(&cluster.nodes[2].storage)
+        .into_iter()
+        .find(|s| s.ballot == ballot(2, 2))
+        .expect("the selection is bound");
+    assert_eq!(
+        decision.entries.get(&d).and_then(|e| e.admission),
+        Some(coord_consensus::NOTHING_ADMISSION),
+        "{decision:?}"
+    );
+}
+
+/// task-d121, C2: a command adopted as nothing from a proposal is not
+/// asked for as a missing payload, and a payload for it arriving late is
+/// not taken: no payload row is written under a nothing.
+#[test]
+fn an_adopted_nothing_asks_for_no_payload_and_takes_none() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    assert!(
+        cluster.nodes[1].follower().missing_payloads().is_empty(),
+        "{:?}",
+        cluster.nodes[1].follower().missing_payloads()
+    );
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::PayloadResponse {
+            command: d,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
+    );
+}
+
+/// task-d121, C2: a proposal under facts over a nothing held below
+/// COMMIT fetches the payload and rebinds on its first arrival.
+#[test]
+fn a_proposal_under_facts_over_a_nothing_rebinds_on_the_payload() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    let facts = payload.admission_digest();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, d, coord_consensus::NOTHING_ADMISSION);
+    // The next ballot re-proposes D: the nothing stays, demoted, until
+    // its proposal.
+    let b2 = ballot(2, 2);
+    install_sync_reproposing(&mut cluster, b2, vec![], BTreeSet::from([d]));
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    propose(&mut cluster, b2, d, facts);
+    assert_eq!(cluster.nodes[1].follower().missing_payloads(), vec![d]);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::PayloadResponse {
+            command: d,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    let record = cluster.nodes[1].follower().table().record(&d).unwrap();
+    assert_eq!(record.payload, Some(facts), "{record:?}");
+    assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
 }

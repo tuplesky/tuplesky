@@ -1149,14 +1149,36 @@ enum LearnScope {
 /// restore the presentation the leader's had displaced and refuse exact
 /// retries of the leader's command as another command's.
 /// The commands of `known` with no payload (task-d46).
+///
+/// A command `nothing` names is carried, held or adopted as nothing
+/// (task-d121): it has no payload to lack.
 fn lacking<'a>(
     known: impl Iterator<Item = &'a CommandId>,
     payloads: &BTreeMap<CommandId, PayloadRecordV1>,
+    nothing: impl Fn(&CommandId) -> bool,
 ) -> alloc::collections::BTreeSet<CommandId> {
     known
-        .filter(|c| !payloads.contains_key(c))
+        .filter(|c| !payloads.contains_key(c) && !nothing(c))
         .copied()
         .collect()
+}
+
+/// Whether `table` holds `command` as nothing (task-d121).
+fn holds_nothing(table: &CommandTable, command: &CommandId) -> bool {
+    table.record(command).is_some_and(CommandRecord::is_nothing)
+}
+
+/// Whether a held proposal is of a nothing (task-d121).
+fn proposes_nothing(held: &BTreeMap<CommandId, HeldProposal>, command: &CommandId) -> bool {
+    held.get(command)
+        .is_some_and(|h| is_nothing(&h.proposal.admission))
+}
+
+/// Whether a pending Sync entry carries a nothing (task-d121).
+fn carries_nothing(pending: &BTreeMap<CommandId, SyncEntry>, command: &CommandId) -> bool {
+    pending
+        .get(command)
+        .is_some_and(|e| e.admission.as_ref().is_some_and(is_nothing))
 }
 
 /// Whether `adopted` holds `command`'s durable adoption under `seqnum`:
@@ -1270,7 +1292,7 @@ impl Follower {
             .filter(|(_, r)| r.phase >= Phase::Accept)
             .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
-        let adopted_lacking = lacking(adopted.keys(), &payloads);
+        let adopted_lacking = lacking(adopted.keys(), &payloads, |c| holds_nothing(&table, c));
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             answer_on_release: BTreeSet::new(),
@@ -3889,7 +3911,7 @@ impl Follower {
         let mut out: Vec<CommandId> = self
             .sync_pending
             .keys()
-            .filter(|c| !self.payloads.contains_key(c))
+            .filter(|c| !self.payloads.contains_key(c) && !carries_nothing(&self.sync_pending, c))
             .chain(self.adopted_lacking.iter())
             .chain(self.held_missing())
             .copied()
@@ -3935,6 +3957,10 @@ impl Follower {
     /// for: what it needs before the selection can be bound. Read lazily,
     /// so a count that stops at its limit walks no further (audit item 5
     /// on #98).
+    ///
+    /// A command the selection carries as nothing, or that this replica
+    /// holds as nothing where the selection names no facts, has no payload
+    /// to lack (task-d121).
     fn selection_missing<'a>(
         table: &'a CommandTable,
         payloads: &'a BTreeMap<CommandId, PayloadRecordV1>,
@@ -3944,7 +3970,7 @@ impl Follower {
             .entries
             .keys()
             .chain(decision.reproposed.iter())
-            .filter(|c| table.phase_of(c).is_none())
+            .filter(|c| table.phase_of(c).is_none() && !Self::wants_no_payload(table, decision, c))
             .copied()
             // Held by a record alone, not executed: its payload batch
             // failed, or the replica crashed while writing it, and came
@@ -3964,6 +3990,7 @@ impl Follower {
                     .filter(|c| {
                         table.record(c).is_some_and(|r| r.phase < Phase::Executed)
                             && !payloads.contains_key(c)
+                            && !Self::wants_no_payload(table, decision, c)
                     }),
             )
             // Held below COMMIT under other facts than the selection
@@ -3971,11 +3998,25 @@ impl Follower {
             // record rebound before binding, so the re-proposal carries
             // the facts a quorum accepted (task-d14).
             .chain(decision.entries.values().filter_map(|e| {
-                let selected = e.admission?;
+                let selected = e.admission.filter(|d| !is_nothing(d))?;
                 let r = table.record(&e.command)?;
                 (r.phase < Phase::Commit && r.payload.is_some_and(|p| p != selected))
                     .then_some(e.command)
             }))
+    }
+
+    /// Whether `decision` needs no payload of `command` (task-d121): it
+    /// carries the command as nothing, as an entry or a re-proposal, or
+    /// names no facts for it while this replica holds it as nothing.
+    fn wants_no_payload(
+        table: &CommandTable,
+        decision: &SyncDecision,
+        command: &CommandId,
+    ) -> bool {
+        let named = decision.entries.get(command).and_then(|e| e.admission);
+        named.as_ref().is_some_and(is_nothing)
+            || decision.nothing.contains(command)
+            || (named.is_none() && holds_nothing(table, command))
     }
 
     /// Whether `command`, which `decision` names, is still something the
@@ -3992,13 +4033,17 @@ impl Follower {
         if table.phase_of(command).is_none() {
             return true;
         }
-        if record.phase < Phase::Executed && !payloads.contains_key(command) {
+        if record.phase < Phase::Executed
+            && !payloads.contains_key(command)
+            && !Self::wants_no_payload(table, decision, command)
+        {
             return true;
         }
         decision
             .entries
             .get(command)
             .and_then(|e| e.admission)
+            .filter(|d| !is_nothing(d))
             .is_some_and(|selected| {
                 record.phase < Phase::Commit && record.payload.is_some_and(|p| p != selected)
             })
@@ -5436,11 +5481,16 @@ impl Follower {
         // that, and kept it grew with every key ever submitted -- at boot,
         // with every payload row there is (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
-        self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads);
+        let table = &self.table;
+        self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads, |c| {
+            holds_nothing(table, c)
+        });
         let kept = &self.kept;
+        let held = &self.held;
         self.held_lacking = lacking(
             self.held.keys().filter(|c| !kept.contains_key(c)),
             &self.payloads,
+            |c| proposes_nothing(held, c),
         );
         self.note_sync_all();
         let held = &self.held;
@@ -5456,12 +5506,16 @@ impl Follower {
     /// `payloads` or its record's payload changed for it (task-d46).
     fn note_lacking(&mut self, command: CommandId) {
         let lacks = !self.payloads.contains_key(&command);
-        if lacks && self.adopted.contains_key(&command) {
+        if lacks && self.adopted.contains_key(&command) && !holds_nothing(&self.table, &command) {
             self.adopted_lacking.insert(command);
         } else {
             self.adopted_lacking.remove(&command);
         }
-        if lacks && self.held.contains_key(&command) && !self.kept.contains_key(&command) {
+        if lacks
+            && self.held.contains_key(&command)
+            && !self.kept.contains_key(&command)
+            && !proposes_nothing(&self.held, &command)
+        {
             self.held_lacking.insert(command);
         } else {
             self.held_lacking.remove(&command);
@@ -5480,7 +5534,10 @@ impl Follower {
     /// for it (task-d109).
     fn note_sync(&mut self, command: CommandId) {
         let pending = self.sync_pending.contains_key(&command);
-        if pending && !self.payloads.contains_key(&command) {
+        if pending
+            && !self.payloads.contains_key(&command)
+            && !carries_nothing(&self.sync_pending, &command)
+        {
             self.sync_lacking.insert(command);
         } else {
             self.sync_lacking.remove(&command);
@@ -5496,7 +5553,10 @@ impl Follower {
     /// installation, after `sync_pending` or the named facts were
     /// replaced whole: a Sync's installation, or a sweep of `payloads`.
     fn note_sync_all(&mut self) {
-        self.sync_lacking = lacking(self.sync_pending.keys(), &self.payloads);
+        let pending = &self.sync_pending;
+        self.sync_lacking = lacking(self.sync_pending.keys(), &self.payloads, |c| {
+            carries_nothing(pending, c)
+        });
         self.sync_refacts = self
             .sync_pending
             .keys()
@@ -5512,7 +5572,9 @@ impl Follower {
     fn sync_missing(&self) -> impl Iterator<Item = &CommandId> {
         debug_assert_eq!(
             self.sync_lacking,
-            lacking(self.sync_pending.keys(), &self.payloads),
+            lacking(self.sync_pending.keys(), &self.payloads, |c| {
+                carries_nothing(&self.sync_pending, c)
+            }),
             "the commands pending installation lacking a payload were not kept with the maps"
         );
         debug_assert!(
@@ -5545,14 +5607,17 @@ impl Follower {
     fn held_missing(&self) -> impl Iterator<Item = &CommandId> {
         debug_assert_eq!(
             self.adopted_lacking,
-            lacking(self.adopted.keys(), &self.payloads),
+            lacking(self.adopted.keys(), &self.payloads, |c| {
+                holds_nothing(&self.table, c)
+            }),
             "the adopted commands lacking a payload were not kept with the maps"
         );
         debug_assert_eq!(
             self.held_lacking,
             lacking(
                 self.held.keys().filter(|c| !self.kept.contains_key(c)),
-                &self.payloads
+                &self.payloads,
+                |c| proposes_nothing(&self.held, c),
             ),
             "the held commands lacking a payload were not kept with the maps"
         );
@@ -5865,7 +5930,9 @@ impl Follower {
     /// what it accepted under its own facts was not decided, since a
     /// decision has one digest and the selection names it.
     fn awaits_selected_facts(&self, command: &CommandId) -> bool {
-        let Some(selected) = self.selected_admission(command) else {
+        // A nothing named is no facts to fetch: it replaces the record
+        // (task-d121).
+        let Some(selected) = self.selected_admission(command).filter(|d| !is_nothing(d)) else {
             return false;
         };
         self.table
@@ -5878,7 +5945,7 @@ impl Follower {
     /// part of [`Follower::awaits_selected_facts`] a selection the
     /// campaign has not bound does not override.
     fn awaits_named_facts(&self, command: &CommandId) -> bool {
-        let Some(named) = self.named_facts.get(command) else {
+        let Some(named) = self.named_facts.get(command).filter(|d| !is_nothing(d)) else {
             return false;
         };
         self.table
@@ -7253,16 +7320,23 @@ impl Follower {
             {
                 continue;
             }
-            let (Some(record), Some(payload)) = (self.table.record(&d), self.payloads.get(&d))
-            else {
+            let Some(record) = self.table.record(&d) else {
                 continue;
+            };
+            // A nothing's row is its dependency row alone (task-d121).
+            let payload = match self.payloads.get(&d) {
+                Some(payload) => Some(payload),
+                None if record.is_nothing() => None,
+                None => continue,
             };
             if record.payload.is_none() {
                 continue;
             }
             let record = record.clone();
             let row = self.dependency_row(&d, &record);
-            updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
+            if let Some(payload) = payload {
+                updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
+            }
             updates.push(row);
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
@@ -8330,16 +8404,25 @@ impl Follower {
         // A nothing this replica holds below COMMIT, which a selection
         // names facts over (task-d121): the payload replaces it, as a
         // rebind replaces other facts.
-        if !self.payloads.contains_key(&command)
-            && self
-                .table
-                .record(&command)
-                .is_some_and(CommandRecord::is_nothing)
-            && self.awaits_selected_facts(&command)
-        {
+        //
+        // So does a proposal held under facts over it. A payload for a
+        // nothing nothing asks facts for is not taken: no payload row is
+        // written under a nothing, and none admits a command a proposal or
+        // a Sync entry carries as nothing.
+        if !self.payloads.contains_key(&command) && holds_nothing(&self.table, &command) {
+            let for_proposal = self
+                .held
+                .get(&command)
+                .is_some_and(|h| h.proposal.admission == payload.admission_digest());
+            if !for_proposal && !self.awaits_selected_facts(&command) {
+                return Vec::new();
+            }
             let mut effects = self.rebind(command, payload);
             effects.extend(self.advance_sync());
             return effects;
+        }
+        if proposes_nothing(&self.held, &command) || carries_nothing(&self.sync_pending, &command) {
+            return Vec::new();
         }
         if self.payloads.contains_key(&command) {
             let for_proposal = self.awaits_rebind(&command)
