@@ -588,12 +588,21 @@ impl<P: Persistence> Voter<P> {
         // Every Sync whose row became durable, a superseded one's too: a
         // higher Sync installed in the same flush is the selection by the
         // time this runs, and nothing else names what the lower counted.
+        // Each Sync is learned once, from here or from the selection
+        // below: a disagreement is logged and counted per learning.
         let mut out = Outbound::default();
+        let synced = self.node.machine().synced_counted().map(|(b, _)| b);
         for (ballot, counted) in self.node.take_durable_counted() {
+            if self.learned_sync == Some(ballot) {
+                continue;
+            }
             out.absorb(
                 self.node
                     .learn_peer_stores(ballot.leader, &counted, &self.ballot)?,
             );
+            if synced == Some(ballot) {
+                self.learned_sync = Some(ballot);
+            }
             self.counted_unsettled.push((ballot, counted));
         }
         let Some((synced, counted)) = self.node.machine().synced_counted() else {
