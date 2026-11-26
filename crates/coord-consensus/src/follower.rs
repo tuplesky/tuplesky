@@ -8529,7 +8529,16 @@ impl Follower {
                     && let Err(e) = c.page(page)
                 {
                     self.rejections.push(FollowerRejection::Page(e));
-                    return Vec::new();
+                    // A verified page that names its report past the bound
+                    // is that voter's answer, as a last page is: the
+                    // campaign is asked again, so one waiting for reports
+                    // (task-d120) ends once every voter has answered,
+                    // whichever of its promise and its pages came last
+                    // (#331 review). Asked again on a later page of the
+                    // same report, the campaign assembles nothing new.
+                    if e != PageError::PastBound {
+                        return Vec::new();
+                    }
                 }
                 self.advance_campaign()
             }

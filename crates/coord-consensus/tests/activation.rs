@@ -7668,6 +7668,53 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
 /// candidate does not campaign again this boot.
 #[test]
 fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
+    let (mut f, b, d, candidate, third) = waiting_behind_a_dependency_no_report_holds();
+    let asked = f.request_report_pages();
+    assert!(
+        sent_to(&asked, r(third))
+            .iter()
+            .any(|m| matches!(m, ProtocolMessage::NewLeader { ballot, .. } if *ballot == b)),
+        "{asked:?}"
+    );
+    // The bound passes with no other report: the selection from the
+    // reports in hand is refused again, and the campaign is given up.
+    f.end_report_wait();
+    assert_eq!(f.report_wait(), None);
+    let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::Behind { missing: d }),
+        "{rejections:?}"
+    );
+    assert!(f.campaign_state().is_none(), "the campaign was given up");
+    assert!(f.won().is_none());
+    // The selection dropped C behind D, which no report holds and the
+    // candidate does not hold decided; nothing was bound, and the
+    // campaign given up as `Behind` is counted as one such selection kept
+    // (task-d121's C0). Both selections, before and after the wait,
+    // counted the drop.
+    assert_eq!(
+        f.unreported_drops(),
+        coord_consensus::UnreportedDrops {
+            undecided: 2,
+            bound_decided: 0,
+            bound_undecided: 0,
+            behind_undecided: 1,
+        }
+    );
+    // It does not campaign again this boot.
+    assert!(f.campaign(ballot(2, candidate)).is_empty());
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::Behind { missing: d }]
+    );
+    assert_eq!(f.ballots().promised(), b);
+}
+
+/// The campaign of `a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind`,
+/// waiting for the third voter's report (task-d120): the follower, its
+/// ballot, the dependency `d` no report read holds, the candidate and the
+/// third voter.
+fn waiting_behind_a_dependency_no_report_holds() -> (Follower, Ballot, CommandId, u8, u8) {
     let id = |n: u8| CommandId(Digest32([0x90 + n; 32]));
     // All on one key, each after the one before.
     let entry = |c: CommandId, phase: Phase, deps: &[CommandId]| {
@@ -7729,45 +7776,69 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
     assert_eq!(f.report_waits(), 1);
     assert!(f.take_rejections().is_empty());
     assert!(f.campaign_state().is_some_and(|c| c.decision().is_none()));
-    let asked = f.request_report_pages();
-    assert!(
-        sent_to(&asked, r(third))
-            .iter()
-            .any(|m| matches!(m, ProtocolMessage::NewLeader { ballot, .. } if *ballot == b)),
-        "{asked:?}"
+    (f, b, d, candidate, third)
+}
+
+/// A third voter whose report is past the page bound answers the
+/// campaign whichever of its promise and its pages comes last (#331
+/// review). Its promise, then a page naming its report past the bound,
+/// end the wait at once, with no timer: the campaign is given up as
+/// `Behind` on `d`.
+#[test]
+fn a_report_past_the_bound_after_its_promise_ends_the_wait() {
+    let (mut f, b, d, _, third) = waiting_behind_a_dependency_no_report_holds();
+    f.step(peer_event(
+        r(third),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(third),
+            store: coord_types::ids::StoreInstanceId(r(third).0),
+        },
+    ));
+    assert_eq!(f.report_wait(), Some((b, d)), "its report is still unread");
+    // Past the page more the bound allows: two pages past what
+    // `MAX_REPORT_ENTRIES` takes.
+    let entries = coord_consensus::MAX_REPORT_ENTRIES + 2 * coord_consensus::MAX_PAGE_ENTRIES;
+    let report = RecoveryReport {
+        replica: r(third),
+        ballot: b,
+        committed_ballot: ballot(0, 0),
+        entries: (0..entries)
+            .map(|n| {
+                let mut c = [0x30; 32];
+                c[..4].copy_from_slice(&u32::try_from(n).unwrap().to_be_bytes());
+                accepted_entry(CommandId(Digest32(c)), &[])
+            })
+            .collect(),
+    };
+    let pages = coord_consensus::paginate(
+        &report,
+        coord_types::ids::StoreInstanceId(report.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
     );
-    // The bound passes with no other report: the selection from the
-    // reports in hand is refused again, and the campaign is given up.
-    f.end_report_wait();
-    assert_eq!(f.report_wait(), None);
+    f.step(peer_event(
+        r(third),
+        ProtocolMessage::ReportPage(pages[0].clone()),
+    ));
+    assert_eq!(f.report_wait(), None, "every voter has answered");
     let rejections = f.take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::Page(
+            coord_consensus::PageError::PastBound
+        )),
+        "{rejections:?}"
+    );
     assert!(
         rejections.contains(&FollowerRejection::Behind { missing: d }),
         "{rejections:?}"
     );
     assert!(f.campaign_state().is_none(), "the campaign was given up");
+    // Its later pages reach no campaign.
+    for page in pages.into_iter().skip(1) {
+        f.step(peer_event(r(third), ProtocolMessage::ReportPage(page)));
+    }
     assert!(f.won().is_none());
-    // The selection dropped C behind D, which no report holds and the
-    // candidate does not hold decided; nothing was bound, and the
-    // campaign given up as `Behind` is counted as one such selection kept
-    // (task-d121's C0). Both selections, before and after the wait,
-    // counted the drop.
-    assert_eq!(
-        f.unreported_drops(),
-        coord_consensus::UnreportedDrops {
-            undecided: 2,
-            bound_decided: 0,
-            bound_undecided: 0,
-            behind_undecided: 1,
-        }
-    );
-    // It does not campaign again this boot.
-    assert!(f.campaign(ballot(2, candidate)).is_empty());
-    assert_eq!(
-        f.take_rejections(),
-        vec![FollowerRejection::Behind { missing: d }]
-    );
-    assert_eq!(f.ballots().promised(), b);
 }
 
 /// Seed 754's give-up in a test (task-d120): a voter that holds the
