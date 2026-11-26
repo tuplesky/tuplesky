@@ -601,6 +601,31 @@ fn a_voter_holding_the_record_answers_even_without_its_support_row() {
     assert!(d.features(1).holders(EP).contains(&replica(3)));
 }
 
+/// `DecidedNothing` is activated live only once `ReleaseAtExecution` is
+/// active, as a genesis manifest naming it is refused without it: one
+/// table for both (#329 review). Activated alone, it was reported active
+/// while the node's gate, which reads both, stayed off.
+#[test]
+fn deciding_a_nothing_is_activated_only_after_release_at_execution() {
+    let mut d = Domain::new(3, &[]);
+    assert_eq!(
+        d.activate(1, Feature::DecidedNothing),
+        Err(ActivateRefusal::Requires {
+            feature: Feature::DecidedNothing,
+            before: Feature::ReleaseAtExecution,
+        })
+    );
+    assert_eq!(d.record(1), None, "a refused activation wrote nothing");
+    assert_eq!(
+        d.activate(1, Feature::ReleaseAtExecution),
+        Ok(Activation::Started)
+    );
+    assert_eq!(
+        d.activate(1, Feature::DecidedNothing),
+        Ok(Activation::Started)
+    );
+}
+
 /// task-d102: the relay (`BatchedRound`) is activated only once
 /// `AnswerOnRelease` is active, since a relayed command is answered on
 /// the leader's release alone. Asked first, it is refused and nothing is

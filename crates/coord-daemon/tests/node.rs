@@ -2065,3 +2065,41 @@ fn the_release_rule_switch_carries_the_selection_rule_across_a_role_change() {
     node.step_down(&ballot()).expect("stepped down");
     assert!(!rules(&node), "and without the switch, as before");
 }
+
+/// task-d121's gate: a follower's campaigns may decide a nothing only
+/// while both the release rule and `DecidedNothing` are on, switched in
+/// either order, and a leader that steps down keeps it.
+#[test]
+fn deciding_a_nothing_is_on_only_under_both_switches() {
+    let rules = |node: &Node<StoreWorker<ModelEngine>>| match node.machine() {
+        Machine::Follower(f) => f.selection_rules(),
+        Machine::Leader(_) => panic!("a follower"),
+    };
+    let mut node = follower(BootId([12; 16]));
+    assert!(!rules(&node).decide_nothing, "off by default");
+    node.set_decided_nothing(true);
+    assert!(!rules(&node).decide_nothing, "not without the release rule");
+    node.set_release_at_execution(true);
+    assert!(rules(&node).decide_nothing);
+    node.set_decided_nothing(false);
+    assert!(!rules(&node).decide_nothing);
+    assert!(
+        rules(&node).leave_out_unheld,
+        "the release rule's own selection rule stays"
+    );
+    node.set_decided_nothing(true);
+    node.set_release_at_execution(false);
+    assert!(
+        !rules(&node).decide_nothing,
+        "nor once the release rule is off"
+    );
+
+    let mut node = leader(BootId([13; 16]));
+    node.set_release_at_execution(true);
+    node.set_decided_nothing(true);
+    node.step_down(&ballot()).expect("stepped down");
+    assert!(
+        rules(&node).decide_nothing,
+        "the follower it became selects under it"
+    );
+}

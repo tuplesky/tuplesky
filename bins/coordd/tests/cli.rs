@@ -692,6 +692,83 @@ fn initializing_is_deliberate_and_happens_exactly_once() {
     assert!(dir.join("state").join("gen-000001").is_dir());
 }
 
+/// The features a genesis manifest names are written by `init` in its
+/// genesis-policy batch (task-d121): two rows more, this voter's support
+/// row and the activation record. A manifest naming one without the
+/// feature it rests on is refused, and nothing is created.
+#[test]
+fn init_writes_the_features_genesis_names_and_refuses_one_it_cannot() {
+    let rows = |out: &str| -> usize {
+        out.lines()
+            .find_map(|line| line.strip_prefix("genesis policy rows="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no genesis policy line: {out}"))
+    };
+    let plain = workspace("init-no-features");
+    let plain_run = run(&config(&plain), &["init"]);
+    assert_eq!(
+        plain_run.code,
+        Some(0),
+        "{}{}",
+        plain_run.out,
+        plain_run.err
+    );
+
+    let named = workspace("init-features");
+    let named_config = config(&named);
+    resign(&named, |m| {
+        m["features"] = serde_json::json!(["release-at-execution", "decided-nothing"]);
+        m["protocol_version"] = coord_membership::FEATURES_PROTOCOL_VERSION.into();
+    });
+    let named_run = run(&named_config, &["init"]);
+    assert_eq!(
+        named_run.code,
+        Some(0),
+        "{}{}",
+        named_run.out,
+        named_run.err
+    );
+    assert_eq!(
+        rows(&named_run.out),
+        rows(&plain_run.out) + 2,
+        "the support row and the activation record: {}",
+        named_run.out
+    );
+
+    let alone = workspace("init-feature-alone");
+    let alone_config = config(&alone);
+    resign(&alone, |m| {
+        m["features"] = serde_json::json!(["decided-nothing"]);
+        m["protocol_version"] = coord_membership::FEATURES_PROTOCOL_VERSION.into();
+    });
+    let refused = run(&alone_config, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("decided-nothing") && refused.err.contains("release-at-execution"),
+        "the refusal does not say which feature, or what it rests on: {}",
+        refused.err
+    );
+    assert!(!alone.join("state").join("gen-000001").exists());
+
+    // Features at the version a build without them accepts are refused
+    // too: such a build would drop them and pin another digest, so a
+    // manifest naming any carries the version it refuses (#329 review).
+    let old = workspace("init-features-old-version");
+    let old_config = config(&old);
+    resign(&old, |m| {
+        m["features"] = serde_json::json!(["release-at-execution", "decided-nothing"]);
+    });
+    let refused = run(&old_config, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("protocol version 2"),
+        "the refusal does not say which version: {}",
+        refused.err
+    );
+    assert!(!old.join("state").join("gen-000001").exists());
+}
+
 /// An initialization that failed before it finished can be run again,
 /// and finishes -- including one that left a journal and no projection.
 ///
