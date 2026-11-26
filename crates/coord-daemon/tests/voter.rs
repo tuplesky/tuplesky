@@ -1311,6 +1311,7 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
             .collect(),
         reproposed: BTreeSet::new(),
         counted: Default::default(),
+        nothing: Default::default(),
     };
     voter
         .on_peer(
@@ -1773,6 +1774,43 @@ fn install(voter: &mut Voter<Stamped>, frames: Vec<Vec<u8>>) {
         voter.flush().expect("flushed");
         voter.finish().expect("finished");
     }
+}
+
+/// A Sync's counted entry that names no voter of the epoch is skipped
+/// unread (#326 review): a Sync costs at most one row per voter.
+#[test]
+fn a_counted_store_of_no_voter_is_not_learned() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    let (campaigned, syncs) = won_with(&mut peer);
+    let stranger = r(9);
+    let syncs = syncs
+        .into_iter()
+        .map(
+            |frame| match coord_consensus::ProtocolMessage::decode(&frame) {
+                Ok(coord_consensus::ProtocolMessage::Sync(mut decision)) => {
+                    decision.counted.insert(
+                        stranger,
+                        coord_consensus::recovery::CountedStore {
+                            incarnation: inc(),
+                            store: coord_types::ids::StoreInstanceId([0x99; 16]),
+                        },
+                    );
+                    coord_consensus::ProtocolMessage::Sync(decision).encode()
+                }
+                _ => frame,
+            },
+        )
+        .collect();
+    install(&mut peer, syncs);
+    assert!(peer.node().machine().synchronized_at(&campaigned));
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.learned, 1, "the candidate's store alone");
+    assert_eq!(durable_row(&peer, stranger, inc()), None);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        Some(coord_types::ids::StoreInstanceId(r(1).0))
+    );
 }
 
 /// A voter that installs a Sync records the store of each voter it

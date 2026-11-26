@@ -378,8 +378,26 @@ pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
 /// per-key digests and the leader sequence number they were synchronized
 /// at; version 3 (task-d14) adds the admission digest each entry was
 /// accepted under; version 4 (task-d121) adds the store of each voter the
-/// selection counted.
-pub const SYNC_SCHEMA_VERSION: u16 = 4;
+/// selection counted; version 5 (task-d121, C2) adds the re-proposals
+/// carried as nothing.
+pub const SYNC_SCHEMA_VERSION: u16 = 5;
+
+/// A version 4 Sync row's selection: version 5's without the nothing
+/// re-proposals (task-d121, C2).
+#[derive(Deserialize)]
+struct SyncDecisionV4 {
+    ballot: Ballot,
+    source_ballot: Ballot,
+    entries: alloc::collections::BTreeMap<coord_types::CommandId, crate::recovery::SyncEntry>,
+    reproposed: alloc::collections::BTreeSet<coord_types::CommandId>,
+    counted:
+        alloc::collections::BTreeMap<coord_types::ids::ReplicaId, crate::recovery::CountedStore>,
+}
+
+#[derive(Deserialize)]
+struct SyncRecordV4 {
+    decision: SyncDecisionV4,
+}
 
 /// A version 3 Sync row's selection: version 4's without the counted
 /// stores (task-d121).
@@ -455,12 +473,15 @@ pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
 
 /// Decode a Sync row.
 ///
-/// Only the current layout is read. A row of an earlier version names no
-/// admission facts, and reading it as a selection without them would let
-/// the replica install and execute its entries under whichever facts it
-/// happens to hold, which is the divergence version 3 exists to prevent
-/// (task-d14). It is refused as corrupt, loudly, and the store has to be
-/// started fresh.
+/// The current layout and versions 4 and 3 are read. A row of a version before 3
+/// names no admission facts, and reading it as a selection without them
+/// would let the replica install and execute its entries under whichever
+/// facts it happens to hold, which is the divergence version 3 exists to
+/// prevent (task-d14). It is refused as corrupt, loudly, and the store has
+/// to be started fresh.
+///
+/// A version 4 row is read with no nothing re-proposals (task-d121, C2):
+/// none was decided before version 5.
 ///
 /// A version 3 row is read with no counted stores (task-d121): what it
 /// selected is whole, and the stores only teach the voter that installs
@@ -469,6 +490,19 @@ pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
     let (version, payload) = open(SYNC_KIND, bytes, "sync record")?;
     match version {
         SYNC_SCHEMA_VERSION => decode_exact(&payload, "sync record"),
+        4 => {
+            let SyncRecordV4 { decision } = decode_exact(&payload, "sync record")?;
+            Ok(SyncRecordV1 {
+                decision: SyncDecision {
+                    ballot: decision.ballot,
+                    source_ballot: decision.source_ballot,
+                    entries: decision.entries,
+                    reproposed: decision.reproposed,
+                    counted: decision.counted,
+                    nothing: alloc::collections::BTreeSet::new(),
+                },
+            })
+        }
         3 => {
             let SyncRecordV3 { decision } = decode_exact(&payload, "sync record")?;
             Ok(SyncRecordV1 {
@@ -478,6 +512,7 @@ pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
                     entries: decision.entries,
                     reproposed: decision.reproposed,
                     counted: alloc::collections::BTreeMap::new(),
+                    nothing: alloc::collections::BTreeSet::new(),
                 },
             })
         }
@@ -545,6 +580,7 @@ fn sync_frame_overhead(ballot: Ballot) -> usize {
         entries: alloc::collections::BTreeMap::new(),
         reproposed: alloc::collections::BTreeSet::new(),
         counted: Default::default(),
+        nothing: Default::default(),
     };
     let body = postcard::to_allocvec(&empty).map_or(0, |b| b.len());
     crate::messages::ProtocolMessage::Sync(empty).encode().len() - body

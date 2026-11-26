@@ -97,6 +97,10 @@ pub enum HashDomain {
     /// being abandoned, the cluster replacing it and the backup the
     /// restore is from (task-59).
     FencingAttestation,
+    /// The admission a command decided as nothing holds in place of
+    /// attested facts (task-d121). No admission receipt is under this
+    /// domain, so no presentation can equal it.
+    DecidedNothing,
 }
 
 impl HashDomain {
@@ -130,6 +134,7 @@ impl HashDomain {
             }
             HashDomain::ConfigurationBallot => "tuplesky coord.v1 2026-09 configuration-ballot",
             HashDomain::ConfigurationCatalog => "tuplesky coord.v1 2026-09 configuration-catalog",
+            HashDomain::DecidedNothing => "tuplesky coord.v1 2026-11 decided-nothing",
         }
     }
 
