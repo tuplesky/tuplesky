@@ -137,12 +137,13 @@ impl Format {
                 current: 1,
                 newest: 1,
             },
-            // Reads ahead to 2, the first format whose records may hold a
-            // group's application outcomes, which its successor writes
-            // (the batching-rule doc's 10.7, step 1a).
+            // Writes 2, the first format whose records may hold a group's
+            // application outcomes (the batching-rule doc's 10.7, step 1b),
+            // and reads 1, which every journal before it holds. The release
+            // before it (step 1a) reads 2, so a voter can go back to it.
             Format::JournalRecord => Window {
                 oldest: 1,
-                current: 1,
+                current: 2,
                 newest: 2,
             },
             Format::JournalMetadata => Window {

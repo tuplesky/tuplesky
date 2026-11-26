@@ -18,6 +18,8 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use coord_consensus::PayloadRecordV1;
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
@@ -26,7 +28,8 @@ use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_storage::journaled::{JournalLimits, JournaledStore, TransitionKind};
 use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage::{
-    Applier, ApplyOutcome, GroupLimits, JournaledDomain, Persistence, StoreWorker, complete, submit,
+    Applier, ApplyError, ApplyOutcome, GROUP_RECORD_BYTES, GROUP_RECORD_UPDATES, GroupLimits,
+    JournaledDomain, Persistence, StoreWorker, complete, run_bytes, submit,
 };
 use coord_store_testkit::journal::{AppendScript, ModelJournal};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
@@ -126,15 +129,13 @@ fn reference() -> Applier<StoreWorker<ModelEngine>> {
 
 /// The serving driver: one shared journal, one attached projection.
 fn journaled() -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
-    let mut store = JournaledStore::open(
-        ModelJournal::new(),
-        CLUSTER,
-        REPLICA,
-        inc(),
-        BOOT,
-        JournalLimits::default(),
-    )
-    .unwrap();
+    journaled_with(JournalLimits::default())
+}
+
+/// [`journaled`] over `limits`.
+fn journaled_with(limits: JournalLimits) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut store =
+        JournaledStore::open(ModelJournal::new(), CLUSTER, REPLICA, inc(), BOOT, limits).unwrap();
     store
         .attach(DOMAIN, ShardId::new(0).unwrap(), ModelEngine::new())
         .unwrap();
@@ -1230,11 +1231,13 @@ fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
         "one projection commit"
     );
     // What the group held, by its records (task-d84): one group of
-    // application outcomes only, a record for each command it executed.
+    // application outcomes only, and one record for the ten commands it
+    // executed, where each took its own before (the batching-rule doc's
+    // 10.7, step 1b).
     let (groups, before) = (cost.groups, cost_before.groups);
     assert_eq!(groups.application - before.application, 1);
     assert_eq!(groups.protocol + groups.both, before.protocol + before.both);
-    assert_eq!(groups.application_records - before.application_records, 10);
+    assert_eq!(groups.application_records - before.application_records, 1);
     assert_eq!(groups.protocol_records, before.protocol_records);
 
     assert_eq!(together, one_at_a_time);
@@ -1360,14 +1363,17 @@ fn a_boot_that_ends_between_a_groups_journal_sync_and_its_projection_commit_reco
         .iter()
         .map(|(command, record)| applier.apply(*command, record).expect("applied"))
         .collect();
+    // Each outcome is queued as it lands, and the append seals the run as
+    // one record (the batching-rule doc's 10.7, step 1b).
+    assert_eq!(applier.store().store().queued(DOMAIN), 10);
     let appended = applier
         .store_mut()
         .store_mut()
         .append_pending()
         .expect("the group reaches the journal");
     assert_eq!(appended.appends, 1);
-    assert_eq!(appended.journaled, 10, "the whole group in one append");
-    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 10);
+    assert_eq!(appended.journaled, 1, "the whole group in one record");
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 1);
 
     // The boot ends here: the group durable, the projection behind it.
     let (journal, mut engines): (ModelJournal, Vec<(DomainId, ModelEngine)>) =
@@ -1454,4 +1460,535 @@ fn the_reference_worker_applies_one_command_at_a_time() {
     let mut applier = reference();
     assert!(!applier.begin_group());
     assert!(!applier.in_group());
+}
+
+/// What the journal holds of the applier's application records, after
+/// the bootstrap's, in order: each one's outcomes, each as its position,
+/// its updates and its bytes as [`coord_storage::batch_bytes`] counts its
+/// batch (the batching-rule doc's 10.7, step 1b).
+fn application_records(
+    applier: &Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> Vec<Vec<(u64, usize, usize)>> {
+    use coord_journal_api::record::RecordBody;
+    let journal = applier.store().store().journal();
+    let stream = (0..64)
+        .filter_map(|id| coord_journal_api::stream::StorageStreamId::from_durable(id).ok())
+        .find(|stream| !journal.records(*stream).is_empty())
+        .expect("one stream");
+    let bytes = |updates: &[coord_core::effect::StoreUpdate]| {
+        updates
+            .iter()
+            .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len) + 16)
+            .sum::<usize>()
+            + 64
+    };
+    journal
+        .records(stream)
+        .iter()
+        .filter_map(|record| match record.body() {
+            RecordBody::ApplicationOutcome {
+                position, updates, ..
+            } => Some(vec![(position.get(), updates.len(), bytes(updates))]),
+            RecordBody::ApplicationGroup {
+                outcomes, updates, ..
+            } => {
+                let mut rest = updates.as_slice();
+                Some(
+                    outcomes
+                        .iter()
+                        .map(|outcome| {
+                            let (own, after) = rest.split_at(outcome.updates as usize);
+                            rest = after;
+                            (outcome.position.get(), own.len(), bytes(own))
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        })
+        .skip(1)
+        .collect()
+}
+
+/// Apply `commands` as the node does (`node.rs`): in one group, and when
+/// the store's queue has no room for a command's batch, the group is
+/// lowered and the same command applied again in the next. Returns each
+/// command's outcome, and the position each group ended at: the store
+/// seals what a group queued when it is lowered.
+fn apply_in_groups(
+    applier: &mut Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+    commands: &[(CommandId, PayloadRecordV1)],
+) -> (Vec<coord_consensus::AppliedOutcome>, BTreeSet<u64>) {
+    // The payloads first, each lowered with its own, so that large ones
+    // never fill the queue.
+    for (command, payload) in commands {
+        support::stage(applier.store_mut(), command, payload);
+        applier.store_mut().lower().unwrap();
+    }
+    let mut outcomes: Vec<coord_consensus::AppliedOutcome> = Vec::new();
+    let mut ends = BTreeSet::new();
+    assert!(applier.begin_group());
+    for (command, payload) in commands {
+        loop {
+            match applier.apply(*command, payload) {
+                Err(ApplyError::GroupFull) => {
+                    assert!(applier.grouped() > 0, "a group of nothing is never full");
+                    applier.finish_group().expect("the group materializes");
+                    ends.insert(outcomes.last().expect("grouped").position.get());
+                    assert!(applier.begin_group());
+                }
+                applied => {
+                    outcomes.push(applied.expect("applied"));
+                    break;
+                }
+            }
+        }
+    }
+    applier.finish_group().expect("the group materializes");
+    ends.insert(outcomes.last().expect("applied").position.get());
+    (outcomes, ends)
+}
+
+/// The bytes a run of outcomes may take under [`journaled`]'s limits:
+/// half the default journal group's, 128 KiB.
+fn run_cap() -> usize {
+    run_bytes(JournalLimits::default().group)
+}
+
+/// The cut rule (the batching-rule doc's 10.7, step 1b), checked over
+/// every record a run left:
+/// - the records hold the outcomes in execution order, none left out;
+/// - a record of several outcomes is within both bounds: 1,024 updates
+///   and the run's bytes ([`run_cap`]);
+/// - an outcome over either bound is alone in its record;
+/// - a record closed where its group did not end only because the next
+///   outcome would have taken it past a bound.
+///
+/// Returns how many records closed at each bound: updates, then bytes.
+fn assert_cut_at_the_bounds(
+    records: &[Vec<(u64, usize, usize)>],
+    first: u64,
+    ends: &BTreeSet<u64>,
+) -> (usize, usize) {
+    let total = |record: &[(u64, usize, usize)]| {
+        (
+            record.iter().map(|o| o.1).sum::<usize>(),
+            record.iter().map(|o| o.2).sum::<usize>(),
+        )
+    };
+    let cap = run_cap();
+    let over = |o: &(u64, usize, usize)| o.1 > GROUP_RECORD_UPDATES || o.2 > cap;
+    let positions: Vec<u64> = records.iter().flatten().map(|o| o.0).collect();
+    assert_eq!(
+        positions,
+        (first..first + positions.len() as u64).collect::<Vec<_>>(),
+        "in execution order"
+    );
+    for record in records {
+        let (updates, bytes) = total(record);
+        if record.len() > 1 {
+            assert!(
+                updates <= GROUP_RECORD_UPDATES && bytes <= cap,
+                "a record of {} outcomes past the bounds: {updates} updates, {bytes} bytes",
+                record.len()
+            );
+        }
+        if record.iter().any(over) {
+            assert_eq!(record.len(), 1, "an outcome over a bound shares a record");
+        }
+    }
+    let (mut at_updates, mut at_bytes) = (0, 0);
+    for pair in records.windows(2) {
+        let (this, next) = (&pair[0], &pair[1][0]);
+        let last = this.last().expect("a record holds an outcome").0;
+        if ends.contains(&last) || this.iter().any(over) || over(next) {
+            continue;
+        }
+        let (updates, bytes) = total(this);
+        let (past_updates, past_bytes) = (
+            updates + next.1 > GROUP_RECORD_UPDATES,
+            bytes + next.2 > cap,
+        );
+        assert!(
+            past_updates || past_bytes,
+            "the record ending at {last} closed before an outcome it had room for"
+        );
+        at_updates += usize::from(past_updates);
+        at_bytes += usize::from(past_bytes);
+    }
+    (at_updates, at_bytes)
+}
+
+/// A put of `len` bytes under its own key, the `seq`th command.
+fn put_of(seq: u64, len: usize) -> (CommandId, PayloadRecordV1) {
+    payload(
+        seq,
+        &put(format!("big-{seq}").as_bytes(), &vec![seq as u8; len]),
+    )
+}
+
+/// How many bytes a put's outcome of a `len`-byte value counts toward a
+/// record's bound: measured from the record a lone one leaves, so the
+/// sizes below follow the rows a put writes.
+fn put_outcome_bytes(len: usize) -> usize {
+    let mut applier = journaled();
+    apply_in_groups(&mut applier, &[put_of(1, len)]);
+    let records = application_records(&applier);
+    assert_eq!(records.len(), 1);
+    records[0][0].2
+}
+
+/// The value length whose put's outcome counts about `bytes`, within a
+/// few bytes: a put's outcome counts a fixed part, each value byte once a
+/// row it is in, and the value's length prefixes. Measured once.
+fn value_for(bytes: usize) -> usize {
+    static SIZES: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (empty, per_byte) = *SIZES.get_or_init(|| {
+        let (empty, step) = (put_outcome_bytes(0), put_outcome_bytes(64 * 1024));
+        let per_byte = (step - empty) / (64 * 1024);
+        assert!(per_byte >= 1, "{empty} {step}");
+        (empty, per_byte)
+    });
+    (bytes - empty) / per_byte
+}
+
+/// The same commands one at a time and in groups: the same outcomes and
+/// the same revision.
+fn assert_same_as_alone(
+    commands: &[(CommandId, PayloadRecordV1)],
+    grouped: &Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+    together: &[coord_consensus::AppliedOutcome],
+) {
+    let mut alone = journaled();
+    let one_at_a_time: Vec<_> = commands
+        .iter()
+        .map(|(command, record)| alone.apply_staged(*command, record).expect("applied"))
+        .collect();
+    assert_eq!(together, one_at_a_time.as_slice());
+    assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
+    assert_eq!(grouped.store().unmaterialized(), 0);
+}
+
+/// A group of 32 outcomes near the run's bytes each ([`run_cap`]) is cut
+/// into records under the bounds (the batching-rule doc's 10.7, step 1b):
+/// no two fit one record, so the store seals each as a record of its own.
+/// The queue is held to 2 MiB here, so it fills partway: the outcome it
+/// has no room for is refused as the group being full, the node's way, and
+/// the group is lowered and the command applied again in the next.
+#[test]
+fn a_group_of_outcomes_near_the_run_bytes_each_is_cut_into_records_under_the_bounds() {
+    let len = value_for(run_cap() - 8 * 1024);
+    let commands: Vec<_> = (1..=32).map(|seq| put_of(seq, len)).collect();
+    let mut applier = journaled_with(JournalLimits {
+        max_queued_bytes_per_domain: 2 * 1024 * 1024,
+        ..JournalLimits::default()
+    });
+    let (together, ends) = apply_in_groups(&mut applier, &commands);
+    let records = application_records(&applier);
+    let first = together[0].position.get();
+    let (_, at_bytes) = assert_cut_at_the_bounds(&records, first, &ends);
+    assert_eq!(records.len(), 32, "one outcome a record");
+    assert!(records.iter().all(|record| record[0].2 <= run_cap()));
+    assert!(ends.len() > 1, "the queue filled: {ends:?}");
+    assert_eq!(
+        at_bytes,
+        32 - ends.len(),
+        "every other record closed at the byte bound"
+    );
+    assert_same_as_alone(&commands, &applier, &together);
+}
+
+/// Outcomes of mixed sizes: each record closes before the outcome that
+/// would take it past the run's bytes, and holds as many as fit before it.
+#[test]
+fn a_group_of_mixed_outcomes_closes_each_record_before_the_outcome_that_would_pass_it() {
+    let fractions = [95, 40, 40, 15, 60, 2, 30, 30];
+    let commands: Vec<_> = (1..=32u64)
+        .map(|seq| {
+            let share = fractions[(seq as usize - 1) % fractions.len()];
+            put_of(seq, value_for(run_cap() * share / 100))
+        })
+        .collect();
+    let mut applier = journaled();
+    let before = applier.store().cost().expect("counted").lowering.groups;
+    let (together, ends) = apply_in_groups(&mut applier, &commands);
+    let records = application_records(&applier);
+    let (_, at_bytes) = assert_cut_at_the_bounds(&records, together[0].position.get(), &ends);
+    assert_eq!(ends.len(), 1, "one group: {ends:?}");
+    assert!(at_bytes >= 8, "{records:?}");
+    assert!(
+        records.iter().any(|record| record.len() >= 3),
+        "{records:?}"
+    );
+    // One record a cut, each the journal's one application record for it,
+    // where each command took its own before.
+    let after = applier.store().cost().expect("counted").lowering.groups;
+    assert_eq!(
+        after.application_records - before.application_records,
+        records.len() as u64
+    );
+    assert!(records.len() < commands.len());
+    assert_same_as_alone(&commands, &applier, &together);
+}
+
+/// An outcome over the run's bytes goes in a record of its own, as every
+/// outcome did before step 1b, and the outcomes on either side of it
+/// share records: one that still fits an ordinary journal group, and one
+/// over 1 MiB, which takes the large-record path.
+#[test]
+fn an_outcome_over_the_run_bytes_goes_in_a_record_of_its_own() {
+    let commands = vec![
+        put_of(1, 16),
+        put_of(2, 16),
+        put_of(3, value_for(run_cap() * 3 / 2)),
+        put_of(4, 16),
+        put_of(5, 16),
+        put_of(6, limits::MAX_VALUE_BYTES),
+        put_of(7, 16),
+        put_of(8, 16),
+    ];
+    let mut applier = journaled();
+    let (together, ends) = apply_in_groups(&mut applier, &commands);
+    let records = application_records(&applier);
+    assert_cut_at_the_bounds(&records, together[0].position.get(), &ends);
+    let shape: Vec<usize> = records.iter().map(Vec::len).collect();
+    assert_eq!(shape, [2, 1, 2, 1, 2], "{records:?}");
+    assert!(records[1][0].2 > run_cap());
+    assert!(records[1][0].2 < JournalLimits::default().group.max_bytes);
+    assert_eq!(records[1][0].0, together[2].position.get());
+    assert!(records[3][0].2 > GROUP_RECORD_BYTES);
+    assert_eq!(records[3][0].0, together[5].position.get());
+    assert_same_as_alone(&commands, &applier, &together);
+}
+
+/// A transaction of `puts` puts, each under its own key.
+fn many_puts(seq: u64, puts: usize) -> (CommandId, PayloadRecordV1) {
+    let success = (0..puts)
+        .map(|i| {
+            BranchOp::Put(PutOp {
+                key: format!("t{seq}-{i:03}").into_bytes(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            })
+        })
+        .collect();
+    payload(
+        seq,
+        &req(CanonicalOperation::Txn(TxnOp {
+            compares: Vec::new(),
+            success,
+            failure: Vec::new(),
+        })),
+    )
+}
+
+/// A group past 1,024 updates is cut at the update bound: small rows,
+/// many of them, so the bytes never bind.
+#[test]
+fn a_group_past_1024_updates_is_cut_at_the_update_bound() {
+    let commands: Vec<_> = (1..=32).map(|seq| many_puts(seq, 100)).collect();
+    let mut applier = journaled();
+    let (together, ends) = apply_in_groups(&mut applier, &commands);
+    let records = application_records(&applier);
+    let (at_updates, at_bytes) =
+        assert_cut_at_the_bounds(&records, together[0].position.get(), &ends);
+    let updates: usize = records.iter().flatten().map(|o| o.1).sum();
+    assert!(updates > 3 * GROUP_RECORD_UPDATES, "{updates}");
+    assert_eq!(ends.len(), 1, "one group: {ends:?}");
+    assert!(records.len() >= 3, "{records:?}");
+    assert_eq!(at_updates, records.len() - 1);
+    assert_eq!(at_bytes, 0);
+    assert!(records.iter().all(|record| record.len() > 1));
+    assert_same_as_alone(&commands, &applier, &together);
+}
+
+/// End the boot here, and open the next on what the journal and the
+/// projection hold: the replay takes whatever the journal has that the
+/// projection lacks.
+fn reboot(
+    applier: Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    let (journal, mut engines): (ModelJournal, Vec<(DomainId, ModelEngine)>) =
+        applier.into_store().into_store().into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .expect("reopened");
+    next.attach(DOMAIN, ShardId::new(0).unwrap(), engine)
+        .expect("attached");
+    assert_eq!(
+        next.unmaterialized(DOMAIN),
+        0,
+        "the replay took the journal"
+    );
+    let base = next.application_base(DOMAIN).expect("attached");
+    let domain = JournaledDomain::new(
+        next,
+        DOMAIN,
+        Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: REPLICA,
+        },
+    )
+    .expect("attached");
+    Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier")
+}
+
+/// After a crash, the first `durable` of `commands` count as applied:
+/// presented again, each answers with the outcome it was reported with
+/// and executes nothing. The rest are executed again, each at the
+/// position and revision it took before, since nothing else has applied
+/// a command since (the batching-rule doc's 10.7, step 1b).
+fn assert_recovered(
+    applier: &mut Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+    commands: &[(CommandId, PayloadRecordV1)],
+    outcomes: &[coord_consensus::AppliedOutcome],
+    durable: usize,
+) {
+    for (i, ((command, record), outcome)) in commands.iter().zip(outcomes).enumerate() {
+        let before = applier.kv_revision().unwrap();
+        assert_eq!(
+            &applier
+                .apply_staged(*command, record)
+                .expect("presented again"),
+            outcome,
+            "command {i}"
+        );
+        let after = applier.kv_revision().unwrap();
+        if i < durable {
+            assert_eq!(after, before, "command {i} is applied, not executed again");
+        } else {
+            assert_eq!(
+                Some(after),
+                outcome.revision,
+                "command {i} is executed again"
+            );
+        }
+    }
+}
+
+/// Apply `commands` in one group, each outcome queued as it lands, and
+/// append them with `script`: the boot's last append, which seals them as
+/// one record or a few.
+fn group_appended_as(
+    commands: &[(CommandId, PayloadRecordV1)],
+    script: AppendScript,
+) -> (
+    Applier<JournaledDomain<ModelJournal, ModelEngine>>,
+    Vec<coord_consensus::AppliedOutcome>,
+) {
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), commands);
+    assert!(applier.begin_group());
+    let outcomes: Vec<_> = commands
+        .iter()
+        .map(|(command, record)| applier.apply(*command, record).expect("applied"))
+        .collect();
+    let store = applier.store_mut().store_mut();
+    store.journal_mut().unwrap().script_append(script);
+    let _ = store.append_pending();
+    (applier, outcomes)
+}
+
+/// The crash cuts at a group's record (the batching-rule doc's 10.7, step
+/// 1b). Torn, the record is not in the journal, and every command of the
+/// group is executed again. Durable but not acknowledged, it is, and
+/// every command counts as applied with the outcome it was reported with.
+#[test]
+fn a_crash_at_a_groups_record_keeps_all_of_the_group_or_none_of_it() {
+    let commands: Vec<_> = (1..=10).map(|seq| put_of(seq, 16)).collect();
+
+    let (applier, outcomes) =
+        group_appended_as(&commands, AppendScript::Indeterminate { applied: false });
+    let mut next = reboot(applier);
+    assert_eq!(
+        next.kv_revision().unwrap(),
+        journaled().kv_revision().unwrap(),
+        "none of the group"
+    );
+    assert_recovered(&mut next, &commands, &outcomes, 0);
+
+    let (applier, outcomes) =
+        group_appended_as(&commands, AppendScript::Indeterminate { applied: true });
+    let mut next = reboot(applier);
+    assert_eq!(
+        Some(next.kv_revision().unwrap()),
+        outcomes.last().unwrap().revision
+    );
+    assert_recovered(&mut next, &commands, &outcomes, commands.len());
+}
+
+/// The cut between two records of one group (the batching-rule doc's
+/// 10.7, step 1b): the first is durable and the second torn. It adds no
+/// state, since a crash between two commands of a group was already
+/// possible with a record each: the first record's commands count as
+/// applied, and the rest are executed again.
+///
+/// Twelve commands of a hundred puts each pass the record's update bound,
+/// so the store cuts the group's outcomes into records. A twin applying
+/// all twelve before one append shows where the first record ends; here
+/// that many are appended alone, and the append of the rest is torn.
+#[test]
+fn a_crash_between_two_records_of_one_group_keeps_the_first_records_commands() {
+    let commands: Vec<_> = (1..=12).map(|seq| many_puts(seq, 100)).collect();
+    let first = {
+        let mut twin = journaled();
+        support::stage_all(twin.store_mut(), &commands);
+        assert!(twin.begin_group());
+        for (command, record) in &commands {
+            twin.apply(*command, record).expect("applied");
+        }
+        let report = twin
+            .store_mut()
+            .store_mut()
+            .append_pending()
+            .expect("appended");
+        assert!(report.journaled > 1, "the update bound cuts the group");
+        let records = application_records(&twin);
+        let group = &records[records.len() - report.journaled..];
+        assert_eq!(
+            group.iter().map(Vec::len).sum::<usize>(),
+            commands.len(),
+            "{group:?}"
+        );
+        group[0].len()
+    };
+    assert!(first > 1 && first < commands.len(), "{first}");
+    let mut applier = journaled();
+    support::stage_all(applier.store_mut(), &commands);
+    assert!(applier.begin_group());
+    let mut outcomes = Vec::new();
+    for (i, (command, record)) in commands.iter().enumerate() {
+        outcomes.push(applier.apply(*command, record).expect("applied"));
+        if i + 1 == first {
+            let report = applier
+                .store_mut()
+                .store_mut()
+                .append_pending()
+                .expect("the first record reaches the journal");
+            assert_eq!(report.journaled, 1, "the group's first record alone");
+        }
+    }
+    assert_eq!(application_records(&applier).last().unwrap().len(), first);
+    let store = applier.store_mut().store_mut();
+    store
+        .journal_mut()
+        .unwrap()
+        .script_append(AppendScript::Indeterminate { applied: false });
+    let _ = store.append_pending();
+
+    let mut next = reboot(applier);
+    assert_eq!(
+        Some(next.kv_revision().unwrap()),
+        outcomes[first - 1].revision
+    );
+    assert_recovered(&mut next, &commands, &outcomes, first);
 }
