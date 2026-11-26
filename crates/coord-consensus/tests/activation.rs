@@ -97,7 +97,23 @@ impl Node {
     fn step(&mut self, e: Event) -> Vec<Effect> {
         match self.role.as_mut().unwrap() {
             Role::Leader(m) => m.step(e),
-            Role::Follower(m) => m.step(e),
+            // The rows of commands it executed and forgot that the
+            // follower wants are read from its durable rows, as `coordd`
+            // reads them (task-d77, task-d121).
+            Role::Follower(m) => {
+                let mut effects = m.step(e);
+                loop {
+                    let wanted = m.executed_rows_wanted();
+                    if wanted.is_empty() {
+                        break effects;
+                    }
+                    let rows: BTreeMap<CommandId, CommandRecord> =
+                        dependency_rows(&self.storage).into_iter().collect();
+                    effects.extend(
+                        m.executed_rows(wanted.into_iter().map(|c| (c, rows.get(&c).cloned()))),
+                    );
+                }
+            }
         }
     }
     fn follower(&self) -> &Follower {
@@ -10940,11 +10956,12 @@ fn install_sync(
     b: Ballot,
     entries: Vec<coord_consensus::SyncEntry>,
 ) -> Vec<FollowerRejection> {
+    let executed = cluster.nodes[1].executed_through();
     let effects = cluster.nodes[1].step(peer_event(
         b.leader,
         ProtocolMessage::NewLeader {
             ballot: b,
-            executed: coord_types::ids::ExecutionPosition::ZERO,
+            executed,
         },
     ));
     cluster.handle(1, effects);
@@ -11219,5 +11236,132 @@ fn a_nothing_proposal_over_a_commit_under_facts_stops() {
             .unwrap()
             .payload,
         Some(facts)
+    );
+}
+
+/// A cluster in which node 1 executed and retired `X` and forgot its
+/// payload, with no Sync since: what `X` was executed under is only in
+/// its durable dependency row (task-d121).
+fn retired_and_forgotten() -> (Cluster, CommandId, Digest32) {
+    let mut cluster = Cluster::with_capacity(41, 4);
+    let x = cluster.admit(1, 1);
+    let held = facts_of(&cluster.nodes[1], &x).expect("its payload row");
+    for s in 2..16u64 {
+        cluster.admit(s, s as u8);
+        cluster.settle();
+    }
+    let f = cluster.nodes[1].follower();
+    assert!(f.table().record(&x).is_none(), "X is retired");
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Executed));
+    assert!(f.payload(&x).is_none(), "X's payload is forgotten");
+    (cluster, x, held)
+}
+
+/// task-d121, C2: a voter handed a nothing for a command it executed and
+/// retired, past the payload it kept, reads its dependency row before the
+/// entry installs, and stops on the second decision.
+#[test]
+fn a_nothing_for_a_command_retired_past_its_payload_stops_after_the_row_read() {
+    let (mut cluster, x, held) = retired_and_forgotten();
+    let rejections = install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            x,
+            Phase::Commit,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    assert!(
+        rejections.contains(&FollowerRejection::IncompatibleAdmission {
+            command: x,
+            held,
+            selected: coord_consensus::NOTHING_ADMISSION,
+        }),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(x));
+}
+
+/// task-d121, C2: the same for a proposal of the nothing.
+#[test]
+fn a_nothing_proposal_for_a_command_retired_past_its_payload_stops() {
+    let (mut cluster, x, held) = retired_and_forgotten();
+    let b = ballot(1, 2);
+    install_sync(&mut cluster, b, vec![]);
+    propose(&mut cluster, b, x, coord_consensus::NOTHING_ADMISSION);
+    let rejections = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::IncompatibleAdmission {
+            command: x,
+            held,
+            selected: coord_consensus::NOTHING_ADMISSION,
+        }),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(x));
+}
+
+/// task-d121, C2: under the facts it was executed under, the retired
+/// command's entry installs as before, after the read.
+#[test]
+fn a_retired_commands_entry_under_its_own_facts_passes_after_the_row_read() {
+    let (mut cluster, x, held) = retired_and_forgotten();
+    let rejections = install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(x, Phase::Commit, held)],
+    );
+    assert!(rejections.is_empty(), "{rejections:?}");
+    assert_eq!(cluster.nodes[1].follower().halted(), None);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .executed_rows_wanted()
+            .is_empty()
+    );
+}
+
+/// task-d121, C2: a payload arriving for a command this voter holds as
+/// nothing, with nothing waiting on facts, is not taken: no payload row is
+/// written under a nothing.
+#[test]
+fn a_late_payload_for_a_nothing_writes_no_payload_row() {
+    let mut cluster = Cluster::new(3);
+    let d = cluster.admit_at(1, 1, &[1]);
+    let (_, payload) = payload_rows(&cluster.nodes[1].storage)
+        .into_iter()
+        .find(|(c, _)| *c == d)
+        .expect("the submission's payload row");
+    install_sync(
+        &mut cluster,
+        ballot(1, 2),
+        vec![sync_entry(
+            d,
+            Phase::Accept,
+            coord_consensus::NOTHING_ADMISSION,
+        )],
+    );
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::PayloadResponse {
+            command: d,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&d)
+            .unwrap()
+            .is_nothing()
+    );
+    assert!(cluster.nodes[1].follower().payload(&d).is_none());
+    assert!(
+        !payload_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, _)| *c == d)
     );
 }

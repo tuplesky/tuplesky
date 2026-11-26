@@ -539,6 +539,33 @@ pub const COMMIT_ROWS_BATCH_BYTES: usize = 1024 * 1024;
 /// checks it against the journal's bound at compile time.
 pub const COMMIT_ROWS_BATCH_UPDATES: usize = 1024;
 
+/// The payload row of `command`, which is never written for a command
+/// this replica holds as nothing (task-d121): a nothing has no payload, and
+/// a payload row under one is facts a recovery would read as decided.
+fn payload_write(
+    table: &CommandTable,
+    command: &CommandId,
+    payload: &PayloadRecordV1,
+) -> Result<StoreUpdate, coord_store_api::engine::EngineError> {
+    debug_assert!(
+        !table.record(command).is_some_and(CommandRecord::is_nothing),
+        "a payload row under a nothing: {command:?}"
+    );
+    payload_update(command, payload)
+}
+
+/// What a retired command was executed under, as far as this replica
+/// can tell now (task-d121).
+#[derive(Clone, Copy)]
+enum RetiredFacts {
+    /// Under these facts, or the nothing marker.
+    Under(Digest32),
+    /// No row kept, so no telling.
+    WithoutRow,
+    /// Its dependency row is still to be read.
+    Unread,
+}
+
 /// What became of one pulled command offered to a window (task-d25).
 enum Pulled {
     /// Installed in the window.
@@ -788,6 +815,15 @@ pub struct Follower {
     /// forgot, as the runtime read them for the campaign's selection
     /// (task-d77); `None` for one with no row. Read again by each campaign.
     executed_rows: BTreeMap<CommandId, Option<CommandRecord>>,
+    /// Commands this replica executed and retired, holds neither the
+    /// payload nor a ledger record of, and was handed a Sync entry or a
+    /// proposal for: their durable dependency rows are read, as a
+    /// campaign's are (task-d77), to check the decision against what they
+    /// were executed under before the entry installs (task-d121).
+    retired_wanted: BTreeSet<CommandId>,
+    /// Proposals of such commands held until the read (task-d121), and
+    /// taken again then if their ballot is still this replica's.
+    retired_proposals: BTreeMap<CommandId, (ReplicaId, FastAck)>,
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
@@ -1313,6 +1349,8 @@ impl Follower {
             campaign: None,
             selection_rules: crate::recovery::SelectionRules::default(),
             executed_rows: BTreeMap::new(),
+            retired_wanted: BTreeSet::new(),
+            retired_proposals: BTreeMap::new(),
             behind: None,
             unbacked: None,
             behind_voters: None,
@@ -1554,6 +1592,8 @@ impl Follower {
             campaign: None,
             selection_rules: crate::recovery::SelectionRules::default(),
             executed_rows: BTreeMap::new(),
+            retired_wanted: BTreeSet::new(),
+            retired_proposals: BTreeMap::new(),
             behind: None,
             unbacked: None,
             behind_voters: None,
@@ -2727,7 +2767,7 @@ impl Follower {
                 if self.payload_row(command).is_none()
                     && let Some(payload) = self.payloads.get(command)
                 {
-                    updates.push(payload_update(command, payload).expect("bounded"));
+                    updates.push(payload_write(&self.table, command, payload).expect("bounded"));
                     self.durable_payloads.push(barrier, *command);
                 }
                 updates.push(self.dependency_row(command, demoted));
@@ -3048,7 +3088,7 @@ impl Follower {
             let payload = record.facts().is_some() && !self.served_payloads.contains(command);
             if payload {
                 let held = self.payloads.get(command).expect("writable");
-                rows.push(payload_update(command, held).expect("bounded"));
+                rows.push(payload_write(&self.table, command, held).expect("bounded"));
             }
             rows.push(dependencies);
             let bytes: usize = rows.iter().map(row_bytes).sum();
@@ -3156,6 +3196,12 @@ impl Follower {
     /// A nothing entry (task-d121) waits on neither: it has no payload to
     /// fetch, and it replaces whatever this replica holds below COMMIT.
     fn sync_blocker(&self, command: &CommandId, entry: &SyncEntry) -> Option<CommandId> {
+        // Retired here, with what it was executed under still to be read:
+        // the entry waits for the read, and is checked against it
+        // (task-d121).
+        if entry.admission.is_some() && self.retired_unread(command) {
+            return Some(*command);
+        }
         let nothing = entry.admission.as_ref().is_some_and(is_nothing);
         if !nothing
             && (self.table.phase_of(command).is_none() || self.awaits_selected_facts(command))
@@ -3226,6 +3272,9 @@ impl Follower {
                 match self.sync_blocker(&command, entry) {
                     None => ready.push(command),
                     Some(blocker) => {
+                        if blocker == command && self.retired_unread(&command) {
+                            self.retired_wanted.insert(command);
+                        }
                         self.sync_waiters
                             .entry(blocker)
                             .or_default()
@@ -3263,13 +3312,17 @@ impl Follower {
                     //
                     // Its payload row, where it is still kept, is what it
                     // was executed under: other facts in the selection are
-                    // a second decision, as for a record (task-d14).
-                    if let (Some(selected), Some(held)) = (
-                        entry.admission,
-                        self.payloads
-                            .get(&command)
-                            .map(PayloadRecordV1::admission_digest),
-                    ) && held != selected
+                    // a second decision, as for a record (task-d14). Past
+                    // that, its ledger record or its dependency row, read
+                    // before the entry was ready, says it, and a nothing
+                    // against facts either way round is one too
+                    // (task-d121).
+                    let facts = self.retired_facts(&command);
+                    if self.campaign.is_none() {
+                        self.executed_rows.remove(&command);
+                    }
+                    if let (Some(selected), RetiredFacts::Under(held)) = (entry.admission, facts)
+                        && held != selected
                     {
                         self.rejections
                             .push(FollowerRejection::IncompatibleAdmission {
@@ -3531,7 +3584,7 @@ impl Follower {
         let mut updates = Vec::new();
         for c in payloads_due {
             let payload = self.payloads.get(&c).expect("held");
-            updates.push(payload_update(&c, payload).expect("bounded"));
+            updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
             self.durable_payloads.push(barrier, c);
             self.payload_unwritten.remove(&c);
         }
@@ -3542,7 +3595,7 @@ impl Follower {
             if record.payload.is_some()
                 && let Some(payload) = self.payloads.get(&c)
             {
-                updates.push(payload_update(&c, payload).expect("bounded"));
+                updates.push(payload_write(&self.table, &c, payload).expect("bounded"));
                 self.durable_payloads.push(barrier, c);
             }
             updates.push(row);
@@ -3712,36 +3765,95 @@ impl Follower {
     /// not hold them; the runtime reads them from its store, as it serves
     /// catch-up from them (task-d08), and hands them back with
     /// [`Follower::executed_rows`].
+    ///
+    /// So are those of retired commands a Sync entry or a proposal named
+    /// (task-d121): a decision is checked against what the command was
+    /// executed under before this replica installs or answers it.
     pub fn executed_rows_wanted(&self) -> Vec<CommandId> {
-        let Some(campaign) = self.campaign.as_ref() else {
-            return Vec::new();
-        };
-        if campaign.decision().is_some() {
-            return Vec::new();
-        }
-        campaign
-            .rows_wanted()
+        let campaign = self
+            .campaign
+            .as_ref()
+            .filter(|c| c.decision().is_none())
+            .map_or(&[][..], Campaign::rows_wanted);
+        let mut out: Vec<CommandId> = campaign
             .iter()
+            .chain(self.retired_wanted.iter())
             .filter(|c| !self.executed_rows.contains_key(c))
             .copied()
-            .collect()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The durable dependency rows of commands
     /// [`Follower::executed_rows_wanted`] named, `None` for one with no
     /// row, and the campaign tried again with them (task-d77).
+    ///
+    /// The Sync entries waiting on a retired command's row are examined
+    /// again with it (task-d121).
     pub fn executed_rows(
         &mut self,
         rows: impl IntoIterator<Item = (CommandId, Option<CommandRecord>)>,
     ) -> Vec<Effect> {
-        if self.campaign.is_none() {
+        let rows: Vec<(CommandId, Option<CommandRecord>)> = rows.into_iter().collect();
+        let retired = rows.iter().any(|(c, _)| self.retired_wanted.contains(c));
+        if self.campaign.is_none() && !retired {
             return Vec::new();
         }
         self.executed_rows.extend(rows);
+        let mut effects = Vec::new();
+        if retired {
+            let read = &self.executed_rows;
+            self.retired_wanted.retain(|c| !read.contains_key(c));
+            let ready: Vec<CommandId> = self
+                .retired_proposals
+                .keys()
+                .filter(|c| read.contains_key(c))
+                .copied()
+                .collect();
+            self.sync_rescan = true;
+            effects.extend(self.advance_sync());
+            for command in ready {
+                let (from, proposal) = self.retired_proposals.remove(&command).expect("held");
+                if proposal.ballot == self.config.quorum.ballot()
+                    && from == self.config.quorum.leader()
+                {
+                    effects.extend(self.on_proposal(from, proposal));
+                }
+            }
+        }
         if let Some(campaign) = self.campaign.as_mut() {
             campaign.supply_moved();
+            effects.extend(self.advance_campaign());
         }
-        self.advance_campaign()
+        effects
+    }
+
+    /// What a command this replica executed and retired was executed
+    /// under: its payload where still kept (task-d14), else its ledger
+    /// record, else its durable dependency row once read (task-d121).
+    fn retired_facts(&self, command: &CommandId) -> RetiredFacts {
+        if let Some(payload) = self.payloads.get(command) {
+            return RetiredFacts::Under(payload.admission_digest());
+        }
+        let row = match self.ledger.record(command) {
+            Some(record) => Some(record),
+            None => match self.executed_rows.get(command) {
+                None => return RetiredFacts::Unread,
+                Some(row) => row.as_ref(),
+            },
+        };
+        row.and_then(|r| r.payload)
+            .map_or(RetiredFacts::WithoutRow, RetiredFacts::Under)
+    }
+
+    /// Whether `command` was executed and retired here, and what it was
+    /// executed under is still to be read.
+    fn retired_unread(&self, command: &CommandId) -> bool {
+        self.table.record(command).is_none()
+            && self.table.phase_of(command) == Some(Phase::Executed)
+            && matches!(self.retired_facts(command), RetiredFacts::Unread)
     }
 
     /// Commands known by identity (a held proposal) without a payload, or
@@ -4956,7 +5068,9 @@ impl Follower {
         let mut staged = Vec::new();
         for running in &self.catch_up.running {
             let command = running.command;
-            updates.push(payload_update(&command, &running.entry.payload).expect("bounded"));
+            updates.push(
+                payload_write(&self.table, &command, &running.entry.payload).expect("bounded"),
+            );
             let record = self
                 .table
                 .record(&command)
@@ -5142,7 +5256,7 @@ impl Follower {
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
         let barrier = *barrier;
-        updates.push(payload_update(&command, &entry.payload).expect("bounded"));
+        updates.push(payload_write(&self.table, &command, &entry.payload).expect("bounded"));
         let record = self.table.record(&command).expect("installed").clone();
         updates.push(self.dependency_row(&command, &record));
         self.ledger.stage(barrier, command, record);
@@ -6457,7 +6571,10 @@ impl Follower {
             .clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
-        let mut updates = alloc::vec![payload_update(&command, &payload).expect("bounded"), row];
+        let mut updates = alloc::vec![
+            payload_write(&self.table, &command, &payload).expect("bounded"),
+            row
+        ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
@@ -6851,6 +6968,35 @@ impl Follower {
             // Executed here and retired: there is no record to adopt the
             // order into and nothing left to decide. Held, it would wait
             // for ever for an adoption that cannot happen (task-d05).
+            //
+            // A nothing against what it was executed under, either way
+            // round, is a second decision, and this replica stops
+            // (task-d121). Where that is still to be read, the proposal
+            // is held, unanswered, and taken again after the read.
+            match self.retired_facts(&command) {
+                RetiredFacts::Unread => {
+                    self.retired_wanted.insert(command);
+                    self.retired_proposals.insert(command, (from, proposal));
+                    return Vec::new();
+                }
+                RetiredFacts::Under(held)
+                    if held != proposal.admission
+                        && (is_nothing(&held) || is_nothing(&proposal.admission)) =>
+                {
+                    self.rejections
+                        .push(FollowerRejection::IncompatibleAdmission {
+                            command,
+                            held,
+                            selected: proposal.admission,
+                        });
+                    self.halted = Some(command);
+                    return Vec::new();
+                }
+                RetiredFacts::Under(_) | RetiredFacts::WithoutRow => {}
+            }
+            if self.campaign.is_none() {
+                self.executed_rows.remove(&command);
+            }
             return self.acknowledge_decided(&proposal, from);
         }
         // A proposal asserts something about a command, including the
@@ -6993,19 +7139,24 @@ impl Follower {
         }
         // Its payload row too (task-d90): a decided record whose payload
         // is not written here is no vote a recovery can re-execute from.
-        if self
-            .payloads
-            .get(&proposal.command)
-            .is_none_or(|p| p.admission_digest() != proposal.admission)
+        // A nothing has none, and its ledger record is its durable row
+        // (task-d121).
+        let nothing = is_nothing(&proposal.admission);
+        if !nothing
+            && self
+                .payloads
+                .get(&proposal.command)
+                .is_none_or(|p| p.admission_digest() != proposal.admission)
         {
             return Vec::new();
         }
         // Held with no row durable or in flight (its batch failed): the row
         // is written again, and the answer waits on it (#195 review).
         let mut effects = Vec::new();
-        let requires = match self.payload_row(&proposal.command) {
-            Some(requires) => requires,
-            None => {
+        let requires = match (nothing, self.payload_row(&proposal.command)) {
+            (true, _) => Vec::new(),
+            (false, Some(requires)) => requires,
+            (false, None) => {
                 let Some(barrier) = self.barrier_outside_frame(&mut effects) else {
                     return effects;
                 };
@@ -7014,7 +7165,7 @@ impl Follower {
                     barrier,
                     base: None,
                     updates: alloc::vec![
-                        payload_update(&proposal.command, payload).expect("bounded")
+                        payload_write(&self.table, &proposal.command, payload).expect("bounded")
                     ],
                 }));
                 self.durable_payloads.push(barrier, proposal.command);
@@ -7111,7 +7262,7 @@ impl Follower {
             }
             let record = record.clone();
             let row = self.dependency_row(&d, &record);
-            updates.push(payload_update(&d, payload).expect("bounded"));
+            updates.push(payload_write(&self.table, &d, payload).expect("bounded"));
             updates.push(row);
             stack.extend(record.deps.iter().copied());
             carried.push((d, record));
@@ -7407,7 +7558,7 @@ impl Follower {
                 if self.payload_row(&command).is_none()
                     && let Some(payload) = self.payloads.get(&command)
                 {
-                    updates.push(payload_update(&command, payload).expect("bounded"));
+                    updates.push(payload_write(&self.table, &command, payload).expect("bounded"));
                     payload_written = true;
                 }
                 let carried = self.unwritten(command, &record.deps, &mut updates);
@@ -8273,7 +8424,7 @@ impl Follower {
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
-            updates: alloc::vec![payload_update(&command, &payload).expect("bounded")],
+            updates: alloc::vec![payload_write(&self.table, &command, &payload).expect("bounded")],
         })];
         // A proposal held for this payload is adopted now, its
         // acknowledgement waiting on this batch (task-d90).
@@ -8313,7 +8464,10 @@ impl Follower {
         let record = self.table.record(&command).expect("rebound").clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
-        let mut updates = alloc::vec![payload_update(&command, &payload).expect("bounded"), row];
+        let mut updates = alloc::vec![
+            payload_write(&self.table, &command, &payload).expect("bounded"),
+            row
+        ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
             barrier,
