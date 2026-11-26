@@ -2936,8 +2936,14 @@ async fn negotiate_incoming(
     if unbound.is_none() {
         lane::apply_to_connection(conn, &shared.limits.lanes[lane.index()]);
     }
-    if let Err(e) = send.write_all(&ack).await {
-        return Err((CloseReason::Transport(e.to_string()), None));
+    // The `HelloAck` is written within the same wait: a caller that grants
+    // the control stream no credit would otherwise hold its place past the
+    // bind deadline, and an unbound place is what anonymous callers share
+    // (#334 review).
+    match timeout(wait(), send.write_all(&ack)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
+        Err(_) => return Err((CloseReason::Timeout, None)),
     }
     // The control stream stays open: `Close` travels on it. The send half
     // is parked with the connection (dropping it would finish the stream).

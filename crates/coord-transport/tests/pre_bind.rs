@@ -572,6 +572,75 @@ async fn an_unbound_connection_is_closed_at_its_deadline_and_its_place_freed() {
     assert!(frontend.open());
 }
 
+/// A caller that grants the acceptor no stream credit can't be sent its
+/// `HelloAck`, and holds its place until the bind deadline closes it
+/// (#334 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_that_takes_no_hello_ack_is_closed_at_its_deadline_and_its_place_freed() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut t = acceptor(
+        &f,
+        Limits {
+            max_unbound: 1,
+            bind_deadline: Duration::from_millis(800),
+            ..limits()
+        },
+    );
+    CountingGate::install(&t);
+
+    // No credit on any stream, and keep-alives so the connection is not
+    // left to the idle timeout.
+    let mut endpoint = client(&f, None);
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(quinn::VarInt::from_u32(0));
+    transport.keep_alive_interval(Some(Duration::from_millis(200)));
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(f.ca.roots())
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![ALPN_API.to_vec()];
+    let mut config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config).unwrap()));
+    config.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(config);
+    let conn = endpoint
+        .connect(t.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let stalled = Dialed {
+        _endpoint: endpoint,
+        conn,
+        control: None,
+    };
+    let (mut send, _recv) = stalled.conn.open_bi().await.unwrap();
+    send.write_all(&hello(PeerRole::Client, Lane::Unary))
+        .await
+        .unwrap();
+
+    assert_eq!(stalled.closed(Duration::from_secs(3)).await.0, TIMEOUT);
+    // Refused before negotiation, so reported as every refused handshake
+    // is: one `Closed` with no lane, and nothing else.
+    let event = timeout(Duration::from_secs(3), t.next_event())
+        .await
+        .expect("event within deadline")
+        .expect("endpoint alive");
+    assert!(
+        matches!(event, TransportEvent::Closed { lane: None, .. }),
+        "{event:?}"
+    );
+    nothing_emitted(&mut t, Duration::from_millis(300)).await;
+    // Its place is free.
+    let next = anonymous(&f, &t).await;
+    next.send(&bind_frame(GOOD)).await;
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_first_control_frame_closes_the_connection() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
