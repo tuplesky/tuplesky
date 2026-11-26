@@ -908,6 +908,36 @@ async fn an_acknowledgement_waiting_for_room_ends_within_its_deadline_and_closes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_dropped_before_it_runs_closes_the_connection_as_unavailable() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut t = acceptor(&f, limits());
+    CountingGate::install(&t);
+
+    // The runtime makes the acknowledgement's future and drops it before
+    // its first poll: the connection is closed as unavailable, not left to
+    // the fallback that refuses the binding, which would tell the caller
+    // to drop a good credential (#334 review).
+    let dialed = anonymous(&f, &t).await;
+    let _recv = dialed.send(&bind_frame(GOOD)).await;
+    assert!(matches!(
+        next_negotiated(&mut t).await,
+        TransportEvent::Connected { .. }
+    ));
+    let responder = match next_negotiated(&mut t).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    drop(
+        responder
+            .respond(encode_frame(KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION, b"ack").unwrap()),
+    );
+    assert_eq!(
+        dialed.closed(Duration::from_secs(3)).await,
+        (REJECTED, BIND_UNAVAILABLE.as_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
 async fn an_acknowledgement_dropped_while_it_waits_closes_the_connection() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
     let mut t = acceptor(&f, held_budget_limits());

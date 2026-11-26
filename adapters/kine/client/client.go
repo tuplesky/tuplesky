@@ -462,10 +462,11 @@ const closeRejected = 2
 const reasonBindUnavailable = "bind unavailable"
 
 // bindSession presents the token on its own stream and requires a
-// BindAck within the frame timeout; anything else (a Close, a reset, a
-// timeout) is a rejected binding and the connection is not used. The
-// one exception is a frontend that says it can't bind now: the token is
-// kept, and ErrBindUnavailable says to bind again.
+// BindAck within the frame timeout; anything else the frontend answers
+// (a Close, a reset) is a rejected binding and the connection is not
+// used. Two exceptions keep the token: a frontend that says it can't bind
+// now, and a wait that runs out before the frontend answers at all.
+// ErrBindUnavailable says to bind again.
 func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string) error {
 	frame, err := wire.EncodeBind(wire.Bind{Token: []byte(token)})
 	if err != nil {
@@ -484,6 +485,16 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 	answer, err := readOneFrame(bindCtx, stream)
 	if err != nil {
 		if bindUnavailable(bindCtx, conn, err) {
+			return ErrBindUnavailable
+		}
+		if bindCtx.Err() != nil {
+			// The wait ran out here before the frontend said anything:
+			// its own deadline starts after ours, so its answer (a
+			// retryable close included) can still be on the way. Nothing
+			// refused the token, so it is kept (#334 review).
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return ErrBindUnavailable
 		}
 		c.invalidateToken()

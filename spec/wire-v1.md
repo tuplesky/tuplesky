@@ -125,7 +125,9 @@ difference after the ALPN and `Hello` are known:
     handshake, raised to its lane's only once its `BindAck` is written;
     an acknowledgement that is not written whole within the frame
     deadline, which covers its wait for send budget, closes the
-    connection with code `2` and "bind unavailable";
+    connection with code `2` and "bind unavailable". That deadline
+    starts after the client's own wait for the answer, so a client whose
+    wait runs out with no answer keeps its token: nothing refused it;
   - its first stream after `Hello` carries exactly one `Bind` of at most
     8,208 bytes, length field included, and any other first frame, a
     longer one, or a second stream before the `BindAck` closes the

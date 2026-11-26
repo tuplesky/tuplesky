@@ -315,7 +315,16 @@ impl Responder {
     /// the stream would let concurrent unary requests, or many API
     /// connections, hand window after window to QUIC outside the caps
     /// this lane exists to enforce.
-    pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
+    ///
+    /// The returned future owns the connection's first-bind obligations
+    /// from the moment it is made, not from its first poll: an
+    /// acknowledgement whose future is dropped before it ever runs closes
+    /// the connection as unavailable, as one dropped while it waits does
+    /// (#334 review).
+    pub fn respond(
+        mut self,
+        frame: Vec<u8>,
+    ) -> impl core::future::Future<Output = Result<(), SendError>> {
         // The runtime acknowledges a binding only once it holds one, so
         // the connection is bound once its acknowledgement is admitted
         // (task-d122). It is raised before the acknowledgement is written:
@@ -333,7 +342,10 @@ impl Responder {
         //
         // Any other answer to a first bind leaves the connection unbound,
         // and it is closed once the answer is written (see [`BindHold`]).
-        let (acknowledging, _unacknowledged) = match self.binding.peer.take() {
+        //
+        // The guard is chosen here, before the future exists, so that it
+        // is in charge even if the future is never polled.
+        let (acknowledging, unacknowledged) = match self.binding.peer.take() {
             Some(peer) if frame.get(4..6) == Some(&KIND_SESSION_BIND_ACK.to_be_bytes()[..]) => {
                 (Some(Acknowledging { peer: Some(peer) }), None)
             }
@@ -345,6 +357,18 @@ impl Responder {
                 }),
             ),
         };
+        self.write_response(frame, acknowledging, unacknowledged)
+    }
+
+    /// [`respond`]'s write, with the first-bind guard already chosen.
+    ///
+    /// [`respond`]: Responder::respond
+    async fn write_response(
+        mut self,
+        frame: Vec<u8>,
+        acknowledging: Option<Acknowledging>,
+        _unacknowledged: Option<BindHold>,
+    ) -> Result<(), SendError> {
         let bytes = frame.len();
         let started = tokio::time::Instant::now();
         let held = match &acknowledging {
