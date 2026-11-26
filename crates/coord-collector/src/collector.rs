@@ -385,9 +385,7 @@ pub enum EvidenceError {
     Vote(VoteError),
     /// Not an evidence message (a recovery or transfer message).
     NotEvidence,
-    /// A second, different release for the command, or a voter's
-    /// `DecidedNothing` against a final release of other facts held for
-    /// it (task-d121).
+    /// A second, different release for the command.
     ReleaseMismatch,
     /// Evidence from a replica that is not a voter of the current
     /// configuration (task-d22), or from a link bound under any role but
@@ -405,6 +403,10 @@ pub enum EvidenceError {
     /// told something the domain did not decide. The node stops, as it does
     /// when a record contradicts a release it holds, and says what it
     /// compared (task-d17).
+    ///
+    /// Also a voter's `DecidedNothing` against a final release of
+    /// anything else, held or answered from, in whichever order the two
+    /// arrive (task-d121, [`MismatchCheck::DecidedNothingAgainstRelease`]).
     AnsweredOtherwise(Box<Mismatch>),
 }
 
@@ -538,6 +540,11 @@ pub enum MismatchCheck {
     /// execution against the one the peer served with it (task-d08). The
     /// release side is the donor's execution.
     CatchUpAgainstDonor,
+    /// A voter's word that the command was decided as nothing (task-d121),
+    /// against a final release this collector held or answered from that
+    /// says something else, in either order (Astra on #328). The own side
+    /// is the canonical refusal at the release's position.
+    DecidedNothingAgainstRelease,
 }
 
 /// What one side of a [`Mismatch`] says the command produced.
@@ -617,6 +624,19 @@ impl Said {
             revision: established.revision(),
             result_digest: established.result_digest(),
             response_len: released.response().len(),
+        }
+    }
+
+    /// The canonical refusal of a decided nothing (task-d121) at
+    /// `position`: what a voter's `DecidedNothing` says, compared at the
+    /// position a release names, since the refusal names none.
+    fn decided_nothing(position: ExecutionPosition) -> Self {
+        Said {
+            release: None,
+            position,
+            revision: None,
+            result_digest: coord_storage::retry::decided_nothing_digest(),
+            response_len: coord_storage::retry::decided_nothing_response().len(),
         }
     }
 
@@ -1541,6 +1561,33 @@ impl Collector {
             return Err(EvidenceError::NotAVoter { sender });
         }
         if !self.pending.contains_key(&command) {
+            // Answered from a release or a record of anything but the
+            // nothing: a voter's `DecidedNothing` contradicts it, as the
+            // release would contradict the voter's answer in the other
+            // order (Astra on #328).
+            if matches!(refusal, SubmissionRefusal::DecidedNothing) {
+                let answered = self
+                    .resolved
+                    .values()
+                    .find(|(c, _, _)| *c == command)
+                    .and_then(|(_, _, own)| *own);
+                if let Some(answered) = answered {
+                    let own = Said {
+                        release: Some(self.refusal_origin(sender)),
+                        ..Said::decided_nothing(answered.position)
+                    };
+                    let differs = answered.differs(&own);
+                    if differs.any() {
+                        return Err(EvidenceError::AnsweredOtherwise(Box::new(Mismatch {
+                            command,
+                            check: MismatchCheck::DecidedNothingAgainstRelease,
+                            release: answered,
+                            own,
+                            differs,
+                        })));
+                    }
+                }
+            }
             return if self.is_resolved(&command) {
                 Ok(Progress::Settled)
             } else {
@@ -1569,17 +1616,33 @@ impl Collector {
         // record under the key to settle from.
         if matches!(refusal, SubmissionRefusal::DecidedNothing) {
             // A final release the entry holds of anything but the nothing
-            // says otherwise (#328 review): a divergence, not an answer,
-            // and the entry stays as it is.
-            if self
+            // says otherwise (#328 reviews): a divergence, not an answer.
+            // The entry stays as it is, and the node stops on it as it
+            // does when the release comes second.
+            let voter = sender;
+            if let Some((leader, released)) = self
                 .pending
                 .get(&command)
                 .and_then(|entry| entry.released.as_ref())
-                .is_some_and(|(_, released)| {
-                    !released.speculative() && !releases_a_nothing(released)
-                })
+                .filter(|(_, released)| !released.speculative() && !releases_a_nothing(released))
             {
-                return Err(EvidenceError::ReleaseMismatch);
+                let release = Said::released(*leader, released);
+                let own = Said {
+                    release: Some(self.refusal_origin(voter)),
+                    ..Said::decided_nothing(release.position)
+                };
+                let differs = Differs {
+                    response: released.response()
+                        != coord_storage::retry::decided_nothing_response().as_slice(),
+                    ..release.differs(&own)
+                };
+                return Err(EvidenceError::AnsweredOtherwise(Box::new(Mismatch {
+                    command,
+                    check: MismatchCheck::DecidedNothingAgainstRelease,
+                    release,
+                    own,
+                    differs,
+                })));
             }
             return Ok(self.settle_decided_nothing(command));
         }
@@ -1666,14 +1729,11 @@ impl Collector {
                     let release = Said::released(sender, released);
                     // A decided nothing answered from one voter named no
                     // position: the release is compared with the
-                    // canonical refusal at the position it names.
-                    let own = own.unwrap_or_else(|| Said {
-                        release: None,
-                        position: established.position(),
-                        revision: None,
-                        result_digest: coord_storage::retry::decided_nothing_digest(),
-                        response_len: coord_storage::retry::decided_nothing_response().len(),
-                    });
+                    // canonical refusal at the position it names, and the
+                    // first final one that agrees fixes that position for
+                    // every later one (Astra on #328).
+                    let unplaced = own.is_none();
+                    let own = own.unwrap_or_else(|| Said::decided_nothing(established.position()));
                     let differs = Differs {
                         response: response != answered,
                         ..release.differs(&own)
@@ -1687,6 +1747,13 @@ impl Collector {
                             differs,
                         })))
                     } else {
+                        if unplaced
+                            && !released.speculative()
+                            && let Some((_, _, kept)) =
+                                self.resolved.values_mut().find(|(c, _, _)| *c == command)
+                        {
+                            *kept = Some(own);
+                        }
                         Ok(true)
                     }
                 }
@@ -1705,6 +1772,18 @@ impl Collector {
         }
         entry.released = Some((sender, released.clone()));
         Ok(false)
+    }
+
+    /// Where a voter's `DecidedNothing` came from, shown on its side of a
+    /// [`MismatchCheck::DecidedNothingAgainstRelease`]: it is not a
+    /// release, but the stop names the voter that said it.
+    fn refusal_origin(&self, voter: ReplicaId) -> ReleaseOrigin {
+        ReleaseOrigin {
+            sender: voter,
+            epoch: self.config.quorum.epoch(),
+            ballot: self.config.quorum.ballot(),
+            speculative: false,
+        }
     }
 
     fn is_resolved(&self, command: &CommandId) -> bool {
