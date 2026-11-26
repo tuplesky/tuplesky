@@ -134,7 +134,9 @@ pub struct CatchUpEntry {
     /// Command.
     pub command: CommandId,
     /// Its payload, which the receiver rehashes against the identity.
-    pub payload: PayloadRecordV1,
+    /// `None` only for a command decided as nothing (task-d121), which
+    /// has none: its decided record says so, and nothing else does.
+    pub payload: Option<PayloadRecordV1>,
     /// The donor's dependency row of the command: the dependencies it was
     /// decided with. `None` when the donor keeps no row for it.
     pub decided: Option<CommandRecord>,
@@ -147,6 +149,21 @@ pub struct CatchUpEntry {
 }
 
 impl CatchUpEntry {
+    /// The admission the command executed under: its payload's, or the
+    /// nothing's where it has none and its decided record is a nothing
+    /// (task-d121). `None` for an entry that is neither, which is not
+    /// whole.
+    pub fn admission(&self) -> Option<Digest32> {
+        match &self.payload {
+            Some(payload) => Some(payload.admission_digest()),
+            None => self
+                .decided
+                .as_ref()
+                .filter(|r| r.is_nothing())
+                .map(|_| crate::commands::NOTHING_ADMISSION),
+        }
+    }
+
     /// The length of its encoding: what it costs a page against
     /// [`MAX_CATCH_UP_BYTES`].
     pub fn encoded_len(&self) -> usize {
@@ -552,6 +569,12 @@ pub enum SubmissionRefusal {
     /// the collector re-routes at once rather than at a timeout. A
     /// fanned-out submission is still dropped without a word.
     NotLeading,
+    /// The command was decided as nothing (task-d121): committed here,
+    /// executed as its canonical refusal, or retired so. The one refusal
+    /// a collector takes from a single voter as definite: a voter gives
+    /// it only from a decision, never from a nothing below COMMIT, which
+    /// a later ballot can still replace with the command's payload.
+    DecidedNothing,
 }
 
 impl ProtocolMessage {
@@ -752,6 +775,9 @@ mod tests {
         let forgotten = postcard::to_allocvec(&SubmissionRefusal::Forgotten).unwrap();
         let not_leading = postcard::to_allocvec(&SubmissionRefusal::NotLeading).unwrap();
         assert_eq!(not_leading, alloc::vec![forgotten[0] + 1]);
+        // task-d121's refusal is appended after it.
+        let nothing = postcard::to_allocvec(&SubmissionRefusal::DecidedNothing).unwrap();
+        assert_eq!(nothing, alloc::vec![not_leading[0] + 1]);
 
         // task-d102's frame is appended after the relayed proposal, and
         // nothing is past it.

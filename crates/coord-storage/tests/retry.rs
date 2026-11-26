@@ -974,3 +974,46 @@ fn an_exact_key_is_read_once_and_charged_on_every_touch_as_its_scans_were() {
         Err(ViewBuildError::BudgetExceeded)
     ));
 }
+
+/// A decided nothing's response is one constant (task-d121): revision zero
+/// and the reason no planner produces. Its digest differs from every other
+/// refusal's at the same revision, so an executed row with it can be read
+/// as the nothing's execution and as nothing else.
+#[test]
+fn a_decided_nothings_result_digest_is_one_constant() {
+    use coord_state::{RejectionReason, Response};
+    let bytes = retry::decided_nothing_response();
+    // Revision 0, outcome `ErrRejected` (35), reason `DecidedNothing` (14).
+    assert_eq!(bytes, [0x00, 0x23, 0x0e]);
+    assert_eq!(
+        retry::decided_nothing_digest(),
+        retry::result_digest(&bytes)
+    );
+    let others = [
+        RejectionReason::Invalid,
+        RejectionReason::NamespaceMismatch,
+        RejectionReason::ResponseTooLarge,
+        RejectionReason::TooManyEvents,
+        RejectionReason::TooManyDeletes,
+        RejectionReason::CounterOverflow,
+        RejectionReason::Unsupported,
+        RejectionReason::ViewTooLarge,
+        RejectionReason::RetryConflict,
+        RejectionReason::RetryTooOld,
+        RejectionReason::RetryOutOfWindow,
+        RejectionReason::SessionInvalid,
+        RejectionReason::RetryUnauthorized,
+        RejectionReason::AdmissionMismatch,
+    ];
+    for reason in others {
+        let other = postcard::to_allocvec(&Response {
+            revision: KvRevision::ZERO,
+            outcome: Outcome::ErrRejected { reason },
+        })
+        .unwrap();
+        assert_ne!(
+            retry::result_digest(&other),
+            retry::decided_nothing_digest()
+        );
+    }
+}

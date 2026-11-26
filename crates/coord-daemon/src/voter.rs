@@ -164,6 +164,17 @@ pub struct Voter<P: Persistence> {
     /// none of its business (Codex on #326). At boot this is `None`, so
     /// the Sync it synchronized to is learned again.
     learned_sync: Option<Ballot>,
+    /// The stores of Syncs this voter learned from their durable rows
+    /// rather than from its synchronized selection, a superseded Sync's
+    /// (Astra on #326's five-voter case, again on #327), kept until the
+    /// peer-store batches settle: a failed one is learned again.
+    counted_unsettled: Vec<(
+        Ballot,
+        std::collections::BTreeMap<
+            coord_types::ids::ReplicaId,
+            coord_consensus::recovery::CountedStore,
+        >,
+    )>,
 }
 
 /// A marked command's release waiting to be published again (task-d100,
@@ -220,6 +231,7 @@ impl<P: Persistence> Voter<P> {
             release_again_lookups: 0,
             held_peers: crate::peer_store::HeldFrames::default(),
             learned_sync: None,
+            counted_unsettled: Vec::new(),
         }
     }
 
@@ -573,19 +585,42 @@ impl<P: Persistence> Voter<P> {
         if self.node.peer_stores().is_none() {
             return Ok(Outbound::default());
         }
+        // Every Sync whose row became durable, a superseded one's too: a
+        // higher Sync installed in the same flush is the selection by the
+        // time this runs, and nothing else names what the lower counted.
+        // Each Sync is learned once, from here or from the selection
+        // below: a disagreement is logged and counted per learning.
+        let mut out = Outbound::default();
+        let synced = self.node.machine().synced_counted().map(|(b, _)| b);
+        for (ballot, counted) in self.node.take_durable_counted() {
+            if self.learned_sync == Some(ballot) {
+                continue;
+            }
+            out.absorb(
+                self.node
+                    .learn_peer_stores(ballot.leader, &counted, &self.ballot)?,
+            );
+            if synced == Some(ballot) {
+                self.learned_sync = Some(ballot);
+            }
+            self.counted_unsettled.push((ballot, counted));
+        }
         let Some((synced, counted)) = self.node.machine().synced_counted() else {
-            return Ok(Outbound::default());
+            return Ok(out);
         };
         if self.learned_sync == Some(synced) {
-            return Ok(Outbound::default());
+            return Ok(out);
         }
         let counted = counted.clone();
         self.learned_sync = Some(synced);
         if counted.is_empty() {
-            return Ok(Outbound::default());
+            return Ok(out);
         }
-        self.node
-            .learn_peer_stores(synced.leader, &counted, &self.ballot)
+        out.absorb(
+            self.node
+                .learn_peer_stores(synced.leader, &counted, &self.ballot)?,
+        );
+        Ok(out)
     }
 
     /// Hand on the promises and reports held behind their peer's store
@@ -601,15 +636,29 @@ impl<P: Persistence> Voter<P> {
                 .peer_stores()
                 .is_some_and(crate::peer_store::PeerStores::unsettled)
         {
+            self.counted_unsettled.clear();
             return Ok(out);
         }
         let settled = self.node.settle_peer_stores();
         if !settled.failed.is_empty() {
             // A failed batch can be a learned row's: the Sync is still
             // installed, so its stores are learned again before anything
-            // is checked against them.
+            // is checked against them, and so are a superseded Sync's.
             self.learned_sync = None;
+            for (ballot, counted) in self.counted_unsettled.clone() {
+                out.absorb(
+                    self.node
+                        .learn_peer_stores(ballot.leader, &counted, &self.ballot)?,
+                );
+            }
             out.absorb(self.learn_counted()?);
+        }
+        if !self
+            .node
+            .peer_stores()
+            .is_some_and(crate::peer_store::PeerStores::unsettled)
+        {
+            self.counted_unsettled.clear();
         }
         for (provenance, frame) in self.held_peers.release(&settled) {
             let message = coord_consensus::ProtocolMessage::decode(&frame).ok();

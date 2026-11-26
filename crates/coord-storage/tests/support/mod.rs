@@ -109,3 +109,39 @@ pub fn stage_all<P: Persistence>(store: &mut P, items: &[(CommandId, PayloadReco
     }
     store.lower().unwrap();
 }
+
+/// Write `command`'s dependency row in epoch 1 as a committed record under
+/// `admission`, in a protocol batch of its own, as the machine writes one.
+pub fn stage_record<P: Persistence>(
+    store: &mut P,
+    command: &CommandId,
+    admission: coord_types::identity::Digest32,
+) {
+    let record = coord_consensus::CommandRecord {
+        phase: coord_consensus::Phase::Commit,
+        deps: Vec::new(),
+        keys: Vec::new(),
+        payload: Some(admission),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: coord_types::identity::Digest32([0; 32]),
+    };
+    let boot = store.boot();
+    store
+        .submit(
+            PersistBatch {
+                barrier: barrier(boot),
+                base: None,
+                updates: vec![
+                    coord_consensus::rows::dependency_update(
+                        coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+                        command,
+                        &record,
+                    )
+                    .unwrap(),
+                ],
+            },
+            TransitionKind::Protocol,
+        )
+        .unwrap();
+}

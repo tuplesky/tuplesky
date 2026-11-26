@@ -17,8 +17,8 @@ use coord_core::capability::{AdmissionFacts, AdmissionPurpose};
 use coord_core::outbox::BarrierAllocator;
 use coord_state::{
     AdmissionReceiptV1, InternalCommand, PlanError, PlanLimits, RejectionReason,
-    SESSION_RETRY_WINDOW, authorize_retained, plan, plan_internal, rejection_plan,
-    rejection_plan_at,
+    SESSION_RETRY_WINDOW, authorize_retained, decided_nothing_plan, plan, plan_internal,
+    rejection_plan, rejection_plan_at,
 };
 use coord_store_api::engine::EngineError;
 use coord_types::ids::{KvRevision, NamespaceId};
@@ -1463,6 +1463,51 @@ impl<P: Persistence> Applier<P> {
                     return Ok(AppliedOutcome {
                         position: planned.position,
                         revision: planned.revision,
+                        result_digest: retry::result_digest(&response),
+                        response,
+                    });
+                }
+                ApplyOutcome::Replan => continue,
+                ApplyOutcome::Indeterminate => {
+                    self.reconcile()?;
+                }
+            }
+        }
+        Err(ApplyError::Diverged)
+    }
+
+    /// Execute `command`, decided as nothing (task-d121), as its canonical
+    /// refusal: it takes its position, records that `command` executed
+    /// with [`retry::decided_nothing_digest`] as its result, records
+    /// nothing under a retry key, and changes nothing else. There is no
+    /// payload: consensus decided the slot without one, so nothing here
+    /// reads a request, a namespace or the state.
+    pub fn apply_nothing(&mut self, command: CommandId) -> Result<AppliedOutcome, ApplyError> {
+        self.usable()?;
+        if self.group.is_none() && !self.inflight.is_empty() {
+            self.drain()?;
+        }
+        // No mutation, so no key is written under it.
+        const UNUSED: NamespaceId = NamespaceId([0; 16]);
+        for _ in 0..8 {
+            let gated = self.planning_view()?;
+            let planned =
+                decided_nothing_plan(self.store.application_base()).map_err(ApplyError::Plan)?;
+            drop(gated);
+            let barrier = self.alloc.allocate();
+            match self
+                .land(barrier, UNUSED, &planned, None, Some(&command))?
+                .refusal_fits()?
+            {
+                ApplyOutcome::Applied(_) => {
+                    let response = retry::decided_nothing_response();
+                    debug_assert_eq!(
+                        postcard::to_allocvec(&planned.response).ok().as_deref(),
+                        Some(response.as_slice())
+                    );
+                    return Ok(AppliedOutcome {
+                        position: planned.position,
+                        revision: None,
                         result_digest: retry::result_digest(&response),
                         response,
                     });

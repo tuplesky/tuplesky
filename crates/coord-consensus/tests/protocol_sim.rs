@@ -2364,7 +2364,7 @@ impl Sim {
             let response = response_of(&executed[..i], c, |x| self.offers.get(x).map(|o| o.key));
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
-                payload: payload.clone(),
+                payload: Some(payload.clone()),
                 decided: rows.get(c).cloned().filter(|_| !self.withholds(donor, c)),
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,

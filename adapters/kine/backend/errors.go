@@ -124,6 +124,13 @@ func mapRejection(reason wire.RejectionReason) error {
 		return status.Error(codes.Unauthenticated, msg)
 	case wire.RejectedRetryUnauthorized, wire.RejectedAdmissionMismatch:
 		return status.Error(codes.PermissionDenied, msg)
+	case wire.RejectedDecidedNothing:
+		// Definite: the command's slot was decided with no write, so it
+		// changed nothing and never will. A caller that issues the
+		// operation again as a new command is safe, which is what Aborted
+		// tells a client to do. Its result carries revision zero, which
+		// no caller reads: the status replaces the result.
+		return status.Error(codes.Aborted, msg)
 	default:
 		return status.Errorf(codes.Internal, "command rejected: reason %d", uint8(reason))
 	}

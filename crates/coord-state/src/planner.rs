@@ -80,6 +80,26 @@ pub fn rejection_plan(view: &ReadView, reason: RejectionReason) -> Result<ApplyP
     rejection_plan_at(view.base, view.kv_revision, reason)
 }
 
+/// The plan of a command decided as nothing (task-d121): it takes its
+/// position, changes nothing, and answers [`Response::decided_nothing`],
+/// which reads no state. The planner never reaches it from a request; the
+/// executor calls it for a committed record holding the marker, which has
+/// no payload to plan from.
+pub fn decided_nothing_plan(base: ApplyBase) -> Result<ApplyPlan, PlanError> {
+    let position = base
+        .execution_position
+        .checked_next()
+        .map_err(|_| PlanError::CounterOverflow)?;
+    Ok(ApplyPlan {
+        base,
+        position,
+        revision: None,
+        mutations: Vec::new(),
+        events: Vec::new(),
+        response: Response::decided_nothing(),
+    })
+}
+
 /// The same rejection built from the base and revision alone, for a
 /// command that cannot even be given a view: the state it would have to
 /// read exceeds the schema's budget, so there is nothing to plan against
