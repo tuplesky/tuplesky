@@ -735,6 +735,14 @@ impl Machine {
         }
     }
 
+    /// Whether `command` executes as a decided nothing (task-d121).
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(m) => m.executes_as_nothing(command),
+            Machine::Follower(m) => m.executes_as_nothing(command),
+        }
+    }
+
     /// The payload of a command this replica has learned.
     pub fn payload(&self, command: &CommandId) -> Option<PayloadRecordV1> {
         match self {
@@ -2678,11 +2686,18 @@ impl<P: Persistence> Node<P> {
                 }
                 break;
             };
+            // A decided nothing (task-d121) has no payload to wait for: it
+            // executes as its canonical refusal.
+            let nothing = self.machine().executes_as_nothing(&command);
             // A command whose turn has come but whose payload this
             // replica does not hold is not something to skip past: the
             // order is the whole of the guarantee, and going on would
             // apply a later command first.
-            let Some(payload) = self.machine().payload(&command) else {
+            let payload = if nothing {
+                None
+            } else if let Some(payload) = self.machine().payload(&command) {
+                Some(payload)
+            } else {
                 // Not something to skip past -- the order is the whole
                 // of the guarantee -- and not a fault either. A replica
                 // learns a command's identity from evidence and its
@@ -2716,7 +2731,10 @@ impl<P: Persistence> Node<P> {
             let applier = &mut self.applier;
             let outcome =
                 match Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
-                    applier.apply(command, &payload)
+                    match &payload {
+                        Some(payload) => applier.apply(command, payload),
+                        None => applier.apply_nothing(command),
+                    }
                 }) {
                     // The group and the protocol's queued batches leave no
                     // room for this command's batch: lower them, and apply

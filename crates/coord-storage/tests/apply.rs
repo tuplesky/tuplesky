@@ -639,3 +639,140 @@ fn a_planner_valid_response_always_fits_its_retry_record() {
     let after = applier.apply_staged(next, &next_record).unwrap();
     assert_eq!(after.position.get(), outcome.position.get() + 1);
 }
+
+/// A command decided as nothing (task-d121) executes as its canonical
+/// refusal: it takes the next position, changes no key and no revision,
+/// binds nothing under a retry key, and its executed row holds the one
+/// digest a decided nothing's row holds, with no payload at its position.
+#[test]
+fn a_decided_nothing_executes_as_its_canonical_refusal() {
+    use coord_consensus::commands::NOTHING_ADMISSION;
+    use coord_store_api::engine::OrderedRead as _;
+    use coord_store_api::registry::Collection;
+    let mut applier = applier(ModelEngine::new());
+    let (first, first_record) = payload(1, &put(b"before", b"1"));
+    let before = applier.apply_staged(first, &first_record).unwrap();
+    let nothing = CommandId(coord_types::identity::Digest32([0x4e; 32]));
+    support::stage_record(applier.store_mut(), &nothing, NOTHING_ADMISSION);
+    let outcome = applier.apply_nothing(nothing).unwrap();
+    assert_eq!(outcome.position.get(), before.position.get() + 1);
+    assert_eq!(outcome.revision, None);
+    assert_eq!(
+        outcome.response,
+        coord_storage::retry::decided_nothing_response()
+    );
+    assert_eq!(
+        outcome.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    let response: Response = postcard::from_bytes(&outcome.response).unwrap();
+    assert_eq!(response, Response::decided_nothing());
+
+    let gated = applier.store().reader().snapshot().unwrap();
+    let at = coord_storage::codecs::position_key(outcome.position);
+    let bytes = gated
+        .view()
+        .get(Collection::ExecutionV1.id(), &at)
+        .unwrap()
+        .expect("the nothing executed");
+    let execution = coord_storage::codecs::decode_execution(&bytes).unwrap();
+    assert_eq!(execution.command, nothing);
+    assert_eq!(execution.executed.revision, None);
+    assert_eq!(
+        execution.executed.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    assert!(
+        gated
+            .view()
+            .get(Collection::PayloadV1.id(), &at)
+            .unwrap()
+            .is_none(),
+        "no payload at a nothing's position"
+    );
+    let recovered = coord_storage::protocol::read_protocol(
+        gated.view(),
+        ConfigurationEpoch::new(1).unwrap(),
+        ViewBudget::default(),
+    )
+    .unwrap();
+    // Its decided record comes back as a nothing, executed at its
+    // position, with no payload to recover.
+    assert!(
+        recovered
+            .records
+            .iter()
+            .any(|(c, r)| *c == nothing && r.is_nothing())
+    );
+    assert!(recovered.executed.contains(&(nothing, outcome.position)));
+    assert!(recovered.payloads.iter().all(|(c, _)| *c != nothing));
+    drop(gated);
+
+    // The revision did not move: the next write takes the one after the
+    // write before the nothing.
+    let (next, next_record) = payload(2, &put(b"after", b"1"));
+    let after = applier.apply_staged(next, &next_record).unwrap();
+    assert_eq!(after.position.get(), outcome.position.get() + 1);
+    assert_eq!(
+        after.revision.map(|r| r.get()),
+        before.revision.map(|r| r.get() + 1)
+    );
+}
+
+/// A restart reads a decided nothing's record back with no payload row
+/// (task-d121), and refuses one that has a payload row beside it: two
+/// values of one command. The negative control is the plain record, whose
+/// missing payload row is still corrupt.
+#[test]
+fn a_restart_reads_a_nothing_without_a_payload_and_refuses_one_with() {
+    use coord_consensus::commands::NOTHING_ADMISSION;
+    use coord_storage::Persistence as _;
+    let read = |applier: &Applier<StoreWorker<ModelEngine>>| {
+        let gated = applier.store().reader().snapshot().unwrap();
+        coord_storage::protocol::read_protocol(
+            gated.view(),
+            ConfigurationEpoch::new(1).unwrap(),
+            ViewBudget::default(),
+        )
+    };
+    let mut applier = applier(ModelEngine::new());
+    let nothing = CommandId(coord_types::identity::Digest32([0x4e; 32]));
+    support::stage_record(applier.store_mut(), &nothing, NOTHING_ADMISSION);
+    applier.store_mut().lower().unwrap();
+    let recovered = read(&applier).unwrap();
+    assert!(
+        recovered
+            .records
+            .iter()
+            .any(|(c, r)| *c == nothing && r.is_nothing())
+    );
+    assert!(recovered.payloads.iter().all(|(c, _)| *c != nothing));
+
+    // A payload put before the nothing's record, and never deleted.
+    let mut applier = applier_fresh();
+    let (with, with_payload) = payload(3, &put(b"k", b"v"));
+    support::stage(applier.store_mut(), &with, &with_payload);
+    support::stage_record(applier.store_mut(), &with, NOTHING_ADMISSION);
+    applier.store_mut().lower().unwrap();
+    let err = read(&applier).unwrap_err();
+    assert!(format!("{err:?}").contains("decided nothing"), "{err:?}");
+
+    // Under facts, a record without its payload row is corrupt.
+    let mut applier = applier_fresh();
+    let plain = CommandId(coord_types::identity::Digest32([0x50; 32]));
+    support::stage_record(
+        applier.store_mut(),
+        &plain,
+        coord_types::identity::Digest32([7; 32]),
+    );
+    applier.store_mut().lower().unwrap();
+    let err = read(&applier).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("without its payload row"),
+        "{err:?}"
+    );
+}
+
+fn applier_fresh() -> Applier<StoreWorker<ModelEngine>> {
+    applier(ModelEngine::new())
+}

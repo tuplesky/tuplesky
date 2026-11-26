@@ -2166,6 +2166,15 @@ impl Leader {
             .waits(|c| self.proposals.get(c).map(|p| p.seqnum))
     }
 
+    /// Whether `command` executes as a decided nothing (task-d121): its
+    /// record holds the marker, so it has no payload, and the runtime
+    /// executes it as the canonical refusal rather than waiting for one.
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        self.table
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
+    }
+
     /// The durable payload of a proposed command.
     pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
         self.payloads.get(command)

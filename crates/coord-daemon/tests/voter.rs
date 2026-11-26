@@ -2252,3 +2252,82 @@ fn a_retried_page_waits_once_behind_its_store_row() {
     assert_eq!(counts.recorded, 1);
     assert_eq!(counts.duplicates, 2);
 }
+
+/// A committed nothing executes at a voter as its canonical refusal
+/// (task-d121, C2b): the runtime waits for no payload, the command takes
+/// the next position, and its executed row holds the one digest a decided
+/// nothing's row holds, with no payload row at its position. Here the
+/// nothing reaches the follower as a Sync entry at COMMIT.
+#[test]
+fn a_committed_nothing_executes_as_its_canonical_refusal() {
+    use coord_store_api::engine::OrderedRead as _;
+    use coord_store_api::registry::Collection;
+    let mut voter = stamped(2);
+    let before = voter.node().machine().executed_through();
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    new_leader(&mut voter, 1, candidate);
+    let nothing = coord_types::CommandId(Digest32([0x4e; 32]));
+    let decision = coord_consensus::SyncDecision {
+        ballot: candidate,
+        source_ballot: ballot(),
+        entries: [(
+            nothing,
+            coord_consensus::SyncEntry {
+                command: nothing,
+                phase: coord_consensus::Phase::Commit,
+                deps: Vec::new(),
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: Some(coord_consensus::commands::NOTHING_ADMISSION),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        reproposed: BTreeSet::new(),
+        counted: Default::default(),
+        nothing: Default::default(),
+    };
+    install(
+        &mut voter,
+        vec![coord_consensus::ProtocolMessage::Sync(decision).encode()],
+    );
+    let after = voter.node().machine().executed_through();
+    assert_eq!(
+        after.get(),
+        before.get() + 1,
+        "the nothing took one position"
+    );
+    let gated = voter
+        .node()
+        .applier()
+        .store()
+        .inner
+        .reader()
+        .snapshot()
+        .unwrap();
+    let at = coord_storage::codecs::position_key(after);
+    let bytes = gated
+        .view()
+        .get(Collection::ExecutionV1.id(), &at)
+        .unwrap()
+        .expect("executed");
+    let execution = coord_storage::codecs::decode_execution(&bytes).unwrap();
+    assert_eq!(execution.command, nothing);
+    assert_eq!(execution.executed.revision, None);
+    assert_eq!(
+        execution.executed.result_digest,
+        coord_storage::retry::decided_nothing_digest()
+    );
+    assert!(
+        gated
+            .view()
+            .get(Collection::PayloadV1.id(), &at)
+            .unwrap()
+            .is_none()
+    );
+}

@@ -4423,6 +4423,15 @@ impl Follower {
         core::mem::take(&mut self.fast_counts)
     }
 
+    /// Whether `command` executes as a decided nothing (task-d121): its
+    /// record holds the marker, so it has no payload, and the runtime
+    /// executes it as the canonical refusal rather than waiting for one.
+    pub fn executes_as_nothing(&self, command: &CommandId) -> bool {
+        self.table
+            .record(command)
+            .is_some_and(CommandRecord::is_nothing)
+    }
+
     /// The durable payload of an initialized command.
     pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
         self.payloads.get(command)
@@ -8560,9 +8569,12 @@ impl Follower {
         let record = self.table.record(&command).expect("rebound").clone();
         let row = self.dependency_row(&command, &record);
         let barrier = self.allocate();
+        // The row first: a store refuses a payload put while the record
+        // it holds is a decided nothing (task-d121), and a rebind may be
+        // over one.
         let mut updates = alloc::vec![
-            payload_write(&self.table, &command, &payload).expect("bounded"),
-            row
+            row,
+            payload_write(&self.table, &command, &payload).expect("bounded")
         ];
         self.carry_unwritten(barrier, command, &record.deps, &mut updates);
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
