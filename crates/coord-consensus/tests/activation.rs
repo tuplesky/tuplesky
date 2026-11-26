@@ -7752,6 +7752,18 @@ fn a_selection_naming_a_dependency_no_report_holds_is_given_up_as_behind() {
 /// ballot, the dependency `d` no report read holds, the candidate and the
 /// third voter.
 fn waiting_behind_a_dependency_no_report_holds() -> (Follower, Ballot, CommandId, u8, u8) {
+    waiting_behind_under(coord_consensus::SelectionRules::default(), true, false)
+}
+
+/// The same campaign under `rules`, with the member's pre-acceptance of
+/// C or without it, and with D at ACCEPT in the member's report without
+/// its payload (`d_accepted`): task-d121's payload shape, in which the
+/// selection fails as `HalfInitialized` rather than leave a gap.
+fn waiting_behind_under(
+    rules: coord_consensus::SelectionRules,
+    with_c: bool,
+    d_accepted: bool,
+) -> (Follower, Ballot, CommandId, u8, u8) {
     let id = |n: u8| CommandId(Digest32([0x90 + n; 32]));
     // All on one key, each after the one before.
     let entry = |c: CommandId, phase: Phase, deps: &[CommandId]| {
@@ -7775,6 +7787,7 @@ fn waiting_behind_a_dependency_no_report_holds() -> (Follower, Ballot, CommandId
         .unwrap();
     let candidate = 3 - member;
     let mut f = standalone(candidate, 32);
+    f.set_selection_rules(rules);
     let b = ballot(1, candidate);
     let effects = f.campaign(b);
     for e in durable_events(&effects) {
@@ -7793,11 +7806,18 @@ fn waiting_behind_a_dependency_no_report_holds() -> (Follower, Ballot, CommandId
         replica: r(member),
         ballot: b,
         committed_ballot: ballot(0, 0),
-        entries: vec![
-            entry(a, Phase::Accept, &[]),
-            entry(x, Phase::Accept, &[d]),
-            entry(c, Phase::PreAccept, &[x]),
-        ],
+        entries: [
+            Some(entry(a, Phase::Accept, &[])),
+            Some(entry(x, Phase::Accept, &[d])),
+            with_c.then(|| entry(c, Phase::PreAccept, &[x])),
+            d_accepted.then(|| coord_consensus::ReportEntry {
+                payload_present: false,
+                ..entry(d, Phase::Accept, &[])
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     };
     for page in coord_consensus::paginate(
         &report,
@@ -7814,6 +7834,135 @@ fn waiting_behind_a_dependency_no_report_holds() -> (Follower, Ballot, CommandId
     assert!(f.take_rejections().is_empty());
     assert!(f.campaign_state().is_some_and(|c| c.decision().is_none()));
     (f, b, d, candidate, third)
+}
+
+/// task-d121's rule on, with what it rests on.
+const DECIDE_NOTHING: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
+    leave_out_unheld: true,
+    decide_nothing: true,
+};
+
+/// The `Behind` shape under task-d121's rule (C5): before the wait passes
+/// the campaign waits as task-d120's does, deciding nothing; once it
+/// passes, the selection carries D as a nothing re-proposal, finds no
+/// gap, and the campaign goes on to bind instead of giving up.
+#[test]
+fn under_the_rule_a_dependency_no_report_holds_is_decided_as_nothing_once_the_wait_passes() {
+    let (mut f, _, d, _, _) = waiting_behind_under(DECIDE_NOTHING, false, false);
+    f.end_report_wait();
+    let rejections = f.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|r| matches!(r, FollowerRejection::Behind { .. })),
+        "{rejections:?}"
+    );
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected")
+        .clone();
+    assert!(
+        decision.nothing.contains(&d) && decision.reproposed.contains(&d),
+        "{decision:?}"
+    );
+    assert_eq!(f.nothing_kept_by_drop(), 0);
+    // Control: without the rule the same campaign gives up as `Behind`.
+    let (mut f, _, d, _, _) = waiting_behind_under(
+        coord_consensus::SelectionRules {
+            decide_nothing: false,
+            ..DECIDE_NOTHING
+        },
+        false,
+        false,
+    );
+    f.end_report_wait();
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Behind { missing: d })
+    );
+    assert!(f.campaign_state().is_none());
+}
+
+/// Condition 5 at the campaign: with C pre-accepted behind X at a fast-set
+/// member, the order check drops C behind D, so the rule stays off, the
+/// campaign gives up as `Behind` after the wait as it does today, and the
+/// selection kept off is counted.
+#[test]
+fn under_the_rule_a_drop_behind_the_dependency_keeps_the_give_up() {
+    let (mut f, _, d, _, _) = waiting_behind_under(DECIDE_NOTHING, true, false);
+    f.end_report_wait();
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Behind { missing: d })
+    );
+    assert!(f.campaign_state().is_none(), "given up");
+    assert!(f.nothing_kept_by_drop() >= 1);
+    assert_eq!(f.nothing_decided(), 0);
+}
+
+/// Every voter answered: task-d120's wait has nothing left to read, so it
+/// has passed, and the rule applies with no timer.
+#[test]
+fn under_the_rule_every_voter_answered_passes_the_wait_at_once() {
+    let (mut f, b, d, _, third) = waiting_behind_under(DECIDE_NOTHING, false, false);
+    f.step(peer_event(
+        r(third),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(third),
+            store: coord_types::ids::StoreInstanceId(r(third).0),
+        },
+    ));
+    let empty = RecoveryReport {
+        replica: r(third),
+        ballot: b,
+        committed_ballot: ballot(0, 0),
+        entries: Vec::new(),
+    };
+    for page in coord_consensus::paginate(
+        &empty,
+        coord_types::ids::StoreInstanceId(empty.replica.0),
+        coord_consensus::MAX_PAGE_ENTRIES,
+    ) {
+        f.step(peer_event(r(third), ProtocolMessage::ReportPage(page)));
+    }
+    assert_eq!(f.report_wait(), None);
+    let rejections = f.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|r| matches!(r, FollowerRejection::Behind { .. })),
+        "{rejections:?}"
+    );
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected");
+    assert!(decision.nothing.contains(&d), "{decision:?}");
+}
+
+/// The payload shape at the campaign: D at ACCEPT with no payload at any
+/// reporter fails the selection as `HalfInitialized`, and no report can
+/// be set aside. Under the rule the campaign waits task-d120's bound,
+/// rather than wait for ever, and then decides D as nothing: its entry
+/// carries the marker. Without the rule it keeps waiting.
+#[test]
+fn under_the_rule_an_acceptance_no_report_holds_a_payload_for_waits_the_bound_and_is_nothing() {
+    let (mut f, b, d, _, _) = waiting_behind_under(DECIDE_NOTHING, false, true);
+    assert_eq!(f.report_wait(), Some((b, d)));
+    f.end_report_wait();
+    assert!(f.take_rejections().is_empty());
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected");
+    assert_eq!(
+        decision.entries[&d].admission,
+        Some(coord_consensus::NOTHING_ADMISSION)
+    );
+    assert!(decision.nothing.is_empty(), "an entry, not a re-proposal");
 }
 
 /// A third voter whose report is past the page bound answers the

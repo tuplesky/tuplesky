@@ -98,6 +98,11 @@ pub struct Campaign {
     report_wait_over: bool,
     /// Whether this campaign has waited so at all.
     waited: bool,
+    /// Commands the selection it holds decided as nothing (task-d121).
+    decided_nothing: u64,
+    /// Selections condition 5 kept the rule off in, since last taken
+    /// (task-d121).
+    kept_by_drop: u64,
 }
 
 impl Campaign {
@@ -133,6 +138,8 @@ impl Campaign {
             report_wait: None,
             report_wait_over: false,
             waited: false,
+            decided_nothing: 0,
+            kept_by_drop: 0,
         }
     }
 
@@ -489,13 +496,82 @@ impl Campaign {
     /// End the wait: the runtime's bound passed. The selection is made
     /// again from the reports in hand, and a refusal now gives the
     /// campaign up. Whether it was waiting.
+    ///
+    /// A selection kept while it waited for payloads (task-d121) is
+    /// dropped, unless it was bound: made again, under the rule, it may
+    /// decide as nothing what nobody could send.
     pub fn end_report_wait(&mut self) -> bool {
         self.report_wait_over = true;
         let waited = self.report_wait.take().is_some();
         if waited {
             self.supply_moved = true;
+            if self.bound.is_none() && !self.durable {
+                self.decision = None;
+                self.awaited = None;
+            }
         }
         waited
+    }
+
+    /// Wait task-d120's bound before a selection under task-d121's rule
+    /// decides as nothing `missing`, a payload the selection waits for
+    /// that may be one nobody can send, keeping the selection and its
+    /// asks meanwhile. `false`, and nothing changes, where the rule is off,
+    /// the wait has passed or already runs, or the selection is bound.
+    pub fn wait_for_payload_holders(&mut self, missing: CommandId) -> bool {
+        if !self.rules.decide_nothing
+            || self.report_wait_over
+            || self.report_wait.is_some()
+            || self.bound.is_some()
+            || self.durable
+        {
+            return false;
+        }
+        self.report_wait = Some(missing);
+        self.waited = true;
+        true
+    }
+
+    /// Where task-d121's rule is on, end task-d120's wait at once, with
+    /// nothing left to read: every voter has answered, or the runtime
+    /// doesn't wait. The selection is dropped and made again under the
+    /// rule. `false`, and nothing changes, where the rule is off, the wait
+    /// has passed already, or the selection is bound.
+    pub fn pass_report_wait(&mut self) -> bool {
+        if !self.rules.decide_nothing
+            || self.report_wait_over
+            || self.bound.is_some()
+            || self.durable
+        {
+            return false;
+        }
+        self.report_wait_over = true;
+        self.report_wait = None;
+        self.decision = None;
+        self.awaited = None;
+        self.supply_moved = true;
+        true
+    }
+
+    /// The rules its selection applies.
+    pub const fn rules(&self) -> crate::recovery::SelectionRules {
+        self.rules
+    }
+
+    /// Commands the selection it holds decided as nothing (task-d121):
+    /// zero without a selection.
+    pub const fn decided_nothing(&self) -> u64 {
+        if self.decision.is_some() {
+            self.decided_nothing
+        } else {
+            0
+        }
+    }
+
+    /// Selections that condition 5 kept task-d121's rule off in, counted
+    /// since last taken.
+    pub fn take_kept_by_drop(&mut self) -> u64 {
+        core::mem::take(&mut self.kept_by_drop)
     }
 
     /// Whether the selection this campaign holds dropped a possible-fast
@@ -657,6 +733,20 @@ impl Campaign {
                 _ => Ok(None),
             };
         }
+        // task-d121's rule decides a nothing only once task-d120's wait
+        // has passed: its bound, or every voter answered. Until then the
+        // campaign selects without it, sets a half-initialized report
+        // aside where that alone gives a selection, and otherwise waits
+        // the bound. After it, the rule applies to a selection over every
+        // report read, none set aside; where that selection still fails,
+        // the set-aside, without the rule, and task-d79's give-up are the
+        // fallback.
+        let ruled = self.rules.decide_nothing;
+        let mut fire = ruled && self.report_wait_over;
+        // The reports before any was set aside, kept only where the rule
+        // may yet apply to them.
+        let mut every_report: Option<Vec<RecoveryReport>> = None;
+        let mut set_aside = false;
         let mut decision = loop {
             let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
             let counts = SelectionCounts::default();
@@ -667,13 +757,16 @@ impl Campaign {
                 source,
                 &decided,
                 self.rules,
+                fire && !set_aside,
                 &counts,
             );
             self.unreported_undecided += counts.unreported_undecided.get();
+            self.kept_by_drop += counts.kept_by_drop.get();
             match selected {
                 Ok(decision) => {
                     self.selected_past_unreported = counts.unreported.get() > 0;
                     self.selected_past_undecided = counts.unreported_undecided.get() > 0;
+                    self.decided_nothing = counts.decided_nothing.get();
                     break decision;
                 }
                 // Rows the runtime reads for the candidate: waited for, as
@@ -684,8 +777,28 @@ impl Campaign {
                 }
                 Err(RecoveryError::HalfInitialized { replica, command }) => {
                     if replica != self.config.leader() && reports.len() > self.config.slow_size() {
+                        if ruled && !fire && every_report.is_none() {
+                            every_report = Some(reports.clone());
+                        }
                         reports.retain(|r| r.replica != replica);
+                        set_aside = true;
                         continue;
+                    }
+                    if ruled && !fire {
+                        // Every voter answered: nothing is left to wait
+                        // for, and the wait has passed.
+                        if everyone {
+                            self.report_wait_over = true;
+                            fire = true;
+                            set_aside = false;
+                            if let Some(every) = every_report.take() {
+                                reports = every;
+                            }
+                            continue;
+                        }
+                        self.report_wait = Some(command);
+                        self.waited = true;
+                        return Ok(None);
                     }
                     if everyone {
                         return Err(RecoveryError::HalfInitialized { replica, command });
@@ -759,6 +872,8 @@ impl Campaign {
     /// The selection was submitted for durable binding under `barrier`.
     pub fn bound(&mut self, barrier: BarrierId) {
         self.bound = Some(barrier);
+        // Bound, it waits for no report or payload holder (task-d121).
+        self.report_wait = None;
     }
 
     /// Barrier of the binding, if submitted.
