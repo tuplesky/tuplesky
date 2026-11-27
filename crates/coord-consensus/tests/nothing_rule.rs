@@ -477,3 +477,142 @@ fn a_nothing_and_facts_in_two_eligible_copies_fail_as_incompatible() {
         Err(RecoveryError::IncompatibleAdmission { command, .. }) if command == d
     ));
 }
+
+/// Condition 3's execution arm in the payload and `Behind` shapes (#335
+/// review): an execution of D at the candidate, read or not, keeps the
+/// rule off D. Rows not read yet are read first; an execution under
+/// facts, or one whose row is gone, leaves the selection as it is without
+/// the rule: the payload shape fails as `HalfInitialized`, and the gap
+/// stays one, which the candidate that executed D binds. With no
+/// execution, D is a nothing: the control.
+#[test]
+fn an_execution_at_the_candidate_keeps_the_rule_off_in_the_payload_and_behind_shapes() {
+    let (a, d, x) = (command(1), command(2), command(3));
+    let payload = at_source(
+        vec![
+            entry(a, Phase::Accept, &[], FACTS, true),
+            entry(d, Phase::Accept, &[a], FACTS, false),
+        ],
+        vec![entry(a, Phase::Accept, &[], FACTS, true)],
+        Vec::new(),
+    );
+    let behind = at_source(
+        vec![entry(x, Phase::Accept, &[d], FACTS, true)],
+        vec![entry(x, Phase::Accept, &[d], FACTS, true)],
+        Vec::new(),
+    );
+    let record = CommandRecord {
+        phase: Phase::Executed,
+        deps: Vec::new(),
+        keys: Vec::new(),
+        payload: Some(FACTS),
+        paths: Vec::new(),
+        synced_seq: Some(1),
+        path: Digest32([0; 32]),
+    };
+    let executed = |facts: ExecutedFacts| Candidate {
+        executed: vec![(d, facts)],
+        ..Candidate::default()
+    };
+    for reports in [&payload, &behind] {
+        assert!(matches!(
+            select_with(reports, &executed(ExecutedFacts::Unread), RULE),
+            Err(RecoveryError::ExecutedRowsUnread { commands }) if commands == vec![d]
+        ));
+        let control = select(reports, RULE).expect("selected");
+        assert!(
+            control.nothing.contains(&d)
+                || control.entries[&d].admission == Some(NOTHING_ADMISSION),
+            "{control:?}"
+        );
+    }
+    for facts in [ExecutedFacts::WithoutRow, ExecutedFacts::With(record)] {
+        assert!(matches!(
+            select_with(&payload, &executed(facts.clone()), RULE),
+            Err(RecoveryError::HalfInitialized { command, .. }) if command == d
+        ));
+        let gap = select_with(&behind, &executed(facts), RULE).expect("selected");
+        assert!(
+            gap.nothing.is_empty() && !gap.reproposed.contains(&d) && !gap.entries.contains_key(&d),
+            "{gap:?}"
+        );
+    }
+}
+
+/// Three voters; the candidate `r(0)` campaigns at ballot 1.
+fn three() -> BallotConfiguration {
+    BallotConfiguration::c2_default(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(1, 0),
+        (0..3).map(r).collect(),
+    )
+    .unwrap()
+}
+
+/// A campaign of `r(0)` under the rule, every voter answered: its own
+/// report is empty; `r(1)` holds F at ACCEPT without its payload; `r(2)`
+/// holds F with it, and E at ACCEPT without one.
+fn every_voter_answered_with_a_report_set_aside() -> coord_consensus::Campaign {
+    let (e, f) = (command(1), command(2));
+    let at_one = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+        replica: r(replica),
+        ballot: ballot(1, 0),
+        committed_ballot: ballot(0, 0),
+        entries,
+    };
+    let mut c = coord_consensus::Campaign::new(three());
+    c.set_rules(RULE);
+    c.own_report(at_one(0, Vec::new()));
+    for report in [
+        at_one(1, vec![entry(f, Phase::Accept, &[], FACTS, false)]),
+        at_one(
+            2,
+            vec![
+                entry(e, Phase::Accept, &[], FACTS, false),
+                entry(f, Phase::Accept, &[], FACTS, true),
+            ],
+        ),
+    ] {
+        let store = coord_types::ids::StoreInstanceId(report.replica.0);
+        c.promise(report.replica, store);
+        for page in coord_consensus::paginate(&report, store, coord_consensus::MAX_PAGE_ENTRIES) {
+            c.page(page).unwrap();
+        }
+    }
+    c
+}
+
+/// Set-aside under the rule (#335 review). Before the rule may apply,
+/// `r(2)`'s report fails the selection on E and is set aside, and the
+/// selection without it fails on F, with no report left to set aside.
+/// Every voter has answered, so the wait has passed: the rule applies, to
+/// every report read again, `r(2)`'s included. E, whose payload nobody
+/// holds, is a nothing; F keeps its facts, as `r(2)` holds its payload.
+/// Over the reports left after the set-aside, F would be a nothing
+/// besides.
+///
+/// Where the candidate committed E, the rule leaves E, and the selection
+/// under the rule fails on it at `r(2)` again. That report is set aside
+/// again, and the rule doesn't apply to the reports left, which don't
+/// hold F's payload: the campaign fails on F, as it does without the rule.
+#[test]
+fn under_the_rule_a_report_set_aside_is_read_again_and_the_rule_never_applies_without_it() {
+    let (e, f) = (command(1), command(2));
+    let mut c = every_voter_answered_with_a_report_set_aside();
+    assert!(c.all_reported());
+    let decision = c
+        .try_select_decided(usize::MAX, |_, _| false, |_: &CommandId| false)
+        .expect("selected")
+        .expect("every voter answered")
+        .clone();
+    assert!(c.report_wait_passed(), "the wait passed with no timer");
+    assert_eq!(decision.entries[&e].admission, Some(NOTHING_ADMISSION));
+    assert_eq!(decision.entries[&f].admission, Some(FACTS), "{decision:?}");
+    assert_eq!(c.decided_nothing(), 1);
+    let mut c = every_voter_answered_with_a_report_set_aside();
+    assert!(matches!(
+        c.try_select_decided(usize::MAX, |_, _| false, |x: &CommandId| *x == e),
+        Err(RecoveryError::HalfInitialized { replica, command }) if replica == r(1) && command == f
+    ));
+    assert_eq!(c.decided_nothing(), 0);
+}

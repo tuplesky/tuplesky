@@ -2150,7 +2150,7 @@ impl Follower {
             // from the payloads it holds, not from a record's digest: the
             // rule reads the same answer, and a record whose payload never
             // arrived supplies nothing (#335 review).
-            let ruled = campaign.rules().decide_nothing;
+            let ruled = campaign.rules().ruled();
             let supplied = |c: &CommandId, named: Option<Digest32>| {
                 if ruled {
                     return table.phase_of(c) == Some(Phase::Executed)
@@ -2280,7 +2280,7 @@ impl Follower {
                 // answers: no report is left that could hold the payload,
                 // and the selection is made again under the rule rather
                 // than wait out the bound (#335 review).
-                if campaign.rules().decide_nothing && !campaign.report_wait_passed() {
+                if campaign.rules().ruled() && !campaign.report_wait_passed() {
                     if self.report_wait && !campaign.all_reported() {
                         if campaign.report_wait().is_none() {
                             let first = campaign

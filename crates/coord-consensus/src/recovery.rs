@@ -527,6 +527,16 @@ pub struct SelectionRules {
     pub decide_nothing: bool,
 }
 
+impl SelectionRules {
+    /// Whether task-d121's rule is on: `decide_nothing`, with the
+    /// `leave_out_unheld` it rests on. The one reading of it the
+    /// selection, the campaign and the follower share (#335 review).
+    #[must_use]
+    pub const fn ruled(self) -> bool {
+        self.decide_nothing && self.leave_out_unheld
+    }
+}
+
 /// [`select_decided`] under `rules`.
 pub fn select_ruled(
     config: &BallotConfiguration,
@@ -595,7 +605,7 @@ pub(crate) fn select_counted(
     // Behind the feature: the move and narrowing of the
     // `HalfInitialized` check, and a payload row at any phase supplying a
     // command. Deciding a nothing needs `fire` as well.
-    let ruled = rules.decide_nothing && rules.leave_out_unheld;
+    let ruled = rules.ruled();
     let fire = fire && ruled;
     let undecided_before = counts.unreported_undecided.get();
     let mut seen = BTreeSet::new();
@@ -970,6 +980,8 @@ pub(crate) fn select_counted(
     }
     let mut nothing: BTreeSet<CommandId> = BTreeSet::new();
     if fire {
+        #[cfg(debug_assertions)]
+        decided_without_a_payload(&entries, &reported_payload, &supplied, decided);
         decide_nothing(
             &mut entries,
             &mut reproposed,
@@ -1087,24 +1099,6 @@ fn decide_nothing(
         .filter(|(c, facts)| free(c, *facts))
         .map(|(c, _)| c)
         .collect();
-    // A decision under facts with no payload at any reporter breaks the
-    // premise the rule rests on (a deciding quorum meets the reports'
-    // and holds the payload, point 4): the rule leaves it, and the
-    // campaign keeps today's wait.
-    #[cfg(debug_assertions)]
-    for e in entries.values() {
-        debug_assert!(
-            e.phase < Phase::Commit
-                || e.admission.as_ref().is_none_or(is_nothing)
-                || reported_payload.contains(&e.command)
-                || decided.decided(&e.command)
-                || decided.holds_payload(&e.command, e.admission)
-                || supplied(&e.command, e.admission)
-                || !matches!(decided.executed(&e.command), ExecutedFacts::No),
-            "decided under facts with no payload at any reporter: {:?}",
-            e.command
-        );
-    }
     let waited_on: BTreeSet<CommandId> = entries
         .values()
         .flat_map(|e| e.deps.iter().copied())
@@ -1133,6 +1127,19 @@ fn decide_nothing(
     if !unread.is_empty() {
         return Err(RecoveryError::ExecutedRowsUnread { commands: unread });
     }
+    // A gap re-proposed orders the entries that wait on it after it, and
+    // the order check never saw it (#335 review, A2): it labels what each
+    // entry waits on from the commands reports hold. Where two
+    // conflicting entries would then wait last on the same gap with no
+    // path between them, `Leader::from_recovered` proposes them beside
+    // each other, unordered. With the gap held undecided, the order check
+    // drops the candidate of such a pair; with it unreported, that drop
+    // is behind a command no report holds, which condition 5 keeps the
+    // rule off for. So the rule is kept off here too, as for a drop.
+    if found && unordered_after(entries, reproposed, &gaps) {
+        counts.kept_by_drop.set(counts.kept_by_drop.get() + 1);
+        return Ok(());
+    }
     let mut decided_nothing = 0u64;
     for c in as_entries {
         if let Some(e) = entries.get_mut(&c) {
@@ -1149,6 +1156,109 @@ fn decide_nothing(
         .decided_nothing
         .set(counts.decided_nothing.get() + decided_nothing);
     Ok(())
+}
+
+/// The tripwire before the rule (task-d121): a decision under facts with
+/// no payload at any reporter breaks the premise the rule rests on (a
+/// deciding quorum meets the reports' and holds the payload, point 4).
+/// The rule leaves such an entry (condition 2), and the campaign keeps
+/// today's wait. Apart from [`decide_nothing`], so that a test of the
+/// condition reaches it in a debug build (#335 review).
+#[cfg(debug_assertions)]
+fn decided_without_a_payload(
+    entries: &BTreeMap<CommandId, SyncEntry>,
+    reported_payload: &BTreeSet<CommandId>,
+    supplied: &impl Fn(&CommandId, Option<Digest32>) -> bool,
+    decided: &impl CandidateDecisions,
+) {
+    for e in entries.values() {
+        debug_assert!(
+            e.phase < Phase::Commit
+                || e.admission.as_ref().is_none_or(is_nothing)
+                || reported_payload.contains(&e.command)
+                || decided.decided(&e.command)
+                || decided.holds_payload(&e.command, e.admission)
+                || supplied(&e.command, e.admission)
+                || !matches!(decided.executed(&e.command), ExecutedFacts::No),
+            "decided under facts with no payload at any reporter: {:?}",
+            e.command
+        );
+    }
+}
+
+/// Whether re-proposing `gaps` as well as `reproposed` leaves two
+/// conflicting entries waiting last on the same gap, with no path between
+/// them through the entries' dependencies (#335 review, A2).
+///
+/// `Leader::from_recovered` proposes each entry right after the last
+/// re-proposal, in identity order, it waits on through the entries it
+/// names, with its own dependencies: two entries waiting last on one
+/// re-proposal are proposed beside each other. An entry whose last is a
+/// re-proposal already in `reproposed` waits last on it with the gaps
+/// added too, unless a later gap is reached, so only the entries waiting
+/// last on a gap can make a pair the order check didn't judge.
+fn unordered_after(
+    entries: &BTreeMap<CommandId, SyncEntry>,
+    reproposed: &BTreeSet<CommandId>,
+    gaps: &[CommandId],
+) -> bool {
+    if gaps.is_empty() {
+        return false;
+    }
+    let mut dependents: BTreeMap<CommandId, Vec<CommandId>> = BTreeMap::new();
+    for (u, e) in entries {
+        for d in &e.deps {
+            dependents.entry(*d).or_default().push(*u);
+        }
+    }
+    // Each entry's last re-proposal, labelled from the last one down by
+    // walking the entries that wait on it, as the order check labels.
+    let waited: BTreeSet<CommandId> = reproposed.iter().chain(gaps).copied().collect();
+    let mut last: BTreeMap<CommandId, CommandId> = BTreeMap::new();
+    for r in waited.iter().rev() {
+        let mut stack = dependents.get(r).cloned().unwrap_or_default();
+        while let Some(u) = stack.pop() {
+            if last.contains_key(&u) {
+                continue;
+            }
+            last.insert(u, *r);
+            stack.extend(dependents.get(&u).into_iter().flatten().copied());
+        }
+    }
+    let reaches = |from: &CommandId, to: &CommandId| {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<CommandId> = entries[from].deps.clone();
+        while let Some(c) = stack.pop() {
+            if c == *to {
+                return true;
+            }
+            if seen.insert(c)
+                && let Some(e) = entries.get(&c)
+            {
+                stack.extend(e.deps.iter().copied());
+            }
+        }
+        false
+    };
+    for gap in gaps {
+        let beside: Vec<&CommandId> = last
+            .iter()
+            .filter(|(_, l)| *l == gap)
+            .map(|(u, _)| u)
+            .collect();
+        for (i, a) in beside.iter().enumerate() {
+            let keys_a: Vec<&Vec<u8>> = entries[*a].paths.iter().map(|(k, _)| k).collect();
+            for b in &beside[i + 1..] {
+                if entries[*b].paths.iter().any(|(k, _)| keys_a.contains(&k))
+                    && !reaches(a, b)
+                    && !reaches(b, a)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The re-proposals a Sync carries (task-d24, from the review of
@@ -2387,6 +2497,163 @@ mod tests {
         );
     }
 
+    /// Conflicting entries `Leader::from_recovered` proposes beside each
+    /// other, right after the same re-proposal, with their own
+    /// dependencies and no path between them (#335 review, A2): it
+    /// proposes an entry right after the last re-proposal, in identity
+    /// order, it waits on through the entries it names.
+    fn unordered_beside_a_reproposal(decision: &SyncDecision) -> Vec<(CommandId, CommandId)> {
+        let entries = &decision.entries;
+        let reached = |from: &CommandId| -> BTreeSet<CommandId> {
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<CommandId> = entries[from].deps.clone();
+            while let Some(c) = stack.pop() {
+                if seen.insert(c)
+                    && let Some(e) = entries.get(&c)
+                {
+                    stack.extend(e.deps.iter().copied());
+                }
+            }
+            seen
+        };
+        let last = |c: &CommandId| {
+            reached(c)
+                .into_iter()
+                .filter(|d| decision.reproposed.contains(d))
+                .max()
+        };
+        let keys = |c: &CommandId| -> Vec<Vec<u8>> {
+            entries[c].paths.iter().map(|(k, _)| k.clone()).collect()
+        };
+        let mut out = Vec::new();
+        for a in entries.keys() {
+            for b in entries.keys().filter(|b| *b > a) {
+                let (la, lb) = (last(a), last(b));
+                if la.is_some()
+                    && la == lb
+                    && keys(a).iter().any(|k| keys(b).contains(k))
+                    && !reached(a).contains(b)
+                    && !reached(b).contains(a)
+                {
+                    out.push((*a, *b));
+                }
+            }
+        }
+        out
+    }
+
+    /// A2's shape (#335 review): adopted X1 and X2, each naming D, X1 on
+    /// C's key (`conflict`) or on another; R held undecided by the other
+    /// reporter, R before D in identity order; and C pre-accepted with its
+    /// payload at the fast-set member, naming R and X2. D is held by no
+    /// report (`d_held` false) or held undecided by the other reporter.
+    fn a_fast_candidate_beside_a_gap(
+        d_held: bool,
+        conflict: bool,
+        rules: SelectionRules,
+        counts: &SelectionCounts,
+    ) -> SyncDecision {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        // Keys are `n % 5`: C on key 1, X1 on it or on key 4.
+        let (rr, d, x2, c) = (3u64, 5, 12, 16);
+        let x1 = if conflict { 11 } else { 14 };
+        let held = alloc::vec![
+            entry(x1, Phase::Accept, alloc::vec![id(d)], 1),
+            entry(x2, Phase::Accept, alloc::vec![id(d)], 1),
+        ];
+        let mut of_member = held.clone();
+        of_member.push(entry(c, Phase::PreAccept, alloc::vec![id(rr), id(x2)], 1));
+        let mut of_other = held;
+        of_other.push(entry(rr, Phase::PreAccept, Vec::new(), 4));
+        if d_held {
+            of_other.push(entry(d, Phase::PreAccept, Vec::new(), 4));
+        }
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        select_counted(
+            &config,
+            &[report(member, of_member), report(other, of_other)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            rules,
+            rules.decide_nothing,
+            counts,
+        )
+        .unwrap()
+    }
+
+    /// A2 (#335 review): a gap D the rule would re-propose, which the
+    /// order check never saw. Adopted X1 and X2 wait on D, and C, kept as
+    /// a fast candidate, waits on R and, through X2, on D, so with D
+    /// re-proposed both X1 and C wait last on it and would be proposed
+    /// beside each other, and they conflict with no path between them.
+    /// With D held undecided, the order check drops C for exactly that; with
+    /// D unreported, such a drop would be behind a command no report holds,
+    /// which condition 5 keeps the rule off for. So the rule is kept off:
+    /// the selection is the one without it, and the candidate gives up as
+    /// `Behind` on D, a stall and no fork. Controls: with X1 on another
+    /// key the rule decides D as nothing, and with D held the order check
+    /// drops C.
+    #[test]
+    fn a_gap_that_would_leave_two_conflicting_entries_unordered_keeps_the_rule_off() {
+        let rules = SelectionRules {
+            leave_out_unheld: true,
+            decide_nothing: true,
+        };
+        let (x1, c, d) = (id(11), id(16), id(5));
+        let counts = SelectionCounts::default();
+        let ruled = a_fast_candidate_beside_a_gap(false, true, rules, &counts);
+        assert!(ruled.entries.contains_key(&c), "C kept: {ruled:?}");
+        assert!(ruled.entries[&x1].deps.contains(&d));
+        assert!(ruled.nothing.is_empty(), "{ruled:?}");
+        assert!(!ruled.reproposed.contains(&d), "D left a gap");
+        assert!(unordered_beside_a_reproposal(&ruled).is_empty());
+        assert_eq!(
+            (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+            (1, 0)
+        );
+        let plain = a_fast_candidate_beside_a_gap(
+            false,
+            true,
+            SelectionRules::default(),
+            &SelectionCounts::default(),
+        );
+        assert_eq!(ruled.entries, plain.entries);
+        assert_eq!(ruled.reproposed, plain.reproposed);
+        // Control: no conflict, nothing left unordered, the rule decides.
+        let counts = SelectionCounts::default();
+        let apart = a_fast_candidate_beside_a_gap(false, false, rules, &counts);
+        assert!(apart.entries.contains_key(&c), "C kept: {apart:?}");
+        assert!(
+            apart.nothing.contains(&d) && apart.reproposed.contains(&d),
+            "{apart:?}"
+        );
+        assert!(unordered_beside_a_reproposal(&apart).is_empty());
+        assert_eq!(
+            (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+            (0, 1)
+        );
+        // Control: D held undecided, the order check drops C.
+        let held = a_fast_candidate_beside_a_gap(true, true, rules, &SelectionCounts::default());
+        assert!(held.reproposed.contains(&c), "C re-proposed: {held:?}");
+        assert!(!held.entries.contains_key(&c));
+        assert!(unordered_beside_a_reproposal(&held).is_empty());
+    }
+
     /// What the candidate executed, in order, for the known gap's bound
     /// half (#308 review).
     struct ExecutedInOrder(Vec<CommandId>);
@@ -2399,6 +2666,229 @@ mod tests {
         fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
             let at = |c: &CommandId| self.0.iter().position(|e| e == c);
             matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+        }
+    }
+
+    /// A candidate that holds the payloads of `held` and decided none.
+    struct HoldsPayloads(Vec<CommandId>);
+
+    impl CandidateDecisions for HoldsPayloads {
+        fn decided(&self, _: &CommandId) -> bool {
+            false
+        }
+
+        fn holds_payload(&self, command: &CommandId, _: Option<Digest32>) -> bool {
+            self.0.contains(command)
+        }
+    }
+
+    /// What the rule could decide beside the known gap's shape, on a key
+    /// of its own (#335 review): an acceptance at the member whose payload
+    /// no report holds (the payload shape), or a pre-acceptance at the
+    /// other reporter without its payload that an acceptance at both waits
+    /// on (the re-proposal shape).
+    #[derive(Clone, Copy)]
+    enum Beside {
+        Payload,
+        Reproposal,
+    }
+
+    impl Beside {
+        /// The command the rule would decide as nothing.
+        const fn command(self) -> u64 {
+            match self {
+                Beside::Payload => 31,
+                Beside::Reproposal => 21,
+            }
+        }
+
+        /// Whether `decision` decided it as nothing.
+        fn decided_nothing(self, decision: &SyncDecision) -> bool {
+            let c = id(self.command());
+            match self {
+                Beside::Payload => decision.entries[&c].admission == Some(NOTHING_ADMISSION),
+                Beside::Reproposal => decision.nothing.contains(&c),
+            }
+        }
+    }
+
+    /// The known gap's shape with `beside` added, under the rule. Where
+    /// `dropped`, no report holds D and the candidate holds its payload,
+    /// undecided: the order check drops C behind D, and D is no gap the
+    /// rule could decide. Otherwise the other reporter holds D and nothing
+    /// is dropped.
+    fn the_known_gap_beside(
+        beside: Beside,
+        dropped: bool,
+        counts: &SelectionCounts,
+    ) -> Result<SyncDecision, RecoveryError> {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        let (a, d, x, c) = (0u64, 5, 10, 15);
+        let mut held = alloc::vec![
+            entry(a, Phase::Accept, Vec::new(), 1),
+            entry(x, Phase::Accept, alloc::vec![id(d)], 1),
+        ];
+        let without_payload = |e: ReportEntry| ReportEntry {
+            payload_present: false,
+            ..e
+        };
+        if let Beside::Reproposal = beside {
+            held.push(entry(26, Phase::Accept, alloc::vec![id(21)], 2));
+        }
+        let mut of_member = held.clone();
+        of_member.push(entry(c, Phase::PreAccept, alloc::vec![id(x)], 1));
+        let mut of_other = held;
+        if !dropped {
+            of_other.push(entry(d, Phase::PreAccept, Vec::new(), 4));
+        }
+        match beside {
+            Beside::Payload => {
+                of_member.push(without_payload(entry(31, Phase::Accept, Vec::new(), 3)));
+            }
+            Beside::Reproposal => {
+                of_other.push(without_payload(entry(21, Phase::PreAccept, Vec::new(), 3)));
+            }
+        }
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        select_counted(
+            &config,
+            &[report(member, of_member), report(other, of_other)],
+            |_, _| false,
+            |_| None,
+            &HoldsPayloads(alloc::vec![id(d)]),
+            SelectionRules {
+                leave_out_unheld: true,
+                decide_nothing: true,
+            },
+            true,
+            counts,
+        )
+    }
+
+    /// Condition 5 outside the gap shape (#335 review): where the order
+    /// check dropped C behind D, which no report holds and the candidate
+    /// holds undecided, the rule decides nothing in the payload or the
+    /// re-proposal shape either, and the selection kept off is counted:
+    /// the payload shape fails as `HalfInitialized`, as it does without
+    /// the rule, and the re-proposal goes out with no value decided.
+    /// With D held by a report nothing is dropped, and the same command is
+    /// decided as nothing: the control. The drop is read from this
+    /// selection's own count, not the total the counts carry in: with
+    /// earlier drops counted, the control decides as before.
+    #[test]
+    fn a_drop_behind_an_unreported_command_keeps_the_rule_off_in_every_shape() {
+        for beside in [Beside::Payload, Beside::Reproposal] {
+            let counts = SelectionCounts::default();
+            match (beside, the_known_gap_beside(beside, true, &counts)) {
+                (Beside::Payload, Err(RecoveryError::HalfInitialized { command, .. })) => {
+                    assert_eq!(command, id(beside.command()));
+                }
+                (Beside::Reproposal, Ok(kept)) => {
+                    assert!(!beside.decided_nothing(&kept), "{kept:?}");
+                    assert!(kept.reproposed.contains(&id(beside.command())));
+                    assert!(kept.nothing.is_empty(), "{kept:?}");
+                }
+                (_, other) => panic!("{other:?}"),
+            }
+            assert_eq!(counts.unreported_undecided.get(), 1);
+            assert_eq!(
+                (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+                (1, 0)
+            );
+            let counts = SelectionCounts::default();
+            let decided = the_known_gap_beside(beside, false, &counts).expect("selected");
+            assert!(beside.decided_nothing(&decided), "{decided:?}");
+            assert_eq!(
+                (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+                (0, 1)
+            );
+            let counts = SelectionCounts::default();
+            counts.unreported_undecided.set(3);
+            let decided = the_known_gap_beside(beside, false, &counts).expect("selected");
+            assert!(beside.decided_nothing(&decided), "{decided:?}");
+            assert_eq!(counts.unreported_undecided.get(), 3);
+            assert_eq!(
+                (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+                (0, 1)
+            );
+        }
+    }
+
+    /// Condition 2 (#335 review): an entry at COMMIT or executed is never
+    /// decided as nothing, whatever the reports hold of its payload. The
+    /// selection never gets here with one whose payload no report holds:
+    /// the tripwire stops a debug build first, so the rule is called on
+    /// the entry directly. The same entry at ACCEPT is decided as
+    /// nothing: the control.
+    #[test]
+    fn an_entry_at_commit_or_executed_is_never_decided_as_nothing() {
+        let d = id(5);
+        let config = BallotConfiguration::c2_default(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(1, 0),
+            (0..3).map(r).collect(),
+        )
+        .unwrap();
+        let report = |replica: u8| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, 0),
+            committed_ballot: ballot(0, 0),
+            entries: alloc::vec![entry(5, Phase::Accept, Vec::new(), 1)],
+        };
+        let selected = select_counted(
+            &config,
+            &[report(0), report(1)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            SelectionRules::default(),
+            false,
+            &SelectionCounts::default(),
+        )
+        .unwrap();
+        let facts = Some(Digest32([0x5a; 32]));
+        for (phase, nothing) in [
+            (Phase::Accept, true),
+            (Phase::Commit, false),
+            (Phase::Executed, false),
+        ] {
+            let mut entries = selected.entries.clone();
+            let e = entries.get_mut(&d).expect("selected");
+            e.phase = phase;
+            e.admission = facts;
+            let counts = SelectionCounts::default();
+            decide_nothing(
+                &mut entries,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &[],
+                &BTreeSet::new(),
+                &|_: &CommandId, _| false,
+                &|_: &CommandId| false,
+                false,
+                &counts,
+            )
+            .unwrap();
+            assert_eq!(
+                entries[&d].admission == Some(NOTHING_ADMISSION),
+                nothing,
+                "{phase:?}"
+            );
+            assert_eq!(counts.decided_nothing.get(), u64::from(nothing));
         }
     }
 
