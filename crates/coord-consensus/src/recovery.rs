@@ -1136,7 +1136,7 @@ fn decide_nothing(
     // drops the candidate of such a pair; with it unreported, that drop
     // is behind a command no report holds, which condition 5 keeps the
     // rule off for. So the rule is kept off here too, as for a drop.
-    if found && unordered_after(entries, reproposed, &gaps) {
+    if found && unordered_after(entries, reproposed, &gaps, &counts.work) {
         counts.kept_by_drop.set(counts.kept_by_drop.get() + 1);
         return Ok(());
     }
@@ -1201,64 +1201,175 @@ fn unordered_after(
     entries: &BTreeMap<CommandId, SyncEntry>,
     reproposed: &BTreeSet<CommandId>,
     gaps: &[CommandId],
+    work: &Cell<u64>,
 ) -> bool {
     if gaps.is_empty() {
         return false;
     }
-    let mut dependents: BTreeMap<CommandId, Vec<CommandId>> = BTreeMap::new();
-    for (u, e) in entries {
-        for d in &e.deps {
-            dependents.entry(*d).or_default().push(*u);
+    let tick = || work.set(work.get().saturating_add(1));
+    // The entries by position, and the dependencies among them.
+    let ids: Vec<CommandId> = entries.keys().copied().collect();
+    let deps: Vec<Vec<usize>> = entries
+        .values()
+        .map(|e| {
+            e.deps
+                .iter()
+                .filter_map(|d| {
+                    tick();
+                    ids.binary_search(d).ok()
+                })
+                .collect()
+        })
+        .collect();
+    let mut dependents: Vec<Vec<usize>> = alloc::vec![Vec::new(); ids.len()];
+    for (u, ds) in deps.iter().enumerate() {
+        for d in ds {
+            dependents[*d].push(u);
         }
     }
     // Each entry's last re-proposal, labelled from the last one down by
-    // walking the entries that wait on it, as the order check labels.
+    // walking the entries that wait on it, as the order check labels: an
+    // entry labelled already waits on one at least as late, and so does
+    // every entry that waits on it.
     let waited: BTreeSet<CommandId> = reproposed.iter().chain(gaps).copied().collect();
-    let mut last: BTreeMap<CommandId, CommandId> = BTreeMap::new();
-    for r in waited.iter().rev() {
-        let mut stack = dependents.get(r).cloned().unwrap_or_default();
-        while let Some(u) = stack.pop() {
-            if last.contains_key(&u) {
-                continue;
+    let mut waiting: BTreeMap<CommandId, Vec<usize>> = BTreeMap::new();
+    for (u, e) in entries.values().enumerate() {
+        for d in &e.deps {
+            if waited.contains(d) {
+                waiting.entry(*d).or_default().push(u);
             }
-            last.insert(u, *r);
-            stack.extend(dependents.get(&u).into_iter().flatten().copied());
         }
     }
-    let reaches = |from: &CommandId, to: &CommandId| {
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<CommandId> = entries[from].deps.clone();
-        while let Some(c) = stack.pop() {
-            if c == *to {
-                return true;
+    let mut last: Vec<Option<CommandId>> = alloc::vec![None; ids.len()];
+    for (r, waiters) in waiting.iter().rev() {
+        let mut stack = waiters.clone();
+        while let Some(u) = stack.pop() {
+            tick();
+            if last[u].is_some() {
+                continue;
             }
-            if seen.insert(c)
-                && let Some(e) = entries.get(&c)
-            {
-                stack.extend(e.deps.iter().copied());
+            last[u] = Some(*r);
+            stack.extend(dependents[u].iter().filter(|w| last[**w].is_none()));
+        }
+    }
+    let gaps: BTreeSet<&CommandId> = gaps.iter().collect();
+    // The entries waiting last on a gap, by gap and key.
+    let mut beside: BTreeMap<(CommandId, &Vec<u8>), Vec<usize>> = BTreeMap::new();
+    for (u, e) in entries.values().enumerate() {
+        if let Some(gap) = last[u].filter(|l| gaps.contains(l)) {
+            for (k, _) in &e.paths {
+                tick();
+                beside.entry((gap, k)).or_default().push(u);
             }
         }
-        false
-    };
-    for gap in gaps {
-        let beside: Vec<&CommandId> = last
-            .iter()
-            .filter(|(_, l)| *l == gap)
-            .map(|(u, _)| u)
-            .collect();
-        for (i, a) in beside.iter().enumerate() {
-            let keys_a: Vec<&Vec<u8>> = entries[*a].paths.iter().map(|(k, _)| k).collect();
-            for b in &beside[i + 1..] {
-                if entries[*b].paths.iter().any(|(k, _)| keys_a.contains(&k))
-                    && !reaches(a, b)
-                    && !reaches(b, a)
-                {
-                    return true;
+    }
+    if beside.values().all(|on| on.len() < 2) {
+        return false;
+    }
+    // The entries' strongly connected components, numbered so that a
+    // dependency's is never above its dependent's (Tarjan's order).
+    let component = components(&deps, &tick);
+    // The entries on one key waiting last on one gap are ordered when
+    // they form a chain: sorted by component, each reaches the one before
+    // it. Two in one component reach each other. Two that don't fail
+    // already as a pair: the earlier reaches no component above its own.
+    // A walk from the later stays among the components between the two,
+    // since none below the earlier's reaches it, so a chain of entries
+    // one after another costs a step each, not a walk of the graph per
+    // pair (#335 review).
+    let mut seen: Vec<usize> = alloc::vec![usize::MAX; ids.len()];
+    let mut walk = 0usize;
+    for on in beside.values_mut().filter(|on| on.len() > 1) {
+        on.sort_by_key(|u| (component[*u], *u));
+        for pair in on.windows(2) {
+            let (earlier, later) = (pair[0], pair[1]);
+            if component[earlier] == component[later] {
+                continue;
+            }
+            walk += 1;
+            let floor = component[earlier];
+            let mut stack = alloc::vec![later];
+            let mut reached = false;
+            while let Some(u) = stack.pop() {
+                tick();
+                if u == earlier {
+                    reached = true;
+                    break;
                 }
+                if seen[u] == walk {
+                    continue;
+                }
+                seen[u] = walk;
+                stack.extend(
+                    deps[u]
+                        .iter()
+                        .filter(|d| component[**d] >= floor && seen[**d] != walk),
+                );
+            }
+            if !reached {
+                return true;
             }
         }
     }
     false
+}
+
+/// The strongly connected components of the graph whose edges `deps`
+/// lists, by node: Tarjan's, iterative, numbering each component once
+/// every one it reaches is numbered, so a node's dependencies are in
+/// components numbered no higher than its own.
+fn components(deps: &[Vec<usize>], tick: &impl Fn()) -> Vec<usize> {
+    let n = deps.len();
+    let unseen = usize::MAX;
+    let (mut number, mut low) = (alloc::vec![unseen; n], alloc::vec![0usize; n]);
+    let mut component = alloc::vec![unseen; n];
+    let mut on_stack = alloc::vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let (mut next, mut numbered) = (0usize, 0usize);
+    for root in 0..n {
+        if number[root] != unseen {
+            continue;
+        }
+        number[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        let mut calls: Vec<(usize, usize)> = alloc::vec![(root, 0)];
+        while let Some(top) = calls.last_mut() {
+            let v = top.0;
+            if let Some(&w) = deps[v].get(top.1) {
+                top.1 += 1;
+                tick();
+                if number[w] == unseen {
+                    number[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    calls.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(number[w]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(parent, _)) = calls.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == number[v] {
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    component[w] = numbered;
+                    if w == v {
+                        break;
+                    }
+                }
+                numbered += 1;
+            }
+        }
+    }
+    component
 }
 
 /// The re-proposals a Sync carries (task-d24, from the review of
@@ -2666,6 +2777,70 @@ mod tests {
         fn executed_before(&self, first: &CommandId, then: &CommandId) -> bool {
             let at = |c: &CommandId| self.0.iter().position(|e| e == c);
             matches!((at(first), at(then)), (Some(a), Some(b)) if a < b)
+        }
+    }
+
+    /// A chain of `len` acceptances on one key, each after the one
+    /// before, the first after a dependency `D` no report holds, as two
+    /// reporters at the source hold them, selected under the rule.
+    fn a_chain_behind_a_gap(len: u64, counts: &SelectionCounts) -> SyncDecision {
+        let config = BallotConfiguration::c2_default(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(1, 1),
+            (0..3).map(r).collect(),
+        )
+        .unwrap();
+        let chain: Vec<ReportEntry> = (0..len)
+            .map(|i| entry(10 + 5 * i, Phase::Accept, alloc::vec![id(5 + 5 * i)], 1))
+            .collect();
+        let report = |replica: u8| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, 1),
+            committed_ballot: ballot(0, 0),
+            entries: chain.clone(),
+        };
+        select_counted(
+            &config,
+            &[report(1), report(2)],
+            |_, _| false,
+            |_| None,
+            &|_: &CommandId| false,
+            SelectionRules {
+                leave_out_unheld: true,
+                decide_nothing: true,
+            },
+            true,
+            counts,
+        )
+        .unwrap()
+    }
+
+    /// The check that a gap leaves no conflicting entries unordered costs
+    /// steps linear in the entries waiting on it (#335 review): every
+    /// entry of a chain on one key waits last on the gap, and a walk per
+    /// pair of them, as the check first made, took about 27 s over 1,000.
+    /// The chain is ordered, so `D` is a nothing.
+    #[test]
+    fn a_gap_with_a_chain_behind_it_is_checked_in_steps_linear_in_the_chain() {
+        let mut before = None;
+        for len in [250, 500, 1_000, 2_000] {
+            let counts = SelectionCounts::default();
+            let decision = a_chain_behind_a_gap(len, &counts);
+            assert!(decision.nothing.contains(&id(5)), "{len}");
+            assert_eq!(
+                (counts.kept_by_drop.get(), counts.decided_nothing.get()),
+                (0, 1)
+            );
+            let steps = counts.work.get();
+            let bound = 64 * len;
+            assert!(steps <= bound, "{steps} steps over {len}, bound {bound}");
+            if let Some(half) = before {
+                assert!(
+                    steps * 10 <= half * 21,
+                    "{steps} steps over {len}, {half} over half as many"
+                );
+            }
+            before = Some(steps);
         }
     }
 
