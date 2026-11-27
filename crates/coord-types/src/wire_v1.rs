@@ -119,6 +119,17 @@ pub const KIND_SESSION_BIND_ACK: u16 = 0x0106;
 /// A frame of any other version is refused at the boundary.
 pub const SESSION_BIND_VERSION: u16 = 1;
 
+/// The largest service token a [`KIND_SESSION_BIND`] frame carries
+/// (`coord_session::MAX_TOKEN_BYTES` is this number).
+pub const SESSION_BIND_MAX_TOKEN_BYTES: usize = 8 * 1024;
+
+/// The largest whole [`KIND_SESSION_BIND`] frame, length field included:
+/// the header, the token's length prefix and the largest token, with a
+/// few bytes to spare (task-d122). A connection that has not bound yet
+/// may send nothing larger, and the transport refuses a longer one from
+/// its header, before it reads any of the payload.
+pub const SESSION_BIND_MAX_FRAME: usize = HEADER_LEN + 8 + SESSION_BIND_MAX_TOKEN_BYTES;
+
 /// A trusted collector's submission to one voter (`spec/wire-v1.md`,
 /// "Collector frames"). Another raw kind of the API range, for the same
 /// reason as the binding above: its payload is
@@ -465,6 +476,14 @@ impl FrameReader {
         let mut header = [0u8; HEADER_LEN];
         header.copy_from_slice(&avail[..HEADER_LEN]);
         Some(check_header(&header))
+    }
+
+    /// The kind of the frame whose header is buffered, once the header is
+    /// complete (task-d122): what a reader that admits only some kinds
+    /// checks before it reads the payload.
+    pub fn pending_kind(&self) -> Option<u16> {
+        let avail = &self.buf[self.start..];
+        (avail.len() >= HEADER_LEN).then(|| u16::from_be_bytes([avail[4], avail[5]]))
     }
 
     /// Bytes buffered but not yet consumed as frames.

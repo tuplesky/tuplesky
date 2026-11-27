@@ -2227,23 +2227,53 @@ async fn raw_first_frame(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_reaches_the_api_plane_without_a_client_certificate() {
+    // Negotiated without one, and announced to the runtime once its first
+    // stream carries a bind (task-d122; the gate's own acceptance is in
+    // `pre_bind.rs`).
     let f = fixture(&[PeerRole::Voter]);
     let mut acceptor = bind(&f, 0);
-    let (reason, connected) = raw_first_frame(
-        &f,
-        &mut acceptor,
-        &f.ids[0],
-        ALPN_API,
-        None,
-        hello_with(
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(f.ca.roots())
+        .with_no_client_auth();
+    client.alpn_protocols = vec![ALPN_API.to_vec()];
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client).unwrap(),
+    )));
+    let conn = endpoint
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
             PeerRole::Client,
             CLUSTER,
             None,
             vec![Lane::Unary.capability()],
-        ),
-    )
-    .await;
-    assert!(connected, "anonymous client refused: {reason:?}");
+        ))
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"token").unwrap())
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    match event(&mut acceptor).await {
+        TransportEvent::Connected { identity, .. } => {
+            assert_eq!(identity.role, PeerRole::Client);
+            assert_eq!(identity.replica, None);
+        }
+        other => panic!("anonymous client not connected: {other:?}"),
+    }
+    assert!(matches!(
+        event(&mut acceptor).await,
+        TransportEvent::ApiRequest { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

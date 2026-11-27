@@ -14,22 +14,25 @@ use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
     BoundedBytes, BoundedVec, COLLECTOR_FRESHNESS_VERSION, COLLECTOR_READ_VERSION,
     COLLECTOR_SUBMIT_VERSIONS, CloseV1, Frame, HelloAckV1, HelloV1, KIND_COLLECTOR_FRESHNESS,
-    KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1, PeerRole,
+    KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK,
+    KindRange, MAX_REASON_BYTES, MessageKind, MessageV1, PeerRole, SESSION_BIND_MAX_FRAME,
     SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{timeout, timeout_at};
 
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
-    CAPABILITY_FRAMES_PER_STREAM, ControlStream, FrameError, FrameStream, KIND_PEER_EVIDENCE,
-    MAX_FRAMES_PER_STREAM, PEER_EVIDENCE_VERSION, read_frame_within,
+    Admit, CAPABILITY_FRAMES_PER_STREAM, ControlStream, FrameError, FrameStream,
+    KIND_PEER_EVIDENCE, MAX_FRAMES_PER_STREAM, PEER_EVIDENCE_VERSION, read_admitted,
+    read_frame_within,
 };
+use crate::gate::{BIND_REFUSED, BIND_UNAVAILABLE, BindCheck, BindGate};
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
 use crate::sched::{Datagrams, FairQueue, LaneStats, PeerTraffic, QueueError, Queued};
@@ -204,6 +207,89 @@ pub struct Responder {
     node: Arc<Budget>,
     deadline: Duration,
     received: Instant,
+    /// The connection this answers a first `Bind` for, while it has not
+    /// bound (task-d122): a `BindAck` written here raises it to its lane.
+    binding: BindHold,
+}
+
+/// A `BindAck` being written (task-d122; #334 review).
+///
+/// Until the acknowledgement is written whole, dropping this closes the
+/// connection as [`Peer::close_unacknowledged`] does, whichever way
+/// [`Responder::respond`] ends: an error returned, or its future dropped
+/// while it waits for room or for the write.
+struct Acknowledging {
+    peer: Option<Arc<Peer>>,
+}
+
+impl Acknowledging {
+    /// Raise the connection to its lane's limits, as the acknowledgement
+    /// is about to be written.
+    fn raise(&self) {
+        if let Some(peer) = &self.peer {
+            peer.mark_bound();
+        }
+    }
+
+    /// The acknowledgement was written whole: the connection stays.
+    fn written(mut self) {
+        self.peer = None;
+    }
+}
+
+impl Drop for Acknowledging {
+    fn drop(&mut self) {
+        if let Some(peer) = self.peer.take() {
+            peer.close_unacknowledged();
+        }
+    }
+}
+
+/// A connection's first `Bind`, with the runtime (task-d122).
+///
+/// The runtime ends a bind one of three ways: a `BindAck`, which raises
+/// the connection; a close, which frees its place; or by letting go of
+/// the stream (an establishment that failed, an answer that is not an
+/// acknowledgement). In the last case nothing else would ever free the
+/// place, so this closes the connection as [`BIND_REFUSED`] unless it
+/// closes first within `grace`: the runtime closes a refused binding
+/// right after letting go of its stream, with the reason it chose.
+struct BindHold {
+    peer: Option<Arc<Peer>>,
+    grace: Duration,
+}
+
+impl BindHold {
+    const NONE: Self = Self {
+        peer: None,
+        grace: Duration::ZERO,
+    };
+}
+
+impl Drop for BindHold {
+    fn drop(&mut self) {
+        let Some(peer) = self.peer.take() else {
+            return;
+        };
+        if !peer.is_unbound() {
+            return;
+        }
+        let grace = self.grace;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            peer.refuse_unbound(CloseCode::Rejected, BIND_REFUSED);
+            return;
+        };
+        handle.spawn(async move {
+            tokio::select! {
+                _ = peer.conn.closed() => {}
+                () = tokio::time::sleep(grace) => {
+                    if peer.is_unbound() {
+                        peer.refuse_unbound(CloseCode::Rejected, BIND_REFUSED);
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl core::fmt::Debug for Responder {
@@ -229,10 +315,76 @@ impl Responder {
     /// the stream would let concurrent unary requests, or many API
     /// connections, hand window after window to QUIC outside the caps
     /// this lane exists to enforce.
-    pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
+    ///
+    /// The returned future owns the connection's first-bind obligations
+    /// from the moment it is made, not from its first poll: an
+    /// acknowledgement whose future is dropped before it ever runs closes
+    /// the connection as unavailable, as one dropped while it waits does
+    /// (#334 review).
+    pub fn respond(
+        mut self,
+        frame: Vec<u8>,
+    ) -> impl core::future::Future<Output = Result<(), SendError>> {
+        // The runtime acknowledges a binding only once it holds one, so
+        // the connection is bound once its acknowledgement is admitted
+        // (task-d122). It is raised before the acknowledgement is written:
+        // the caller opens its next stream once it reads it, and that
+        // stream must find the lane's limits. It is raised only after the
+        // budgets admit it, and one deadline covers the admission, the
+        // write and the finish, so an acknowledgement waiting for room
+        // ends within the frame deadline as any write does (#334 review).
+        //
+        // An acknowledgement that is not written whole (its admission, the
+        // write or the finish fails, the deadline passes, the caller
+        // stopped the stream, or this future is dropped while it waits)
+        // closes the connection: the caller never read it, and the lane's
+        // limits must not outlive it (#334 review; see [`Acknowledging`]).
+        //
+        // Any other answer to a first bind leaves the connection unbound,
+        // and it is closed once the answer is written (see [`BindHold`]).
+        //
+        // The guard is chosen here, before the future exists, so that it
+        // is in charge even if the future is never polled.
+        let (acknowledging, unacknowledged) = match self.binding.peer.take() {
+            Some(peer) if frame.get(4..6) == Some(&KIND_SESSION_BIND_ACK.to_be_bytes()[..]) => {
+                (Some(Acknowledging { peer: Some(peer) }), None)
+            }
+            peer => (
+                None,
+                Some(BindHold {
+                    peer,
+                    grace: self.binding.grace,
+                }),
+            ),
+        };
+        self.write_response(frame, acknowledging, unacknowledged)
+    }
+
+    /// [`respond`]'s write, with the first-bind guard already chosen.
+    ///
+    /// [`respond`]: Responder::respond
+    async fn write_response(
+        mut self,
+        frame: Vec<u8>,
+        acknowledging: Option<Acknowledging>,
+        _unacknowledged: Option<BindHold>,
+    ) -> Result<(), SendError> {
         let bytes = frame.len();
-        let (dest, node) = self.admit(bytes).await?;
-        timeout(self.deadline, async {
+        let started = tokio::time::Instant::now();
+        let held = match &acknowledging {
+            Some(_) => timeout_at(started + self.deadline, self.admit(bytes))
+                .await
+                .map_err(|_| SendError::Timeout)??,
+            None => self.admit(bytes).await?,
+        };
+        if let Some(acknowledging) = &acknowledging {
+            acknowledging.raise();
+        }
+        let until = match &acknowledging {
+            Some(_) => started + self.deadline,
+            None => tokio::time::Instant::now() + self.deadline,
+        };
+        timeout_at(until, async {
             self.send
                 .write_all(&frame)
                 .await
@@ -243,6 +395,10 @@ impl Responder {
         })
         .await
         .map_err(|_| SendError::Timeout)??;
+        if let Some(acknowledging) = acknowledging {
+            acknowledging.written();
+        }
+        let (dest, node) = held;
         let stopped = self.send.stopped();
         tokio::spawn(async move {
             let _dest = dest;
@@ -479,6 +635,18 @@ struct Peer {
     /// from the same negotiated set, so the sender batches exactly where
     /// the receiver reads a batch.
     batched: bool,
+    /// While an API connection without a client certificate has not bound
+    /// (task-d122): its place under [`Limits::max_unbound`], and the
+    /// limits of the lane its `BindAck` raises it to.
+    unbound: Mutex<Option<Unbound>>,
+    /// Woken when the connection binds.
+    bound: Notify,
+}
+
+/// What an API connection without a certificate holds until it binds.
+struct Unbound {
+    _place: OwnedSemaphorePermit,
+    lane: LaneLimits,
 }
 
 impl Peer {
@@ -508,7 +676,55 @@ impl Peer {
                     .capabilities
                     .contains(&CAPABILITY_FRAMES_PER_STREAM),
             identity,
+            unbound: Mutex::new(None),
+            bound: Notify::new(),
         })
+    }
+
+    /// Hold a connection without a certificate unbound (task-d122): at
+    /// its `place` under the unbound cap, and at the floor until its
+    /// `BindAck` raises it to `lane`.
+    fn hold_unbound(&self, place: OwnedSemaphorePermit, lane: LaneLimits) {
+        *self.unbound.lock().unwrap() = Some(Unbound {
+            _place: place,
+            lane,
+        });
+    }
+
+    fn is_unbound(&self) -> bool {
+        self.unbound.lock().unwrap().is_some()
+    }
+
+    /// Raise a connection that has just bound to its lane's limits, and
+    /// free its place under the unbound cap (task-d122).
+    fn mark_bound(&self) {
+        let Some(unbound) = self.unbound.lock().unwrap().take() else {
+            return;
+        };
+        lane::apply_to_connection(&self.conn, &unbound.lane);
+        drop(unbound);
+        self.bound.notify_one();
+    }
+
+    /// Close a connection whose `BindAck` was not written whole
+    /// (task-d122; #334 review). Once admitted, it was raised to its lane
+    /// before the write, so that the caller's next stream finds the lane's
+    /// limits. The caller never read the acknowledgement, so the connection
+    /// must not stay open at those limits; one that ended before it was
+    /// raised still holds its place under the unbound cap, which this
+    /// frees. Its token passed, so the reason is the one a client keeps its
+    /// token under and binds again.
+    fn close_unacknowledged(&self) {
+        self.refuse_unbound(CloseCode::Rejected, BIND_UNAVAILABLE);
+    }
+
+    /// Close a connection that has not bound, freeing its place at once
+    /// (task-d122). `reason` crosses the wire and is one of the fixed
+    /// strings, or empty.
+    fn refuse_unbound(&self, code: CloseCode, reason: &str) {
+        self.unbound.lock().unwrap().take();
+        self.conn
+            .close(VarInt::from_u32(code as u32), reason.as_bytes());
     }
 }
 
@@ -889,6 +1105,17 @@ struct Shared {
     /// What went between this node and its peers (task-d62).
     traffic: Traffic,
     accept_permits: Arc<Semaphore>,
+    /// Places for API connections without a certificate that have not
+    /// bound (task-d122; [`Limits::max_unbound`]).
+    unbound: Arc<Semaphore>,
+    /// The check a first bind passes before the runtime sees it
+    /// (task-d122; [`Transport::set_bind_gate`]).
+    gate: std::sync::RwLock<Option<Arc<dyn BindGate>>>,
+    /// Until when this node takes binds, in milliseconds after `epoch`:
+    /// `u64::MAX` before the runtime says, 0 when it takes none
+    /// ([`Transport::publish_fresh_until`]).
+    fresh_until: AtomicU64,
+    epoch: Instant,
     /// What this endpoint presents, and what it needs in order to present
     /// another leaf later (task-d02; see [`Transport::set_identity`]).
     tls: Mutex<Tls>,
@@ -962,6 +1189,26 @@ impl Shared {
 
     fn next_id(&self) -> ConnectionId {
         ConnectionId(self.next.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Whether this node takes binds now, as the runtime last said
+    /// (task-d122). Read in whole milliseconds, rounded down on both
+    /// sides, so it never says yes past the instant published.
+    fn binds_fresh(&self) -> bool {
+        let until = self.fresh_until.load(Ordering::Acquire);
+        if until == u64::MAX {
+            return true;
+        }
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        now < until
+    }
+
+    /// Send an event without waiting for room (task-d122): a close from
+    /// before negotiation, which an unauthenticated party can cause at
+    /// will, is dropped rather than wait on the runtime with its accept
+    /// permit held.
+    fn try_emit(&self, event: TransportEvent) {
+        let _ = self.events[event.lane().index()].try_send(event);
     }
 
     async fn emit(&self, event: TransportEvent) {
@@ -1228,7 +1475,8 @@ impl Dialer {
                         remote: conn.remote_address(),
                     })
                     .await;
-                tokio::spawn(serve(self.shared.clone(), peer, control_recv));
+                tokio::spawn(watch_control(peer.clone(), control_recv));
+                tokio::spawn(serve(self.shared.clone(), peer));
                 Ok(id)
             }
             Err(reason) => {
@@ -1540,6 +1788,10 @@ impl Transport {
             next: AtomicU64::new(1),
             traffic: Traffic::default(),
             accept_permits: Arc::new(Semaphore::new(limits.max_connections.max(1))),
+            unbound: Arc::new(Semaphore::new(limits.max_unbound)),
+            gate: std::sync::RwLock::new(None),
+            fresh_until: AtomicU64::new(u64::MAX),
+            epoch: Instant::now(),
             tls: Mutex::new(Tls {
                 provider,
                 roots: local.roots,
@@ -1638,6 +1890,36 @@ impl Transport {
         tls.collector = Some(config);
         tls.collector_until = until;
         Ok(())
+    }
+
+    /// Check the first bind of every API connection without a client
+    /// certificate with `gate` from now on, before the runtime sees it
+    /// (task-d122). Until a gate is installed such a bind goes to the
+    /// runtime unchecked, still alone on its connection and bounded by
+    /// its header.
+    pub fn set_bind_gate(&self, gate: Arc<dyn BindGate>) {
+        *self.shared.gate.write().unwrap() = Some(gate);
+    }
+
+    /// Say until when this node takes binds (task-d122): a first bind
+    /// from a connection without a certificate that arrives later is
+    /// closed as [`BIND_UNAVAILABLE`] before its token is checked, and
+    /// the caller keeps its token and retries. `None` says it takes none
+    /// until the next call; before the first call it takes every one.
+    ///
+    /// The runtime publishes the instant its own check would refuse
+    /// from, or an earlier one: an instant published early only makes a
+    /// caller retry, but one published late would spend a token check
+    /// the runtime then refuses anyway.
+    ///
+    /// [`BIND_UNAVAILABLE`]: crate::BIND_UNAVAILABLE
+    pub fn publish_fresh_until(&self, until: Option<Instant>) {
+        let millis = until.map_or(0, |at| {
+            u64::try_from(at.saturating_duration_since(self.shared.epoch).as_millis())
+                .unwrap_or(u64::MAX - 1)
+                .min(u64::MAX - 1)
+        });
+        self.shared.fresh_until.store(millis, Ordering::Release);
     }
 
     /// The fixed TLS profile.
@@ -2311,40 +2593,43 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
         // This endpoint's own leaf has ended: nothing is accepted under
         // it, whoever is asking.
         incoming.refuse();
-        shared
-            .emit(TransportEvent::Closed {
-                connection: id,
-                lane: None,
-                reason: CloseReason::Expired,
-            })
-            .await;
+        shared.try_emit(TransportEvent::Closed {
+            connection: id,
+            lane: None,
+            reason: CloseReason::Expired,
+        });
         return;
     }
+    // Closes before negotiation are not waited for (task-d122): an
+    // unauthenticated party can cause them at will, and waiting on the
+    // runtime here would hold the accept permit while it does.
     let conn = match timeout(shared.limits.handshake_timeout, incoming).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            shared
-                .emit(TransportEvent::Closed {
-                    connection: id,
-                    lane: None,
-                    reason: CloseReason::Transport(e.to_string()),
-                })
-                .await;
+            shared.try_emit(TransportEvent::Closed {
+                connection: id,
+                lane: None,
+                reason: CloseReason::Transport(e.to_string()),
+            });
             return;
         }
         Err(_) => {
-            shared
-                .emit(TransportEvent::Closed {
-                    connection: id,
-                    lane: None,
-                    reason: CloseReason::Timeout,
-                })
-                .await;
+            shared.try_emit(TransportEvent::Closed {
+                connection: id,
+                lane: None,
+                reason: CloseReason::Timeout,
+            });
             return;
         }
     };
     match negotiate_incoming(&shared, &conn).await {
-        Ok((class, lane, identity, control_recv)) => {
+        Ok(Negotiated {
+            class,
+            lane,
+            identity,
+            control,
+            unbound: None,
+        }) => {
             let peer = Peer::new(
                 id,
                 conn.clone(),
@@ -2365,23 +2650,150 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
                     remote: conn.remote_address(),
                 })
                 .await;
-            serve(shared, peer, control_recv).await;
+            tokio::spawn(watch_control(peer.clone(), control));
+            serve(shared, peer).await;
+        }
+        // No certificate: nothing reaches the runtime until a bind passes
+        // the gate (task-d122).
+        Ok(Negotiated {
+            class,
+            lane,
+            identity,
+            control,
+            unbound: Some((place, deadline)),
+        }) => {
+            let peer = Peer::new(
+                id,
+                conn.clone(),
+                class,
+                lane,
+                identity,
+                true,
+                &shared.limits.lanes[lane.index()],
+            );
+            peer.hold_unbound(place, shared.limits.lanes[lane.index()]);
+            tokio::spawn(watch_control(peer.clone(), control));
+            if admit_bind(&shared, &peer, until, deadline).await {
+                serve(shared, peer).await;
+            }
         }
         Err((reason, control)) => {
             let mut control = control;
             close_connection(&conn, control.as_mut(), &reason).await;
-            shared
-                .emit(TransportEvent::Closed {
-                    connection: id,
-                    lane: None,
-                    reason,
-                })
-                .await;
+            shared.try_emit(TransportEvent::Closed {
+                connection: id,
+                lane: None,
+                reason,
+            });
         }
     }
 }
 
-type Negotiated = (Class, Lane, BoundIdentity, ControlStream);
+/// A connection negotiated: its class, lane and identity, its control
+/// stream, and, for an API connection without a certificate, its place
+/// under the unbound cap and when its bind deadline falls (task-d122).
+struct Negotiated {
+    class: Class,
+    lane: Lane,
+    identity: BoundIdentity,
+    control: ControlStream,
+    unbound: Option<(OwnedSemaphorePermit, Instant)>,
+}
+
+/// The longest `Close` frame, length field included: the header, the
+/// code, the reason's length prefix and the longest reason, with room to
+/// spare. Nothing longer may sit on a control stream after `Hello`
+/// (task-d122).
+const MAX_CLOSE_FRAME: usize = 8 + 16 + MAX_REASON_BYTES;
+
+/// Take the first and only stream an API connection without a client
+/// certificate may open before it binds, and pass its `Bind` to the
+/// runtime only if the gate does (task-d122; see [`crate::gate`]).
+///
+/// A connection refused here is closed, and its place freed, without the
+/// runtime hearing of it. One that passes is registered and announced,
+/// its bind emitted as a request whose responder raises it to its lane
+/// when the runtime acknowledges the binding; true then.
+async fn admit_bind(shared: &Arc<Shared>, peer: &Arc<Peer>, until: u64, deadline: Instant) -> bool {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let (send, mut recv) = match timeout(left(), peer.conn.accept_bi()).await {
+        Ok(Ok(streams)) => streams,
+        Ok(Err(_)) => {
+            peer.unbound.lock().unwrap().take();
+            return false;
+        }
+        Err(_) => {
+            peer.refuse_unbound(CloseCode::Timeout, "");
+            return false;
+        }
+    };
+    let admit = Admit {
+        kind: Some(KIND_SESSION_BIND),
+        max_len: SESSION_BIND_MAX_FRAME,
+    };
+    let frame = match read_admitted(&mut recv, left(), true, admit).await {
+        Ok(frame) if frame.version == SESSION_BIND_VERSION => frame,
+        Err(FrameError::Timeout) => {
+            peer.refuse_unbound(CloseCode::Timeout, "");
+            return false;
+        }
+        Ok(_) | Err(_) => {
+            peer.refuse_unbound(CloseCode::Protocol, "");
+            return false;
+        }
+    };
+    // A node that does not take binds now says so before it reads the
+    // credential, so it answers every token alike and spends nothing on
+    // one (#323's order).
+    if !shared.binds_fresh() {
+        peer.refuse_unbound(CloseCode::Rejected, BIND_UNAVAILABLE);
+        return false;
+    }
+    let gate = shared.gate.read().unwrap().clone();
+    match gate.map_or(BindCheck::Pass, |gate| gate.check(&frame)) {
+        BindCheck::Pass => {}
+        BindCheck::Refused => {
+            peer.refuse_unbound(CloseCode::Rejected, BIND_REFUSED);
+            return false;
+        }
+        BindCheck::Unavailable => {
+            peer.refuse_unbound(CloseCode::Rejected, BIND_UNAVAILABLE);
+            return false;
+        }
+    }
+    spawn_expiry(shared, peer, until);
+    shared.register(peer.clone());
+    shared
+        .emit(TransportEvent::Connected {
+            connection: peer.id,
+            class: peer.class,
+            lane: peer.lane,
+            identity: peer.identity.clone(),
+            remote: peer.conn.remote_address(),
+        })
+        .await;
+    shared
+        .emit(TransportEvent::ApiRequest {
+            connection: peer.id,
+            lane: peer.lane,
+            identity: peer.identity.clone(),
+            frame,
+            responder: Responder {
+                send,
+                lane: peer.lane,
+                link: shared.link(Shared::link_key(peer)),
+                node: shared.node_budget.clone(),
+                deadline: shared.limits.frame_timeout,
+                received: Instant::now(),
+                binding: BindHold {
+                    peer: Some(peer.clone()),
+                    grace: shared.limits.bind_deadline,
+                },
+            },
+        })
+        .await;
+    true
+}
 
 async fn negotiate_incoming(
     shared: &Shared,
@@ -2400,13 +2812,38 @@ async fn negotiate_incoming(
             Class::Peer => return Err((reason, None)),
         },
     };
-    let (mut send, recv) = match timeout(shared.limits.handshake_timeout, conn.accept_bi()).await {
+    // Without a certificate the caller is nobody yet (task-d122): it
+    // takes a place under the unbound cap or is closed now, and one
+    // deadline, from here, covers its `Hello` and its bind.
+    let unbound = match certs {
+        Some(_) => None,
+        None => match shared.unbound.clone().try_acquire_owned() {
+            Ok(place) => Some((place, Instant::now() + shared.limits.bind_deadline)),
+            Err(_) => return Err((CloseReason::Rejected("unbound".into()), None)),
+        },
+    };
+    let wait = || {
+        unbound
+            .as_ref()
+            .map_or(shared.limits.handshake_timeout, |(_, deadline)| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(shared.limits.handshake_timeout)
+            })
+    };
+    let (mut send, recv) = match timeout(wait(), conn.accept_bi()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
         Err(_) => return Err((CloseReason::Timeout, None)),
     };
     let mut control = ControlStream::new(recv);
-    let frame = match control.next_frame(shared.limits.handshake_timeout).await {
+    // The first frame is `Hello`, and no longer than its class allows,
+    // known from its header before anything past it is read (task-d122).
+    let hello_only = Admit {
+        kind: Some(MessageKind::Hello as u16),
+        max_len: 4 + KindRange::Negotiation.max_frame_length() as usize,
+    };
+    let frame = match control.next_admitted(wait(), hello_only).await {
         Ok(f) => f,
         Err(e) => return Err((frame_reason(e), Some(send))),
     };
@@ -2494,25 +2931,35 @@ async fn negotiate_incoming(
         Ok(Ok(bytes)) => bytes,
         _ => return Err((CloseReason::Malformed("hello ack".into()), Some(send))),
     };
-    // The lane's stream limits and window apply from here on.
-    lane::apply_to_connection(conn, &shared.limits.lanes[lane.index()]);
-    if let Err(e) = send.write_all(&ack).await {
-        return Err((CloseReason::Transport(e.to_string()), None));
+    // The lane's stream limits and window apply from here on; for a
+    // connection without a certificate, from its `BindAck` (task-d122).
+    if unbound.is_none() {
+        lane::apply_to_connection(conn, &shared.limits.lanes[lane.index()]);
+    }
+    // The `HelloAck` is written within the same wait: a caller that grants
+    // the control stream no credit would otherwise hold its place past the
+    // bind deadline, and an unbound place is what anonymous callers share
+    // (#334 review).
+    match timeout(wait(), send.write_all(&ack)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
+        Err(_) => return Err((CloseReason::Timeout, None)),
     }
     // The control stream stays open: `Close` travels on it. The send half
     // is parked with the connection (dropping it would finish the stream).
     tokio::spawn(park_control(send, conn.clone()));
-    Ok((
+    Ok(Negotiated {
         class,
         lane,
-        BoundIdentity {
+        identity: BoundIdentity {
             role: bound.role,
             replica: bound.replica,
             incarnation: bound.incarnation,
             capabilities: granted,
         },
         control,
-    ))
+        unbound,
+    })
 }
 
 /// Keep the control send half alive until the connection closes.
@@ -2522,9 +2969,25 @@ async fn park_control(send: SendStream, conn: quinn::Connection) {
 }
 
 /// Serve a negotiated connection until it closes.
-async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
-    tokio::spawn(watch_control(peer.clone(), control));
+async fn serve(shared: Arc<Shared>, peer: Arc<Peer>) {
     let reason = loop {
+        // A connection whose bind is with the runtime opens nothing else
+        // until it is acknowledged (task-d122): another stream closes it.
+        if peer.is_unbound() {
+            tokio::select! {
+                biased;
+                () = peer.bound.notified() => continue,
+                accepted = peer.conn.accept_bi() => match accepted {
+                    Ok(_) => {
+                        *peer.close_reason.lock().unwrap() =
+                            Some(CloseReason::Malformed("stream before bind".into()));
+                        peer.refuse_unbound(CloseCode::Protocol, "");
+                        continue;
+                    }
+                    Err(e) => break e,
+                },
+            }
+        }
         // A reader permit is taken before the stream is accepted, so a
         // stalled consumer stops acceptance rather than growing a backlog.
         let permit = peer
@@ -2583,8 +3046,17 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
 
 /// Watch the control stream for an orderly `Close`.
 async fn watch_control(peer: Arc<Peer>, mut control: ControlStream) {
+    // After `Hello` only a `Close` travels here, so nothing longer is read
+    // (task-d122): a partial frame left on the stream holds no more.
+    let close_only = Admit {
+        kind: Some(MessageKind::Close as u16),
+        max_len: MAX_CLOSE_FRAME,
+    };
     loop {
-        match control.next_frame(Duration::from_secs(3600)).await {
+        match control
+            .next_admitted(Duration::from_secs(3600), close_only)
+            .await
+        {
             Ok(frame) => match decode(&frame) {
                 Ok(MessageV1::Close(c)) => {
                     *peer.close_reason.lock().unwrap() =
@@ -2956,6 +3428,7 @@ async fn read_request(
                         node: shared.node_budget.clone(),
                         deadline: shared.limits.frame_timeout,
                         received,
+                        binding: BindHold::NONE,
                     },
                 })
                 .await;

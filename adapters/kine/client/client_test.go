@@ -79,6 +79,8 @@ type serverBehavior struct {
 	unavailable atomic.Bool
 	// unavailableFrame answers a Bind with a Close frame saying the same.
 	unavailableFrame atomic.Bool
+	// bindSilent never answers a Bind: the client's wait runs out first.
+	bindSilent atomic.Bool
 }
 
 // runServer starts an in-process quic-go frontend. It reads the control
@@ -155,6 +157,10 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 			}
 			if frame.Kind == uint16(wire.KindBind) {
 				b.binds.Add(1)
+				if b.bindSilent.Load() {
+					<-conn.Context().Done()
+					return
+				}
 				if b.unavailable.Load() {
 					_ = s.Close()
 					_ = conn.CloseWithError(2, "bind unavailable")
@@ -543,18 +549,26 @@ func (s *countingTokens) Invalidate()                           { s.invalidated.
 // it; a refused token is still dropped (#320 follow-up).
 func TestBindUnavailableKeepsTheToken(t *testing.T) {
 	cert, pool := testCert(t)
-	for _, shape := range []string{"close after an empty stream", "close frame"} {
+	for _, shape := range []string{"close after an empty stream", "close frame", "no answer within the wait"} {
 		t.Run(shape, func(t *testing.T) {
 			b := &serverBehavior{expectToken: "svc-token", session: [16]byte{7, 7}}
-			if shape == "close frame" {
+			timeout := 2 * time.Second
+			switch shape {
+			case "close frame":
 				b.unavailableFrame.Store(true)
-			} else {
+			case "no answer within the wait":
+				// The frontend's own deadline starts after the client's,
+				// so its retryable close can arrive after the client gave
+				// up; the token is kept (#334 review).
+				b.bindSilent.Store(true)
+				timeout = 300 * time.Millisecond
+			default:
 				b.unavailable.Store(true)
 			}
 			addr, stop := runServer(t, cert, b)
 			defer stop()
 			tokens := &countingTokens{token: "svc-token"}
-			c := New(addr, Config{TLS: clientTLS(pool), Tokens: tokens, FrameTimeout: 2 * time.Second})
+			c := New(addr, Config{TLS: clientTLS(pool), Tokens: tokens, FrameTimeout: timeout})
 			inst := instance()
 			inv, _ := inst.Allocate([]byte("op"), command(1), 1000)
 			if _, err := c.Do(context.Background(), inv.Frame); !errors.Is(err, ErrBindUnavailable) {
@@ -569,6 +583,7 @@ func TestBindUnavailableKeepsTheToken(t *testing.T) {
 			// The frontend can bind again: the kept token binds.
 			b.unavailable.Store(false)
 			b.unavailableFrame.Store(false)
+			b.bindSilent.Store(false)
 			inv, _ = inst.Allocate([]byte("op"), command(2), 1000)
 			if out, err := c.Do(context.Background(), inv.Frame); err != nil || out.Unknown {
 				t.Fatalf("bind again: %v %+v", err, out)
