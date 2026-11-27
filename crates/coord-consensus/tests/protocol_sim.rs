@@ -419,11 +419,13 @@ struct Knobs {
     /// reports they haven't read (before task-d120), as
     /// `PROTOCOL_SIM_NO_REPORT_WAIT` sets for every run.
     no_report_wait: bool,
-    /// task-d121's rule on: every candidate selects with
+    /// task-d121's rule: with `Some(true)` every candidate selects with
     /// `SelectionRules::decide_nothing`, as a domain whose genesis names
-    /// `decided-nothing` does. `PROTOCOL_SIM_DECIDE_NOTHING=1` sets it
-    /// for every run.
-    decide_nothing: bool,
+    /// `decided-nothing` does, and with `Some(false)` none does. `None`
+    /// leaves it to `PROTOCOL_SIM_DECIDE_NOTHING=1`, which turns it on
+    /// for every run that doesn't set it: a directed control that
+    /// compares the two keeps both (Astra on #336).
+    decide_nothing: Option<bool>,
 }
 
 impl Knobs {
@@ -479,7 +481,7 @@ impl Knobs {
         forget_everywhere: false,
         holders_gone: None,
         no_report_wait: false,
-        decide_nothing: false,
+        decide_nothing: None,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -753,11 +755,12 @@ struct Node {
 fn rules(knobs: &Knobs) -> coord_consensus::SelectionRules {
     coord_consensus::SelectionRules {
         leave_out_unheld: true,
-        decide_nothing: knobs.decide_nothing || decide_nothing_on(),
+        decide_nothing: knobs.decide_nothing.unwrap_or_else(decide_nothing_on),
     }
 }
 
-/// `PROTOCOL_SIM_DECIDE_NOTHING=1`: task-d121's rule in every run.
+/// `PROTOCOL_SIM_DECIDE_NOTHING=1`: task-d121's rule in every run that
+/// doesn't set it ([`Knobs::decide_nothing`]).
 fn decide_nothing_on() -> bool {
     std::env::var("PROTOCOL_SIM_DECIDE_NOTHING").is_ok_and(|v| v == "1")
 }
@@ -839,8 +842,6 @@ struct Msg {
 struct Shadow {
     set: Option<VoteSet>,
     admission: Option<Digest32>,
-    /// Whether the acknowledgements counted carry the marker (task-d121).
-    nothing: Option<bool>,
     /// Leader replies waiting for an admission to count them under.
     leader: Vec<FastAck>,
 }
@@ -1610,20 +1611,31 @@ impl Sim {
                 // may.
                 Effect::Released(released) => {
                     let c = released.established().command();
-                    // A final release of the marker answers the command's
-                    // held callers as refused (task-d121's C2b).
-                    if !released.speculative()
+                    let nothing = !released.speculative()
                         && released
                             .admission()
                             .as_ref()
-                            .is_some_and(coord_consensus::is_nothing)
-                    {
-                        self.refuse_as_nothing(c, || format!("released by node {i}"));
+                            .is_some_and(coord_consensus::is_nothing);
+                    // A final release of the marker is the leader's
+                    // decision of a nothing, whether or not it reaches
+                    // the frontend (task-d121).
+                    if nothing {
+                        self.decide_as(c, true, || format!("released by node {i}"));
                     }
-                    if !self.marked.contains(&c) || released.speculative() {
+                    let marked = self.marked.contains(&c) && !released.speculative();
+                    if !(nothing || marked) {
                         continue;
                     }
+                    // Lost on the way, it answers no one (Codex on #336).
                     if !self.healing && self.chance("frontend-loss", self.knobs.frontend_loss) {
+                        continue;
+                    }
+                    // Delivered, it answers the command's held callers as
+                    // refused (task-d121's C2b).
+                    if nothing {
+                        self.refuse_as_nothing(c, || format!("released by node {i}"));
+                    }
+                    if !marked {
                         continue;
                     }
                     if released.admission() == self.submitted.get(&c).copied()
@@ -1691,11 +1703,9 @@ impl Sim {
         }
         match message {
             ProtocolMessage::FastAck(a) => {
-                shadow.nothing = Some(coord_consensus::is_nothing(&a.admission));
                 let _ = set.add(Vote::Fast(a));
             }
             ProtocolMessage::SlowAck(a) => {
-                shadow.nothing = Some(coord_consensus::is_nothing(&a.admission));
                 let _ = set.add(Vote::Slow(a));
             }
             ProtocolMessage::LeaderReply {
@@ -1722,9 +1732,11 @@ impl Sim {
                 let _ = set.add(Vote::Fast(reply));
             }
         }
-        let nothing = shadow
-            .nothing
-            .or_else(|| shadow.admission.as_ref().map(coord_consensus::is_nothing));
+        // The value is the one the counted votes accepted: an
+        // acknowledgement under another admission is refused by the set
+        // (`AdmissionConflict`), and says nothing of what was learned
+        // (Codex on #336).
+        let nothing = set.admission().as_ref().map(coord_consensus::is_nothing);
         if let Some(learned) = set.learned() {
             let deps = learned.deps().to_vec();
             if self.trace.is_some() && !self.decided.contains_key(&command) {
@@ -4228,10 +4240,13 @@ impl Sim {
     }
 
     /// Every admitted command settled, every decision the frontend
-    /// learned or a voter executed is in the one order, and every voter
+    /// learned, a voter counted or acknowledged at COMMIT, a leader
+    /// released or a voter executed is in the one order, and every voter
     /// executed as far as the others and has nothing left it could
     /// execute. A decision learned from a durable majority that the next
-    /// selection dropped would otherwise pass as settled.
+    /// selection dropped would otherwise pass as settled, and so would
+    /// one no frontend learned whose submitter was destroyed (Astra on
+    /// #336).
     fn healed(&self) -> bool {
         self.leader_index().is_some()
             && (0..self.n)
@@ -4244,6 +4259,7 @@ impl Sim {
             && self
                 .decided
                 .keys()
+                .chain(self.decided_as.keys())
                 .all(|c| self.executed_anywhere.contains(c))
             && self.unsettled().is_empty()
     }
@@ -5494,6 +5510,8 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
         crash: 5_000,
         holders_gone: Some(destroy),
         no_report_wait: true,
+        // Without the rule, whatever the environment says.
+        decide_nothing: Some(false),
         ..Knobs::row(10)
     };
     let run =
@@ -5556,7 +5574,7 @@ fn a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_sur
         campaign: 12_000,
         crash: 5_000,
         holders_gone: Some(destroy),
-        decide_nothing: true,
+        decide_nothing: Some(true),
         ..Knobs::row(10)
     };
     let run =
@@ -5611,7 +5629,7 @@ fn seed_2971_decides_both_shapes_as_nothing_at_five_voters_and_the_survivors_lea
         campaign: 12_000,
         crash: 5_000,
         holders_gone: Some(destroy),
-        decide_nothing: rule,
+        decide_nothing: Some(rule),
         ..Knobs::row(10)
     };
     let run = |destroy, rule| run_knobs_keeping(5, knobs(destroy, rule), 2971, Some(false));
@@ -5864,7 +5882,7 @@ fn row_20_fails_when_a_vote_does_not_rest_on_its_payload_row() {
     for decide_nothing in [false, true] {
         let knobs = Knobs {
             drop_payload_rows: true,
-            decide_nothing,
+            decide_nothing: Some(decide_nothing),
             ..Knobs::row(20)
         };
         let found = first_failure(3, knobs).or_else(|| first_failure(5, knobs));
@@ -6292,6 +6310,60 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
 /// at this row decides a nothing with the rule where the control gives
 /// up: a nothing takes its holders gone, as in
 /// `a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead`.
+/// The recovery check owes every decision a voter saw (Astra on #336). A
+/// decision counted at a quorum that no frontend learned and no voter
+/// executed, as one whose submitter was destroyed is, keeps a domain
+/// that is otherwise healed from passing as healed.
+#[test]
+fn a_decision_no_voter_executed_keeps_the_domain_from_healing() {
+    let mut sim = Sim::new(3, Knobs::row(10), 1);
+    assert!(sim.healed(), "a domain that has done nothing is healed");
+    let c = CommandId(Digest32([0x5d; 32]));
+    sim.decide_as(c, false, || "counted at node 1".to_owned());
+    assert!(!sim.healed(), "healed with a decision no voter executed");
+}
+
+/// What the frontend learned is the value the counted votes accepted
+/// (Codex on #336). After a quorum learns a command with its payload, a
+/// stray acknowledgement of it under the marker, which the vote set
+/// refuses (`AdmissionConflict`), is no second decision of it.
+#[test]
+fn an_acknowledgement_the_vote_set_refuses_is_no_second_decision() {
+    let mut sim = Sim::new(3, Knobs::row(10), 1);
+    let b = ballot(1, 0);
+    let c = CommandId(Digest32([0x5e; 32]));
+    let payload = Digest32([0x11; 32]);
+    sim.submitted.insert(c, payload);
+    let ack = |from: u8, admission| FastAck {
+        replica: r(from),
+        ballot: b,
+        command: c,
+        deps: Vec::new(),
+        paths: Vec::new(),
+        path: Digest32([0; 32]),
+        admission,
+        seqnum: None,
+    };
+    sim.at_frontend(
+        0,
+        ProtocolMessage::LeaderReply {
+            ballot: b,
+            command: c,
+            seqnum: 1,
+            deps: Vec::new(),
+            path: Digest32([0; 32]),
+        },
+    );
+    sim.at_frontend(1, ProtocolMessage::FastAck(ack(1, payload)));
+    assert!(sim.learned.contains(&c), "the fast quorum is learned");
+    assert_eq!(sim.decided_as.get(&c).map(|d| d.0), Some(false));
+    sim.at_frontend(
+        2,
+        ProtocolMessage::FastAck(ack(2, coord_consensus::commands::NOTHING_ADMISSION)),
+    );
+    assert_eq!(sim.decided_as.get(&c).map(|d| d.0), Some(false));
+}
+
 #[test]
 fn seeds_880_and_9857_lead_under_the_rule_where_they_gave_up_as_behind() {
     let knobs = |rule: bool| Knobs {
@@ -6299,7 +6371,7 @@ fn seeds_880_and_9857_lead_under_the_rule_where_they_gave_up_as_behind() {
         hold: 160_000,
         campaign: 12_000,
         crash: 5_000,
-        decide_nothing: rule,
+        decide_nothing: Some(rule),
         ..Knobs::row(10)
     };
     for seed in [880, 9857] {
@@ -6307,10 +6379,6 @@ fn seeds_880_and_9857_lead_under_the_rule_where_they_gave_up_as_behind() {
         assert_eq!(ruled.behind, 0, "seed {seed}: {ruled:?}");
         assert!(ruled.healed, "seed {seed}: {ruled:?}");
         assert_eq!(ruled.nothing_kept_by_drop, 0, "seed {seed}: {ruled:?}");
-        // `PROTOCOL_SIM_DECIDE_NOTHING` turns the rule on for every run.
-        if decide_nothing_on() {
-            continue;
-        }
         let off = run_knobs(3, knobs(false), seed, Some(false)).unwrap();
         assert!(off.behind_unexecuted > 0, "seed {seed}: {off:?}");
         assert_eq!(off.nothing_executed, 0, "seed {seed}: {off:?}");
