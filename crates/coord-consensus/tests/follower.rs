@@ -804,6 +804,7 @@ fn a_higher_promise_in_flight_fences_the_configured_ballot() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     assert!(matches!(effects.as_slice(), [Effect::Persist(_), ..]));
@@ -1290,6 +1291,7 @@ fn a_proposal_held_across_a_higher_promise_is_not_accepted_after_it() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: coord_types::ids::ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     for event in durable_of(&promised, 3) {
@@ -2425,6 +2427,7 @@ fn sync_entry_over_a_relayed_payload(phase: Phase) {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     settle(&mut f, promised, &mut seq);
@@ -3702,6 +3705,7 @@ fn a_new_ballot_drops_the_payloads_kept_with_the_old_ballots_proposals() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     settle(&mut f, promised, &mut seq);
@@ -3813,6 +3817,7 @@ fn a_sync_that_releases_a_kept_command_undecided_drops_its_kept_copy() {
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: ExecutionPosition::new(fit as u64).unwrap(),
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     // Executed behind the promise: room comes, and nothing kept is taken.
@@ -3843,6 +3848,7 @@ fn a_sync_that_releases_a_kept_command_undecided_drops_its_kept_copy() {
         ProtocolMessage::NewLeader {
             ballot: ballot(2, 0),
             executed: ExecutionPosition::new(fit as u64).unwrap(),
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     settle(&mut f, promised, &mut seq);
@@ -3892,6 +3898,7 @@ fn kept_payloads_are_taken_when_a_promise_row_fails_with_nothing_left_to_execute
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
             executed: ExecutionPosition::ZERO,
+            store: coord_types::ids::StoreInstanceId([0; 16]),
         },
     ));
     let barrier = effects_barrier(&promise);
