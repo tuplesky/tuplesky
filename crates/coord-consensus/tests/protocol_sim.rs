@@ -415,6 +415,11 @@ struct Knobs {
     /// reports they haven't read (before task-d120), as
     /// `PROTOCOL_SIM_NO_REPORT_WAIT` sets for every run.
     no_report_wait: bool,
+    /// task-d121's rule on: every candidate selects with
+    /// `SelectionRules::decide_nothing`, as a domain whose genesis names
+    /// `decided-nothing` does. `PROTOCOL_SIM_DECIDE_NOTHING=1` sets it
+    /// for every run.
+    decide_nothing: bool,
 }
 
 impl Knobs {
@@ -470,6 +475,7 @@ impl Knobs {
         forget_everywhere: false,
         holders_gone: None,
         no_report_wait: false,
+        decide_nothing: false,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -739,11 +745,18 @@ struct Node {
 
 /// The rules every candidate here selects under: one build everywhere,
 /// every voter on point 4, as a domain that activated `ReleaseAtExecution`
-/// is (task-d90).
-const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
-    leave_out_unheld: true,
-    decide_nothing: false,
-};
+/// is (task-d90), and task-d121's rule where `knobs` turns it on.
+fn rules(knobs: &Knobs) -> coord_consensus::SelectionRules {
+    coord_consensus::SelectionRules {
+        leave_out_unheld: true,
+        decide_nothing: knobs.decide_nothing || decide_nothing_on(),
+    }
+}
+
+/// `PROTOCOL_SIM_DECIDE_NOTHING=1`: task-d121's rule in every run.
+fn decide_nothing_on() -> bool {
+    std::env::var("PROTOCOL_SIM_DECIDE_NOTHING").is_ok_and(|v| v == "1")
+}
 
 /// What a node is handed in one step: an event, or a step of storage
 /// events ([`Knobs::storage_steps`]).
@@ -938,6 +951,12 @@ struct Sim {
     reoffered: BTreeSet<CommandId>,
     /// Commands executed anywhere: each has a record that answers it.
     executed_anywhere: BTreeSet<CommandId>,
+    /// How each command executed anywhere was executed: as a nothing
+    /// (task-d121), or with its payload.
+    executed_as_nothing: BTreeMap<CommandId, bool>,
+    /// Each node's current follower machine's count of selections
+    /// task-d121's condition 5 kept the rule off, as last read.
+    kept_by_drop_seen: Vec<u64>,
     /// The command each node's current follower machine gave its
     /// campaign up as `Behind` on, once counted: a machine that gave up
     /// refuses every later campaign of its boot on the same command.
@@ -1093,6 +1112,11 @@ struct Stats {
     queue_orders: u32,
     /// Batches a fence at a promise refused (`Knobs::fence`).
     fenced: u32,
+    /// Commands executed as nothing (task-d121), each counted once.
+    nothing_executed: u32,
+    /// Selections task-d121's condition 5 kept the rule off: a drop
+    /// behind a command no report holds was counted.
+    nothing_kept_by_drop: u64,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -1240,7 +1264,7 @@ impl Sim {
                     capacity: knobs.capacity,
                 });
                 follower.set_learning(LearningMode::Full);
-                follower.set_selection_rules(RULES);
+                follower.set_selection_rules(rules(&knobs));
                 follower.set_report_wait(report_wait_on() && !knobs.no_report_wait);
                 Role::Follower(follower)
             };
@@ -1288,6 +1312,8 @@ impl Sim {
             forgotten: BTreeSet::new(),
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
+            executed_as_nothing: BTreeMap::new(),
+            kept_by_drop_seen: vec![0; usize::from(n)],
             behind_counted: vec![None; usize::from(n)],
             behind_undecided_seen: vec![0; usize::from(n)],
             report_waits_seen: vec![0; usize::from(n)],
@@ -1700,7 +1726,7 @@ impl Sim {
                 let q = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut f = Follower::from_recovered(l.into_recovered(), q);
-                f.set_selection_rules(RULES);
+                f.set_selection_rules(rules(&self.knobs));
                 f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
                 // A new machine: its examinations count from here, against
                 // what it is given from here, its own carried selection
@@ -1720,6 +1746,7 @@ impl Sim {
                 self.behind_counted[usize::from(i)] = None;
                 self.behind_undecided_seen[usize::from(i)] = 0;
                 self.report_waits_seen[usize::from(i)] = 0;
+                self.kept_by_drop_seen[usize::from(i)] = 0;
                 self.report_wait_timers[usize::from(i)] = None;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
@@ -2561,21 +2588,25 @@ impl Sim {
             return;
         }
         let node = &mut self.nodes[usize::from(i)];
-        let (c, deps, position) = match node.role.as_ref().expect("alive") {
+        let (c, deps, position, nothing) = match node.role.as_ref().expect("alive") {
             Role::Leader(m) => {
                 let c = m.next_executable().expect("executable");
+                let record = m.table().record(&c);
                 (
                     c,
-                    m.table().record(&c).map(|r| r.deps.clone()),
+                    record.map(|r| r.deps.clone()),
                     m.executed_through(),
+                    record.is_some_and(coord_consensus::CommandRecord::is_nothing),
                 )
             }
             Role::Follower(m) => {
                 let c = m.next_executable().expect("executable");
+                let record = m.table().record(&c);
                 (
                     c,
-                    m.table().record(&c).map(|r| r.deps.clone()),
+                    record.map(|r| r.deps.clone()),
                     m.executed_through(),
+                    record.is_some_and(coord_consensus::CommandRecord::is_nothing),
                 )
             }
         };
@@ -2595,7 +2626,20 @@ impl Sim {
             && !node
                 .storage
                 .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0);
-        let response = response_of(&node.executed, &c, |x| self.offers.get(x).map(|o| o.key));
+        // A nothing executes as the canonical refusal, against no state
+        // and with no effect: the commands after it read the key as if
+        // it never ran (task-d121).
+        let response = if nothing {
+            nothing_response(&c)
+        } else {
+            let effective: Vec<CommandId> = node
+                .executed
+                .iter()
+                .filter(|x| self.executed_as_nothing.get(x) != Some(&true))
+                .copied()
+                .collect();
+            response_of(&effective, &c, |x| self.offers.get(x).map(|o| o.key))
+        };
         let outcome = AppliedOutcome {
             position,
             revision: None,
@@ -2655,6 +2699,28 @@ impl Sim {
                 self.executed_anywhere.insert(c);
             }
         }
+        // One decision of a command: executed as nothing everywhere, or
+        // with its payload everywhere (task-d121).
+        match self.executed_as_nothing.get(&c) {
+            Some(was) if *was != nothing => self.fail(&format!(
+                "node {i} executed {c:?} {} where another executed it {}",
+                if nothing {
+                    "as nothing"
+                } else {
+                    "with its payload"
+                },
+                if *was {
+                    "as nothing"
+                } else {
+                    "with its payload"
+                }
+            )),
+            Some(_) => {}
+            None => {
+                self.executed_as_nothing.insert(c, nothing);
+                self.stats.nothing_executed += u32::from(nothing);
+            }
+        }
         // Oracle 7 (task-d90): a result is released once its command is
         // executed in memory, and every execution of it anywhere, before
         // a crash or after, gives the same bytes.
@@ -2698,10 +2764,18 @@ impl Sim {
     /// there. Recovery re-executes a decided command, so a vote counted
     /// toward a decision without one could leave a released command's
     /// payload durable nowhere once every voter crashes.
+    ///
+    /// A vote for a nothing (task-d121) has no payload to rest on: it
+    /// rests on the nothing's dependency row durable there instead.
     fn check_vote_payload(&mut self, i: u8, message: &ProtocolMessage) {
-        let commands: Vec<CommandId> = match message {
-            ProtocolMessage::FastAck(a) if a.replica == r(i) => vec![a.command],
-            ProtocolMessage::SlowAck(a) if a.replica == r(i) => vec![a.command],
+        let nothing = |d: &Digest32| coord_consensus::is_nothing(d);
+        let commands: Vec<(CommandId, bool)> = match message {
+            ProtocolMessage::FastAck(a) if a.replica == r(i) => {
+                vec![(a.command, nothing(&a.admission))]
+            }
+            ProtocolMessage::SlowAck(a) if a.replica == r(i) => {
+                vec![(a.command, nothing(&a.admission))]
+            }
             ProtocolMessage::ReportPage(p) => {
                 let boot = self.nodes[usize::from(i)].boot;
                 if !self.pages_read.insert((i, boot, p.ballot.number, p.page)) {
@@ -2710,16 +2784,25 @@ impl Sim {
                 p.entries
                     .iter()
                     .filter(|e| e.payload_present)
-                    .map(|e| e.command)
+                    .map(|e| (e.command, false))
                     .collect()
             }
             _ => return,
         };
-        let held: BTreeSet<CommandId> = payload_rows(&self.nodes[usize::from(i)].storage)
+        let storage = &self.nodes[usize::from(i)].storage;
+        let held: BTreeSet<CommandId> = payload_rows(storage).into_iter().map(|(c, _)| c).collect();
+        let rows: BTreeSet<CommandId> = dependency_rows(storage)
             .into_iter()
+            .filter(|(_, r)| r.is_nothing())
             .map(|(c, _)| c)
             .collect();
-        if let Some(c) = commands.iter().find(|c| !held.contains(c)) {
+        if let Some((c, _)) = commands.iter().find(|(c, nothing)| {
+            if *nothing {
+                !rows.contains(c)
+            } else {
+                !held.contains(c)
+            }
+        }) {
             let what = match message {
                 ProtocolMessage::ReportPage(_) => "reported the payload of",
                 _ => "voted for",
@@ -2812,23 +2895,42 @@ impl Sim {
         let Some(Role::Leader(m)) = &self.nodes[usize::from(i)].role else {
             return;
         };
-        let proposed: Vec<CommandId> = self
+        // A nothing proposal (task-d121) rests on its dependency row,
+        // as a nothing vote does (`check_vote_payload`).
+        let proposed: Vec<(CommandId, bool)> = self
             .offers
             .keys()
-            .filter(|c| m.proposal(c).is_some_and(|p| p.barrier == barrier))
-            .copied()
+            .filter_map(|c| {
+                m.proposal(c)
+                    .filter(|p| p.barrier == barrier)
+                    .map(|p| (*c, coord_consensus::is_nothing(&p.admission)))
+            })
             .collect();
         if proposed.is_empty() {
             return;
         }
-        let held: BTreeSet<CommandId> = payload_rows(&self.nodes[usize::from(i)].storage)
+        let storage = &self.nodes[usize::from(i)].storage;
+        let held: BTreeSet<CommandId> = payload_rows(storage).into_iter().map(|(c, _)| c).collect();
+        let rows: BTreeSet<CommandId> = dependency_rows(storage)
             .into_iter()
+            .filter(|(_, r)| r.is_nothing())
             .map(|(c, _)| c)
             .collect();
-        if let Some(c) = proposed.iter().find(|c| !held.contains(c)) {
+        if let Some((c, nothing)) = proposed.iter().find(|(c, nothing)| {
+            if *nothing {
+                !rows.contains(c)
+            } else {
+                !held.contains(c)
+            }
+        }) {
             self.fail(&format!(
-                "leader {i}'s proposal of {} is durable with no durable payload row",
-                short(c)
+                "leader {i}'s proposal of {} is durable with no durable {}",
+                short(c),
+                if *nothing {
+                    "nothing row"
+                } else {
+                    "payload row"
+                }
             ));
         }
         self.stats.votes_checked += proposed.len();
@@ -2899,6 +3001,10 @@ impl Sim {
                     self.stats.report_waits +=
                         u32::try_from(waits.saturating_sub(*seen)).unwrap_or(u32::MAX);
                     *seen = waits;
+                    let kept = f.nothing_kept_by_drop();
+                    let seen = &mut self.kept_by_drop_seen[usize::from(i)];
+                    self.stats.nothing_kept_by_drop += kept.saturating_sub(*seen);
+                    *seen = kept;
                     for r in &rejections {
                         if let FollowerRejection::Behind { missing } = r
                             && self.behind_counted[usize::from(i)] != Some(*missing)
@@ -3119,7 +3225,7 @@ impl Sim {
         .restore_execution(executed, node.executed.iter().copied())
         .restore_payloads(payload_rows(&node.storage));
         f.set_learning(LearningMode::Full);
-        f.set_selection_rules(RULES);
+        f.set_selection_rules(rules(&self.knobs));
         f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
         // Restored from rows, its executions are the journal's (task-d90).
         if self.knobs.late_execution && !self.knobs.count_in_memory {
@@ -3131,6 +3237,7 @@ impl Sim {
         self.behind_counted[usize::from(i)] = None;
         self.behind_undecided_seen[usize::from(i)] = 0;
         self.report_waits_seen[usize::from(i)] = 0;
+        self.kept_by_drop_seen[usize::from(i)] = 0;
         self.report_wait_timers[usize::from(i)] = None;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
@@ -3638,13 +3745,21 @@ impl Sim {
 
     /// Oracle 7 once healed (task-d90): every voter's execution of every
     /// released command, read again from its order, gives the released
-    /// bytes.
+    /// bytes. A command executed as nothing reads as the canonical refusal
+    /// and is not in the order the commands after it read (task-d121).
     fn check_released(&mut self) {
         for i in 0..self.n {
             let executed = self.nodes[usize::from(i)].executed.clone();
+            let mut effective: Vec<CommandId> = Vec::with_capacity(executed.len());
             for (k, c) in executed.iter().enumerate() {
-                let response =
-                    response_of(&executed[..k], c, |x| self.offers.get(x).map(|o| o.key));
+                let response = if self.executed_as_nothing.get(c) == Some(&true) {
+                    nothing_response(c)
+                } else {
+                    let response =
+                        response_of(&effective, c, |x| self.offers.get(x).map(|o| o.key));
+                    effective.push(*c);
+                    response
+                };
                 if self.released.get(c).is_some_and(|r| *r != response) {
                     self.fail(&format!(
                         "after healing node {i} holds {} at {} with a result other than \
@@ -4389,6 +4504,15 @@ fn response_of(
     response.extend_from_slice(&same.last().map_or([0; 32], |p| p.0.0));
     response.extend_from_slice(&(same.len() as u64).to_be_bytes());
     response.push(key.unwrap_or(0xff));
+    response
+}
+
+/// What a command decided as nothing executes as at every voter: no
+/// effect, the same bytes everywhere (task-d121).
+fn nothing_response(c: &CommandId) -> Vec<u8> {
+    let mut response = Vec::with_capacity(46);
+    response.extend_from_slice(b"decided-nothing:");
+    response.extend_from_slice(&c.0.0);
     response
 }
 
@@ -5742,6 +5866,8 @@ fn seeds_from_the_environment() {
                 totals.unreported_drop_runs += s.unreported_drop_runs;
                 totals.bound_unreported += s.bound_unreported;
                 totals.fenced += s.fenced;
+                totals.nothing_executed += s.nothing_executed;
+                totals.nothing_kept_by_drop += s.nothing_kept_by_drop;
             }
             Err(failed) => {
                 let (e, s) = *failed;
@@ -5762,7 +5888,7 @@ fn seeds_from_the_environment() {
          with an undecided drop {}, of those on a command no voter executed {}), \
          report waits {}, half-initialized {}, \
          unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
-         fenced {}, failed {}",
+         fenced {}, executed as nothing {}, kept off the rule by a drop {}, failed {}",
         v[2],
         v[3],
         totals.behind,
@@ -5775,6 +5901,8 @@ fn seeds_from_the_environment() {
         totals.unreported_drop_runs,
         totals.bound_unreported,
         totals.fenced,
+        totals.nothing_executed,
+        totals.nothing_kept_by_drop,
         failures.len()
     );
     if knobs.holders_gone.is_some() {
@@ -5808,4 +5936,39 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
     };
     let stats = run_knobs(3, knobs, 3, Some(true)).unwrap();
     assert!(stats.queue_orders > 0, "{stats:?}");
+}
+
+/// Seeds 880 and 9857 (task-d121, traced on #312): row 10 at three
+/// voters under the targeted schedule, with no catch-up. In each, a
+/// command one voter pre-accepted is missing from both reports the
+/// selection counts, task-d120's wait does not bring that voter's report
+/// in, and the campaign gives up as `Behind` on it. Under the rule the
+/// command is decided as nothing once the wait passes, every voter
+/// executes it as the canonical refusal, and no campaign gives up.
+///
+/// The control runs the same schedule with the rule off: each seed
+/// gives up as `Behind` on a command no voter executed.
+#[test]
+fn seeds_880_and_9857_decide_the_unreported_command_as_nothing_and_lead() {
+    let knobs = |rule: bool| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        decide_nothing: rule,
+        ..Knobs::row(10)
+    };
+    for seed in [880, 9857] {
+        let ruled = run_knobs(3, knobs(true), seed, Some(false)).unwrap();
+        assert_eq!(ruled.behind, 0, "seed {seed}: {ruled:?}");
+        assert!(ruled.nothing_executed > 0, "seed {seed}: {ruled:?}");
+        assert_eq!(ruled.nothing_kept_by_drop, 0, "seed {seed}: {ruled:?}");
+        // `PROTOCOL_SIM_DECIDE_NOTHING` turns the rule on for every run.
+        if decide_nothing_on() {
+            continue;
+        }
+        let off = run_knobs(3, knobs(false), seed, Some(false)).unwrap();
+        assert!(off.behind_unexecuted > 0, "seed {seed}: {off:?}");
+        assert_eq!(off.nothing_executed, 0, "seed {seed}: {off:?}");
+    }
 }

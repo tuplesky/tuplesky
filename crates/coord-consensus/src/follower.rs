@@ -1199,6 +1199,17 @@ fn holds_nothing(table: &CommandTable, command: &CommandId) -> bool {
     table.record(command).is_some_and(CommandRecord::is_nothing)
 }
 
+/// Whether an adopted `command` has no payload to lack as a nothing
+/// (task-d121): its record a nothing, or the record retired as one. A
+/// nothing executed and retired stays adopted until the table forgets
+/// it, and the index of adopted commands lacking a payload must not take
+/// it back in the meantime.
+fn adopted_as_nothing(table: &CommandTable, command: &CommandId) -> bool {
+    table
+        .record(command)
+        .map_or_else(|| table.decided_nothing(command), CommandRecord::is_nothing)
+}
+
 /// Whether a held proposal is of a nothing (task-d121).
 fn proposes_nothing(held: &BTreeMap<CommandId, HeldProposal>, command: &CommandId) -> bool {
     held.get(command)
@@ -1329,7 +1340,7 @@ impl Follower {
             .filter(|(_, r)| r.phase >= Phase::Accept)
             .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
-        let adopted_lacking = lacking(adopted.keys(), &payloads, |c| holds_nothing(&table, c));
+        let adopted_lacking = lacking(adopted.keys(), &payloads, |c| adopted_as_nothing(&table, c));
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             answer_on_release: BTreeSet::new(),
@@ -5813,7 +5824,7 @@ impl Follower {
         self.bindings.retain(|_, c| !table.forgotten(c));
         let table = &self.table;
         self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads, |c| {
-            holds_nothing(table, c)
+            adopted_as_nothing(table, c)
         });
         let kept = &self.kept;
         let held = &self.held;
@@ -5836,7 +5847,10 @@ impl Follower {
     /// `payloads` or its record's payload changed for it (task-d46).
     fn note_lacking(&mut self, command: CommandId) {
         let lacks = !self.payloads.contains_key(&command);
-        if lacks && self.adopted.contains_key(&command) && !holds_nothing(&self.table, &command) {
+        if lacks
+            && self.adopted.contains_key(&command)
+            && !adopted_as_nothing(&self.table, &command)
+        {
             self.adopted_lacking.insert(command);
         } else {
             self.adopted_lacking.remove(&command);
@@ -5938,7 +5952,7 @@ impl Follower {
         debug_assert_eq!(
             self.adopted_lacking,
             lacking(self.adopted.keys(), &self.payloads, |c| {
-                holds_nothing(&self.table, c)
+                adopted_as_nothing(&self.table, c)
             }),
             "the adopted commands lacking a payload were not kept with the maps"
         );
