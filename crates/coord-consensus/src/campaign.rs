@@ -75,6 +75,10 @@ pub struct Campaign {
     /// last counted, by count: counted again only when one more could
     /// have (#335 review).
     answered_from: Option<usize>,
+    /// The reports the count read, and how many could be complete when
+    /// it read them: the next selection from as many takes them rather
+    /// than read them again (#335 review).
+    answered_reports: Option<(usize, Vec<RecoveryReport>)>,
     supply_moved: bool,
     /// How many times a payload or an execution arrived while the
     /// campaign had not selected (diagnostic, task-d33).
@@ -138,6 +142,7 @@ impl Campaign {
             assembled_from: None,
             answered: 0,
             answered_from: None,
+            answered_reports: None,
             supply_moved: false,
             supply_moves: 0,
             sources: Vec::new(),
@@ -444,9 +449,10 @@ impl Campaign {
         self.supply_moves
     }
 
-    /// How many times the complete reports were assembled for a selection
-    /// (task-d26): once per arrival from a majority on, never per page
-    /// before it.
+    /// How many times the complete reports were assembled, for a selection
+    /// or to count the voters that answered (task-d26): once per arrival
+    /// from a majority on, never per page before it. A selection made
+    /// after the count from the same reports takes the count's.
     pub const fn assemblies(&self) -> u64 {
         self.assemblies
     }
@@ -631,8 +637,17 @@ impl Campaign {
         let could_be_complete = self.could_be_complete();
         if self.answered_from != Some(could_be_complete) {
             self.answered_from = Some(could_be_complete);
-            self.answered = self.count_answered(&self.reports());
+            let reports = self.read_reports();
+            self.answered = self.count_answered(&reports);
+            self.answered_reports = Some((could_be_complete, reports));
         }
+    }
+
+    /// The complete reports ([`Campaign::reports`]), counted as one
+    /// assembly: each copies and hashes every entry of every report.
+    fn read_reports(&mut self) -> Vec<RecoveryReport> {
+        self.assemblies += 1;
+        self.reports()
     }
 
     /// The promised voters whose report is complete or past the page
@@ -761,8 +776,13 @@ impl Campaign {
         }
         self.assembled_from = Some(could_be_complete);
         self.supply_moved = false;
-        self.assemblies += 1;
-        let mut reports = self.reports();
+        // The count read these reports already where it read them from as
+        // many: the last page of a payload wait is counted, then selected
+        // from at once (#335 review).
+        let mut reports = match self.answered_reports.take() {
+            Some((from, reports)) if from == could_be_complete => reports,
+            _ => self.read_reports(),
+        };
         // A voter whose report announced more pages than the bound
         // answered too: its report is past the bound, as one too large is.
         let past_pages: Vec<RecoveryError> = self

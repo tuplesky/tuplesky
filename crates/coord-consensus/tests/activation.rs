@@ -8018,13 +8018,17 @@ fn under_the_rule_with_the_wait_off_an_acceptance_no_report_holds_a_payload_for_
 /// campaign waits task-d120's bound for a voter that holds it. The third
 /// voter's report holds nothing: no voter is left that could, so the wait
 /// passes with no timer, and the selection made again under the rule
-/// decides D as nothing.
+/// decides D as nothing. The reports are assembled once for the last
+/// page: the selection made again takes the ones the count of the
+/// voters that answered read (#335 review).
 #[test]
 fn under_the_rule_a_payload_wait_ends_when_the_last_voter_answers() {
     let (mut f, b, d, _, third) =
         campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
     assert!(f.report_wait().is_some(), "a payload wait");
     assert_eq!(f.report_waits(), 1);
+    let assemblies = |f: &Follower| f.campaign_state().expect("a campaign").assemblies();
+    let before = assemblies(&f);
     let decision = f
         .campaign_state()
         .and_then(|c| c.decision())
@@ -8058,6 +8062,11 @@ fn under_the_rule_a_payload_wait_ends_when_the_last_voter_answers() {
     assert_eq!(f.report_wait(), None, "the wait passed with no timer");
     assert_eq!(f.report_waits(), 1);
     assert!(f.take_rejections().is_empty());
+    assert_eq!(
+        assemblies(&f),
+        before + 1,
+        "the last page is assembled once"
+    );
     let decision = f
         .campaign_state()
         .and_then(|c| c.decision())
