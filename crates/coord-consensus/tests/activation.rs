@@ -8068,6 +8068,181 @@ fn under_the_rule_a_payload_wait_ends_when_the_last_voter_answers() {
     );
 }
 
+/// A payload wait does not end on a report it never reads (#335
+/// review). The third voter's pages arrive from one store, and then its
+/// promise names another: the report is complete but never read, as the
+/// selection reads none from another store than its promise, so the wait
+/// for a voter that holds D goes on. Read from the store its promise
+/// names, the same empty report ends the wait: the control.
+#[test]
+fn under_the_rule_a_payload_wait_does_not_end_on_a_report_from_another_store() {
+    for matching in [true, false] {
+        let (mut f, b, d, _, third) =
+            campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
+        assert!(f.report_wait().is_some(), "a payload wait");
+        let empty = RecoveryReport {
+            replica: r(third),
+            ballot: b,
+            committed_ballot: ballot(0, 0),
+            entries: Vec::new(),
+        };
+        let promised = coord_types::ids::StoreInstanceId(r(third).0);
+        let paged = if matching {
+            promised
+        } else {
+            coord_types::ids::StoreInstanceId(r(3).0)
+        };
+        assert_eq!(paged == promised, matching);
+        for page in coord_consensus::paginate(&empty, paged, coord_consensus::MAX_PAGE_ENTRIES) {
+            f.step(peer_event(r(third), ProtocolMessage::ReportPage(page)));
+        }
+        f.step(peer_event(
+            r(third),
+            ProtocolMessage::Promise {
+                ballot: b,
+                synced: ballot(0, 0),
+                replica: r(third),
+                store: promised,
+            },
+        ));
+        let decision = f
+            .campaign_state()
+            .and_then(|c| c.decision())
+            .expect("a selection");
+        assert_eq!(f.report_wait().is_none(), matching, "{decision:?}");
+        assert_eq!(decision.nothing.contains(&d), matching, "{decision:?}");
+        assert!(f.take_rejections().is_empty());
+    }
+}
+
+/// A stray end of a payload wait changes nothing (#335 review): with no
+/// wait running, `end_report_wait` neither drops the selection nor marks
+/// the wait as passed, so a later payload wait still waits its bound.
+/// Ended while one runs, it passes it: the control.
+#[test]
+fn under_the_rule_ending_no_report_wait_changes_nothing() {
+    let (mut f, _, d, _, _) = campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
+    let campaign = f.campaign_state().expect("a campaign");
+    assert!(!campaign.report_wait_passed());
+    let moves = campaign.supply_moves();
+    assert!(f.report_wait().is_some(), "a payload wait");
+    // Control: the wait running, its end passes it.
+    f.end_report_wait();
+    let campaign = f.campaign_state().expect("a campaign");
+    assert!(campaign.report_wait_passed());
+    let after = (campaign.decision().cloned(), campaign.supply_moves());
+    assert!(after.0.as_ref().is_some_and(|x| x.nothing.contains(&d)));
+    assert_ne!(after.1, moves);
+    // No wait running: a second end changes nothing.
+    f.end_report_wait();
+    let campaign = f.campaign_state().expect("a campaign");
+    assert_eq!(
+        (campaign.decision().cloned(), campaign.supply_moves()),
+        after
+    );
+    // Before any wait, an end changes nothing either.
+    let mut c =
+        coord_consensus::Campaign::new(f.campaign_state().expect("a campaign").config().clone());
+    c.set_rules(DECIDE_NOTHING);
+    assert!(!c.end_report_wait());
+    assert!(!c.report_wait_passed());
+    assert_eq!(c.supply_moves(), 0);
+}
+
+/// A payload wait ended by the timer (#335 review): D is pre-accepted at
+/// the member without its payload, and the third voter never answers.
+/// The selection kept through the wait re-proposes D with no value
+/// decided; once the bound passes it is dropped and made again under the
+/// rule, which decides D as nothing. The kept selection, before the
+/// bound, is the control.
+#[test]
+fn under_the_rule_a_payload_wait_ended_by_the_timer_decides_the_payload_as_nothing() {
+    let (mut f, _, d, _, _) = campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
+    assert!(f.report_wait().is_some(), "a payload wait");
+    let kept = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("the selection kept")
+        .clone();
+    assert!(
+        kept.reproposed.contains(&d) && kept.nothing.is_empty(),
+        "{kept:?}"
+    );
+    f.end_report_wait();
+    assert_eq!(f.report_wait(), None);
+    assert!(f.take_rejections().is_empty());
+    let campaign = f.campaign_state().expect("a campaign");
+    assert!(campaign.report_wait_passed());
+    let decision = campaign.decision().expect("selected again");
+    assert!(
+        decision.reproposed.contains(&d) && decision.nothing.contains(&d),
+        "{decision:?}"
+    );
+    assert_eq!(f.report_waits(), 1);
+}
+
+/// The `Behind` shape with the runtime's report wait off (#335 review):
+/// the wait passes at once, and the campaign decides D as nothing rather
+/// than give up. Without the rule the same campaign gives up as `Behind`
+/// at once: the control.
+#[test]
+fn under_the_rule_with_the_wait_off_a_dependency_no_report_holds_is_nothing_at_once() {
+    let (mut f, _, d, _, _) = campaign_under(DECIDE_NOTHING, false, None, false);
+    assert_eq!(f.report_wait(), None);
+    assert_eq!(f.report_waits(), 0);
+    let rejections = f.take_rejections();
+    assert!(rejections.is_empty(), "{rejections:?}");
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected with no timer");
+    assert!(
+        decision.reproposed.contains(&d) && decision.nothing.contains(&d),
+        "{decision:?}"
+    );
+    let (mut f, _, d, _, _) = campaign_under(
+        coord_consensus::SelectionRules {
+            decide_nothing: false,
+            ..DECIDE_NOTHING
+        },
+        false,
+        None,
+        false,
+    );
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Behind { missing: d })
+    );
+    assert!(f.campaign_state().is_none());
+}
+
+/// Above the forgetting floor the rule decides no new nothing (#335
+/// review): a missing row there is no evidence that the candidate never
+/// executed a command. The `Behind` shape gives up as `Behind` once the
+/// wait passes, as without the rule; at genesis it decides D as nothing:
+/// the control.
+#[test]
+fn under_the_rule_above_the_floor_no_nothing_is_decided() {
+    for above in [true, false] {
+        let (mut f, _, d, _, _) = waiting_behind_under(DECIDE_NOTHING, false, false);
+        f.set_floor_above_genesis(above);
+        f.end_report_wait();
+        let behind = f
+            .take_rejections()
+            .contains(&FollowerRejection::Behind { missing: d });
+        assert_eq!(behind, above);
+        assert_eq!(f.campaign_state().is_none(), above);
+        assert_eq!(f.nothing_decided(), 0, "counted once bound");
+        if !above {
+            let decision = f
+                .campaign_state()
+                .and_then(|c| c.decision())
+                .expect("selected");
+            assert!(decision.nothing.contains(&d), "{decision:?}");
+        }
+    }
+}
+
 /// A payload wait asks again for a lost promise (#335 review). D is
 /// pre-accepted at the member without its payload, and the third voter,
 /// the only one left that could hold it, never got the `NewLeader`. While

@@ -66,6 +66,15 @@ pub struct Campaign {
     /// payload arrived since: a selection that waited is tried again only
     /// when one of the two moved (task-d33).
     assembled_from: Option<usize>,
+    /// The voters that answered as the last assembly counted them: a
+    /// report read, the candidate's own included, or one past the page
+    /// bound (#335 review). [`Campaign::all_reported`] reads it, so that it
+    /// counts what the selection does.
+    answered: usize,
+    /// The promised voters that could have answered when `answered` was
+    /// last counted, by count: counted again only when one more could
+    /// have (#335 review).
+    answered_from: Option<usize>,
     supply_moved: bool,
     /// How many times a payload or an execution arrived while the
     /// campaign had not selected (diagnostic, task-d33).
@@ -127,6 +136,8 @@ impl Campaign {
             payload_sources_failed: BTreeSet::new(),
             assemblies: 0,
             assembled_from: None,
+            answered: 0,
+            answered_from: None,
             supply_moved: false,
             supply_moves: 0,
             sources: Vec::new(),
@@ -455,18 +466,16 @@ impl Campaign {
         self.decision.is_some() && self.selected_past_unreported
     }
 
-    /// Whether every voter of the ballot has answered: its promise is in
-    /// and its report is complete or past the page bound, the
-    /// candidate's own included. No other report can arrive.
-    pub fn all_reported(&self) -> bool {
-        let others = self
-            .assembler
-            .all_pages_held()
-            .chain(self.assembler.past_bound().keys())
-            .filter(|r| self.promised.contains(r))
-            .collect::<BTreeSet<_>>()
-            .len();
-        others + usize::from(self.own.is_some()) >= self.config.voters().len()
+    /// Whether every voter of the ballot has answered: its report read,
+    /// from the store its promise named and matching its digest, or past
+    /// the page bound, the candidate's own included. No other report can
+    /// arrive. Every page held is not enough (#335 review): a report from
+    /// another store than its promise, or one whose digest fails, is never
+    /// read, and the wait it would end is the one that may still bring the
+    /// voter's report in. The selection counts the same voters.
+    pub fn all_reported(&mut self) -> bool {
+        self.count_answers();
+        self.answered >= self.config.voters().len()
     }
 
     /// Wait for the reports not read yet, rather than give the campaign
@@ -516,22 +525,26 @@ impl Campaign {
     /// A selection kept while it waited for payloads (task-d121) is
     /// dropped, unless it was bound: made again, under the rule, it may
     /// decide as nothing what nobody could send.
+    ///
+    /// With no wait running nothing changes (#335 review): a stray call
+    /// would otherwise let the next selection decide a nothing with no
+    /// wait behind it.
     pub fn end_report_wait(&mut self) -> bool {
+        if self.report_wait.take().is_none() {
+            return false;
+        }
         let over = core::mem::replace(&mut self.report_wait_over, true);
-        let waited = self.report_wait.take().is_some();
         // The wait ends once, and the selection made after it may cost
         // one more assembly.
         if !over && self.bound.is_none() && !self.durable {
             self.supply_moves += 1;
         }
-        if waited {
-            self.supply_moved = true;
-            if self.bound.is_none() && !self.durable {
-                self.decision = None;
-                self.awaited = None;
-            }
+        self.supply_moved = true;
+        if self.bound.is_none() && !self.durable {
+            self.decision = None;
+            self.awaited = None;
         }
-        waited
+        true
     }
 
     /// Wait task-d120's bound before a selection under task-d121's rule
@@ -544,7 +557,7 @@ impl Campaign {
     /// read by the selection made after the wait. `false`, and nothing changes, where the rule is off,
     /// the wait has passed or already runs, or the selection is bound.
     pub fn wait_for_payload_holders(&mut self, missing: CommandId) -> bool {
-        if !self.rules.decide_nothing
+        if !self.rules.ruled()
             || self.report_wait_over
             || self.report_wait.is_some()
             || self.bound.is_some()
@@ -563,11 +576,7 @@ impl Campaign {
     /// rule. `false`, and nothing changes, where the rule is off, the wait
     /// has passed already, or the selection is bound.
     pub fn pass_report_wait(&mut self) -> bool {
-        if !self.rules.decide_nothing
-            || self.report_wait_over
-            || self.bound.is_some()
-            || self.durable
-        {
+        if !self.rules.ruled() || self.report_wait_over || self.bound.is_some() || self.durable {
             return false;
         }
         self.report_wait_over = true;
@@ -612,6 +621,42 @@ impl Campaign {
     /// Report pages held (task-d28).
     pub fn pages_held(&self) -> usize {
         self.assembler.pages_held()
+    }
+
+    /// Count again the voters that answered, once one more could have:
+    /// the reports are read again only then, as the assembly reads them.
+    /// A selection held is not made again, and a report that completes
+    /// meanwhile is counted here (#335 review).
+    fn count_answers(&mut self) {
+        let could_be_complete = self.could_be_complete();
+        if self.answered_from != Some(could_be_complete) {
+            self.answered_from = Some(could_be_complete);
+            self.answered = self.count_answered(&self.reports());
+        }
+    }
+
+    /// The promised voters whose report is complete or past the page
+    /// bound, the candidate's own included: those that could have
+    /// answered, before the reports are read.
+    fn could_be_complete(&self) -> usize {
+        self.assembler
+            .all_pages_held()
+            .chain(self.assembler.past_bound().keys())
+            .filter(|r| self.promised.contains(r))
+            .count()
+            + usize::from(self.own.is_some())
+    }
+
+    /// The voters that answered, given the reports read: those, and
+    /// each promised voter whose report is past the page bound.
+    fn count_answered(&self, reports: &[RecoveryReport]) -> usize {
+        reports.len()
+            + self
+                .assembler
+                .past_bound()
+                .keys()
+                .filter(|r| self.promised.contains(r) && !reports.iter().any(|x| x.replica == **r))
+                .count()
     }
 
     /// Complete reports from promising voters, own included.
@@ -694,22 +739,16 @@ impl Campaign {
         supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
         decided: impl CandidateDecisions,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
-        if self.decision.is_some() {
-            return Ok(self.decision.as_ref());
-        }
         // Assembling copies every entry of every complete report, and a
         // campaign is asked on every page and promise that arrives: until
         // a majority could be complete nothing is assembled (task-d26). A
         // voter whose report is past the page bound answered too, and
         // counts: with too few in bounds the campaign fails on it by name
         // (task-d24) rather than waiting for pages it will never hold.
-        let could_be_complete = self
-            .assembler
-            .all_pages_held()
-            .chain(self.assembler.past_bound().keys())
-            .filter(|r| self.promised.contains(r))
-            .count()
-            + usize::from(self.own.is_some());
+        let could_be_complete = self.could_be_complete();
+        if self.decision.is_some() {
+            return Ok(self.decision.as_ref());
+        }
         if could_be_complete < self.config.slow_size() {
             return Ok(None);
         }
@@ -737,7 +776,10 @@ impl Campaign {
                 limit: self.assembler.max_pages(),
             })
             .collect();
-        let everyone = reports.len() + past_pages.len() >= self.config.voters().len();
+        self.answered = reports.len() + past_pages.len();
+        self.answered_from = Some(could_be_complete);
+        debug_assert_eq!(self.answered, self.count_answered(&reports));
+        let everyone = self.answered >= self.config.voters().len();
         let oversize = |r: &RecoveryReport| RecoveryError::ReportTooLarge {
             replica: r.replica,
             entries: r.entries.len(),
@@ -769,7 +811,7 @@ impl Campaign {
         // report read, none set aside; where that selection still fails,
         // the set-aside, without the rule, and task-d79's give-up are the
         // fallback.
-        let ruled = self.rules.decide_nothing;
+        let ruled = self.rules.ruled();
         let mut fire = ruled && self.report_wait_over;
         // The reports before any was set aside, kept only where the rule
         // may yet apply to them.
