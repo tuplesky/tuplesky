@@ -3,6 +3,96 @@
 What an operator should know about a build before running it. The
 newest entry comes first.
 
+## Alpha: durability
+
+Acknowledged writes survive process crashes and modeled power loss (fsync semantics, tested with a fault-injecting filesystem). Not validated with real power cuts, lying storage devices or on-disk bit rot. Damage found at recovery is refused rather than repaired, and the node recovers from its peers. No background scrubbing.
+
+What a damaged voter does, case by case (design
+[Section 5.4](../design/tuplesky-design.md#s5-4) and its failure table):
+
+- **Its journal fails to open.** The voter quarantines its disk and
+  exits with status 2 at start, before it contacts any peer. Waiting
+  doesn't bring it back: an operator acts. It doesn't restart as an
+  empty voter. It comes back as a learner under a new generation,
+  through membership, and catches up from its peers from there.
+- **Its projection is lost or unreadable, and its journal is sound.**
+  Under the default journal profile, `journaled-strict-v1`, the voter
+  refuses to start. Under `journaled-replay-v1`, it discards the
+  projection, installs its local baseline and replays its own journal
+  onto it, then serves.
+
+Either way, the domain goes on serving while a majority of voters is up.
+
+## Alpha: a command whose payload is lost with its holders (task-d121)
+
+When every voter that held a command's payload is lost for good, a
+domain without the rule can stop electing a leader: a campaign whose
+selection must carry the command gives up on it, or waits for a voter
+that never answers. An election still succeeds where the surviving
+selection has nothing to carry for that command. With the rule, the
+voters left usually decide such a command as nothing and lead, but not
+always:
+
+- **The rule stays off where the order check can't read the order.**
+  Where a selection's order check dropped a possible fast decision
+  behind a dependency no report holds, the rule stays off for that
+  selection. Such a decision may have been made fast, under dependencies
+  the check couldn't read. A surviving majority then still gives up or
+  waits, as without the rule.
+- **The domain can stay without a leader after the loss.** If every
+  selection after the loss meets that case, no voter leads again until
+  the lost storage, or every voter, is restored. The simulator finds
+  such runs (seeds 363 and 582, after the only holder is destroyed).
+
+Design [4.9](../design/tuplesky-design.md#s4-9) states the rule and this
+limit.
+
+- **Turning it on.** The rule is a feature, on in a domain where both
+  `release-at-execution` and `decided-nothing` are active. There are two
+  ways:
+  - its genesis manifest names both (its `features`);
+  - a running domain activates them live while every voter is up,
+    through the leader's admin socket (`<state_directory>/admin.sock`,
+    here `$sock`):
+    1. `coordctl feature --socket "$sock" activate release-at-execution`.
+       Success can mean preparation has only started.
+    2. `coordctl feature --socket "$sock" status`, until
+       `release-at-execution` is in the active set.
+    3. `coordctl feature --socket "$sock" activate decided-nothing`,
+       which is refused until the first is active.
+
+  Either way it needs every voter, so it can't be switched on after the
+  loss. `coordctl feature --socket "$sock" status` shows a running
+  domain's active set, as the leader sees it. A
+  domain with neither active runs without the rule.
+- **What a caller sees.** The command takes effect as nothing. Its
+  submitter gets a definite refusal, `decided-nothing`, once the
+  nothing is decided, never before. A retry of the command meets the
+  same refusal once the nothing is committed. Before that it is held,
+  and it is answered with the command's release.
+- **A wiped voter is caught only where another voter recorded it.**
+  Each voter writes a random store identity at `init`. A voter refuses
+  a peer, or a candidate, that comes back under another identity than
+  the one it recorded. A candidate whose store was wiped before any
+  voter the campaign needs had recorded its identity is not caught.
+  A voter restored alone from an old copy of its own store carries
+  that store's identity, and no check finds it (design
+  [5.4](../design/tuplesky-design.md#s5-4)). Restore every voter from
+  the same backup, as the disaster-recovery runbook says.
+- **The manifest stands in for every voter preparing the feature.**
+  In a domain whose genesis names the feature, every voter writes the
+  same activation record from the signed manifest at `init`, and no
+  activation round runs. A domain whose genesis doesn't name the
+  feature activates it live, as above.
+
+## Alpha: clients are trusted (#312 finding 2)
+
+Alpha assumes trusted, authenticated clients. A bound client that stops
+reading its connection can stall the domain loop for about 10 s for
+each frame it blocks. The stall clears when the write times out, or on a
+restart. Connections without a client certificate are bounded before
+they bind (#334).
+
 ## Alpha: a voter's policy is bounded in staleness (#320)
 
 A voter's frontend answers bindings, output and watches from its own
