@@ -3908,12 +3908,17 @@ impl Leader {
     /// Nor before the payload row (task-d90): the leader's acceptance is a
     /// vote recovery may re-execute from, so it counts only where the
     /// payload row is durable here or in a proposal batch it waits on.
+    /// A nothing (task-d121) has no payload to re-execute: its acceptance
+    /// row is the whole value, so the leader counts its vote for one as
+    /// for any entry. Refusing it left a nothing re-proposal to the
+    /// followers' votes alone, and with only a majority up it never
+    /// committed, nor anything behind it.
     fn adopt_own(&mut self, command: CommandId, barrier: BarrierId) {
         if !self.served_payloads.contains(&command)
             && !self
                 .proposals
                 .get(&command)
-                .is_some_and(|p| writes_payload(&p.updates))
+                .is_some_and(|p| writes_payload(&p.updates) || is_nothing(&p.admission))
         {
             self.rejections.push(Rejection::NoPayloadRow(command));
             return;
