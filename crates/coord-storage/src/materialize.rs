@@ -16,7 +16,7 @@ use crate::journaled::TransitionKind;
 use crate::persistence::{Persistence, Refused};
 
 /// Lower a plan into the immutable batch materialization will apply:
-/// current rows, history versions, complete events of the revision, lease
+/// current rows, complete events (each mutated key's version, task-d105) of the revision, lease
 /// records and reverse-index rows, the KV revision frontier, the retention floor and, when the
 /// command has a stable invocation identity, its retry record and executed
 /// identity. The batch carries the plan's base so the worker rechecks it in
@@ -45,34 +45,22 @@ pub fn plan_to_batch(
     let revision = plan.revision;
     for m in &plan.mutations {
         match m {
+            // A write's or a delete's version is its revision's event row
+            // (task-d105): no history row is written.
             Mutation::Write { key, entry } => {
-                let rev = revision.expect("write implies a revision");
+                debug_assert!(revision.is_some(), "a write implies a revision");
                 updates.push(StoreUpdate {
                     collection: Collection::KvCurrentV1.id(),
                     key: codecs::current_key(&namespace, key),
                     value: Some(codecs::encode_current(entry)?),
                 });
-                updates.push(StoreUpdate {
-                    collection: Collection::KvHistoryV1.id(),
-                    key: codecs::history_key(&namespace, key, rev),
-                    value: Some(codecs::encode_history(&codecs::HistoryRecordV1 {
-                        entry: Some(entry.clone()),
-                    })?),
-                });
             }
             Mutation::Delete { key, .. } => {
-                let rev = revision.expect("delete implies a revision");
+                debug_assert!(revision.is_some(), "a delete implies a revision");
                 updates.push(StoreUpdate {
                     collection: Collection::KvCurrentV1.id(),
                     key: codecs::current_key(&namespace, key),
                     value: None,
-                });
-                updates.push(StoreUpdate {
-                    collection: Collection::KvHistoryV1.id(),
-                    key: codecs::history_key(&namespace, key, rev),
-                    value: Some(codecs::encode_history(&codecs::HistoryRecordV1 {
-                        entry: None,
-                    })?),
                 });
             }
             Mutation::LeaseAttach {
@@ -350,9 +338,31 @@ const LOWERINGS: usize = 64;
 /// which on the journal-first path means the record is safe but the
 /// state nobody can read yet. Reporting an outcome on any of those
 /// publishes a revision the next reader will not find.
+///
+/// A group on a pipelined store discloses its results earlier, at the
+/// group's `JournalDurable` (task-d63, design Section 4.5), because a
+/// result needs only its record; what this waits for is what an outcome
+/// reported here publishes as well, its revision to readers and
+/// watches.
 pub fn complete<P: Persistence>(
     store: &mut P,
     pending: &Pending,
+) -> Result<ApplyOutcome, EngineError> {
+    complete_sharing(store, pending, None)
+}
+
+/// [`complete`], handing every event that is not `pending`'s own to
+/// `others` when it is given, whatever the outcome.
+///
+/// A lowering moves whatever the store had queued, and on a replica that
+/// is the protocol's batches as well as this one: a vote, a promise, an
+/// adoption. Their `JournalDurable` is what releases the sends waiting on
+/// them, and it comes out of this lowering or out of none. Dropped here,
+/// the send it gated waited until a new ballot or a restart.
+pub(crate) fn complete_sharing<P: Persistence>(
+    store: &mut P,
+    pending: &Pending,
+    mut others: Option<&mut Vec<StorageEvent>>,
 ) -> Result<ApplyOutcome, EngineError> {
     let mut events = Vec::new();
     for _ in 0..LOWERINGS {
@@ -380,7 +390,12 @@ pub fn complete<P: Persistence>(
                 _ => {}
             }
         }
-        events.extend(lowered.events);
+        for event in lowered.events {
+            match others.as_deref_mut() {
+                Some(others) if event.barrier() != Some(pending.barrier) => others.push(event),
+                _ => events.push(event),
+            }
+        }
         if materialized {
             return Ok(ApplyOutcome::Applied(events));
         }
@@ -417,10 +432,73 @@ pub fn apply_plan<P: Persistence>(
     plan: &ApplyPlan,
     binding: Option<&RetryBinding>,
 ) -> Result<ApplyOutcome, EngineError> {
+    apply_plan_sharing(store, barrier, namespace, plan, binding, None)
+}
+
+/// [`apply_plan`], handing the events that are not the plan's own to
+/// `others` ([`complete_sharing`]).
+pub(crate) fn apply_plan_sharing<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    binding: Option<&RetryBinding>,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
     let (batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
+    land_prepared_sharing(store, batch, kind, &pending, others)
+}
+
+/// Submit a batch [`prepare`] made and complete it, handing the events that
+/// are not its own to `others` ([`complete_sharing`]).
+pub(crate) fn land_prepared_sharing<P: Persistence>(
+    store: &mut P,
+    batch: PersistBatch,
+    kind: TransitionKind,
+    pending: &Pending,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
     match submit(store, batch, kind)? {
-        Submitted::Accepted => complete(store, &pending),
+        Submitted::Accepted => complete_sharing(store, pending, others),
         Submitted::Replan => Ok(ApplyOutcome::Replan),
         Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
     }
+}
+
+/// Apply `plan` as `command`'s refusal: its position and whatever the plan
+/// carries, with `command`'s executed identity and nothing under a retry
+/// key.
+///
+/// A refused command executed like any other. Without its executed row a
+/// restart would find it unexecuted and execute it again, at a position
+/// after everything this voter executed since, which is not where the
+/// other voters executed it (task-d12).
+pub fn apply_refused_plan<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    command: &coord_types::CommandId,
+) -> Result<ApplyOutcome, EngineError> {
+    apply_refused_plan_sharing(store, barrier, namespace, plan, command, None)
+}
+
+/// [`apply_refused_plan`], handing the events that are not the plan's own
+/// to `others` ([`complete_sharing`]).
+pub(crate) fn apply_refused_plan_sharing<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    command: &coord_types::CommandId,
+    others: Option<&mut Vec<StorageEvent>>,
+) -> Result<ApplyOutcome, EngineError> {
+    let (mut batch, kind, pending) = prepare(barrier, namespace, plan, None)?;
+    batch.updates.push(crate::retry::executed_update(
+        command,
+        plan.position,
+        plan.revision,
+        pending.result_digest,
+    )?);
+    land_prepared_sharing(store, batch, kind, &pending, others)
 }

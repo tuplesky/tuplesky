@@ -33,6 +33,11 @@ var (
 	// ErrBindRejected: the frontend refused the session binding (the
 	// token was not accepted, or the answer was not an acknowledgement).
 	ErrBindRejected = errors.New("bind rejected")
+	// ErrBindUnavailable: the frontend can't bind now (its copy of the
+	// policy may be behind the domain's), and said so before it read the
+	// token, so the token is kept. Bind again, here later or at another
+	// frontend.
+	ErrBindUnavailable = errors.New("bind unavailable")
 	// ErrWatchLost: the watch stream or its connection ended without a
 	// close frame; resume from the last complete revision.
 	ErrWatchLost = errors.New("watch lost")
@@ -447,9 +452,21 @@ func readHelloAck(ctx context.Context, stream *quic.Stream, lane Lane) error {
 	}
 }
 
+// closeRejected is the close code a frontend refuses a binding with
+// (spec/wire-v1.md: Rejected).
+const closeRejected = 2
+
+// reasonBindUnavailable is the close reason of a frontend that can't
+// bind now: it says so before it reads the token, so the answer says
+// nothing about the token (#320 follow-up).
+const reasonBindUnavailable = "bind unavailable"
+
 // bindSession presents the token on its own stream and requires a
-// BindAck within the frame timeout; anything else (a Close, a reset, a
-// timeout) is a rejected binding and the connection is not used.
+// BindAck within the frame timeout; anything else the frontend answers
+// (a Close, a reset) is a rejected binding and the connection is not
+// used. Two exceptions keep the token: a frontend that says it can't bind
+// now, and a wait that runs out before the frontend answers at all.
+// ErrBindUnavailable says to bind again.
 func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string) error {
 	frame, err := wire.EncodeBind(wire.Bind{Token: []byte(token)})
 	if err != nil {
@@ -467,8 +484,27 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 	_ = stream.Close()
 	answer, err := readOneFrame(bindCtx, stream)
 	if err != nil {
+		if bindUnavailable(bindCtx, conn, err) {
+			return ErrBindUnavailable
+		}
+		if bindCtx.Err() != nil {
+			// The wait ran out here before the frontend said anything:
+			// its own deadline starts after ours, so its answer (a
+			// retryable close included) can still be on the way. Nothing
+			// refused the token, so it is kept (#334 review).
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return ErrBindUnavailable
+		}
 		c.invalidateToken()
 		return ErrBindRejected
+	}
+	if msg, err := wire.Decode(answer); err == nil {
+		if closing, ok := msg.(wire.Close); ok && closing.Code == closeRejected &&
+			string(closing.Reason) == reasonBindUnavailable {
+			return ErrBindUnavailable
+		}
 	}
 	ack, err := wire.DecodeBindAck(answer)
 	if err != nil {
@@ -476,6 +512,28 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 		return ErrBindRejected
 	}
 	return c.adopt(ack, sha256.Sum256([]byte(token)))
+}
+
+// bindUnavailable says whether a bind read that failed with readErr was a
+// frontend saying it can't bind now. The frontend ends the bind stream
+// unanswered and then closes the connection with the reason, so the read
+// can see either first: an ended stream waits, within ctx, for the close
+// that explains it.
+func bindUnavailable(ctx context.Context, conn *quic.Conn, readErr error) bool {
+	said := func(err error) bool {
+		var app *quic.ApplicationError
+		return errors.As(err, &app) && app.Remote &&
+			app.ErrorCode == closeRejected && app.ErrorMessage == reasonBindUnavailable
+	}
+	if said(readErr) {
+		return true
+	}
+	select {
+	case <-conn.Context().Done():
+		return said(context.Cause(conn.Context()))
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // invalidateToken tells a caching token source that the credential it

@@ -97,6 +97,10 @@ pub enum HashDomain {
     /// being abandoned, the cluster replacing it and the backup the
     /// restore is from (task-59).
     FencingAttestation,
+    /// The admission a command decided as nothing holds in place of
+    /// attested facts (task-d121). No admission receipt is under this
+    /// domain, so no presentation can equal it.
+    DecidedNothing,
 }
 
 impl HashDomain {
@@ -130,6 +134,7 @@ impl HashDomain {
             }
             HashDomain::ConfigurationBallot => "tuplesky coord.v1 2026-09 configuration-ballot",
             HashDomain::ConfigurationCatalog => "tuplesky coord.v1 2026-09 configuration-catalog",
+            HashDomain::DecidedNothing => "tuplesky coord.v1 2026-11 decided-nothing",
         }
     }
 
@@ -189,9 +194,14 @@ impl CommandId {
     /// Derive the identity. The request must be valid and canonical.
     pub fn derive(retry_key: &RetryKey, request: &LogicalRequest) -> Result<Self, ValidationError> {
         let payload = request.canonical_bytes()?;
-        Ok(CommandId(
-            HashDomain::CommandId.digest(&[&retry_key.canonical_bytes(), &payload]),
-        ))
+        Ok(Self::from_canonical(retry_key, &payload))
+    }
+
+    /// Derive the identity from a request's canonical bytes, already
+    /// checked to be canonical (as `RequestV1::logical` checks them): what
+    /// [`CommandId::derive`] computes, without encoding the request again.
+    pub fn from_canonical(retry_key: &RetryKey, canonical: &[u8]) -> Self {
+        CommandId(HashDomain::CommandId.digest(&[&retry_key.canonical_bytes(), canonical]))
     }
 
     /// Borrow the raw digest bytes.

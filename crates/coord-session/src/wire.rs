@@ -13,7 +13,7 @@ pub const KIND_BIND: u16 = coord_types::wire_v1::KIND_SESSION_BIND;
 /// The frontend acknowledges a binding.
 pub const KIND_BIND_ACK: u16 = coord_types::wire_v1::KIND_SESSION_BIND_ACK;
 /// Largest accepted token.
-pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
+pub const MAX_TOKEN_BYTES: usize = coord_types::wire_v1::SESSION_BIND_MAX_TOKEN_BYTES;
 const VERSION: u16 = coord_types::wire_v1::SESSION_BIND_VERSION;
 
 /// The binding request.

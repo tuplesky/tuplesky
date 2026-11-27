@@ -202,6 +202,11 @@ pub enum BindError {
     /// binding needed did not happen. Nothing is bound; the caller may
     /// present the credential again.
     Unavailable,
+    /// This node's policy may be behind the domain's (#312, #320), so it
+    /// binds nothing now. The node said so before it read the credential,
+    /// so this says nothing about the credential: the caller keeps it and
+    /// binds again, here once the node is fresh or at another node.
+    Stale,
 }
 
 fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -214,6 +219,23 @@ fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
         out[i] = u8::from_str_radix(s, 16).ok()?;
     }
     Some(out)
+}
+
+/// What a node checks of a connection's first bind before its frontend
+/// sees it (task-d122): that the frame decodes and its token verifies
+/// against `config` at `clock`, as [`verify_bind`] verifies it.
+///
+/// Whether the session exists, how the token compares with a binding the
+/// connection already holds, and whether the node's policy is fresh are
+/// the frontend's, after: this is only what an unauthenticated caller can
+/// make a node do, kept to one token check off the frontend's loop.
+pub fn check_bind(
+    config: &BindingConfig,
+    frame: &coord_types::wire_v1::Frame,
+    clock: &ClockHealth,
+) -> Result<(), BindError> {
+    let bind = crate::wire::decode_bind(frame).map_err(|_| BindError::Malformed)?;
+    verify_bind(config, bind.token.as_slice(), clock, None).map(|_| ())
 }
 
 /// Verify `token` at `clock` and produce the binding; with `existing`, a

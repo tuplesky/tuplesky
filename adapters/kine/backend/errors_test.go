@@ -31,6 +31,7 @@ func TestRejectionReasonsMapToActionableStatuses(t *testing.T) {
 		wire.RejectedSessionInvalid:    codes.Unauthenticated,
 		wire.RejectedRetryUnauthorized: codes.PermissionDenied,
 		wire.RejectedAdmissionMismatch: codes.PermissionDenied,
+		wire.RejectedDecidedNothing:    codes.Aborted,
 	}
 	for reason, code := range want {
 		err := mapOutcomeError(wire.Result{Kind: wire.OutcomeErrRejected, Reason: reason})
@@ -48,8 +49,8 @@ func TestRejectionReasonsMapToActionableStatuses(t *testing.T) {
 			t.Fatalf("reason %s: message %q does not name it", reason, s.Message())
 		}
 	}
-	if len(want) != 14 {
-		t.Fatalf("the reason table has %d entries; wire names 14", len(want))
+	if len(want) != 15 {
+		t.Fatalf("the reason table has %d entries; wire names 15", len(want))
 	}
 	// And the outcome is named rather than reported as a number.
 	if got := outcomeName(wire.OutcomeErrRejected); got != "ErrRejected" {
@@ -66,5 +67,30 @@ func TestARequestTooLargeIsNotRetried(t *testing.T) {
 	}
 	if !strings.Contains(s.Message(), "request too large") {
 		t.Fatalf("message %q does not name the reason", s.Message())
+	}
+}
+
+// An executed command whose result is withheld is not a refusal to admit,
+// and a retired result is neither (task-d23): each has its own status and
+// names what happened.
+func TestAWithheldResultAndARetiredOneAreTheirOwnStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		code uint16
+		want codes.Code
+		text string
+	}{
+		{codeOutputWithheld, codes.PermissionDenied, "executed, result withheld"},
+		{codeResultRetired, codes.DataLoss, "result retired"},
+	} {
+		s, _ := status.FromError(mapWireError(tc.code, []byte("x")))
+		if s.Code() != tc.want {
+			t.Fatalf("code %#04x: status %s, want %s", tc.code, s.Code(), tc.want)
+		}
+		if !strings.Contains(s.Message(), tc.text) {
+			t.Fatalf("code %#04x: message %q does not say %q", tc.code, s.Message(), tc.text)
+		}
+	}
+	if s, _ := status.FromError(mapWireError(codeNotAdmitted, []byte("x"))); strings.Contains(s.Message(), "withheld") {
+		t.Fatalf("not admitted reads as withheld: %q", s.Message())
 	}
 }

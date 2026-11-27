@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use coord_core::event::PeerProvenance;
 use coord_transport::{BindError, BoundIdentity, IdentityBinder, role_class};
 use coord_transport::{Class, LocalIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -187,7 +188,8 @@ pub fn roots_of(cas: &[&TestCa]) -> Arc<rustls::RootCertStore> {
 pub struct TestBinder {
     cluster: ClusterId,
     domain: DomainId,
-    known: HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole)>,
+    /// Each issued leaf's identity, with the domain it was issued for.
+    known: HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole, DomainId)>,
     /// When the credentials this binder admits stop being valid, in
     /// unix seconds (task-58). `None` leaves the connection bounded by
     /// the age cap alone, which is what every test that is not about
@@ -231,11 +233,22 @@ impl TestBinder {
         self.ends.insert(identity.chain[0].as_ref().to_vec(), until);
     }
 
-    /// Register an issued identity.
+    /// Register an issued identity, issued for this binder's domain.
     pub fn register(&mut self, identity: &TestIdentity) {
+        self.register_in(identity, self.domain);
+    }
+
+    /// Register an identity issued for `domain`: a sibling domain's,
+    /// under the same authority, when `domain` is not this binder's.
+    pub fn register_in(&mut self, identity: &TestIdentity, domain: DomainId) {
         self.known.insert(
             identity.chain[0].as_ref().to_vec(),
-            (identity.replica, identity.incarnation, identity.role),
+            (
+                identity.replica,
+                identity.incarnation,
+                identity.role,
+                domain,
+            ),
         );
     }
 }
@@ -247,7 +260,7 @@ impl IdentityBinder for TestBinder {
         hello: &HelloV1,
     ) -> Result<BoundIdentity, BindError> {
         let leaf = certs.first().ok_or(BindError::NoCertificate)?;
-        let (replica, incarnation, role) = self
+        let (replica, incarnation, role, issued_for) = self
             .known
             .get(leaf.as_ref())
             .ok_or(BindError::UnknownCertificate)?;
@@ -257,12 +270,25 @@ impl IdentityBinder for TestBinder {
         if hello.cluster_id != self.cluster {
             return Err(BindError::ClusterMismatch);
         }
-        if hello.domain_id != self.domain {
+        // The domain is the credential's, as the production binder takes
+        // it from the certificate; the Hello must name the same one.
+        if *issued_for != self.domain || hello.domain_id != self.domain {
             return Err(BindError::DomainMismatch);
         }
         let peer = role_class(*role) == Class::Peer;
         if peer && hello.incarnation != Some(*incarnation) {
             return Err(BindError::IncarnationMismatch);
+        }
+        // A non-voter peer never holds a voter's replica identity, as the
+        // production binder refuses one naming a committed voter: here,
+        // a voter registered with this binder.
+        if peer
+            && *role != PeerRole::Voter
+            && self.known.values().any(|(voter, _, known, domain)| {
+                *known == PeerRole::Voter && voter == replica && *domain == self.domain
+            })
+        {
+            return Err(BindError::NonVoterNamesVoter);
         }
         Ok(BoundIdentity {
             role: *role,
@@ -278,4 +304,22 @@ impl IdentityBinder for TestBinder {
             .and_then(|leaf| self.ends.get(leaf.as_ref()).copied())
             .unwrap_or(self.expires_at)
     }
+}
+
+/// The provenance the transport gives a peer frame once its link is
+/// bound with `role`, for a test that drives a runtime's handler
+/// directly, without a connection.
+///
+/// `PeerProvenance::from_transport` is confined to the transport crate
+/// (`cargo xtask check-deps`), and the scan covers a production crate's
+/// `#[cfg(test)]` modules too. This crate is test-only, so the policy
+/// keeps it off every production edge. A unit test that needs a link's
+/// provenance takes it from here and doesn't mint one itself.
+pub const fn bound_provenance(
+    from: ReplicaId,
+    incarnation: ReplicaIncarnation,
+    role: PeerRole,
+    connection: u64,
+) -> PeerProvenance {
+    PeerProvenance::from_transport(from, incarnation, role, connection)
 }

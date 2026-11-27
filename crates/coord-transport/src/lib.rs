@@ -41,20 +41,28 @@ pub mod budget;
 pub mod config;
 pub mod endpoint;
 pub mod frames;
+pub mod gate;
 pub mod identity;
 pub mod lane;
 pub mod sched;
 
 pub use budget::{Budget, BudgetError, BudgetLimits};
-pub use config::{ALPN_API, ALPN_PEER, Class, ClientIdentity, Limits, LocalIdentity, TlsProfile};
-pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
-    Transport, TransportError, TransportEvent,
+pub use config::{
+    ALPN_API, ALPN_PEER, AckFrequency, Class, ClientIdentity, Congestion, Limits, LocalIdentity,
+    Reordering, TlsProfile,
 };
-pub use frames::{FrameError, KIND_PEER_EVIDENCE, evidence_frame};
+pub use endpoint::{
+    CloseCode, CloseReason, ConnectionId, Destination, Dialer, PathReading, Refused, RequestError,
+    Responder, SendError, TrafficReader, Transport, TransportError, TransportEvent, WakeHold,
+};
+pub use frames::{
+    Admit, CAPABILITY_FRAMES_PER_STREAM, FrameError, FrameStream, KIND_PEER_EVIDENCE,
+    MAX_FRAMES_PER_STREAM, evidence_frame,
+};
+pub use gate::{BIND_REFUSED, BIND_UNAVAILABLE, BindCheck, BindGate};
 pub use identity::{BindError, BoundIdentity, IdentityBinder, role_class};
 pub use lane::{Lane, LaneError, LaneLimits, lane_of_hello, role_lanes};
-pub use sched::{FairQueue, LaneStats, QueueError, Queued, WaitStats};
+pub use sched::{Datagrams, FairQueue, LaneStats, PeerTraffic, QueueError, Queued, WaitStats};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

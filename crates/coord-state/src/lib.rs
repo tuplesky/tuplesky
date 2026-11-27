@@ -72,14 +72,14 @@ pub use expiry::{
 };
 pub use internal::InternalCommand;
 pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
-pub use limits::{PlanLimits, SESSION_RETRY_WINDOW};
+pub use limits::{MAX_LEASE_BYTES, PlanLimits, SESSION_RETRY_WINDOW};
 pub use plan::{
     ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, RejectionReason,
     Response,
 };
 pub use planner::{
-    PlanError, authorize_retained, plan, plan_internal, rejection_plan, rejection_plan_at,
-    service_command,
+    PlanError, authorize_retained, decided_nothing_plan, plan, plan_internal, rejection_plan,
+    rejection_plan_at, service_command,
 };
 pub use policy::{
     Action, AdmissionReceiptV1, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval,

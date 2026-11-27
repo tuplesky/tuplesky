@@ -3,6 +3,9 @@
 //! pinned public key delivered through deployment trust; a larger epoch
 //! or a discovery-node signature alone is never sufficient.
 
+use std::collections::BTreeSet;
+
+use coord_types::formats::Feature;
 use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::{
     ClusterId, ConfigurationEpoch, DomainId, PrincipalId, ReplicaId, ReplicaIncarnation,
@@ -55,6 +58,25 @@ pub struct GenesisManifest {
     pub admin: String,
     /// Protocol/version policy identifier.
     pub protocol_version: u32,
+    /// The features active from genesis, by stable name
+    /// (`Feature::name`; task-d121, design Section 10.2).
+    ///
+    /// A feature that keeps a stalled domain going can't be activated
+    /// once it has stalled: activation needs a leader. So a domain names
+    /// such a feature here, under the manifest's signature, and every
+    /// voter's `init` records it active with no activation round. Left
+    /// out of the serialized manifest when empty, so a manifest naming
+    /// none keeps the digest it had before this field existed.
+    ///
+    /// A manifest that names one carries [`FEATURES_PROTOCOL_VERSION`],
+    /// and one naming none carries [`PROTOCOL_VERSION`]
+    /// ([`GenesisManifest::check_protocol`]). A build from before this
+    /// field drops it when it parses the manifest, and would verify the
+    /// rest and pin another digest. That build accepts only
+    /// [`PROTOCOL_VERSION`], so it refuses such a manifest at `init` and
+    /// at start instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// Why a manifest was rejected.
@@ -75,10 +97,37 @@ pub enum GenesisError {
     },
     /// The admin key is not a PEM-encoded P-256 public key.
     AdminKey,
+    /// A manifest at [`FEATURES_PROTOCOL_VERSION`] that names no
+    /// feature. Each version has one meaning: a manifest naming none
+    /// carries [`PROTOCOL_VERSION`] (#329 review).
+    VersionWithoutFeatures {
+        /// The manifest's version.
+        version: u32,
+    },
+    /// A feature the manifest names can't be active from genesis.
+    Feature {
+        /// The name as the manifest gives it.
+        name: String,
+        /// Why.
+        reason: String,
+    },
 }
 
 /// The protocol version this build's genesis manifests carry.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The protocol version a genesis manifest naming features carries
+/// (task-d121). A build that predates `features` accepts only
+/// [`PROTOCOL_VERSION`], so it refuses such a manifest rather than drop
+/// the features and pin another digest; a manifest naming none keeps
+/// [`PROTOCOL_VERSION`], with its encoding and pin unchanged.
+pub const FEATURES_PROTOCOL_VERSION: u32 = 2;
+
+/// The genesis protocol versions this build reads: what a `coordd`
+/// built from this source passes to [`verify_genesis`], and what
+/// [`sign_genesis`] checks a manifest against before it signs. A caller
+/// modelling another build passes that build's versions instead.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION, FEATURES_PROTOCOL_VERSION];
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -121,13 +170,99 @@ impl GenesisManifest {
         ))
     }
 
+    /// The features active from genesis, or why one named can't be.
+    ///
+    /// Each name is a feature this build supports and activates through
+    /// a prepare marker, named once, with every feature it rests on
+    /// (`Feature::requires`) named too. A marker is never named: the
+    /// record `init` writes carries each feature's marker with it.
+    pub fn genesis_features(&self) -> Result<BTreeSet<Feature>, GenesisError> {
+        let refused = |name: &str, reason: String| GenesisError::Feature {
+            name: name.to_owned(),
+            reason,
+        };
+        let mut out = BTreeSet::new();
+        for name in &self.features {
+            let Some(feature) = Feature::from_name(name) else {
+                return Err(refused(name, "this build knows no such feature".into()));
+            };
+            if feature.is_marker() {
+                return Err(refused(
+                    name,
+                    "a prepare marker is written with its feature, never named".into(),
+                ));
+            }
+            if feature.prepare_marker().is_none() {
+                return Err(refused(
+                    name,
+                    "it has no prepare marker, so it is not activated from genesis".into(),
+                ));
+            }
+            if !coord_types::formats::Supported::supports(feature) {
+                return Err(refused(name, "this build does not support it".into()));
+            }
+            if !out.insert(feature) {
+                return Err(refused(name, "named twice".into()));
+            }
+        }
+        for feature in &out {
+            if let Some(required) = feature.requires()
+                && !out.contains(&required)
+            {
+                return Err(refused(
+                    feature.name(),
+                    format!("it rests on {}, which is not named", required.name()),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// A stable digest of the canonical manifest, used to pin it durably.
     pub fn digest(&self) -> Digest32 {
         let canonical = serde_json::to_vec(self).expect("serializable");
         HashDomain::AuthGrantCommitment.digest(&[b"genesis-manifest", &canonical])
     }
 
-    fn validate(&self, supported_protocol: u32) -> Result<(), GenesisError> {
+    /// The manifest's protocol version, checked against the versions the
+    /// caller reads and against its features: the one rule the signer
+    /// and every verifier apply (#329 review).
+    ///
+    /// - A version the caller doesn't read is
+    ///   [`GenesisError::UnsupportedProtocol`].
+    /// - A manifest naming a feature carries
+    ///   [`FEATURES_PROTOCOL_VERSION`], which a build without features
+    ///   refuses ([`GenesisError::Feature`] otherwise).
+    /// - A manifest naming none carries [`PROTOCOL_VERSION`]
+    ///   ([`GenesisError::VersionWithoutFeatures`] otherwise).
+    pub fn check_protocol(&self, supported: &[u32]) -> Result<(), GenesisError> {
+        if !supported.contains(&self.protocol_version) {
+            return Err(GenesisError::UnsupportedProtocol {
+                version: self.protocol_version,
+            });
+        }
+        match self.features.first() {
+            Some(first) if self.protocol_version != FEATURES_PROTOCOL_VERSION => {
+                Err(GenesisError::Feature {
+                    name: first.clone(),
+                    reason: format!(
+                        "a manifest naming a feature carries protocol version \
+                         {FEATURES_PROTOCOL_VERSION}, which a build without features \
+                         refuses; this one carries {}",
+                        self.protocol_version
+                    ),
+                })
+            }
+            None if self.protocol_version != PROTOCOL_VERSION => {
+                Err(GenesisError::VersionWithoutFeatures {
+                    version: self.protocol_version,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate(&self, supported: &[u32]) -> Result<(), GenesisError> {
         if self.cluster_id().is_none()
             || self.domain_id().is_none()
             || self.config_epoch().is_none()
@@ -143,11 +278,8 @@ impl GenesisManifest {
                 return Err(GenesisError::Invalid);
             }
         }
-        if self.protocol_version != supported_protocol {
-            return Err(GenesisError::UnsupportedProtocol {
-                version: self.protocol_version,
-            });
-        }
+        self.check_protocol(supported)?;
+        self.genesis_features()?;
         Ok(())
     }
 }
@@ -157,10 +289,18 @@ impl GenesisManifest {
 pub struct SignedGenesis(pub String);
 
 /// Sign a manifest with the admin ES256 key (provisioning trust).
+///
+/// A manifest whose version and features break
+/// [`GenesisManifest::check_protocol`] for this build is refused before
+/// it is signed. Signed, a feature-bearing manifest at
+/// [`PROTOCOL_VERSION`] would be refused by a build with features and
+/// read without them by one from before: a majority of older voters could
+/// serve with the features off (#329 review).
 pub fn sign_genesis(
     manifest: &GenesisManifest,
     key: &EncodingKey,
 ) -> Result<SignedGenesis, GenesisError> {
+    manifest.check_protocol(SUPPORTED_PROTOCOL_VERSIONS)?;
     let mut header = Header::new(Algorithm::ES256);
     header.typ = Some("genesis+jwt".into());
     let mut claims = serde_json::to_value(manifest).map_err(|_| GenesisError::Malformed)?;
@@ -235,10 +375,14 @@ pub fn admin_key_from_pem(pem: &[u8]) -> Result<DecodingKey, GenesisError> {
 }
 
 /// Verify a delivered manifest against the pinned public key.
+///
+/// `supported` is every protocol version the caller reads: a node built
+/// from this source passes [`SUPPORTED_PROTOCOL_VERSIONS`]. The manifest
+/// must satisfy [`GenesisManifest::check_protocol`] against it.
 pub fn verify_genesis(
     signed: &SignedGenesis,
     pinned: &DecodingKey,
-    supported_protocol: u32,
+    supported: &[u32],
 ) -> Result<GenesisManifest, GenesisError> {
     let header = decode_header(&signed.0).map_err(|_| GenesisError::Malformed)?;
     if header.alg != Algorithm::ES256
@@ -254,7 +398,7 @@ pub fn verify_genesis(
     validation.required_spec_claims.clear();
     let data = decode::<GenesisManifest>(&signed.0, pinned, &validation)
         .map_err(|_| GenesisError::Signature)?;
-    data.claims.validate(supported_protocol)?;
+    data.claims.validate(supported)?;
     Ok(data.claims)
 }
 

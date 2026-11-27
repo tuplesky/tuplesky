@@ -15,6 +15,9 @@ by the lightweight CI job. Checks:
 * Every ```mermaid`` block has a known diagram type, balanced quotes and, in
   sequence diagrams, no unescaped ``;`` inside messages (Section 12.4). With
   ``--render``, each block is also rendered with the pinned mermaid-cli.
+* No file repeats a level-2 heading: a stale copy pasted below a file's
+  real content keeps every link and task reference valid, so nothing else
+  here would notice it.
 """
 from __future__ import annotations
 
@@ -217,6 +220,23 @@ def parse_plan(plan_path: Path, report: Report):
     return set(specs), design_refs
 
 
+def check_duplicate_headings(files: list[Path], report: Report) -> None:
+    for path in files:
+        seen: dict[str, int] = {}
+        in_fence = False
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence or not line.startswith("## "):
+                continue
+            title = line[3:].strip()
+            if title in seen:
+                report.error(path, lineno, f"heading {title!r} repeats the one at line {seen[title]}")
+            else:
+                seen[title] = lineno
+
+
 def check_task_references(files: list[Path], known: set[str], report: Report) -> None:
     allowed = known | RETIRED_TASKS
     for path in files:
@@ -318,6 +338,7 @@ def main(argv=None) -> int:
     else:
         report.error(plan_path, None, "plan document missing")
     check_task_references(files, known, report)
+    check_duplicate_headings(files, report)
     for path in files:
         for lineno, block in mermaid_blocks(path.read_text(encoding="utf-8")):
             report.checked_mermaid += 1

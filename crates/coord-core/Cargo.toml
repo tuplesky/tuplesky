@@ -18,3 +18,4 @@ serde.workspace = true
 [dev-dependencies]
 postcard.workspace = true
 coord-sim.workspace = true
+serde_json.workspace = true

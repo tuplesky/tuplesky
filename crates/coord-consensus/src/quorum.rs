@@ -7,6 +7,7 @@
 //! `ThreeQuarters`). A different fast set needs a higher ballot.
 
 use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 
 use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,11 @@ pub enum ConfigurationError {
 /// construct one, and decoding goes through the same validation, so every
 /// value in existence satisfies the quorum invariants (the leader is a
 /// voter in every fast set; a C2 fast set is exactly a majority).
+///
+/// The voter sets are shared, never changed after construction, so a
+/// clone (one per command's vote set, on every voter and in the
+/// collector) is two reference counts rather than two trees (task-d60).
+/// The encoding is the sets', unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BallotConfiguration {
     /// Configuration epoch (exact voter identities).
@@ -98,11 +104,21 @@ pub struct BallotConfiguration {
     /// Ballot; its leader leads every quorum.
     ballot: Ballot,
     /// Exact voters of the epoch.
-    voters: BTreeSet<ReplicaId>,
+    #[serde(serialize_with = "shared_set")]
+    voters: Arc<BTreeSet<ReplicaId>>,
     /// C2: the fixed fast set. C1: every voter is eligible.
-    fast_set: BTreeSet<ReplicaId>,
+    #[serde(serialize_with = "shared_set")]
+    fast_set: Arc<BTreeSet<ReplicaId>>,
     /// Fast-quorum class.
     class: FastQuorumClass,
+}
+
+/// A shared set encodes as the set itself.
+fn shared_set<S: serde::Serializer>(
+    set: &Arc<BTreeSet<ReplicaId>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    set.as_ref().serialize(serializer)
 }
 
 /// The encoded shape of a configuration; validated before it becomes one.
@@ -121,8 +137,8 @@ impl<'de> Deserialize<'de> for BallotConfiguration {
         let config = BallotConfiguration {
             epoch: raw.epoch,
             ballot: raw.ballot,
-            voters: raw.voters,
-            fast_set: raw.fast_set,
+            voters: Arc::new(raw.voters),
+            fast_set: Arc::new(raw.fast_set),
             class: raw.class,
         };
         config
@@ -144,12 +160,12 @@ impl BallotConfiguration {
     }
 
     /// Exact voters of the epoch.
-    pub const fn voters(&self) -> &BTreeSet<ReplicaId> {
+    pub fn voters(&self) -> &BTreeSet<ReplicaId> {
         &self.voters
     }
 
     /// The fast set (every voter for C1).
-    pub const fn fast_set(&self) -> &BTreeSet<ReplicaId> {
+    pub fn fast_set(&self) -> &BTreeSet<ReplicaId> {
         &self.fast_set
     }
 
@@ -169,8 +185,8 @@ impl BallotConfiguration {
         let config = BallotConfiguration {
             epoch,
             ballot,
-            voters,
-            fast_set,
+            voters: Arc::new(voters),
+            fast_set: Arc::new(fast_set),
             class: FastQuorumClass::C2,
         };
         config.validate()?;
@@ -206,8 +222,8 @@ impl BallotConfiguration {
         let config = BallotConfiguration {
             epoch,
             ballot,
-            fast_set: voters.clone(),
-            voters,
+            fast_set: Arc::new(voters.clone()),
+            voters: Arc::new(voters),
             class: FastQuorumClass::C1,
         };
         config.validate()?;
@@ -280,6 +296,58 @@ impl BallotConfiguration {
         match self.class {
             FastQuorumClass::C2 => true,
             FastQuorumClass::C1 => 2 * self.fast_size() >= self.voters.len() + self.slow_size(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(i: u8) -> ReplicaId {
+        ReplicaId([i; 16])
+    }
+
+    /// The encoded shape before the sets were shared (task-d60).
+    #[derive(Serialize)]
+    struct Owned {
+        epoch: ConfigurationEpoch,
+        ballot: Ballot,
+        voters: BTreeSet<ReplicaId>,
+        fast_set: BTreeSet<ReplicaId>,
+        class: FastQuorumClass,
+    }
+
+    /// A clone shares the voter sets rather than copying them, and the
+    /// encoding is byte for byte what it was with owned sets; it decodes
+    /// back to an equal configuration.
+    #[test]
+    fn a_clone_shares_the_sets_and_the_encoding_is_unchanged() {
+        let epoch = ConfigurationEpoch::new(3).unwrap();
+        let ballot = Ballot {
+            epoch,
+            number: 7,
+            leader: r(2),
+        };
+        let voters: BTreeSet<ReplicaId> = (1..=5).map(r).collect();
+        for config in [
+            BallotConfiguration::c2_default(epoch, ballot, voters.clone()).unwrap(),
+            BallotConfiguration::c1(epoch, ballot, voters.clone()).unwrap(),
+        ] {
+            let clone = config.clone();
+            assert!(Arc::ptr_eq(&config.voters, &clone.voters));
+            assert!(Arc::ptr_eq(&config.fast_set, &clone.fast_set));
+            let owned = Owned {
+                epoch,
+                ballot,
+                voters: voters.clone(),
+                fast_set: config.fast_set().clone(),
+                class: config.class(),
+            };
+            let bytes = postcard::to_allocvec(&config).unwrap();
+            assert_eq!(bytes, postcard::to_allocvec(&owned).unwrap());
+            let back: BallotConfiguration = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(back, config);
         }
     }
 }

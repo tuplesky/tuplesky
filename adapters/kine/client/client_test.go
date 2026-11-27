@@ -73,6 +73,14 @@ type serverBehavior struct {
 	binds       atomic.Int64
 	// refuseHello answers the negotiation with a Close instead of an ack.
 	refuseHello atomic.Bool
+	// unavailable answers a Bind as a frontend that can't bind now does:
+	// the stream ends unanswered and the connection closes with code 2,
+	// "bind unavailable".
+	unavailable atomic.Bool
+	// unavailableFrame answers a Bind with a Close frame saying the same.
+	unavailableFrame atomic.Bool
+	// bindSilent never answers a Bind: the client's wait runs out first.
+	bindSilent atomic.Bool
 }
 
 // runServer starts an in-process quic-go frontend. It reads the control
@@ -149,9 +157,20 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 			}
 			if frame.Kind == uint16(wire.KindBind) {
 				b.binds.Add(1)
+				if b.bindSilent.Load() {
+					<-conn.Context().Done()
+					return
+				}
+				if b.unavailable.Load() {
+					_ = s.Close()
+					_ = conn.CloseWithError(2, "bind unavailable")
+					return
+				}
 				bind, err := wire.DecodeBind(frame)
 				var out []byte
-				if err == nil && b.expectToken != "" && string(bind.Token) == b.expectToken {
+				if b.unavailableFrame.Load() {
+					out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind unavailable")})
+				} else if err == nil && b.expectToken != "" && string(bind.Token) == b.expectToken {
 					out, _ = wire.EncodeBindAck(wire.BindAck{
 						Session:        b.session,
 						ExpiresAt:      uint64(time.Now().Add(time.Hour).Unix()),
@@ -512,6 +531,83 @@ func TestBindPresentsTokenOnceAndLearnsSession(t *testing.T) {
 	}
 	if _, ok := wrong.Session(); ok {
 		t.Fatal("session after refusal")
+	}
+}
+
+// countingTokens hands out one token and counts how often a binding told
+// it to drop it.
+type countingTokens struct {
+	token       string
+	invalidated atomic.Int64
+}
+
+func (s *countingTokens) Token(context.Context) (string, error) { return s.token, nil }
+func (s *countingTokens) Invalidate()                           { s.invalidated.Add(1) }
+
+// A frontend that can't bind now (its policy may be stale) says so before
+// it reads the token, so the client keeps the token and binds again with
+// it; a refused token is still dropped (#320 follow-up).
+func TestBindUnavailableKeepsTheToken(t *testing.T) {
+	cert, pool := testCert(t)
+	for _, shape := range []string{"close after an empty stream", "close frame", "no answer within the wait"} {
+		t.Run(shape, func(t *testing.T) {
+			b := &serverBehavior{expectToken: "svc-token", session: [16]byte{7, 7}}
+			timeout := 2 * time.Second
+			switch shape {
+			case "close frame":
+				b.unavailableFrame.Store(true)
+			case "no answer within the wait":
+				// The frontend's own deadline starts after the client's,
+				// so its retryable close can arrive after the client gave
+				// up; the token is kept (#334 review).
+				b.bindSilent.Store(true)
+				timeout = 300 * time.Millisecond
+			default:
+				b.unavailable.Store(true)
+			}
+			addr, stop := runServer(t, cert, b)
+			defer stop()
+			tokens := &countingTokens{token: "svc-token"}
+			c := New(addr, Config{TLS: clientTLS(pool), Tokens: tokens, FrameTimeout: timeout})
+			inst := instance()
+			inv, _ := inst.Allocate([]byte("op"), command(1), 1000)
+			if _, err := c.Do(context.Background(), inv.Frame); !errors.Is(err, ErrBindUnavailable) {
+				t.Fatalf("unavailable binding: %v", err)
+			}
+			if got := tokens.invalidated.Load(); got != 0 {
+				t.Fatalf("token dropped %d times by a frontend that never read it", got)
+			}
+			if _, ok := c.Session(); ok {
+				t.Fatal("session from an unavailable binding")
+			}
+			// The frontend can bind again: the kept token binds.
+			b.unavailable.Store(false)
+			b.unavailableFrame.Store(false)
+			b.bindSilent.Store(false)
+			inv, _ = inst.Allocate([]byte("op"), command(2), 1000)
+			if out, err := c.Do(context.Background(), inv.Frame); err != nil || out.Unknown {
+				t.Fatalf("bind again: %v %+v", err, out)
+			}
+			if s, ok := c.Session(); !ok || s != b.session {
+				t.Fatalf("session %v %v", s, ok)
+			}
+			if got := tokens.invalidated.Load(); got != 0 {
+				t.Fatalf("token dropped %d times", got)
+			}
+		})
+	}
+	// Control: a refused token is dropped.
+	b := &serverBehavior{expectToken: "svc-token", session: [16]byte{7, 7}}
+	addr, stop := runServer(t, cert, b)
+	defer stop()
+	tokens := &countingTokens{token: "other"}
+	c := New(addr, Config{TLS: clientTLS(pool), Tokens: tokens, FrameTimeout: 2 * time.Second})
+	inv, _ := instance().Allocate([]byte("op"), command(1), 1000)
+	if _, err := c.Do(context.Background(), inv.Frame); !errors.Is(err, ErrBindRejected) {
+		t.Fatalf("refused binding: %v", err)
+	}
+	if got := tokens.invalidated.Load(); got != 1 {
+		t.Fatalf("refused token dropped %d times, want 1", got)
 	}
 }
 

@@ -18,8 +18,8 @@
 //! as closing it. None of those fail a type check, and all of them are
 //! decided here, where a test can state them without a socket.
 
-use coord_collector::{Action, FanOut};
-use coord_session::Ingress;
+use coord_collector::{Action, FanOut, ReadPlan};
+use coord_session::{BindError, Ingress};
 use coord_storage::watch::Registration;
 use coord_transport::CloseCode;
 use coord_types::RetryKey;
@@ -38,6 +38,9 @@ pub enum Step {
     /// Keep the stream open under the plan's invocation, and send the
     /// plan to the voters first.
     Submit(Box<FanOut>),
+    /// Keep the stream open under the read's invocation, and send it to
+    /// the leader the collector follows first (task-d50).
+    Read(Box<ReadPlan>),
     /// Keep the stream open as this watch's output stream: replay the
     /// registration's revisions onto it, then pump it for as long as the
     /// subscription lasts.
@@ -83,6 +86,14 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // back: nothing the caller could do with the session precedes
         // the session.
         Ingress::Establishing(plan) => Step::Submit(plan),
+        // A node whose policy may be stale refused before it read the
+        // credential (#320 follow-up), so saying so tells the caller
+        // nothing about its token: only that it should keep it and bind
+        // again, here later or at another node.
+        Ingress::Rejected(BindError::Stale) => Step::Close {
+            code: CloseCode::Rejected,
+            reason: coord_transport::BIND_UNAVAILABLE,
+        },
         // A refused, absent or ended binding are three ways of saying the
         // same thing -- this connection has no session -- and the peer
         // learns which only as `Rejected`, because whether a token was
@@ -90,7 +101,7 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // entitled to distinguish.
         Ingress::Rejected(_) => Step::Close {
             code: CloseCode::Rejected,
-            reason: "bind refused",
+            reason: coord_transport::BIND_REFUSED,
         },
         Ingress::NotBound => Step::Close {
             code: CloseCode::Rejected,
@@ -103,6 +114,7 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         Ingress::Action(action) => match action {
             Action::Respond(delivery) => Step::Answer(delivery.frame),
             Action::FanOut(plan) => Step::Submit(Box::new(plan)),
+            Action::Read(plan) => Step::Read(Box::new(plan)),
             Action::Pending { .. } => match retry_key {
                 Some(key) => Step::Hold(key),
                 None => Step::Close {
@@ -136,12 +148,16 @@ impl Step {
         match self {
             Step::Hold(key) => Some(*key),
             Step::Submit(plan) => Some(plan.retry_key),
+            Step::Read(plan) => Some(plan.retry_key),
             _ => None,
         }
     }
 
     /// Whether the stream this step names stays open after it.
     pub const fn keeps_the_stream(&self) -> bool {
-        matches!(self, Step::Hold(_) | Step::Submit(_) | Step::Watch { .. })
+        matches!(
+            self,
+            Step::Hold(_) | Step::Submit(_) | Step::Read(_) | Step::Watch { .. }
+        )
     }
 }

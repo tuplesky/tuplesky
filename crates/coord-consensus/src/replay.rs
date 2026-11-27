@@ -159,12 +159,46 @@ impl EvidenceStore {
         }
     }
 
+    /// Drop what was kept for `command` that required `failed`, a batch
+    /// that will never be durable (task-d90): its send was dropped, and
+    /// published again it would be dropped again, so the next proposal
+    /// is answered afresh instead.
+    pub fn drop_requiring(&mut self, command: &CommandId, failed: &BarrierId) {
+        if let Some(kept) = self.own.get_mut(command) {
+            kept.retain(|e| !e.requires.contains(failed));
+            if kept.is_empty() {
+                self.own.remove(command);
+            }
+        }
+    }
+
+    /// Count one more publication of a marked command's release again
+    /// (task-d100, step A), under the same bound as a repaired reply:
+    /// past [`MAX_EVIDENCE_REPAIRS`] the duplicate is refused, as an
+    /// unmarked command's would be (#204 review). Nothing is kept for a
+    /// marked command, so the counts are swept by the table here too.
+    pub fn count_release_again(
+        &mut self,
+        command: CommandId,
+        table: &CommandTable,
+    ) -> Result<(), ReplayRefusal> {
+        let repairs = self.repairs.entry(command).or_insert(0);
+        if *repairs >= MAX_EVIDENCE_REPAIRS {
+            return Err(ReplayRefusal::TooMany);
+        }
+        *repairs += 1;
+        if self.repairs.len() > self.capacity.saturating_mul(2) {
+            self.sweep(table);
+        }
+        Ok(())
+    }
+
     /// Forget every command the table no longer remembers either.
     fn sweep(&mut self, table: &CommandTable) {
-        self.own
-            .retain(|c, _| table.record(c).is_some() || table.tombstones().contains(c));
-        let own = &self.own;
-        self.repairs.retain(|c, _| own.contains_key(c));
+        let remembered =
+            |c: &CommandId| table.record(c).is_some() || table.tombstones().contains(c);
+        self.own.retain(|c, _| remembered(c));
+        self.repairs.retain(|c, _| remembered(c));
     }
 
     /// The sends that publish `command`'s evidence again, or why there
@@ -225,6 +259,11 @@ impl EvidenceStore {
         }
         *self.repairs.entry(command).or_insert(0) += 1;
         Ok(sends)
+    }
+
+    /// What this replica published for `command`, as it was published.
+    pub fn kept(&self, command: &CommandId) -> &[RetainedEvidence] {
+        self.own.get(command).map_or(&[], Vec::as_slice)
     }
 
     /// How often `command`'s evidence has been published again this boot.

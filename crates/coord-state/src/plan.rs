@@ -202,7 +202,12 @@ pub enum RejectionReason {
     NamespaceMismatch,
     /// The response would exceed the semantic response budget.
     ResponseTooLarge,
-    /// The mutation would exceed the events-per-revision budget.
+    /// The mutation would exceed the events-per-revision budget: too many
+    /// events, or rows that one journal record can't hold (too many, a row
+    /// key or value too long, or too many bytes in all). A node journals
+    /// each command as one record, so a command whose rows don't fit one is
+    /// refused here, at every voter alike, rather than stopping each voter
+    /// that tries to record it.
     TooManyEvents,
     /// The range delete would remove more keys than allowed.
     TooManyDeletes,
@@ -237,6 +242,15 @@ pub enum RejectionReason {
     /// because it is a property of the accepted command, identical on
     /// every replica, and the command already holds its position.
     AdmissionMismatch,
+    /// The command was decided as nothing (task-d121): consensus fixed its
+    /// slot with no payload, so it never executes as what was submitted.
+    /// The planner never produces it. Its one response is
+    /// [`Response::decided_nothing`], the same at every voter and against
+    /// every state, which is what lets a node's executed row, holding only
+    /// that response's digest, prove the refusal.
+    ///
+    /// Appended, so every existing reason keeps its encoding.
+    DecidedNothing,
 }
 
 /// A Kine-facing entry: the entry's value and revisions plus the TTL of
@@ -279,6 +293,24 @@ pub struct Response {
     pub revision: KvRevision,
     /// Outcome.
     pub outcome: Outcome,
+}
+
+impl Response {
+    /// The canonical response of a command decided as nothing
+    /// (task-d121): revision zero and
+    /// [`RejectionReason::DecidedNothing`]. It reads no state, so every
+    /// voter writes the same bytes and the same result digest for it, and
+    /// a row with that digest is the nothing's execution and nothing else.
+    /// The revision is zero, not the domain's: keeping the real one would
+    /// need a marker in the executed row, a format change.
+    pub const fn decided_nothing() -> Self {
+        Response {
+            revision: KvRevision::ZERO,
+            outcome: Outcome::ErrRejected {
+                reason: RejectionReason::DecidedNothing,
+            },
+        }
+    }
 }
 
 /// Event kind.

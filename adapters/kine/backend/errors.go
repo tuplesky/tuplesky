@@ -18,6 +18,8 @@ const (
 	codeNotAdmitted             uint16 = 0x0004
 	codeResultTooLarge          uint16 = 0x0005
 	codeRequestTooLarge         uint16 = 0x0006
+	codeOutputWithheld          uint16 = 0x0007
+	codeResultRetired           uint16 = 0x0008
 )
 
 // mapWireError turns an established error response into the gRPC status
@@ -36,6 +38,12 @@ func mapWireError(code uint16, detail []byte) error {
 		return status.Error(codes.ResourceExhausted, "result too large: "+msg)
 	case codeRequestTooLarge:
 		return status.Error(codes.InvalidArgument, "request too large: "+msg)
+	case codeOutputWithheld:
+		// The operation executed; only its result is not disclosed. It is
+		// not a refusal to admit, and it is not retried.
+		return status.Error(codes.PermissionDenied, "executed, result withheld: "+msg)
+	case codeResultRetired:
+		return status.Error(codes.DataLoss, "result retired: "+msg)
 	case codeRequestIdentityConflict:
 		return status.Error(codes.Internal, "request identity conflict: "+msg)
 	default:
@@ -54,6 +62,9 @@ func mapClientError(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, client.ErrBindRejected):
 		return status.Error(codes.Unauthenticated, err.Error())
+	case errors.Is(err, client.ErrBindUnavailable):
+		// Not the credential: this frontend can't bind now. Retried.
+		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, client.ErrProtocol):
 		return status.Error(codes.Internal, err.Error())
 	default:
@@ -113,6 +124,13 @@ func mapRejection(reason wire.RejectionReason) error {
 		return status.Error(codes.Unauthenticated, msg)
 	case wire.RejectedRetryUnauthorized, wire.RejectedAdmissionMismatch:
 		return status.Error(codes.PermissionDenied, msg)
+	case wire.RejectedDecidedNothing:
+		// Definite: the command's slot was decided with no write, so it
+		// changed nothing and never will. A caller that issues the
+		// operation again as a new command is safe, which is what Aborted
+		// tells a client to do. Its result carries revision zero, which
+		// no caller reads: the status replaces the result.
+		return status.Error(codes.Aborted, msg)
 	default:
 		return status.Errorf(codes.Internal, "command rejected: reason %d", uint8(reason))
 	}

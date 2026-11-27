@@ -17,7 +17,7 @@ use coord_state::plan::KvEventKind;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::view::KvEntry;
 use coord_storage::codecs::{
-    self, EventRecordV1, ExecutedRecordV1, HistoryRecordV1, RetryFloorV1, RetryRecordV1,
+    self, EventRecordV1, ExecutedRecordV1, ExecutionRecordV1, RetryFloorV1, RetryRecordV1,
 };
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
 use coord_storage::policy::{bootstrap_session, rule_update};
@@ -126,26 +126,34 @@ fn rows(profile: Profile) -> Vec<Row> {
         put(
             &mut rows,
             Collection::PayloadV1,
-            command(n).as_bytes().to_vec(),
+            codecs::position_key(pos(u64::from(n))).to_vec(),
             format!("payload-{n}").into_bytes(),
         );
         put(
             &mut rows,
-            Collection::ExecutedV1,
-            codecs::executed_key(&command(n)),
-            codecs::encode_executed(&ExecutedRecordV1 {
-                position: pos(u64::from(n)),
-                revision: Some(rev(revision)),
-                result_digest: Digest32([n; 32]),
+            Collection::ExecutionV1,
+            codecs::position_key(pos(u64::from(n))).to_vec(),
+            codecs::encode_execution(&ExecutionRecordV1 {
+                command: command(n),
+                executed: ExecutedRecordV1 {
+                    position: pos(u64::from(n)),
+                    revision: Some(rev(revision)),
+                    result_digest: Digest32([n; 32]),
+                },
             })
             .unwrap(),
         );
     }
     if profile.unexecuted_payload {
+        // Pending, by intake order, in the node-private collection
+        // (task-d113, step 2): not common state.
         put(
             &mut rows,
-            Collection::PayloadV1,
-            command(4).as_bytes().to_vec(),
+            Collection::PendingPayloadV1,
+            coord_storage::intake::pending_key(
+                coord_storage::intake::IntakeOrder { seq: 9, ordinal: 0 },
+                &command(4),
+            ),
             b"payload-4-unexecuted".to_vec(),
         );
     }
@@ -161,32 +169,6 @@ fn rows(profile: Profile) -> Vec<Row> {
         Collection::KvCurrentV1,
         codecs::current_key(&NS, b"b"),
         codecs::encode_current(&entry(b"v3", 3, 3, 1)).unwrap(),
-    );
-    let history = |v: &[u8], c: u64, m: u64, ver: u64| {
-        codecs::encode_history(&HistoryRecordV1 {
-            entry: Some(entry(v, c, m, ver)),
-        })
-        .unwrap()
-    };
-    if !profile.gc_done {
-        put(
-            &mut rows,
-            Collection::KvHistoryV1,
-            codecs::history_key(&NS, b"a", rev(1)),
-            history(b"v1", 1, 1, 1),
-        );
-    }
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"a", rev(2)),
-        history(b"v2", 1, 2, 2),
-    );
-    put(
-        &mut rows,
-        Collection::KvHistoryV1,
-        codecs::history_key(&NS, b"b", rev(3)),
-        history(b"v3", 3, 3, 1),
     );
     let event = |k: &[u8], e: Option<KvEntry>, p: Option<KvEntry>| {
         codecs::encode_event(&EventRecordV1 {
@@ -460,10 +442,9 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
         Collection::SessionV1,
         Collection::LeaseV1,
         Collection::LeaseKeysV1,
-        Collection::KvHistoryV1,
         Collection::EventsV1,
         Collection::PayloadV1,
-        Collection::ExecutedV1,
+        Collection::ExecutionV1,
         Collection::AuthGrantV1,
     ] {
         assert!(summary(c).unwrap() > 0, "{c:?}");
@@ -471,13 +452,13 @@ fn equal_common_state_hashes_equally_across_private_differences_and_engines() {
     for c in [
         Collection::MetaV1,
         Collection::ProtocolV1,
+        Collection::KvHistoryV1,
         Collection::CheckpointV1,
     ] {
         assert_eq!(summary(c), None, "{c:?}");
     }
-    // Canonical normalization: one history version at or below the floor
-    // per key, no event below the floor, only executed payloads.
-    assert_eq!(summary(Collection::KvHistoryV1), Some(2));
+    // Canonical normalization: below the floor, only each key's newest put
+    // at or below it (a@2, not a@1; task-d105), and only executed payloads.
     assert_eq!(summary(Collection::EventsV1), Some(2));
     assert_eq!(summary(Collection::PayloadV1), Some(3));
     assert_eq!(ca.manifest.boundary.execution_position, pos(3));
@@ -570,12 +551,15 @@ fn rows_beyond_the_boundary_are_refused() {
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(9)),
-        &codecs::encode_executed(&ExecutedRecordV1 {
-            position: pos(9),
-            revision: None,
-            result_digest: Digest32([9; 32]),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(9)),
+        &codecs::encode_execution(&ExecutionRecordV1 {
+            command: command(9),
+            executed: ExecutedRecordV1 {
+                position: pos(9),
+                revision: None,
+                result_digest: Digest32([9; 32]),
+            },
         })
         .unwrap(),
     )
@@ -585,7 +569,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::BeyondBoundary {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
     // A retained retry response at or below the execution position but
@@ -638,28 +622,12 @@ fn rows_beyond_the_boundary_are_refused() {
             collection: Collection::EventsV1.id().0
         }
     );
-    let mut engine = model(Profile::default());
-    let mut tx = engine.begin_write().unwrap();
-    tx.put(
-        Collection::KvHistoryV1.id(),
-        &codecs::history_key(&NS, b"c", rev(9)),
-        b"late",
-    )
-    .unwrap();
-    tx.commit_durable().unwrap();
-    let view = engine.reader().snapshot().unwrap();
-    assert_eq!(
-        export_shared(&view, origin(), &limits).unwrap_err(),
-        ExportError::BeyondBoundary {
-            collection: Collection::KvHistoryV1.id().0
-        }
-    );
     // A row the exporter decodes must decode.
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(
-        Collection::ExecutedV1.id(),
-        &codecs::executed_key(&command(8)),
+        Collection::ExecutionV1.id(),
+        &codecs::position_key(pos(2)),
         b"garbage",
     )
     .unwrap();
@@ -668,7 +636,7 @@ fn rows_beyond_the_boundary_are_refused() {
     assert_eq!(
         export_shared(&view, origin(), &limits).unwrap_err(),
         ExportError::Corrupt {
-            collection: Collection::ExecutedV1.id().0
+            collection: Collection::ExecutionV1.id().0
         }
     );
 }
@@ -733,12 +701,32 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
         Err(VerifyError::RootMismatch)
     );
     let mut format = cp.manifest.clone();
-    format.format = 2;
+    format.format = SHARED_CHECKPOINT_FORMAT_V1 + 1;
     format.root = format.compute_root();
     assert_eq!(
         verify_shared(&format, &encoded),
-        Err(VerifyError::UnsupportedFormat { found: 2 })
+        Err(VerifyError::UnsupportedFormat {
+            found: SHARED_CHECKPOINT_FORMAT_V1 + 1
+        })
     );
+    // What this build says it reads is what it verifies (#247 review): the
+    // format window's `oldest` is read by `supports`, not on this path, so
+    // nothing else holds the two together. Format 1, the layout before
+    // step 2 and task-d105, is the one an older image carries.
+    for version in 0..=SHARED_CHECKPOINT_FORMAT_V1 + 1 {
+        let mut format = cp.manifest.clone();
+        format.format = version;
+        format.root = format.compute_root();
+        let verified = !matches!(
+            verify_shared(&format, &encoded),
+            Err(VerifyError::UnsupportedFormat { .. })
+        );
+        assert_eq!(
+            verified,
+            coord_types::formats::Format::SharedCheckpoint.supports(u32::from(version)),
+            "format {version}: what `supports` says and what `verify_shared` reads differ"
+        );
+    }
     let mut counts = cp.manifest.clone();
     counts.collections[6].rows += 1;
     counts.root = counts.compute_root();
@@ -1079,5 +1067,201 @@ fn shared_checkpoint_fixture_is_frozen() {
     assert_eq!(
         stored, fixture,
         "shared checkpoint fixture drifted; the canonical traversal and root are frozen"
+    );
+}
+
+/// An image of the layout before task-d113's step 2 is refused (#243
+/// review): the image #240's build exported from the same model, frozen as
+/// it was, carries format 1, and a build of format 2 verifies none of it.
+/// Its rows are by command where this layout's are by position, so it is
+/// refused, not read.
+#[test]
+fn an_image_of_the_layout_before_rows_by_position_is_refused() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/shared_checkpoint_format1.json");
+    let old: CheckpointFixture =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(old.format, 1);
+    assert_eq!(SHARED_CHECKPOINT_FORMAT_V1, 2);
+    let bytes: Vec<u8> = (0..old.manifest_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&old.manifest_hex[i..i + 2], 16).unwrap())
+        .collect();
+    let manifest = SharedManifestV1::decode(&bytes).unwrap();
+    assert_eq!(manifest.format, 1);
+    assert!(matches!(
+        verify_shared(&manifest, &[]),
+        Err(VerifyError::UnsupportedFormat { found: 1 })
+    ));
+    // The model's image today differs from it in its root: the layout moved.
+    let cp = export(&model(Profile::default()), &ExportLimits::default());
+    assert_ne!(hex(&cp.manifest.root.0), old.root_hex);
+}
+
+/// What an inline export costs as common state grows: the floor runs
+/// [`export_shared`] and [`SharedImageStore::keep`] on the serving loop,
+/// so their time is time the domain does not serve. Run by hand:
+///
+/// `FLOOR_MEASURE_MIB=16,64,256 cargo test --release -p coord-checkpoint
+/// --test export -- --ignored --nocapture measure_the_inline_boundary`
+///
+/// Each size writes a redb store and an image of about that many MiB.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn measure_the_inline_boundary() {
+    use coord_checkpoint::store::SharedImageStore;
+    use std::time::Instant;
+
+    let sizes: Vec<usize> = std::env::var("FLOOR_MEASURE_MIB")
+        .unwrap_or_else(|_| "16,64".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    // coordd's default `[state] cache_bytes`.
+    let cache: usize = std::env::var("FLOOR_MEASURE_CACHE_MIB")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(64);
+    let value = codecs::encode_current(&entry(&[b'x'; 1000], 3, 3, 1)).unwrap();
+    for mib in sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let mut generation = Generation::create(
+            &dir.path().join("store"),
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: ReplicaId([3; 16]),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+            },
+            OpenOptions {
+                cache_bytes: cache * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        seed(generation.engine(), Profile::default());
+        let rows = mib * 1024 * 1024 / (value.len() + 24);
+        for batch in (0..rows).collect::<Vec<_>>().chunks(4096) {
+            let mut tx = generation.engine().begin_write().unwrap();
+            for i in batch {
+                tx.put(
+                    Collection::KvCurrentV1.id(),
+                    &codecs::current_key(&NS, format!("bulk-{i:010}").as_bytes()),
+                    &value,
+                )
+                .unwrap();
+            }
+            tx.commit_durable().unwrap();
+        }
+        let engine = generation.engine();
+        let started = Instant::now();
+        let view = engine.reader().snapshot().unwrap();
+        let checkpoint = export_shared(&view, origin(), &ExportLimits::default()).unwrap();
+        let exported = started.elapsed();
+        let images = SharedImageStore::open(&dir.path().join("images")).unwrap();
+        let started = Instant::now();
+        let bytes = images.keep(&checkpoint).unwrap();
+        let kept = started.elapsed();
+        let manifest = checkpoint.manifest.encode().unwrap().len();
+        println!(
+            "state {mib} MiB cache {cache} MiB: rows {} chunks {} manifest {manifest} B image {bytes} B \
+             export {:.3}s keep {:.3}s total {:.3}s ({:.1} ms/MiB)",
+            checkpoint.manifest.rows(),
+            checkpoint.chunks.len(),
+            exported.as_secs_f64(),
+            kept.as_secs_f64(),
+            (exported + kept).as_secs_f64(),
+            (exported + kept).as_secs_f64() * 1000.0 / mib as f64,
+        );
+    }
+}
+
+/// Below the retention floor the export carries each key's newest put at
+/// or below it, and nothing else (task-d105; #245 review: the fixture's
+/// key sits at the floor, so it could not tell). With the floor at 3, key
+/// `a`'s put at 2 is below it and the newest, so it goes; its put at 1
+/// does not. Key `c`, put at 1 and deleted at 2, carries nothing: its
+/// newest version below the floor is a delete. The export equals one of a
+/// store that holds only what goes, and differs from one without `a`'s
+/// put at 2.
+#[test]
+fn below_the_floor_the_export_carries_each_keys_newest_put_and_nothing_else() {
+    let at_floor_3 = |engine: &mut ModelEngine, extra: &[(Vec<u8>, Option<Vec<u8>>)]| {
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(
+            Collection::MetaV1.id(),
+            meta_fields::RETENTION_FLOOR,
+            &codecs::encode_counter(3).unwrap(),
+        )
+        .unwrap();
+        for (key, value) in extra {
+            match value {
+                Some(v) => tx.put(Collection::EventsV1.id(), key, v).unwrap(),
+                None => tx.delete(Collection::EventsV1.id(), key).unwrap(),
+            }
+        }
+        tx.commit_durable().unwrap();
+    };
+    let c_event = |kind: KvEventKind, entry: Option<KvEntry>, prev: Option<KvEntry>| {
+        codecs::encode_event(&EventRecordV1 {
+            kind,
+            namespace: NS,
+            key: b"c".to_vec(),
+            entry,
+            prev,
+        })
+        .unwrap()
+    };
+    // Every row: a@1, a@2, b@3, and c put at 1 and deleted at 2.
+    let mut full = model(Profile::default());
+    at_floor_3(
+        &mut full,
+        &[
+            (
+                codecs::event_key(rev(1), 1),
+                Some(c_event(KvEventKind::Put, Some(entry(b"c1", 1, 1, 1)), None)),
+            ),
+            (
+                codecs::event_key(rev(2), 1),
+                Some(c_event(
+                    KvEventKind::Delete,
+                    None,
+                    Some(entry(b"c1", 1, 1, 1)),
+                )),
+            ),
+        ],
+    );
+    // Only what goes: a@2 and b@3.
+    let mut kept = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut kept, &[]);
+    // And without a@2.
+    let mut without = model(Profile {
+        gc_done: true,
+        ..Profile::default()
+    });
+    at_floor_3(&mut without, &[(codecs::event_key(rev(2), 0), None)]);
+
+    let limits = ExportLimits::default();
+    let (cf, ck, cw) = (
+        export(&full, &limits),
+        export(&kept, &limits),
+        export(&without, &limits),
+    );
+    assert_eq!(cf.manifest.boundary.retention_floor, rev(3));
+    let events = |cp: &SharedCheckpointV1| {
+        cp.manifest
+            .collections
+            .iter()
+            .find(|s| s.collection == Collection::EventsV1.id().0)
+            .map(|s| s.rows)
+    };
+    assert_eq!(events(&cf), Some(2), "a@2 and b@3");
+    assert_eq!(cf.manifest, ck.manifest);
+    assert_eq!(cf.chunks, ck.chunks);
+    assert_eq!(events(&cw), Some(1));
+    assert_ne!(
+        cf.manifest.root, cw.manifest.root,
+        "the newest put below the floor is carried"
     );
 }

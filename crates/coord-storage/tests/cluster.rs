@@ -66,6 +66,7 @@ fn identity(n: u8, me: u8) -> ConfigurationIdentity {
         voters: (0..n).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
+        store: coord_types::ids::StoreInstanceId(r(me).0),
         role: ReplicaRole::Voter,
     }
 }
@@ -299,7 +300,12 @@ impl Cluster {
                 };
                 let (from, frame) = self.nodes[pick].inbox.remove(idx).unwrap();
                 let event = Event::Peer(AuthenticatedPeerMessage::new(
-                    PeerProvenance::from_transport(from, ReplicaIncarnation::new(1).unwrap(), 1),
+                    PeerProvenance::from_transport(
+                        from,
+                        ReplicaIncarnation::new(1).unwrap(),
+                        coord_types::wire_v1::PeerRole::Voter,
+                        1,
+                    ),
                     frame,
                 ));
                 let effects = self.nodes[pick].machine.step(event);

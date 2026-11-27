@@ -72,6 +72,21 @@ pub struct Limits {
     pub max_connection_age: Duration,
     /// Keep-alive interval (liveness only; never a lease or membership).
     pub keep_alive: Duration,
+    /// API connections without a client certificate that may be open and
+    /// not yet bound at once (task-d122). They count under
+    /// `max_connections` as well, so it leaves at least
+    /// `max_connections - max_unbound` places to callers that hold a
+    /// certificate or have bound; one beyond it is closed as soon as its
+    /// TLS handshake shows it has no certificate.
+    pub max_unbound: usize,
+    /// How long a connection without a client certificate has, from the
+    /// end of its TLS handshake, to send `Hello` and a `Bind` whose token
+    /// verifies (task-d122). One deadline for all of it, in place of the
+    /// separate handshake waits; at it the connection is closed with
+    /// [`CloseCode::Timeout`] and its place under `max_unbound` freed.
+    ///
+    /// [`CloseCode::Timeout`]: crate::CloseCode::Timeout
+    pub bind_deadline: Duration,
     /// Depth of each lane's owned event queue; that lane's readers wait
     /// when it is full while the other lanes keep flowing.
     pub event_queue: usize,
@@ -81,6 +96,198 @@ pub struct Limits {
     pub lanes: [LaneLimits; 4],
     /// Shared destination and node byte budgets (task-31).
     pub budget: BudgetLimits,
+    /// The most frames a peer lane's sender puts on one stream, where the
+    /// link grants [`crate::CAPABILITY_FRAMES_PER_STREAM`] (task-d61).
+    /// One, and the endpoint does not offer the capability: each frame
+    /// has a stream of its own. Above [`crate::MAX_FRAMES_PER_STREAM`]
+    /// it is that.
+    pub stream_frames: usize,
+    /// The most bytes of frames a peer lane's sender puts on one stream.
+    /// A frame larger than this still goes, alone.
+    pub stream_bytes: usize,
+    /// How often this endpoint asks the other end of each connection to
+    /// acknowledge (task-d70). [`AckFrequency::DEFAULT`] by default.
+    /// `None` asks nothing, and QUIC's own cadence holds: an ACK every
+    /// second ack-eliciting packet, within 25 ms.
+    pub ack_frequency: Option<AckFrequency>,
+    /// How far out of order this endpoint's packets may arrive before its
+    /// loss detection calls the ones overtaken lost. QUIC's own,
+    /// [`Reordering::QUIC`], by default.
+    pub reordering: Reordering,
+    /// The congestion controller every connection of this endpoint runs
+    /// for what it sends. [`Congestion::Cubic`] by default.
+    pub congestion: Congestion,
+    /// The round trip a connection assumes until it has measured one.
+    /// `None` keeps quinn's 333 ms (RFC 9002, Section 6.2.2).
+    pub initial_rtt: Option<Duration>,
+}
+
+/// The acknowledgement cadence an endpoint asks of its peers, through
+/// QUIC's acknowledgement-frequency extension (task-d70). A peer that
+/// does not support the extension ignores it.
+///
+/// With about one data datagram per peer per command, an acknowledgement
+/// sent after every second packet often has nothing to ride on and
+/// travels as a datagram of its own; a higher threshold lets it wait for
+/// the reply that follows. The delay is best left to the peer: QUIC's own
+/// is 25 ms, so a shorter one sends an acknowledgement sooner, alone, on a
+/// connection with little traffic. At threshold 8 and QUIC's delay the
+/// runner's five voters sent about a sixth fewer datagrams per command and
+/// half the api plane's ACKs, for 4% less CPU per operation (#98). Loss is
+/// learned after as many packets more, within the same 25 ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckFrequency {
+    /// Ack-eliciting packets the peer may receive before it must
+    /// acknowledge: zero acknowledges every packet, one every second.
+    pub threshold: u32,
+    /// The longest the peer may hold an acknowledgement below the
+    /// threshold. `None` keeps the peer's own `max_ack_delay`, QUIC's
+    /// 25 ms unless it says otherwise. QUIC clamps a delay to at least the
+    /// peer's `min_ack_delay` and at most the greater of the path's RTT
+    /// and 25 ms.
+    pub max_delay: Option<Duration>,
+}
+
+impl AckFrequency {
+    /// The cadence asked by default: an ACK after eight ack-eliciting
+    /// packets, within the peer's own delay (task-d70).
+    pub const DEFAULT: AckFrequency = AckFrequency {
+        threshold: 8,
+        max_delay: None,
+    };
+}
+
+/// How far out of order a packet may arrive before loss detection calls
+/// it lost (#98's +jitter10 cell).
+///
+/// A sender calls a packet lost once a packet sent after it is
+/// acknowledged and either `packets` were sent after it, or it was sent
+/// more than `time_eighths / 8` of the round trip earlier (RFC 9002,
+/// Section 6.1). Each call is a retransmission and, at most once a round
+/// trip, a cut of the congestion window (CUBIC's to 0.7); quinn does not
+/// undo a cut it later finds spurious.
+///
+/// QUIC's thresholds, [`Reordering::QUIC`], are three packets and 9/8.
+/// They suit neither a path whose delay jitters nor this transport's
+/// acknowledgement cadence:
+/// - Jitter reorders: packets sent milliseconds apart swap places, and
+///   at a packet or more a millisecond far more than three are overtaken.
+/// - [`AckFrequency::DEFAULT`] lets the peer hold an acknowledgement up
+///   to its `max_ack_delay` (25 ms), longer than the eighth of a round
+///   trip QUIC's time threshold leaves.
+///
+/// In the packet simulator, a link of 35 ms each way whose delay jitters
+/// with a standard deviation of a tenth of it (29 to 41 ms), and which
+/// loses nothing, had about 450 of 2,200 packets called lost with CUBIC
+/// at QUIC's thresholds, the window cut about 300 times, and 2 s of
+/// frames take 46 to 52 s to move. At [`Reordering::BY_TIME`] 6 seeds of
+/// 10 called none lost and moved them in 2.0 s; the other 4 called one
+/// to seven early, in slow start, and took 4.9 to 6.5 s.
+///
+/// [`Reordering::BY_TIME`] calls loss by time alone: no count of packets
+/// is reached, so a send rate that reorders more packets in the same
+/// milliseconds does not change it. RACK (RFC 8985) also calls loss by
+/// time once it has seen reordering, but its window is not fixed: it
+/// starts at a quarter of the minimum round trip and widens, as
+/// retransmissions prove spurious, up to one smoothed round trip, so a
+/// packet is called lost between 5/4 and 2 round trips after it was
+/// sent. 7/4 sits in that range, fixed. Linux also undoes a window cut
+/// that a spurious retransmission caused, and quinn does not, which is
+/// why a wide window suits here.
+///
+/// A real loss is found 7/4 of a round trip after the packet was sent,
+/// where QUIC's thresholds find it about one round trip after, once
+/// three later packets are acknowledged. So it helps where the path
+/// reorders, and costs a little where it only loses. In the same
+/// simulator at 1% loss: on a link that keeps order CUBIC moved the
+/// frames about as soon either way (medians 6.4 against 7.9 s at a 70 ms
+/// round trip, 12.0 against 15.0 s at 140, with a wide spread across
+/// seeds), and BBR a little later (2.12 against 2.07 s, 2.32 against
+/// 2.18 s); on a link that also jitters, CUBIC 4.9 and 3.8 times sooner
+/// (10.1 against 49.7 s, 20.2 against 77.3 s).
+///
+/// QUIC's stay the default until testing's WAN cells confirm another
+/// (#185); a node picks one per run from `COORDD_REORDERING`.
+///
+/// The thresholds are the sender's, but the receiver decides when an
+/// acknowledgement goes: with [`AckFrequency`] set, the peer is asked to
+/// acknowledge out of order arrivals at once only when the gap could call
+/// a packet lost, `packets - 1` (quinn's advice), and at
+/// [`Reordering::BY_TIME`] never ([`Reordering::peer_threshold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reordering {
+    /// Packets sent after a packet, and acknowledged before it, that call
+    /// it lost. At least three (RFC 9002).
+    pub packets: u32,
+    /// The time threshold in eighths of the round trip: a packet is
+    /// called lost once this long has passed since it was sent and a
+    /// packet sent after it has been acknowledged. Nine is QUIC's 9/8; at
+    /// least nine, and from `COORDD_REORDERING` at most
+    /// [`Reordering::MAX_TIME_EIGHTHS`].
+    pub time_eighths: u32,
+}
+
+impl Reordering {
+    /// QUIC's own thresholds (RFC 9002, and quinn's defaults): three
+    /// packets and 9/8 of the round trip. The default.
+    pub const QUIC: Reordering = Reordering {
+        packets: 3,
+        time_eighths: 9,
+    };
+
+    /// Loss by time alone, at 7/4 of the round trip: the thresholds
+    /// proposed for a path whose delay jitters.
+    pub const BY_TIME: Reordering = Reordering {
+        packets: u32::MAX,
+        time_eighths: 14,
+    };
+
+    /// The widest time threshold a node takes from `COORDD_REORDERING`:
+    /// four round trips. Wider, a loss would wait for the probe timeout.
+    pub const MAX_TIME_EIGHTHS: u32 = 32;
+
+    /// The time threshold as quinn takes it, a multiple of the round
+    /// trip.
+    pub fn time_threshold(self) -> f32 {
+        self.time_eighths as f32 / 8.0
+    }
+
+    /// The reordering threshold asked of the peer with an acknowledgement
+    /// cadence: the gap at which an out of order arrival is acknowledged
+    /// at once, `packets - 1`, the gap that could call a packet lost
+    /// (quinn's advice). With no count of packets ([`Reordering::BY_TIME`])
+    /// it is 0, which asks the peer to take no special action for an out
+    /// of order arrival.
+    pub fn peer_threshold(self) -> u32 {
+        if self.packets == u32::MAX {
+            0
+        } else {
+            self.packets.saturating_sub(1)
+        }
+    }
+}
+
+/// The congestion controller a connection runs for what it sends.
+///
+/// Each end runs its own for its own packets. An accepted connection
+/// runs the one its endpoint was configured with, chosen before the
+/// peer's `Hello` names the lane, so a node's choice holds for every lane
+/// of a plane at both ends only when both ends make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Congestion {
+    /// CUBIC (RFC 9438), quinn's default and this transport's until now:
+    /// a loss cuts the window to 0.7, at most once a round trip.
+    Cubic,
+    /// BBR, quinn's port of quiche's BBRv1, which quinn's documentation
+    /// marks experimental. It sizes the window from the bandwidth and the
+    /// shortest round trip it has measured, and a loss does not cut it:
+    /// while recovering it holds the window to what is in flight. quinn's
+    /// pacer spreads the window over the round trip and does not use the
+    /// pacing rate BBR computes.
+    Bbr,
+    /// NewReno (RFC 9002, Section 7): a loss halves the window, at most
+    /// once a round trip.
+    NewReno,
 }
 
 impl Default for Limits {
@@ -94,10 +301,45 @@ impl Default for Limits {
             idle_timeout: Duration::from_secs(30),
             max_connection_age: Duration::from_secs(12 * 3600),
             keep_alive: Duration::from_secs(5),
+            max_unbound: 64,
+            bind_deadline: Duration::from_secs(5),
             event_queue: 1024,
             max_inflight: 64,
             lanes: LaneLimits::DEFAULTS,
             budget: BudgetLimits::default(),
+            stream_frames: 64,
+            stream_bytes: 256 * 1024,
+            ack_frequency: Some(AckFrequency::DEFAULT),
+            reordering: Reordering::QUIC,
+            congestion: Congestion::Cubic,
+            initial_rtt: None,
+        }
+    }
+}
+
+impl Limits {
+    /// The limits a domain node's endpoints run under, on both planes
+    /// (task-d82).
+    ///
+    /// A killed process closes nothing, so a link to it ends only at the
+    /// idle timeout, and what the link decides waits that long:
+    /// - **The peer plane:** a follower counts itself led while it holds a
+    ///   link to the leader it promised. And a voter restarted under its
+    ///   incarnation is locked out until then, since its peers keep their
+    ///   own connections to the dead process and those win the lane.
+    /// - **The api plane:** a frontend's submission link to a voter is an
+    ///   api connection, and a submission it sends on one to a dead voter
+    ///   waits out the timeout before the link is dialled again.
+    ///
+    /// So a node runs seconds, with a keep-alive that four losses in a row
+    /// do not close. QUIC takes the smaller of the two ends' idle
+    /// timeouts, so a link to a peer of an older build, or a caller on
+    /// the defaults, runs at this one's.
+    pub fn node() -> Self {
+        Limits {
+            idle_timeout: Duration::from_secs(5),
+            keep_alive: Duration::from_secs(1),
+            ..Limits::default()
         }
     }
 }

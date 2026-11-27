@@ -18,7 +18,9 @@ use coord_membership::{
 use coord_node_issuer::{Ca, NodeIssuer, NodeRequest, RolePolicy};
 use coord_transport::{BindError, IdentityBinder};
 use coord_types::identity::Digest32;
-use coord_types::ids::{ClusterId, DomainId, PrincipalId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{
+    ClusterId, DomainId, PrincipalId, ReplicaId, ReplicaIncarnation, StoreInstanceId,
+};
 use coord_types::wire_v1::{BoundedVec, HelloV1, PeerRole};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use rcgen::string::Ia5String;
@@ -28,6 +30,17 @@ use time::OffsetDateTime;
 
 const CLUSTER: ClusterId = ClusterId([1; 16]);
 const DOMAIN: DomainId = DomainId([2; 16]);
+/// A sibling domain of the same cluster, under the same issuer.
+const SIBLING: DomainId = DomainId([3; 16]);
+/// A node of either domain, in any role, issued to one workload that
+/// names the role and the domain it asks for.
+const ANY_ROLE: [(u8, PeerRole); 5] = [
+    (9, PeerRole::Observer),
+    (10, PeerRole::Learner),
+    (11, PeerRole::Frontend),
+    (12, PeerRole::KineCollector),
+    (13, PeerRole::Client),
+];
 const NOW: u64 = 1_700_000_000;
 const AUD: &str = "node-enrollment";
 const K8S_ISS: &str = "https://kubernetes.default.svc";
@@ -60,6 +73,28 @@ fn admin_key() -> AdminKey {
 
 fn pinned(admin: &AdminKey) -> DecodingKey {
     DecodingKey::from_ec_components(&admin.x, &admin.y).unwrap()
+}
+
+/// The genesis protocol versions a node built from this source reads.
+const THIS_BUILD: &[u32] = coord_membership::SUPPORTED_PROTOCOL_VERSIONS;
+
+/// The versions a build from before `features` reads.
+const BEFORE_FEATURES: &[u32] = &[coord_membership::PROTOCOL_VERSION];
+
+/// `manifest` signed as a signer that applies no version rule would:
+/// the claims `sign_genesis` writes, without its `check_protocol`. What a
+/// verifier makes of a manifest this build's signer refuses to issue.
+fn sign_unchecked(manifest: &GenesisManifest, key: &EncodingKey) -> SignedGenesis {
+    let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
+    header.typ = Some("genesis+jwt".into());
+    let mut claims = serde_json::to_value(manifest).unwrap();
+    if let serde_json::Value::Object(map) = &mut claims {
+        map.insert("iss".into(), "tuplesky-genesis".into());
+        map.insert("sub".into(), manifest.cluster.clone().into());
+        map.insert("aud".into(), manifest.domain.clone().into());
+        map.insert("exp".into(), (u64::MAX / 2).into());
+    }
+    SignedGenesis(jsonwebtoken::encode(&header, &claims, key).unwrap())
 }
 
 // ---- the WIF issuer that mints node certificates ---------------------------
@@ -110,13 +145,14 @@ fn build_issuer() -> Issuer {
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_der = ca_cert.der().to_vec();
     let ca = Ca::load(&ca_der, &ca_key.serialize_der(), NOW).unwrap();
-    let policy = |node: u8, role: PeerRole, ns: &str, sa: &str| RolePolicy {
+    let policy_in = |domain: DomainId, node: u8, role: PeerRole, ns: &str, sa: &str| RolePolicy {
         issuer: "k8s".into(),
         required: [("namespace", ns), ("serviceaccount", sa)]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         cluster: CLUSTER,
+        domain,
         nodes: vec![ReplicaId([node; 16])],
         role,
         min_incarnation: 1,
@@ -124,12 +160,21 @@ fn build_issuer() -> Issuer {
         dns_names: vec![],
         ip_addresses: vec![],
     };
-    let rules = vec![
+    let policy = |node, role, ns, sa| policy_in(DOMAIN, node, role, ns, sa);
+    let mut rules = vec![
         policy(1, PeerRole::Voter, "voters", "voter-1"),
         policy(2, PeerRole::Voter, "voters", "voter-2"),
         policy(3, PeerRole::Voter, "voters", "voter-3"),
         policy(9, PeerRole::Observer, "observers", "observer-0"),
+        policy(1, PeerRole::Observer, "impostors", "observer-1"),
+        policy(2, PeerRole::Learner, "impostors", "learner-2"),
     ];
+    for domain in [DOMAIN, SIBLING] {
+        rules.push(policy_in(domain, 1, PeerRole::Voter, "any", "any"));
+        for (node, role) in ANY_ROLE {
+            rules.push(policy_in(domain, node, role, "any", "any"));
+        }
+    }
     Issuer {
         issuer: NodeIssuer::new(verifier, ca, rules),
         idp_key: idp,
@@ -157,19 +202,33 @@ impl Issuer {
 
     /// Issue a certificate for a node; returns the leaf DER.
     fn issue(&mut self, node: u8, incarnation: u64, role: PeerRole, ns: &str, sa: &str) -> Vec<u8> {
-        let key = ecdsa();
+        let _ = role;
+        self.issue_as(&ecdsa(), node, incarnation, ns, sa, None)
+    }
+
+    /// Issue a certificate for a node under `key`, asking for `choice`'s
+    /// role and domain among the workload's rules.
+    fn issue_as(
+        &mut self,
+        key: &KeyPair,
+        node: u8,
+        incarnation: u64,
+        ns: &str,
+        sa: &str,
+        choice: Option<(PeerRole, DomainId)>,
+    ) -> Vec<u8> {
         let mut params = CertificateParams::default();
         params.distinguished_name.push(DnType::CommonName, "csr");
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        let csr = params.serialize_request(&key).unwrap();
-        let _ = role;
+        let csr = params.serialize_request(key).unwrap();
         let request = NodeRequest {
             assertion: self.assertion(ns, sa),
             csr_der: csr.der().to_vec(),
             node: [node; 16],
             incarnation,
             lifetime_secs: 300,
-            role: None,
+            role: choice.map(|(role, _)| role),
+            domain: choice.map(|(_, domain)| domain.0),
         };
         self.issuer
             .enroll(&request, &ClockHealth::healthy(NOW, 5))
@@ -196,9 +255,22 @@ fn spki(cert_der: &[u8]) -> String {
 /// A manifest committing the three founding voters by key, together with
 /// the certificates those keys belong to.
 fn manifest_with_voters(issuer: &mut Issuer, admin: &AdminKey) -> (GenesisManifest, Vec<Vec<u8>>) {
+    let (manifest, certs, _) = manifest_with_voter_keys(issuer, admin);
+    (manifest, certs)
+}
+
+/// The same, with the voters' keys.
+fn manifest_with_voter_keys(
+    issuer: &mut Issuer,
+    admin: &AdminKey,
+) -> (GenesisManifest, Vec<Vec<u8>>, Vec<KeyPair>) {
     let _ = admin;
+    let keys: Vec<KeyPair> = (1u8..=3).map(|_| ecdsa()).collect();
     let certs: Vec<Vec<u8>> = (1u8..=3)
-        .map(|n| issuer.issue(n, 1, PeerRole::Voter, "voters", &format!("voter-{n}")))
+        .map(|n| {
+            let sa = format!("voter-{n}");
+            issuer.issue_as(&keys[usize::from(n - 1)], n, 1, "voters", &sa, None)
+        })
         .collect();
     let manifest = GenesisManifest {
         cluster: hex(&CLUSTER.0),
@@ -220,15 +292,20 @@ fn manifest_with_voters(issuer: &mut Issuer, admin: &AdminKey) -> (GenesisManife
         })],
         admin: hex(&PrincipalId([0xa; 16]).0),
         protocol_version: 1,
+        features: Vec::new(),
     };
-    (manifest, certs)
+    (manifest, certs, keys)
 }
 
 fn hello(role: PeerRole, incarnation: Option<u64>) -> HelloV1 {
+    hello_in(DOMAIN, role, incarnation)
+}
+
+fn hello_in(domain: DomainId, role: PeerRole, incarnation: Option<u64>) -> HelloV1 {
     HelloV1 {
         role,
         cluster_id: CLUSTER,
-        domain_id: DOMAIN,
+        domain_id: domain,
         incarnation: incarnation.map(|i| ReplicaIncarnation::new(i).unwrap()),
         capabilities: BoundedVec::new(vec![1]).unwrap(),
     }
@@ -241,6 +318,7 @@ fn der(bytes: &[u8]) -> CertificateDer<'static> {
 #[derive(Default)]
 struct Store {
     pinned: Option<Digest32>,
+    instance: Option<StoreInstanceId>,
     journal: bool,
     fail: bool,
 }
@@ -252,8 +330,12 @@ impl GenesisStore for Store {
         }
         Ok(self.pinned)
     }
-    fn pin(&mut self, digest: Digest32) -> Result<(), StoreFailure> {
+    fn store_instance(&self) -> Result<Option<StoreInstanceId>, StoreFailure> {
+        Ok(self.instance)
+    }
+    fn pin(&mut self, digest: Digest32, store: StoreInstanceId) -> Result<(), StoreFailure> {
         self.pinned = Some(digest);
+        self.instance = Some(store);
         Ok(())
     }
     fn journal_intact(&self) -> Result<bool, StoreFailure> {
@@ -273,46 +355,66 @@ fn a_signed_genesis_initializes_pinned_membership() {
     let signed = sign_genesis(&manifest, &admin.enc).unwrap();
     // Verified against the pinned key; a different key or a tampered
     // token is refused.
-    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
     assert_eq!(verified, manifest);
     let other = admin_key();
     assert_eq!(
-        verify_genesis(&signed, &pinned(&other), 1),
+        verify_genesis(&signed, &pinned(&other), THIS_BUILD),
         Err(GenesisError::Signature)
     );
     let mut tampered = signed.0.clone();
     tampered.pop();
     tampered.push(if signed.0.ends_with('a') { 'b' } else { 'a' });
-    assert!(verify_genesis(&SignedGenesis(tampered), &pinned(&admin), 1).is_err());
+    assert!(verify_genesis(&SignedGenesis(tampered), &pinned(&admin), THIS_BUILD).is_err());
     // An unsupported protocol version.
     assert!(matches!(
-        verify_genesis(&signed, &pinned(&admin), 2),
+        verify_genesis(&signed, &pinned(&admin), &[2]),
         Err(GenesisError::UnsupportedProtocol { version: 1 })
     ));
     // First boot pins; a returning boot with the same manifest re-opens;
     // a different manifest is a digest mismatch (quarantine); a lost
     // journal quarantines.
     let mut store = Store::default();
-    let init = initialize(&verified, &mut store).unwrap();
+    let init = initialize(&verified, &mut store, || Ok(StoreInstanceId([7; 16]))).unwrap();
     assert!(init.first_boot);
     assert_eq!(init.membership.epoch().get(), 1);
-    let again = initialize(&verified, &mut store).unwrap();
+    assert_eq!(init.store_instance, StoreInstanceId([7; 16]));
+    // A returning boot reads the pinned identity back, and draws none
+    // (task-d121; from Astra's review of C1: a backup drew one).
+    let again = initialize(&verified, &mut store, || {
+        panic!("a pinned store draws no identity")
+    })
+    .unwrap();
     assert!(!again.first_boot);
+    assert_eq!(again.store_instance, StoreInstanceId([7; 16]));
+    // Five voters, not four: another manifest the design allows
+    // (task-d31).
     let mut other_manifest = manifest.clone();
-    other_manifest.voters.push(VoterSeed {
-        node: hex(&[4; 16]),
-        incarnation: 1,
-        public_key: spki(&voter_certs[0]),
-    });
+    for n in [4u8, 5] {
+        other_manifest.voters.push(VoterSeed {
+            node: hex(&[n; 16]),
+            incarnation: 1,
+            public_key: spki(&voter_certs[0]),
+        });
+    }
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
-    let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
+    let other_verified = verify_genesis(&other_signed, &pinned(&admin), THIS_BUILD).unwrap();
     assert!(matches!(
-        initialize(&other_verified, &mut store),
+        initialize(&other_verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::DigestMismatch { .. })
     ));
+    // A pinned store without its identity is damaged, and is not given
+    // a new one.
+    store.instance = None;
+    assert_eq!(
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
+        Err(InitError::Store)
+    );
+    assert_eq!(store.instance, None);
+    store.instance = Some(StoreInstanceId([7; 16]));
     store.journal = false;
     assert_eq!(
-        initialize(&verified, &mut store),
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([8; 16]))),
         Err(InitError::JournalLost)
     );
     let _ = &mut issuer;
@@ -455,6 +557,135 @@ fn the_binder_admits_current_voters_and_refuses_everything_else() {
     );
 }
 
+/// A non-voter peer never holds a committed voter's name (design Section
+/// 10.1). The transport keys a voter's link by its replica, and the
+/// provenance of every frame names the replica it came from; an observer
+/// or learner certificate the issuer signed for a voter's node would be
+/// that voter to both. It is refused at the committed generation and at
+/// any other, while the same roles for nodes that aren't voters bind.
+#[test]
+fn an_observer_or_learner_certificate_naming_a_committed_voter_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let binder = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+
+    for incarnation in [1, 7] {
+        let observer = issuer.issue(
+            1,
+            incarnation,
+            PeerRole::Observer,
+            "impostors",
+            "observer-1",
+        );
+        assert_eq!(
+            binder.bind(
+                &[der(&observer)],
+                &hello(PeerRole::Observer, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "an observer certificate for voter 1 at generation {incarnation}"
+        );
+        let learner = issuer.issue(2, incarnation, PeerRole::Learner, "impostors", "learner-2");
+        assert_eq!(
+            binder.bind(
+                &[der(&learner)],
+                &hello(PeerRole::Learner, Some(incarnation))
+            ),
+            Err(BindError::NonVoterNamesVoter),
+            "a learner certificate for voter 2 at generation {incarnation}"
+        );
+    }
+
+    // The control: the same roles for nodes no voter is known by bind,
+    // with their own replica identity.
+    let observer = issuer.issue(9, 1, PeerRole::Observer, "observers", "observer-0");
+    let bound = binder
+        .bind(&[der(&observer)], &hello(PeerRole::Observer, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Observer, Some(ReplicaId([9; 16])))
+    );
+    let learner = issuer.issue_as(
+        &ecdsa(),
+        10,
+        1,
+        "any",
+        "any",
+        Some((PeerRole::Learner, DOMAIN)),
+    );
+    let bound = binder
+        .bind(&[der(&learner)], &hello(PeerRole::Learner, Some(1)))
+        .unwrap();
+    assert_eq!(
+        (bound.role, bound.replica),
+        (PeerRole::Learner, Some(ReplicaId([10; 16])))
+    );
+}
+
+/// A certificate reaches only the domain it names (design Section 11.1,
+/// Codex's P1 on #267). Two domains of one cluster share its issuer, so a
+/// certificate a sibling domain's rule issued is signed by the same CA
+/// and names the same cluster. It used to bind here in any role whose
+/// binding membership doesn't check -- a frontend's among them, which
+/// submits and establishes sessions -- by naming this domain in its
+/// `Hello`. Every role is refused here, and binds on its own domain.
+#[test]
+fn a_certificate_for_a_sibling_domain_is_refused_here_in_every_role() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, voter_certs, voter_keys) = manifest_with_voter_keys(&mut issuer, &admin);
+    let here = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+    // The sibling commits the same voters, so the voter's case turns on
+    // the domain alone: the same node, generation and committed key.
+    let mut sibling = manifest.clone();
+    sibling.domain = hex(&SIBLING.0);
+    let there = PeerBinder::new(Membership::from_genesis(&sibling).unwrap());
+
+    let mut roles = vec![(1u8, PeerRole::Voter)];
+    roles.extend(ANY_ROLE);
+    for (node, role) in roles {
+        let peer = coord_transport::identity::role_class(role) == coord_transport::Class::Peer;
+        let incarnation = peer.then_some(1);
+        let key = if role == PeerRole::Voter {
+            &voter_keys[0]
+        } else {
+            &ecdsa()
+        };
+        let mine = issuer.issue_as(key, node, 1, "any", "any", Some((role, DOMAIN)));
+        let theirs = issuer.issue_as(key, node, 1, "any", "any", Some((role, SIBLING)));
+
+        // The same role, issued for this domain, binds here.
+        let bound = here
+            .bind(&[der(&mine)], &hello(role, incarnation))
+            .unwrap_or_else(|e| panic!("{role:?} of this domain: {e:?}"));
+        assert_eq!(bound.role, role);
+        // The sibling's, naming this domain in its Hello, does not.
+        assert_eq!(
+            here.bind(&[der(&theirs)], &hello(role, incarnation)),
+            Err(BindError::DomainMismatch),
+            "{role:?} issued for the sibling domain"
+        );
+        // Nor does this domain's, naming the sibling, on the sibling's.
+        assert_eq!(
+            there.bind(&[der(&mine)], &hello_in(SIBLING, role, incarnation)),
+            Err(BindError::DomainMismatch),
+            "{role:?} issued for this domain, on the sibling"
+        );
+        // The sibling's binds where it was issued for.
+        let bound = there
+            .bind(&[der(&theirs)], &hello_in(SIBLING, role, incarnation))
+            .unwrap_or_else(|e| panic!("{role:?} on its own domain: {e:?}"));
+        assert_eq!(bound.role, role);
+    }
+    // The founding voter's own certificate is this domain's.
+    assert!(
+        here.bind(&[der(&voter_certs[0])], &hello(PeerRole::Voter, Some(1)))
+            .is_ok()
+    );
+}
+
 #[test]
 fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
     // Pinning first and crashing left a pinned digest with no journal,
@@ -469,7 +700,10 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
         fn pinned_digest(&self) -> Result<Option<Digest32>, StoreFailure> {
             Ok(self.pinned)
         }
-        fn pin(&mut self, _digest: Digest32) -> Result<(), StoreFailure> {
+        fn store_instance(&self) -> Result<Option<StoreInstanceId>, StoreFailure> {
+            Ok(None)
+        }
+        fn pin(&mut self, _digest: Digest32, _store: StoreInstanceId) -> Result<(), StoreFailure> {
             // The power goes out exactly here.
             Err(StoreFailure)
         }
@@ -485,10 +719,13 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
     let mut issuer = build_issuer();
     let (manifest, _certs) = manifest_with_voters(&mut issuer, &admin);
     let signed = sign_genesis(&manifest, &admin.enc).unwrap();
-    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
 
     let mut store = CrashOnPin::default();
-    assert_eq!(initialize(&verified, &mut store), Err(InitError::Store));
+    assert_eq!(
+        initialize(&verified, &mut store, || Ok(StoreInstanceId([7; 16]))),
+        Err(InitError::Store)
+    );
     // Nothing was pinned, and the journal is there: the retry is an
     // ordinary first boot, not a quarantine.
     assert_eq!(store.pinned, None);
@@ -498,7 +735,7 @@ fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
         journal: store.journal,
         ..Store::default()
     };
-    let init = initialize(&verified, &mut retry).unwrap();
+    let init = initialize(&verified, &mut retry, || Ok(StoreInstanceId([7; 16]))).unwrap();
     assert!(init.first_boot);
 }
 
@@ -752,7 +989,7 @@ fn a_manifest_signed_from_a_pem_key_verifies_against_its_public_pem() {
     let signed = coord_membership::sign_genesis_pem(&manifest, private.as_bytes()).unwrap();
     let verifying = coord_membership::admin_key_from_pem(public.as_bytes()).unwrap();
     assert_eq!(
-        verify_genesis(&signed, &verifying, coord_membership::PROTOCOL_VERSION).unwrap(),
+        verify_genesis(&signed, &verifying, THIS_BUILD).unwrap(),
         manifest
     );
 
@@ -762,7 +999,7 @@ fn a_manifest_signed_from_a_pem_key_verifies_against_its_public_pem() {
         verify_genesis(
             &signed,
             &coord_membership::admin_key_from_pem(other_public.as_bytes()).unwrap(),
-            coord_membership::PROTOCOL_VERSION
+            THIS_BUILD
         ),
         Err(GenesisError::Signature)
     );
@@ -833,7 +1070,7 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
         b64url(br#"{"alg":"none","typ":"JWT"}"#)
     ));
     assert!(matches!(
-        verify_genesis(&none, &pinned(&admin), coord_membership::PROTOCOL_VERSION),
+        verify_genesis(&none, &pinned(&admin), THIS_BUILD),
         Err(GenesisError::Algorithm | GenesisError::Malformed)
     ));
 
@@ -843,11 +1080,142 @@ fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
         jsonwebtoken::encode(&header, &manifest, &admin.enc).unwrap(),
     );
     assert_eq!(
-        verify_genesis(
-            &pointed,
-            &pinned(&admin),
-            coord_membership::PROTOCOL_VERSION
-        ),
+        verify_genesis(&pointed, &pinned(&admin), THIS_BUILD),
         Err(GenesisError::Algorithm)
     );
+}
+
+/// A manifest naming no features serializes as it did before the field
+/// existed, so its pinned digest is unchanged; one naming them is another
+/// manifest (task-d121), at a protocol version a build without features
+/// refuses (#329 review).
+#[test]
+fn a_manifest_naming_no_features_keeps_its_digest() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    assert!(manifest.features.is_empty());
+    let value = serde_json::to_value(&manifest).unwrap();
+    assert!(
+        value.get("features").is_none(),
+        "an empty list is serialized, and every pinned digest moves"
+    );
+    // As a manifest from before the field reads: no key at all.
+    let read: GenesisManifest = serde_json::from_value(value).unwrap();
+    assert_eq!(read, manifest);
+    assert_eq!(read.digest(), manifest.digest());
+
+    assert_eq!(
+        manifest.protocol_version,
+        coord_membership::PROTOCOL_VERSION
+    );
+    let mut named = manifest.clone();
+    named.features = vec!["release-at-execution".into(), "decided-nothing".into()];
+    named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    assert_ne!(named.digest(), manifest.digest());
+    let signed = sign_genesis(&named, &admin.enc).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), THIS_BUILD).unwrap();
+    assert_eq!(verified, named);
+    assert_eq!(
+        verified.genesis_features().unwrap(),
+        [
+            coord_types::formats::Feature::ReleaseAtExecution,
+            coord_types::formats::Feature::DecidedNothing,
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// A feature that can't be active from genesis is refused when the
+/// manifest is verified, so `init` and every start refuse it too.
+#[test]
+fn a_feature_that_cannot_be_active_from_genesis_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let refused = |names: &[&str]| {
+        let mut named = manifest.clone();
+        named.features = names.iter().map(|n| (*n).to_owned()).collect();
+        named.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+        let signed = sign_genesis(&named, &admin.enc).unwrap();
+        match verify_genesis(&signed, &pinned(&admin), THIS_BUILD) {
+            Err(GenesisError::Feature { name, reason }) => (name, reason),
+            other => panic!("{names:?} was not refused: {other:?}"),
+        }
+    };
+    assert_eq!(refused(&["no-such-feature"]).0, "no-such-feature");
+    assert!(refused(&["decided-nothing-prepared"]).1.contains("marker"));
+    assert!(
+        refused(&["checkpoint-floor"])
+            .1
+            .contains("no prepare marker")
+    );
+    assert!(
+        refused(&["release-at-execution", "release-at-execution"])
+            .1
+            .contains("twice")
+    );
+    let (name, reason) = refused(&["decided-nothing"]);
+    assert_eq!(name, "decided-nothing");
+    assert!(reason.contains("release-at-execution"), "{reason}");
+    // The relay rests on answer-on-release, as its live activation does:
+    // one table for both (#329 review).
+    let (name, reason) = refused(&["batched-round"]);
+    assert_eq!(name, "batched-round");
+    assert!(reason.contains("answer-on-release"), "{reason}");
+    // Its prerequisite alone is a manifest the design allows.
+    let mut alone = manifest.clone();
+    alone.features = vec!["release-at-execution".into()];
+    alone.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    let signed = sign_genesis(&alone, &admin.enc).unwrap();
+    assert!(verify_genesis(&signed, &pinned(&admin), THIS_BUILD).is_ok());
+    // Features at the version a build without them accepts: the signer
+    // won't issue it, and a verifier refuses one signed elsewhere, so no
+    // build reads them as a featureless manifest (#329 review).
+    let mut old_version = alone.clone();
+    old_version.protocol_version = coord_membership::PROTOCOL_VERSION;
+    let at_one = |e: Result<_, GenesisError>| match e {
+        Err(GenesisError::Feature { name, reason }) => {
+            assert_eq!(name, "release-at-execution");
+            assert!(reason.contains("protocol version 2"), "{reason}");
+        }
+        other => panic!("features at version 1 were not refused: {other:?}"),
+    };
+    at_one(sign_genesis(&old_version, &admin.enc).map(|_| ()));
+    let signed = sign_unchecked(&old_version, &admin.enc);
+    at_one(verify_genesis(&signed, &pinned(&admin), THIS_BUILD).map(|_| ()));
+    // The features' version with none named: each version has one
+    // meaning, so the signer and the verifier both refuse it (#329
+    // review, 61bf620c).
+    let mut bare = manifest.clone();
+    bare.protocol_version = coord_membership::FEATURES_PROTOCOL_VERSION;
+    let without = GenesisError::VersionWithoutFeatures {
+        version: coord_membership::FEATURES_PROTOCOL_VERSION,
+    };
+    assert_eq!(sign_genesis(&bare, &admin.enc), Err(without.clone()));
+    let signed = sign_unchecked(&bare, &admin.enc);
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), THIS_BUILD),
+        Err(without)
+    );
+    // A build from before the field reads version 2 as no version it has.
+    // That is also what it reads in a manifest naming features: it drops
+    // the unknown key, and the version left is one it refuses, so it pins
+    // nothing (#329 review).
+    let unsupported = Err(GenesisError::UnsupportedProtocol {
+        version: coord_membership::FEATURES_PROTOCOL_VERSION,
+    });
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), BEFORE_FEATURES),
+        unsupported
+    );
+    let signed = sign_genesis(&alone, &admin.enc).unwrap();
+    assert_eq!(
+        verify_genesis(&signed, &pinned(&admin), BEFORE_FEATURES),
+        unsupported
+    );
+    // The caller's versions are read on every branch: a feature-bearing
+    // manifest is refused by a caller that doesn't read its version.
+    assert_eq!(verify_genesis(&signed, &pinned(&admin), &[99]), unsupported);
 }

@@ -14,8 +14,13 @@
 //!   server `RequestIdentityConflict` is the same typed error.
 //! * A deadline reports the outcome as *unknown* (a completion the
 //!   application sees), keeps the invocation and resolves it by identity
-//!   with `ResolveRequest`; `Pending` keeps it unknown, `Unknown` from the
-//!   server is final.
+//!   with `ResolveRequest`; `Pending` keeps it unknown. `Unknown` from the
+//!   server ends the resolution, and `retry()` after it submits the same
+//!   invocation again under the same identity, whose answer is the
+//!   retained outcome where the domain keeps one (task-d23).
+//! * An executed command whose result the caller may not see is
+//!   `Withheld`, never a refusal to admit; one whose result is no longer
+//!   kept is `Retired`. Both are final.
 //! * Outstanding requests (queued, in flight, unknown) are bounded; the
 //!   pool bounds concurrent streams; a credential is presented once per
 //!   connection binding.
@@ -111,8 +116,17 @@ pub enum Outcome {
     /// Established error.
     Failed(RetryError),
     /// Unknown: the deadline passed or the endpoint lost the identity; the
-    /// operation may or may not have happened. Resolve by identity.
+    /// operation may or may not have happened. Resolve by identity, or
+    /// `retry()` to submit the same invocation again.
     Unknown,
+    /// The operation happened, and its result is withheld from this
+    /// caller under the current policy (task-d23). It is not submitted
+    /// again, and it is not a refusal to admit.
+    Withheld,
+    /// Retired, result unavailable: the invocation is at or below its
+    /// client instance's retirement floor and no result is kept for it
+    /// (task-d23). Whether it happened is not retrievable.
+    Retired,
 }
 
 /// Where a request is.
@@ -214,6 +228,8 @@ struct Entry {
     not_before: u64,
     /// Sends and resolves performed.
     attempts: u32,
+    /// Of those, the ones answered `BACKPRESSURE`.
+    backpressured: u32,
 }
 
 /// The SDK client of one session against one endpoint.
@@ -298,6 +314,20 @@ impl<P: CredentialProvider> Client<P> {
         self.requests.get(&request).map_or(0, |e| e.attempts)
     }
 
+    /// Of a request's attempts, those the frontend answered
+    /// `BACKPRESSURE`: refused before admission, nothing done. The request
+    /// stays queued and goes out again after the backoff, so this is how an
+    /// application tells a frontend refusing it from an outcome it could not
+    /// learn. When it equals [`Client::attempts`], every attempt this
+    /// client made was refused, and none of them reached the domain. A
+    /// retry of a request this client still holds as unknown keeps its
+    /// earlier attempts. An earlier submission of the same sequence that
+    /// this client no longer holds (before a restart, or a request
+    /// forgotten and retried) is not counted here.
+    pub fn backpressured(&self, request: RequestId) -> u32 {
+        self.requests.get(&request).map_or(0, |e| e.backpressured)
+    }
+
     /// Requests not done.
     pub fn outstanding(&self) -> usize {
         self.requests
@@ -334,6 +364,15 @@ impl<P: CredentialProvider> Client<P> {
     /// cached credential is dropped; the next connect exchanges again.
     pub fn binding_rejected(&mut self, connection: ConnectionId) {
         self.credentials.invalidate();
+        self.pool.closed(connection);
+    }
+
+    /// The frontend could not bind now (the connection closed as
+    /// `Rejected` with the reason "bind unavailable": its policy may be
+    /// behind the domain's). It said so before it read the credential,
+    /// so the cached credential is kept and the next connect, here later
+    /// or at another frontend, presents it again (#320 follow-up).
+    pub fn binding_unavailable(&mut self, connection: ConnectionId) {
         self.pool.closed(connection);
     }
 
@@ -380,8 +419,12 @@ impl<P: CredentialProvider> Client<P> {
         {
             return Ok(id);
         }
+        // An unknown outcome is not an answer to replay: the same
+        // invocation goes out again, and the domain answers it from its
+        // record where it executed (task-d23).
         if let Some(e) = self.requests.get(&id)
             && let RequestState::Done(outcome) = &e.state
+            && *outcome != Outcome::Unknown
         {
             self.completions.push_back(Completion {
                 request: id,
@@ -391,7 +434,21 @@ impl<P: CredentialProvider> Client<P> {
             return Ok(id);
         }
         self.check_window()?;
+        // A retained request whose outcome was unknown keeps the attempts
+        // it made: one of them may have reached the domain, and
+        // `backpressured` equal to `attempts` must never say otherwise of
+        // a retry refused BACKPRESSURE (Codex on #228).
+        let made = self
+            .requests
+            .get(&id)
+            .map(|e| (e.attempts, e.backpressured));
         self.insert(now, id, invocation, deadline_ms);
+        if let Some((attempts, backpressured)) = made
+            && let Some(e) = self.requests.get_mut(&id)
+        {
+            e.attempts = attempts;
+            e.backpressured = backpressured;
+        }
         self.pump(now);
         Ok(id)
     }
@@ -524,12 +581,17 @@ impl<P: CredentialProvider> Client<P> {
                     // The same invocation, later; nothing is done.
                     e.state = RequestState::Queued;
                     e.not_before = now + self.config.backoff;
+                    e.backpressured += 1;
                     return;
                 }
                 codes::NOT_ADMITTED => {
                     self.credentials.invalidate();
                     Outcome::Failed(RetryError::NotAdmitted)
                 }
+                // The command executed: nothing about the binding is in
+                // question, and nothing is sent again (task-d23).
+                codes::OUTPUT_WITHHELD => Outcome::Withheld,
+                codes::RESULT_RETIRED => Outcome::Retired,
                 codes::MALFORMED_REQUEST => Outcome::Failed(RetryError::Malformed),
                 codes::RESULT_TOO_LARGE => Outcome::Failed(RetryError::ResultTooLarge),
                 codes::REQUEST_TOO_LARGE => Outcome::Failed(RetryError::RequestTooLarge),
@@ -644,6 +706,7 @@ impl<P: CredentialProvider> Client<P> {
                 deadline_ms,
                 not_before: now,
                 attempts: 0,
+                backpressured: 0,
             },
         );
     }

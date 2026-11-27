@@ -93,6 +93,10 @@ struct EnrollBody {
     /// names one; see [`NodeRequest::role`].
     #[serde(default)]
     role: Option<String>,
+    /// Hex of the domain asked for, where the request names one; see
+    /// [`NodeRequest::domain`].
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -168,6 +172,11 @@ async fn enroll(State(state): State<Arc<IssuerState>>, Json(body): Json<EnrollBo
         Some(Some(role)) => Some(role),
         Some(None) => return error(StatusCode::BAD_REQUEST, "malformed"),
     };
+    let domain = match body.domain.as_deref().map(unhex16) {
+        None => None,
+        Some(Some(domain)) => Some(domain),
+        Some(None) => return error(StatusCode::BAD_REQUEST, "malformed"),
+    };
     let request = NodeRequest {
         assertion: body.assertion,
         csr_der,
@@ -175,6 +184,7 @@ async fn enroll(State(state): State<Arc<IssuerState>>, Json(body): Json<EnrollBo
         incarnation: body.incarnation,
         lifetime_secs: body.lifetime_secs,
         role,
+        domain,
     };
     let clock = state.clock.read();
     match state.issuer.lock().await.enroll(&request, &clock) {

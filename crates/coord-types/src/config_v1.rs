@@ -180,6 +180,9 @@ pub enum ConfigError {
     NoVoters,
     /// More voters than the bound.
     TooManyVoters,
+    /// A voter count other than three or five, or one for the
+    /// single-voter test profile (task-d31).
+    UnsupportedVoterCount,
     /// Voters are not sorted ascending by node, or a node repeats.
     VotersNotSortedUnique,
     /// A public key is not an uncompressed P-256 point.
@@ -290,6 +293,11 @@ impl GroupConfigurationV1 {
         }
         if self.voters.len() > limits::MAX_VOTERS {
             return Err(ConfigError::TooManyVoters);
+        }
+        // Three or five voters, or one for the single-voter test profile
+        // (task-d31): two and four have no fast quorum the design defines.
+        if !matches!(self.voters.len(), 1 | 3 | 5) {
+            return Err(ConfigError::UnsupportedVoterCount);
         }
         for pair in self.voters.windows(2) {
             if pair[0].node >= pair[1].node {

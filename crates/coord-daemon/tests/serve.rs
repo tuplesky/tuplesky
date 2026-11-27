@@ -5,7 +5,7 @@
 //! the caller sees an empty answer, or waits out a deadline, or keeps a
 //! connection it should have lost. None of those is a type error.
 
-use coord_collector::{Action, Delivery, FanOut};
+use coord_collector::{Action, Delivery, FanOut, ReadPlan};
 use coord_daemon::serve::{Step, step};
 use coord_session::Ingress;
 use coord_session::binding::BindError;
@@ -52,9 +52,11 @@ fn a_binding_is_acknowledged_and_its_stream_ends() {
 /// refused stops being served. Ignoring the frame is not the same as
 /// closing: the same frame can simply be sent again.
 ///
-/// All three close as `Rejected` and say no more. Whether a token was
+/// All of them close as `Rejected` and say no more. Whether a token was
 /// wrong, absent or merely late is not something an unbound caller is
-/// entitled to distinguish, and the reason crosses the wire.
+/// entitled to distinguish, and the reason crosses the wire. The one
+/// other reason, "bind unavailable", is a stale node's, given before it
+/// read the token (#320 follow-up): it says nothing about the token.
 #[test]
 fn a_connection_without_a_live_binding_stops_being_served() {
     for (ingress, reason) in [
@@ -66,6 +68,10 @@ fn a_connection_without_a_live_binding_stops_being_served() {
             }),
             "bind refused",
         ),
+        // A node that can't decide from its policy now refused before it
+        // read the credential (#320 follow-up), so it can say so without
+        // saying anything about the token: the caller keeps it.
+        (Ingress::Rejected(BindError::Stale), "bind unavailable"),
     ] {
         let decided = step(ingress, Some(key(1)));
         assert_eq!(
@@ -158,6 +164,26 @@ fn a_pending_request_that_names_no_invocation_is_refused_not_held() {
         }
     );
     assert!(!decided.keeps_the_stream());
+}
+
+/// A read sent to the leader keeps its stream under its own invocation
+/// (task-d50): the leader's answer, or the ordered command it falls back
+/// to, is delivered on it. Ending it would cancel the read the moment it
+/// was sent and leave the caller with nothing.
+#[test]
+fn a_leader_read_holds_its_stream_under_its_invocation() {
+    let decided = step(
+        Ingress::Action(Action::Read(ReadPlan {
+            command: CommandId(Digest32([0xd; 32])),
+            retry_key: key(5),
+            leader: coord_types::ids::ReplicaId([9; 16]),
+            frame: b"read".to_vec(),
+        })),
+        None,
+    );
+    assert!(matches!(decided, Step::Read(_)));
+    assert!(decided.keeps_the_stream());
+    assert_eq!(decided.held(), Some(key(5)));
 }
 
 /// A watch keeps its stream, because a watch is not a request with a long
