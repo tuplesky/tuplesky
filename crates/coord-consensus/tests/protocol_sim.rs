@@ -2529,7 +2529,10 @@ impl Sim {
     /// What `coordd` serves for a catch-up ask at `ballot` after
     /// `after`: the donor's executed commands from there, each with its
     /// durable payload and dependency row, stopping at the first it
-    /// cannot show.
+    /// cannot show. A command executed as nothing goes with no payload
+    /// and its nothing row, and its result is the canonical refusal; the
+    /// result of each command after it reads the order as its executor
+    /// did, without the nothings (task-d121, as `complete` executes).
     fn page(&self, donor: u8, ballot: Ballot, after: ExecutionPosition) -> ProtocolMessage {
         let node = &self.nodes[usize::from(donor)];
         let payloads: BTreeMap<CommandId, coord_consensus::PayloadRecordV1> =
@@ -2539,20 +2542,36 @@ impl Sim {
         // Its durable executions: what its store holds (task-d90).
         let executed = &node.executed[..node.durable_executed];
         let mut entries = Vec::new();
+        let as_nothing = |x: &CommandId| self.executed_as_nothing.get(x) == Some(&true);
         for (i, c) in executed
             .iter()
             .enumerate()
             .skip(usize::try_from(after.get()).unwrap_or(usize::MAX))
             .take(self.knobs.page)
         {
-            let Some(payload) = payloads.get(c) else {
-                break;
+            let decided = rows.get(c).cloned().filter(|_| !self.withholds(donor, c));
+            let (payload, response) = if as_nothing(c) {
+                // Whole only with its nothing row: that is all it is.
+                if !decided.as_ref().is_some_and(CommandRecord::is_nothing) {
+                    break;
+                }
+                (None, nothing_response(c))
+            } else {
+                let Some(payload) = payloads.get(c) else {
+                    break;
+                };
+                let effective: Vec<CommandId> = executed[..i]
+                    .iter()
+                    .filter(|x| !as_nothing(x))
+                    .copied()
+                    .collect();
+                let response = response_of(&effective, c, |x| self.offers.get(x).map(|o| o.key));
+                (Some(payload.clone()), response)
             };
-            let response = response_of(&executed[..i], c, |x| self.offers.get(x).map(|o| o.key));
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
-                payload: Some(payload.clone()),
-                decided: rows.get(c).cloned().filter(|_| !self.withholds(donor, c)),
+                payload,
+                decided,
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,
                 result_digest: digest_of(&response),
@@ -6310,6 +6329,37 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
 /// at this row decides a nothing with the rule where the control gives
 /// up: a nothing takes its holders gone, as in
 /// `a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead`.
+/// A voter that catches up past a command executed as nothing reads the
+/// order its donor executed (task-d121's C5b). Row 10 at three voters,
+/// with catch-up, the rule on and node 0, the only holder of a command,
+/// destroyed: the voters left decide it as nothing and lead, and a voter
+/// behind pulls the commands after it from the other. Each pulled result
+/// must be the one the puller computes for itself. Before the donor's
+/// page read the order without the nothings, as its executor does, seeds
+/// 702 and 942 failed here as a catch-up divergence; with the holder only
+/// marked, or without the rule, neither ever did.
+#[test]
+fn a_voter_catching_up_past_a_nothing_reads_the_order_its_donor_executed() {
+    for seed in [702, 942] {
+        let knobs = Knobs {
+            peer_ack_loss: 750_000,
+            hold: 160_000,
+            campaign: 12_000,
+            crash: 5_000,
+            holders_gone: Some(true),
+            decide_nothing: Some(true),
+            ..Knobs::row(10)
+        };
+        let stats = run_knobs(3, knobs, seed, Some(true)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stats.gone, 0b1, "seed {seed}: {stats:?}");
+        assert!(stats.nothing_executed > 0, "seed {seed}: {stats:?}");
+        assert!(
+            stats.led_after_gone && stats.healed,
+            "seed {seed}: {stats:?}"
+        );
+    }
+}
+
 /// The recovery check owes every decision a voter saw (Astra on #336). A
 /// decision counted at a quorum that no frontend learned and no voter
 /// executed, as one whose submitter was destroyed is, keeps a domain
