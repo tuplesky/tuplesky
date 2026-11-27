@@ -273,7 +273,15 @@ impl BoundFrontend {
         self.watches.get(&(connection, watch_id)).copied()
     }
 
-    /// Replace the STS keys (rotation).
+    /// What bindings are verified against: the STS keys, issuer and
+    /// audience. A transport's pre-bind gate verifies a first bind's
+    /// token against the same (task-d122).
+    pub fn config(&self) -> &BindingConfig {
+        &self.config
+    }
+
+    /// Replace the STS keys (rotation). A runtime that gave
+    /// [`Self::config`] to a pre-bind gate replaces them there too.
     pub fn set_jwks(&mut self, jwks: serde_json::Value) {
         self.config.jwks = jwks;
     }

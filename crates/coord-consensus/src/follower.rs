@@ -1956,7 +1956,8 @@ impl Follower {
     /// whole ballot. And ask the voters that have not promised for their
     /// promise again (task-d82): a `NewLeader` is published once too.
     /// Driven on an interval while the campaign selects; nothing is asked
-    /// once the selection is made.
+    /// once the selection is made, but for one kept through a payload
+    /// wait (task-d121).
     pub fn request_report_pages(&mut self) -> Vec<Effect> {
         let (Some(campaign), Some(boot)) = (self.campaign.as_ref(), self.boot) else {
             return Vec::new();

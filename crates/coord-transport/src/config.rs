@@ -72,6 +72,21 @@ pub struct Limits {
     pub max_connection_age: Duration,
     /// Keep-alive interval (liveness only; never a lease or membership).
     pub keep_alive: Duration,
+    /// API connections without a client certificate that may be open and
+    /// not yet bound at once (task-d122). They count under
+    /// `max_connections` as well, so it leaves at least
+    /// `max_connections - max_unbound` places to callers that hold a
+    /// certificate or have bound; one beyond it is closed as soon as its
+    /// TLS handshake shows it has no certificate.
+    pub max_unbound: usize,
+    /// How long a connection without a client certificate has, from the
+    /// end of its TLS handshake, to send `Hello` and a `Bind` whose token
+    /// verifies (task-d122). One deadline for all of it, in place of the
+    /// separate handshake waits; at it the connection is closed with
+    /// [`CloseCode::Timeout`] and its place under `max_unbound` freed.
+    ///
+    /// [`CloseCode::Timeout`]: crate::CloseCode::Timeout
+    pub bind_deadline: Duration,
     /// Depth of each lane's owned event queue; that lane's readers wait
     /// when it is full while the other lanes keep flowing.
     pub event_queue: usize,
@@ -286,6 +301,8 @@ impl Default for Limits {
             idle_timeout: Duration::from_secs(30),
             max_connection_age: Duration::from_secs(12 * 3600),
             keep_alive: Duration::from_secs(5),
+            max_unbound: 64,
+            bind_deadline: Duration::from_secs(5),
             event_queue: 1024,
             max_inflight: 64,
             lanes: LaneLimits::DEFAULTS,

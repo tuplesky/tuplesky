@@ -343,13 +343,27 @@ impl Campaign {
         self
     }
 
+    /// Whether the selection it holds ends the asks for promises and
+    /// report pages: one is made, and it is not one kept only while it
+    /// waits task-d120's bound for a payload's holders (task-d121). That
+    /// selection is made again when the wait ends, from every report read
+    /// by then, and a voter's promise is what its payload asks go by: a
+    /// lost promise or first page of the only voter left that holds the
+    /// payload was asked for again only after the selection was dropped,
+    /// too late to count (#335 review).
+    const fn selection_settled(&self) -> bool {
+        self.decision.is_some()
+            && (self.report_wait.is_none() || self.bound.is_some() || self.durable)
+    }
+
     /// The report pages to ask each promising voter for again (task-d28):
     /// those still missing from a report some page of which arrived, or
     /// an empty list -- the first pages -- for one of which none did. The
     /// candidate's own report is never asked for, and nothing is once
-    /// the selection is made.
+    /// the selection is made, but for one kept through a payload wait
+    /// ([`Campaign::wait_for_payload_holders`]).
     pub fn missing_pages(&self) -> Vec<(ReplicaId, Vec<u32>)> {
-        if self.decision.is_some() {
+        if self.selection_settled() {
             return Vec::new();
         }
         let me = self.config.leader();
@@ -374,7 +388,8 @@ impl Campaign {
     /// of the ballot whose promise has not arrived, the candidate
     /// excluded, once its own promise is durable (its report is taken
     /// then, as the first `NewLeader` waited for) and until the selection
-    /// is made.
+    /// is made, but for one kept through a payload wait
+    /// ([`Campaign::wait_for_payload_holders`]).
     ///
     /// A `NewLeader` is published once, and one sent on a connection its
     /// peer was closing is lost: a voter restarted under its incarnation
@@ -383,7 +398,7 @@ impl Campaign {
     /// again, so the campaign held the voter until the election replaced
     /// it at its ceiling, 16 s later.
     pub fn unpromised(&self) -> Vec<ReplicaId> {
-        if self.decision.is_some() || self.own.is_none() {
+        if self.selection_settled() || self.own.is_none() {
             return Vec::new();
         }
         let me = self.config.leader();
@@ -412,7 +427,8 @@ impl Campaign {
     }
 
     /// How many times something the selection may wait on arrived before
-    /// it was made: each may cost one more assembly (task-d33).
+    /// it was made, or the wait for the reports not read ended (task-d120,
+    /// task-d121): each may cost one more assembly (task-d33).
     pub const fn supply_moves(&self) -> u64 {
         self.supply_moves
     }
@@ -501,8 +517,13 @@ impl Campaign {
     /// dropped, unless it was bound: made again, under the rule, it may
     /// decide as nothing what nobody could send.
     pub fn end_report_wait(&mut self) -> bool {
-        self.report_wait_over = true;
+        let over = core::mem::replace(&mut self.report_wait_over, true);
         let waited = self.report_wait.take().is_some();
+        // The wait ends once, and the selection made after it may cost
+        // one more assembly.
+        if !over && self.bound.is_none() && !self.durable {
+            self.supply_moves += 1;
+        }
         if waited {
             self.supply_moved = true;
             if self.bound.is_none() && !self.durable {
@@ -516,7 +537,11 @@ impl Campaign {
     /// Wait task-d120's bound before a selection under task-d121's rule
     /// decides as nothing `missing`, a payload the selection waits for
     /// that may be one nobody can send, keeping the selection and its
-    /// asks meanwhile. `false`, and nothing changes, where the rule is off,
+    /// asks meanwhile: for the payloads, and for the promises and report
+    /// pages not in ([`Campaign::unpromised`], [`Campaign::missing_pages`]),
+    /// so that a voter whose promise or first page was lost is asked
+    /// again, its payload asked of it once it promises, and its report
+    /// read by the selection made after the wait. `false`, and nothing changes, where the rule is off,
     /// the wait has passed or already runs, or the selection is bound.
     pub fn wait_for_payload_holders(&mut self, missing: CommandId) -> bool {
         if !self.rules.decide_nothing
@@ -550,6 +575,9 @@ impl Campaign {
         self.decision = None;
         self.awaited = None;
         self.supply_moved = true;
+        // The wait ends once, and the selection made again costs one
+        // more assembly.
+        self.supply_moves += 1;
         true
     }
 

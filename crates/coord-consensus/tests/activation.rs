@@ -7952,11 +7952,21 @@ fn under_the_rule_every_voter_answered_passes_the_wait_at_once() {
             .any(|r| matches!(r, FollowerRejection::Behind { .. })),
         "{rejections:?}"
     );
-    let decision = f
-        .campaign_state()
-        .and_then(|c| c.decision())
-        .expect("selected");
+    let campaign = f.campaign_state().expect("campaigning");
+    let decision = campaign.decision().expect("selected");
     assert!(decision.nothing.contains(&d), "{decision:?}");
+    // Assembled once a majority could be complete, once when the third
+    // report completed, and once after the wait passed: within the
+    // budget `protocol_sim`'s oracle 5 holds a campaign to, once a
+    // majority could be complete and once per supply, a wait's end among
+    // them (seeds 22, 37 and 241 of row 10 under the rule went over).
+    assert_eq!(campaign.assemblies(), 3);
+    assert!(
+        campaign.assemblies() <= 2 + campaign.supply_moves(),
+        "{} assemblies, {} supplies",
+        campaign.assemblies(),
+        campaign.supply_moves()
+    );
 }
 
 /// The payload shape at the campaign: D at ACCEPT with no payload at any
@@ -8056,6 +8066,119 @@ fn under_the_rule_a_payload_wait_ends_when_the_last_voter_answers() {
         decision.reproposed.contains(&d) && decision.nothing.contains(&d),
         "{decision:?}"
     );
+}
+
+/// A payload wait asks again for a lost promise (#335 review). D is
+/// pre-accepted at the member without its payload, and the third voter,
+/// the only one left that could hold it, never got the `NewLeader`. While
+/// the campaign waits the bound for D's holders, keeping its selection,
+/// the runtime's paced asks reach the third voter, and once it promises
+/// the payload asks do too. Once the wait passes and the selection is
+/// made again, nothing more is asked: the control.
+#[test]
+fn under_the_rule_a_payload_wait_asks_again_for_a_lost_promise() {
+    let (mut f, b, d, _, third) =
+        campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
+    assert!(f.report_wait().is_some(), "a payload wait");
+    assert!(
+        f.campaign_state().and_then(|c| c.decision()).is_some(),
+        "the selection kept"
+    );
+    let asked = sent_to(&f.request_report_pages(), r(third));
+    assert!(
+        asked
+            .iter()
+            .any(|m| matches!(m, ProtocolMessage::NewLeader { ballot, .. } if *ballot == b)),
+        "{asked:?}"
+    );
+    f.step(peer_event(
+        r(third),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(third),
+            store: coord_types::ids::StoreInstanceId(r(third).0),
+        },
+    ));
+    assert!(f.report_wait().is_some(), "still waiting");
+    let asked = sent_to(&f.request_payloads(r(3 - third)), r(third));
+    assert!(
+        asked.iter().any(
+            |m| matches!(m, ProtocolMessage::PayloadRequest { commands } if commands.contains(&d))
+        ),
+        "{asked:?}"
+    );
+    // Control: past the wait, the selection made again ends the asks.
+    f.end_report_wait();
+    assert!(f.campaign_state().and_then(|c| c.decision()).is_some());
+    assert!(f.request_report_pages().is_empty());
+}
+
+/// A payload wait asks again for a promised voter's first page (#335
+/// review): the third voter promised, and every page of its report was
+/// lost. While the campaign waits the bound for D's holders the paced
+/// asks ask it for its first pages; its report, once read, is selected
+/// from when the wait passes, and the payload it holds is no nothing.
+/// Without the third voter's report the selection made after the wait
+/// decides D as nothing: the control.
+#[test]
+fn under_the_rule_a_payload_wait_asks_again_for_a_promised_voters_first_page() {
+    let holding = |phase: Phase| coord_consensus::ReportEntry {
+        command: CommandId(Digest32([0x95; 32])),
+        phase,
+        deps: Vec::new(),
+        path: Digest32([1; 32]),
+        paths: vec![(vec![0], Digest32([1; 32]))],
+        seqnum: 1,
+        keys: vec![vec![0]],
+        payload_present: true,
+        admission: None,
+    };
+    for read in [true, false] {
+        let (mut f, b, d, _, third) =
+            campaign_under(DECIDE_NOTHING, false, Some(Phase::PreAccept), true);
+        assert_eq!(holding(Phase::PreAccept).command, d);
+        f.step(peer_event(
+            r(third),
+            ProtocolMessage::Promise {
+                ballot: b,
+                synced: ballot(0, 0),
+                replica: r(third),
+                store: coord_types::ids::StoreInstanceId(r(third).0),
+            },
+        ));
+        assert!(f.report_wait().is_some(), "a payload wait");
+        let asked = sent_to(&f.request_report_pages(), r(third));
+        assert!(
+            asked.iter().any(|m| matches!(
+                m,
+                ProtocolMessage::ReportPageRequest { ballot, pages } if *ballot == b && pages.is_empty()
+            )),
+            "{asked:?}"
+        );
+        if read {
+            let report = RecoveryReport {
+                replica: r(third),
+                ballot: b,
+                committed_ballot: ballot(0, 0),
+                entries: vec![holding(Phase::PreAccept)],
+            };
+            for page in coord_consensus::paginate(
+                &report,
+                coord_types::ids::StoreInstanceId(report.replica.0),
+                coord_consensus::MAX_PAGE_ENTRIES,
+            ) {
+                f.step(peer_event(r(third), ProtocolMessage::ReportPage(page)));
+            }
+        } else {
+            f.end_report_wait();
+        }
+        let decision = f
+            .campaign_state()
+            .and_then(|c| c.decision())
+            .expect("selected");
+        assert_eq!(!decision.nothing.contains(&d), read, "{decision:?}");
+    }
 }
 
 /// A third voter whose report is past the page bound answers the
