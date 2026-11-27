@@ -402,11 +402,15 @@ struct Knobs {
     forget_everywhere: bool,
     /// Every holder gone for good (task-d119's third option, #185). At
     /// the first campaign given up as `Behind` on a command no voter
-    /// executed, while no voter leads and every voter that holds that
-    /// command, in its table or its durable rows, is down: with
-    /// `Some(true)` those voters never come back, their storage
-    /// destroyed; with `Some(false)` the moment is only marked, the
-    /// control. From the mark the run counts whether any voter led, the
+    /// executed, or waiting on one (task-d121's build step: a `Behind`
+    /// or `HalfInitialized` wait, or a payload a re-proposal waits for),
+    /// while no voter leads and every voter that holds that command, in
+    /// its table or its durable rows (for a payload wait, its payload),
+    /// is down: with `Some(true)` those voters never come back, their
+    /// storage destroyed, where they are a minority; with `Some(false)`,
+    /// or where they are not a minority, the moment is only marked, the
+    /// control. With task-d121's rule on, the heal check holds for the
+    /// voters left: they must lead and settle. From the mark the run counts whether any voter led, the
     /// campaigns given up as `Behind` and the boots of the voters left,
     /// and while healing it restarts every live voter [`GONE_BOOTS`]
     /// times more, as an operator's restarts would. `None`: neither.
@@ -415,6 +419,13 @@ struct Knobs {
     /// reports they haven't read (before task-d120), as
     /// `PROTOCOL_SIM_NO_REPORT_WAIT` sets for every run.
     no_report_wait: bool,
+    /// task-d121's rule: with `Some(true)` every candidate selects with
+    /// `SelectionRules::decide_nothing`, as a domain whose genesis names
+    /// `decided-nothing` does, and with `Some(false)` none does. `None`
+    /// leaves it to `PROTOCOL_SIM_DECIDE_NOTHING=1`, which turns it on
+    /// for every run that doesn't set it: a directed control that
+    /// compares the two keeps both (Astra on #336).
+    decide_nothing: Option<bool>,
 }
 
 impl Knobs {
@@ -470,6 +481,7 @@ impl Knobs {
         forget_everywhere: false,
         holders_gone: None,
         no_report_wait: false,
+        decide_nothing: None,
     };
 
     /// These knobs with task-d98's early proposals and the three faults
@@ -739,11 +751,19 @@ struct Node {
 
 /// The rules every candidate here selects under: one build everywhere,
 /// every voter on point 4, as a domain that activated `ReleaseAtExecution`
-/// is (task-d90).
-const RULES: coord_consensus::SelectionRules = coord_consensus::SelectionRules {
-    leave_out_unheld: true,
-    decide_nothing: false,
-};
+/// is (task-d90), and task-d121's rule where `knobs` turns it on.
+fn rules(knobs: &Knobs) -> coord_consensus::SelectionRules {
+    coord_consensus::SelectionRules {
+        leave_out_unheld: true,
+        decide_nothing: knobs.decide_nothing.unwrap_or_else(decide_nothing_on),
+    }
+}
+
+/// `PROTOCOL_SIM_DECIDE_NOTHING=1`: task-d121's rule in every run that
+/// doesn't set it ([`Knobs::decide_nothing`]).
+fn decide_nothing_on() -> bool {
+    std::env::var("PROTOCOL_SIM_DECIDE_NOTHING").is_ok_and(|v| v == "1")
+}
 
 /// What a node is handed in one step: an event, or a step of storage
 /// events ([`Knobs::storage_steps`]).
@@ -938,6 +958,20 @@ struct Sim {
     reoffered: BTreeSet<CommandId>,
     /// Commands executed anywhere: each has a record that answers it.
     executed_anywhere: BTreeSet<CommandId>,
+    /// How each command executed anywhere was executed: as a nothing
+    /// (task-d121), or with its payload.
+    executed_as_nothing: BTreeMap<CommandId, bool>,
+    /// Each command decided anywhere, as a nothing or with its payload,
+    /// and where that was first seen (task-d121): executed, counted by a
+    /// leader, committed at a follower's acknowledgement, or learned at
+    /// the frontend. A voter destroyed later keeps what it decided here.
+    decided_as: BTreeMap<CommandId, (bool, String)>,
+    /// Commands a submitter was answered as refused, decided as nothing
+    /// (task-d121, #315 review), and how.
+    refused_as_nothing: BTreeMap<CommandId, String>,
+    /// Each node's current follower machine's count of selections
+    /// task-d121's condition 5 kept the rule off, as last read.
+    kept_by_drop_seen: Vec<u64>,
     /// The command each node's current follower machine gave its
     /// campaign up as `Behind` on, once counted: a machine that gave up
     /// refuses every later campaign of its boot on the same command.
@@ -1048,8 +1082,10 @@ struct Stats {
     catch_up_pages: u32,
     caught_up: u64,
     ballots: u64,
-    /// Steps healing took (the largest, in a total).
+    /// Steps healing took (the largest, in a total), and whether it
+    /// healed.
     heal_steps: u32,
+    healed: bool,
     /// Commands settled as refused for another under their key.
     conflicts: usize,
     /// Peaks of oracle 5, over every node.
@@ -1093,6 +1129,14 @@ struct Stats {
     queue_orders: u32,
     /// Batches a fence at a promise refused (`Knobs::fence`).
     fenced: u32,
+    /// Commands executed as nothing (task-d121), each counted once.
+    nothing_executed: u32,
+    /// Whether the command `Knobs::holders_gone` marked was executed as
+    /// nothing (task-d121).
+    gone_on_nothing: bool,
+    /// Selections task-d121's condition 5 kept the rule off: a drop
+    /// behind a command no report holds was counted.
+    nothing_kept_by_drop: u64,
     payload_windows: u32,
     payload_crashes: u32,
     restored_without_payload: usize,
@@ -1240,7 +1284,7 @@ impl Sim {
                     capacity: knobs.capacity,
                 });
                 follower.set_learning(LearningMode::Full);
-                follower.set_selection_rules(RULES);
+                follower.set_selection_rules(rules(&knobs));
                 follower.set_report_wait(report_wait_on() && !knobs.no_report_wait);
                 Role::Follower(follower)
             };
@@ -1288,6 +1332,10 @@ impl Sim {
             forgotten: BTreeSet::new(),
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
+            executed_as_nothing: BTreeMap::new(),
+            decided_as: BTreeMap::new(),
+            refused_as_nothing: BTreeMap::new(),
+            kept_by_drop_seen: vec![0; usize::from(n)],
             behind_counted: vec![None; usize::from(n)],
             behind_undecided_seen: vec![0; usize::from(n)],
             report_waits_seen: vec![0; usize::from(n)],
@@ -1563,10 +1611,31 @@ impl Sim {
                 // may.
                 Effect::Released(released) => {
                     let c = released.established().command();
-                    if !self.marked.contains(&c) || released.speculative() {
+                    let nothing = !released.speculative()
+                        && released
+                            .admission()
+                            .as_ref()
+                            .is_some_and(coord_consensus::is_nothing);
+                    // A final release of the marker is the leader's
+                    // decision of a nothing, whether or not it reaches
+                    // the frontend (task-d121).
+                    if nothing {
+                        self.decide_as(c, true, || format!("released by node {i}"));
+                    }
+                    let marked = self.marked.contains(&c) && !released.speculative();
+                    if !(nothing || marked) {
                         continue;
                     }
+                    // Lost on the way, it answers no one (Codex on #336).
                     if !self.healing && self.chance("frontend-loss", self.knobs.frontend_loss) {
+                        continue;
+                    }
+                    // Delivered, it answers the command's held callers as
+                    // refused (task-d121's C2b).
+                    if nothing {
+                        self.refuse_as_nothing(c, || format!("released by node {i}"));
+                    }
+                    if !marked {
                         continue;
                     }
                     if released.admission() == self.submitted.get(&c).copied()
@@ -1606,6 +1675,14 @@ impl Sim {
                 ..
             } => {
                 self.forgotten.insert(*command);
+                return;
+            }
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::DecidedNothing,
+                ..
+            } => {
+                self.refuse_as_nothing(*command, || format!("by node {from}"));
                 return;
             }
             _ => return,
@@ -1655,6 +1732,11 @@ impl Sim {
                 let _ = set.add(Vote::Fast(reply));
             }
         }
+        // The value is the one the counted votes accepted: an
+        // acknowledgement under another admission is refused by the set
+        // (`AdmissionConflict`), and says nothing of what was learned
+        // (Codex on #336).
+        let nothing = set.admission().as_ref().map(coord_consensus::is_nothing);
         if let Some(learned) = set.learned() {
             let deps = learned.deps().to_vec();
             if self.trace.is_some() && !self.decided.contains_key(&command) {
@@ -1676,6 +1758,11 @@ impl Sim {
                 self.stats.learned += 1;
             }
             self.decide(command, &deps, &format!("learned at the frontend in {b:?}"));
+            if let Some(nothing) = nothing {
+                self.decide_as(command, nothing, || {
+                    format!("learned at the frontend in {}", bn(&b))
+                });
+            }
         }
     }
 
@@ -1692,6 +1779,59 @@ impl Sim {
         }
     }
 
+    /// Note `command` decided as nothing or with its payload, as `how`
+    /// saw it (task-d121): one command has one decision, and one a
+    /// submitter was answered as refused is never decided with its
+    /// payload.
+    fn decide_as(&mut self, command: CommandId, nothing: bool, how: impl FnOnce() -> String) {
+        let value = |nothing: bool| {
+            if nothing {
+                "as nothing"
+            } else {
+                "with its payload"
+            }
+        };
+        match self.decided_as.get(&command) {
+            Some((was, first)) if *was != nothing => {
+                let first = first.clone();
+                self.fail(&format!(
+                    "{} was decided {} ({first}) and {} ({})",
+                    short(&command),
+                    value(*was),
+                    value(nothing),
+                    how()
+                ))
+            }
+            Some(_) => {}
+            None => {
+                let how = how();
+                if !nothing && let Some(refused) = self.refused_as_nothing.get(&command) {
+                    let refused = refused.clone();
+                    self.fail(&format!(
+                        "{} was decided with its payload ({how}) and answered as refused \
+                         ({refused})",
+                        short(&command)
+                    ));
+                }
+                self.decided_as.insert(command, (nothing, how));
+            }
+        }
+    }
+
+    /// Note a submitter answered that `command` was decided as nothing,
+    /// as `how` says (task-d121): it must never take effect.
+    fn refuse_as_nothing(&mut self, command: CommandId, how: impl FnOnce() -> String) {
+        if let Some((false, first)) = self.decided_as.get(&command) {
+            let first = first.clone();
+            self.fail(&format!(
+                "{} was answered as refused ({}) and decided with its payload ({first})",
+                short(&command),
+                how()
+            ));
+        }
+        self.refused_as_nothing.entry(command).or_insert_with(how);
+    }
+
     /// Change roles as `coordd`'s driver does (`Node::change_role`).
     fn convert(&mut self, i: u8) {
         let node = &mut self.nodes[usize::from(i)];
@@ -1700,7 +1840,7 @@ impl Sim {
                 let q = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut f = Follower::from_recovered(l.into_recovered(), q);
-                f.set_selection_rules(RULES);
+                f.set_selection_rules(rules(&self.knobs));
                 f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
                 // A new machine: its examinations count from here, against
                 // what it is given from here, its own carried selection
@@ -1720,6 +1860,7 @@ impl Sim {
                 self.behind_counted[usize::from(i)] = None;
                 self.behind_undecided_seen[usize::from(i)] = 0;
                 self.report_waits_seen[usize::from(i)] = 0;
+                self.kept_by_drop_seen[usize::from(i)] = 0;
                 self.report_wait_timers[usize::from(i)] = None;
                 if let Some(t) = self.trace.as_mut() {
                     t.push_back(format!("{:>5} node {i} deposed", self.step));
@@ -1843,16 +1984,30 @@ impl Sim {
             _ => None,
         };
         let effects = self.nodes[usize::from(i)].step_input(input);
+        // What each command counted here was decided as (task-d121).
+        let mut counted_as: Vec<(CommandId, bool)> = Vec::new();
         match &mut self.nodes[usize::from(i)].role {
-            Some(Role::Leader(l)) => self.counted.extend(l.take_learned()),
+            Some(Role::Leader(l)) => {
+                for c in l.take_learned() {
+                    if let Some(r) = l.table().record(&c) {
+                        counted_as.push((c, r.is_nothing()));
+                    }
+                    self.counted.insert(c);
+                }
+            }
             Some(Role::Follower(f)) => {
                 if let Some(c) = acked
-                    && f.table().phase_of(&c) >= Some(coord_consensus::Phase::Commit)
+                    && let Some(r) = f.table().record(&c)
+                    && r.phase >= coord_consensus::Phase::Commit
                 {
+                    counted_as.push((c, r.is_nothing()));
                     self.counted.insert(c);
                 }
             }
             None => {}
+        }
+        for (c, nothing) in counted_as {
+            self.decide_as(c, nothing, || format!("counted at node {i}"));
         }
         let mut watch_notes: Vec<String> = Vec::new();
         if let Some((c, before, deps_before)) = phase_watch {
@@ -2374,7 +2529,10 @@ impl Sim {
     /// What `coordd` serves for a catch-up ask at `ballot` after
     /// `after`: the donor's executed commands from there, each with its
     /// durable payload and dependency row, stopping at the first it
-    /// cannot show.
+    /// cannot show. A command executed as nothing goes with no payload
+    /// and its nothing row, and its result is the canonical refusal; the
+    /// result of each command after it reads the order as its executor
+    /// did, without the nothings (task-d121, as `complete` executes).
     fn page(&self, donor: u8, ballot: Ballot, after: ExecutionPosition) -> ProtocolMessage {
         let node = &self.nodes[usize::from(donor)];
         let payloads: BTreeMap<CommandId, coord_consensus::PayloadRecordV1> =
@@ -2384,20 +2542,36 @@ impl Sim {
         // Its durable executions: what its store holds (task-d90).
         let executed = &node.executed[..node.durable_executed];
         let mut entries = Vec::new();
+        let as_nothing = |x: &CommandId| self.executed_as_nothing.get(x) == Some(&true);
         for (i, c) in executed
             .iter()
             .enumerate()
             .skip(usize::try_from(after.get()).unwrap_or(usize::MAX))
             .take(self.knobs.page)
         {
-            let Some(payload) = payloads.get(c) else {
-                break;
+            let decided = rows.get(c).cloned().filter(|_| !self.withholds(donor, c));
+            let (payload, response) = if as_nothing(c) {
+                // Whole only with its nothing row: that is all it is.
+                if !decided.as_ref().is_some_and(CommandRecord::is_nothing) {
+                    break;
+                }
+                (None, nothing_response(c))
+            } else {
+                let Some(payload) = payloads.get(c) else {
+                    break;
+                };
+                let effective: Vec<CommandId> = executed[..i]
+                    .iter()
+                    .filter(|x| !as_nothing(x))
+                    .copied()
+                    .collect();
+                let response = response_of(&effective, c, |x| self.offers.get(x).map(|o| o.key));
+                (Some(payload.clone()), response)
             };
-            let response = response_of(&executed[..i], c, |x| self.offers.get(x).map(|o| o.key));
             entries.push(coord_consensus::CatchUpEntry {
                 command: *c,
-                payload: Some(payload.clone()),
-                decided: rows.get(c).cloned().filter(|_| !self.withholds(donor, c)),
+                payload,
+                decided,
                 position: ExecutionPosition::new(i as u64 + 1).unwrap(),
                 revision: None,
                 result_digest: digest_of(&response),
@@ -2561,21 +2735,25 @@ impl Sim {
             return;
         }
         let node = &mut self.nodes[usize::from(i)];
-        let (c, deps, position) = match node.role.as_ref().expect("alive") {
+        let (c, deps, position, nothing) = match node.role.as_ref().expect("alive") {
             Role::Leader(m) => {
                 let c = m.next_executable().expect("executable");
+                let record = m.table().record(&c);
                 (
                     c,
-                    m.table().record(&c).map(|r| r.deps.clone()),
+                    record.map(|r| r.deps.clone()),
                     m.executed_through(),
+                    record.is_some_and(coord_consensus::CommandRecord::is_nothing),
                 )
             }
             Role::Follower(m) => {
                 let c = m.next_executable().expect("executable");
+                let record = m.table().record(&c);
                 (
                     c,
-                    m.table().record(&c).map(|r| r.deps.clone()),
+                    record.map(|r| r.deps.clone()),
                     m.executed_through(),
+                    record.is_some_and(coord_consensus::CommandRecord::is_nothing),
                 )
             }
         };
@@ -2595,7 +2773,20 @@ impl Sim {
             && !node
                 .storage
                 .holds_or_writes(Collection::PayloadV1.id().0, &c.0.0);
-        let response = response_of(&node.executed, &c, |x| self.offers.get(x).map(|o| o.key));
+        // A nothing executes as the canonical refusal, against no state
+        // and with no effect: the commands after it read the key as if
+        // it never ran (task-d121).
+        let response = if nothing {
+            nothing_response(&c)
+        } else {
+            let effective: Vec<CommandId> = node
+                .executed
+                .iter()
+                .filter(|x| self.executed_as_nothing.get(x) != Some(&true))
+                .copied()
+                .collect();
+            response_of(&effective, &c, |x| self.offers.get(x).map(|o| o.key))
+        };
         let outcome = AppliedOutcome {
             position,
             revision: None,
@@ -2655,6 +2846,32 @@ impl Sim {
                 self.executed_anywhere.insert(c);
             }
         }
+        // One decision of a command: executed as nothing everywhere, or
+        // with its payload everywhere (task-d121).
+        match self.executed_as_nothing.get(&c) {
+            Some(was) if *was != nothing => self.fail(&format!(
+                "node {i} executed {c:?} {} where another executed it {}",
+                if nothing {
+                    "as nothing"
+                } else {
+                    "with its payload"
+                },
+                if *was {
+                    "as nothing"
+                } else {
+                    "with its payload"
+                }
+            )),
+            Some(_) => {}
+            None => {
+                self.executed_as_nothing.insert(c, nothing);
+                self.stats.nothing_executed += u32::from(nothing);
+                if nothing && self.stats.gone_on == Some(c) {
+                    self.stats.gone_on_nothing = true;
+                }
+            }
+        }
+        self.decide_as(c, nothing, || format!("executed by node {i} at {}", k + 1));
         // Oracle 7 (task-d90): a result is released once its command is
         // executed in memory, and every execution of it anywhere, before
         // a crash or after, gives the same bytes.
@@ -2698,10 +2915,18 @@ impl Sim {
     /// there. Recovery re-executes a decided command, so a vote counted
     /// toward a decision without one could leave a released command's
     /// payload durable nowhere once every voter crashes.
+    ///
+    /// A vote for a nothing (task-d121) has no payload to rest on: it
+    /// rests on the nothing's dependency row durable there instead.
     fn check_vote_payload(&mut self, i: u8, message: &ProtocolMessage) {
-        let commands: Vec<CommandId> = match message {
-            ProtocolMessage::FastAck(a) if a.replica == r(i) => vec![a.command],
-            ProtocolMessage::SlowAck(a) if a.replica == r(i) => vec![a.command],
+        let nothing = |d: &Digest32| coord_consensus::is_nothing(d);
+        let commands: Vec<(CommandId, bool)> = match message {
+            ProtocolMessage::FastAck(a) if a.replica == r(i) => {
+                vec![(a.command, nothing(&a.admission))]
+            }
+            ProtocolMessage::SlowAck(a) if a.replica == r(i) => {
+                vec![(a.command, nothing(&a.admission))]
+            }
             ProtocolMessage::ReportPage(p) => {
                 let boot = self.nodes[usize::from(i)].boot;
                 if !self.pages_read.insert((i, boot, p.ballot.number, p.page)) {
@@ -2710,16 +2935,25 @@ impl Sim {
                 p.entries
                     .iter()
                     .filter(|e| e.payload_present)
-                    .map(|e| e.command)
+                    .map(|e| (e.command, false))
                     .collect()
             }
             _ => return,
         };
-        let held: BTreeSet<CommandId> = payload_rows(&self.nodes[usize::from(i)].storage)
+        let storage = &self.nodes[usize::from(i)].storage;
+        let held: BTreeSet<CommandId> = payload_rows(storage).into_iter().map(|(c, _)| c).collect();
+        let rows: BTreeSet<CommandId> = dependency_rows(storage)
             .into_iter()
+            .filter(|(_, r)| r.is_nothing())
             .map(|(c, _)| c)
             .collect();
-        if let Some(c) = commands.iter().find(|c| !held.contains(c)) {
+        if let Some((c, _)) = commands.iter().find(|(c, nothing)| {
+            if *nothing {
+                !rows.contains(c)
+            } else {
+                !held.contains(c)
+            }
+        }) {
             let what = match message {
                 ProtocolMessage::ReportPage(_) => "reported the payload of",
                 _ => "voted for",
@@ -2812,23 +3046,42 @@ impl Sim {
         let Some(Role::Leader(m)) = &self.nodes[usize::from(i)].role else {
             return;
         };
-        let proposed: Vec<CommandId> = self
+        // A nothing proposal (task-d121) rests on its dependency row,
+        // as a nothing vote does (`check_vote_payload`).
+        let proposed: Vec<(CommandId, bool)> = self
             .offers
             .keys()
-            .filter(|c| m.proposal(c).is_some_and(|p| p.barrier == barrier))
-            .copied()
+            .filter_map(|c| {
+                m.proposal(c)
+                    .filter(|p| p.barrier == barrier)
+                    .map(|p| (*c, coord_consensus::is_nothing(&p.admission)))
+            })
             .collect();
         if proposed.is_empty() {
             return;
         }
-        let held: BTreeSet<CommandId> = payload_rows(&self.nodes[usize::from(i)].storage)
+        let storage = &self.nodes[usize::from(i)].storage;
+        let held: BTreeSet<CommandId> = payload_rows(storage).into_iter().map(|(c, _)| c).collect();
+        let rows: BTreeSet<CommandId> = dependency_rows(storage)
             .into_iter()
+            .filter(|(_, r)| r.is_nothing())
             .map(|(c, _)| c)
             .collect();
-        if let Some(c) = proposed.iter().find(|c| !held.contains(c)) {
+        if let Some((c, nothing)) = proposed.iter().find(|(c, nothing)| {
+            if *nothing {
+                !rows.contains(c)
+            } else {
+                !held.contains(c)
+            }
+        }) {
             self.fail(&format!(
-                "leader {i}'s proposal of {} is durable with no durable payload row",
-                short(c)
+                "leader {i}'s proposal of {} is durable with no durable {}",
+                short(c),
+                if *nothing {
+                    "nothing row"
+                } else {
+                    "payload row"
+                }
             ));
         }
         self.stats.votes_checked += proposed.len();
@@ -2899,6 +3152,10 @@ impl Sim {
                     self.stats.report_waits +=
                         u32::try_from(waits.saturating_sub(*seen)).unwrap_or(u32::MAX);
                     *seen = waits;
+                    let kept = f.nothing_kept_by_drop();
+                    let seen = &mut self.kept_by_drop_seen[usize::from(i)];
+                    self.stats.nothing_kept_by_drop += kept.saturating_sub(*seen);
+                    *seen = kept;
                     for r in &rejections {
                         if let FollowerRejection::Behind { missing } = r
                             && self.behind_counted[usize::from(i)] != Some(*missing)
@@ -2959,6 +3216,23 @@ impl Sim {
         for (missing, undecided) in core::mem::take(&mut self.gave_up) {
             self.holders_gone(missing, undecided);
         }
+        // A campaign waiting on a command (task-d121's build step): the
+        // reports a `Behind` or `HalfInitialized` selection lacks, or,
+        // with its selection kept, the payload a re-proposal waits for.
+        if self.knobs.holders_gone.is_some() && self.gone_mark.is_none() {
+            let waits: Vec<(CommandId, bool)> = self
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.role {
+                    Some(Role::Follower(f)) => f.campaign_state(),
+                    _ => None,
+                })
+                .filter_map(|c| c.report_wait().map(|m| (m, c.decision().is_some())))
+                .collect();
+            for (missing, payload) in waits {
+                self.holders_gone_on(missing, payload);
+            }
+        }
         if self.gone_mark.is_some() && self.leader_index().is_some() {
             self.stats.led_after_gone = true;
         }
@@ -2977,15 +3251,37 @@ impl Sim {
             self.stats.behind_after_gone_undecided += u32::from(undecided);
             return;
         }
-        if self.executed_anywhere.contains(&missing) || self.leader_index().is_some() {
+        let _ = destroy;
+        self.holders_gone_on(missing, false);
+    }
+
+    /// `Knobs::holders_gone`'s moment on `missing`, a command a campaign
+    /// gave up on or waits on: `payload` where it waits for the
+    /// command's payload, whose holders are the voters holding that.
+    fn holders_gone_on(&mut self, missing: CommandId, payload: bool) {
+        let Some(destroy) = self.knobs.holders_gone else {
+            return;
+        };
+        if self.gone_mark.is_some()
+            || self.executed_anywhere.contains(&missing)
+            || self.leader_index().is_some()
+        {
             return;
         }
         let holders: Vec<u8> = (0..self.n)
-            .filter(|v| self.holds_anywhere(*v, &missing))
+            .filter(|v| {
+                if payload {
+                    self.holds_payload_anywhere(*v, &missing)
+                } else {
+                    self.holds_anywhere(*v, &missing)
+                }
+            })
             .collect();
         if holders.is_empty() || holders.iter().any(|v| self.nodes[usize::from(*v)].alive()) {
             return;
         }
+        // Destroyed, the voters left must be a majority.
+        let destroy = destroy && 2 * holders.len() < usize::from(self.n);
         self.gone_mark = Some(missing);
         self.stats.gone_on = Some(missing);
         if destroy {
@@ -3001,6 +3297,20 @@ impl Sim {
                 if destroy { "destroyed" } else { "marked" }
             )
         });
+    }
+
+    /// Whether node `v` holds `command`'s payload: in its machine, or in
+    /// a durable payload row it would restart with.
+    fn holds_payload_anywhere(&self, v: u8, command: &CommandId) -> bool {
+        let node = &self.nodes[usize::from(v)];
+        let held = match &node.role {
+            Some(Role::Leader(m)) => m.payload(command).is_some(),
+            Some(Role::Follower(m)) => m.payload(command).is_some(),
+            None => false,
+        };
+        held || payload_rows(&node.storage)
+            .iter()
+            .any(|(c, _)| c == command)
     }
 
     /// Whether node `v` holds `command`: in its table, or in a durable
@@ -3119,7 +3429,7 @@ impl Sim {
         .restore_execution(executed, node.executed.iter().copied())
         .restore_payloads(payload_rows(&node.storage));
         f.set_learning(LearningMode::Full);
-        f.set_selection_rules(RULES);
+        f.set_selection_rules(rules(&self.knobs));
         f.set_report_wait(report_wait_on() && !self.knobs.no_report_wait);
         // Restored from rows, its executions are the journal's (task-d90).
         if self.knobs.late_execution && !self.knobs.count_in_memory {
@@ -3131,6 +3441,7 @@ impl Sim {
         self.behind_counted[usize::from(i)] = None;
         self.behind_undecided_seen[usize::from(i)] = 0;
         self.report_waits_seen[usize::from(i)] = 0;
+        self.kept_by_drop_seen[usize::from(i)] = 0;
         self.report_wait_timers[usize::from(i)] = None;
         self.note(|| format!("restart node {i} at {}", bn(&active)));
         self.step_node(i, boot_event(boot));
@@ -3638,13 +3949,21 @@ impl Sim {
 
     /// Oracle 7 once healed (task-d90): every voter's execution of every
     /// released command, read again from its order, gives the released
-    /// bytes.
+    /// bytes. A command executed as nothing reads as the canonical refusal
+    /// and is not in the order the commands after it read (task-d121).
     fn check_released(&mut self) {
         for i in 0..self.n {
             let executed = self.nodes[usize::from(i)].executed.clone();
+            let mut effective: Vec<CommandId> = Vec::with_capacity(executed.len());
             for (k, c) in executed.iter().enumerate() {
-                let response =
-                    response_of(&executed[..k], c, |x| self.offers.get(x).map(|o| o.key));
+                let response = if self.executed_as_nothing.get(c) == Some(&true) {
+                    nothing_response(c)
+                } else {
+                    let response =
+                        response_of(&effective, c, |x| self.offers.get(x).map(|o| o.key));
+                    effective.push(*c);
+                    response
+                };
                 if self.released.get(c).is_some_and(|r| *r != response) {
                     self.fail(&format!(
                         "after healing node {i} holds {} at {} with a result other than \
@@ -3907,7 +4226,11 @@ impl Sim {
     /// (`settle_conflict_from_record`). What the simulator knows some
     /// other node executed is not an answer.
     fn settled(&self, command: &CommandId) -> bool {
-        if self.learned.contains(command) || self.answered.contains(command) {
+        // Answered as refused, decided as nothing (task-d121).
+        if self.learned.contains(command)
+            || self.answered.contains(command)
+            || self.refused_as_nothing.contains_key(command)
+        {
             return true;
         }
         let from_record = self.reoffered.contains(command)
@@ -3925,27 +4248,37 @@ impl Sim {
     }
 
     fn unsettled(&self) -> Vec<CommandId> {
+        // A destroyed voter's own clients are gone with it.
         self.offers
-            .keys()
+            .iter()
+            .filter(|(_, o)| !self.destroyed.contains(&o.host))
+            .map(|(c, _)| c)
             .filter(|c| !self.settled(c))
             .copied()
             .collect()
     }
 
     /// Every admitted command settled, every decision the frontend
-    /// learned or a voter executed is in the one order, and every voter
+    /// learned, a voter counted or acknowledged at COMMIT, a leader
+    /// released or a voter executed is in the one order, and every voter
     /// executed as far as the others and has nothing left it could
     /// execute. A decision learned from a durable majority that the next
-    /// selection dropped would otherwise pass as settled.
+    /// selection dropped would otherwise pass as settled, and so would
+    /// one no frontend learned whose submitter was destroyed (Astra on
+    /// #336).
     fn healed(&self) -> bool {
         self.leader_index().is_some()
-            && (0..self.n).all(|i| {
-                self.nodes[usize::from(i)].executed.len() == self.order.len() && !self.executable(i)
-            })
+            && (0..self.n)
+                .filter(|i| !self.destroyed.contains(i))
+                .all(|i| {
+                    self.nodes[usize::from(i)].executed.len() == self.order.len()
+                        && !self.executable(i)
+                })
             && self.learned.is_subset(&self.executed_anywhere)
             && self
                 .decided
                 .keys()
+                .chain(self.decided_as.keys())
                 .all(|c| self.executed_anywhere.contains(c))
             && self.unsettled().is_empty()
     }
@@ -4009,6 +4342,7 @@ impl Sim {
             self.check_halts();
             self.check_budgets();
             if self.healed() {
+                self.stats.healed = true;
                 self.stats.heal_steps = k;
                 self.stats.conflicts = self
                     .offers
@@ -4025,9 +4359,10 @@ impl Sim {
         if !self.catch_up {
             return;
         }
-        // With its holders destroyed the domain isn't meant to heal: the
-        // run reads what it did instead (`Knobs::holders_gone`).
-        if !self.destroyed.is_empty() {
+        // With its holders destroyed the domain isn't meant to heal
+        // without task-d121's rule: the run reads what it did instead
+        // (`Knobs::holders_gone`). With the rule, the voters left must.
+        if !self.destroyed.is_empty() && !rules(&self.knobs).decide_nothing {
             return;
         }
         let unsettled = self.unsettled();
@@ -4389,6 +4724,15 @@ fn response_of(
     response.extend_from_slice(&same.last().map_or([0; 32], |p| p.0.0));
     response.extend_from_slice(&(same.len() as u64).to_be_bytes());
     response.push(key.unwrap_or(0xff));
+    response
+}
+
+/// What a command decided as nothing executes as at every voter: no
+/// effect, the same bytes everywhere (task-d121).
+fn nothing_response(c: &CommandId) -> Vec<u8> {
+    let mut response = Vec::with_capacity(46);
+    response.extend_from_slice(b"decided-nothing:");
+    response.extend_from_slice(&c.0.0);
     response
 }
 
@@ -5185,6 +5529,8 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
         crash: 5_000,
         holders_gone: Some(destroy),
         no_report_wait: true,
+        // Without the rule, whatever the environment says.
+        decide_nothing: Some(false),
         ..Knobs::row(10)
     };
     let run =
@@ -5226,6 +5572,143 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
         "the control never led after the mark: the stall is not the destroyed storage's"
     );
     assert_eq!(marked.gone, 0, "the control destroyed storage");
+}
+
+/// The same run under task-d121's rule (its acceptance: the test above
+/// flips). Node 2's storage is destroyed as before; the two voters left
+/// decide the command it alone held as nothing, lead, and settle every
+/// command their own clients submitted. With the storage only marked the
+/// run leads too, and decides nothing as nothing on the marked command
+/// it brings back.
+///
+/// The report wait is on, as it ships. The two voters left decide the
+/// nothing only because the leader counts its own vote for it
+/// (`Leader::adopt_own`): without that, the nothing and the chain
+/// behind it waited for a third vote that never came.
+#[test]
+fn a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead() {
+    let knobs = |destroy| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        decide_nothing: Some(true),
+        ..Knobs::row(10)
+    };
+    let run =
+        |destroy| run_knobs(3, knobs(destroy), 2135, Some(false)).unwrap_or_else(|e| panic!("{e}"));
+    let (gone, marked) = (run(true), run(false));
+    println!("destroyed: {gone:?}");
+    println!("marked: {marked:?}");
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2135 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        gone.led_after_gone,
+        "no voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(
+        gone.nothing_executed > 0,
+        "nothing executed as nothing: {gone:?}"
+    );
+    assert!(
+        gone.gone_on_nothing,
+        "{} was not executed as nothing: {gone:?}",
+        short(&on)
+    );
+    assert!(gone.healed, "the voters left did not settle: {gone:?}");
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark"
+    );
+}
+
+/// Seed 2971 at five voters (task-d121's acceptance, the five-voter
+/// flip): both shapes of the stall in one run. Row 10, task-d119's
+/// targeted schedule as above, no catch-up, the report wait on as it
+/// ships. Node 2 alone holds `753c`, a dependency of an entry node 0's
+/// selections carry, when node 0 gives it up as `Behind` and the knob
+/// destroys node 2. Node 2 also alone held durably the payloads of
+/// `c03a` and `cf3d`, which the other four hold at ACCEPT without them
+/// once the faults stop and every voter restarts (the payload shape).
+///
+/// Without the rule, node 0's campaign for b65 waits for ever as
+/// `HalfInitialized` for node 2's report, and the heal check fails it.
+/// With the rule, the four voters left decide all three as nothing, lead
+/// and settle every command their own clients submitted. With node 2
+/// only marked, the run leads either way and decides nothing as nothing.
+#[test]
+fn seed_2971_decides_both_shapes_as_nothing_at_five_voters_and_the_survivors_lead() {
+    let knobs = |destroy, rule| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        decide_nothing: Some(rule),
+        ..Knobs::row(10)
+    };
+    let run = |destroy, rule| run_knobs_keeping(5, knobs(destroy, rule), 2971, Some(false));
+    let gone = run(true, true).unwrap_or_else(|f| panic!("{}", f.0));
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2971 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        gone.gone_on_nothing,
+        "{} was not executed as nothing: {gone:?}",
+        short(&on)
+    );
+    assert_eq!(
+        gone.nothing_executed,
+        3,
+        "not {} and the two payloads node 2 alone held executed as nothing: {gone:?}",
+        short(&on)
+    );
+    assert!(
+        gone.led_after_gone,
+        "no voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(gone.healed, "the voters left did not settle: {gone:?}");
+    assert_eq!(
+        gone.nothing_kept_by_drop, 0,
+        "condition 5 kept the rule off a selection"
+    );
+
+    // Control: the rule off, node 2 destroyed. The campaign waits for
+    // the destroyed voter's report and never completes.
+    let (stall, off) = *run(true, false).expect_err("the run without the rule led");
+    assert!(
+        stall.contains("did not complete"),
+        "the run without the rule failed otherwise: {stall}"
+    );
+    assert_eq!(off.gone_on, Some(on), "the control marks another command");
+    assert!(
+        !off.led_after_gone,
+        "the run without the rule led after the mark"
+    );
+
+    // Control: node 2 only marked. The run leads with the rule, and
+    // decides nothing as nothing.
+    let marked = run(false, true).unwrap_or_else(|f| panic!("{}", f.0));
+    assert_eq!(
+        marked.gone_on,
+        Some(on),
+        "the control marks another command"
+    );
+    assert_eq!(marked.gone, 0, "the control destroyed storage");
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark"
+    );
+    assert_eq!(
+        marked.nothing_executed, 0,
+        "the control decided a command as nothing with every holder kept"
+    );
 }
 
 /// Lever 2, step 1: followers' journals complete runs of batches at
@@ -5403,18 +5886,31 @@ fn row_22_the_leader_crashed_in_the_gates_window() {
 /// Row 20's negative control (task-d90, point 4): with a follower's
 /// payload rows dropped on their way to its store, some vote leaves on a
 /// payload row that is not there, and oracle 9 says so.
+///
+/// Under task-d121's rule too (C5b, a premise test): the rule reads a
+/// command no report holds a payload row for as one no quorum voted for,
+/// so a voter's record kept without its payload row would let a
+/// selection decide a command executed elsewhere as nothing. Oracle 9
+/// fails such a run before any selection reads the report: with the
+/// vote check alone switched off, every seed of 200 at three and at five
+/// voters still fails, on a follower executing a command whose payload
+/// row is durable nowhere or on a leader's own proposal durable without
+/// it, with the rule and without.
 #[test]
 fn row_20_fails_when_a_vote_does_not_rest_on_its_payload_row() {
-    let knobs = Knobs {
-        drop_payload_rows: true,
-        ..Knobs::row(20)
-    };
-    let found = first_failure(3, knobs).or_else(|| first_failure(5, knobs));
-    println!("row 20 without payload rows: {found:?}");
-    assert!(
-        found.is_some(),
-        "no seed of row 20 failed with followers' payload rows dropped"
-    );
+    for decide_nothing in [false, true] {
+        let knobs = Knobs {
+            drop_payload_rows: true,
+            decide_nothing: Some(decide_nothing),
+            ..Knobs::row(20)
+        };
+        let found = first_failure(3, knobs).or_else(|| first_failure(5, knobs));
+        println!("row 20 without payload rows, rule {decide_nothing}: {found:?}");
+        assert!(
+            found.is_some(),
+            "no seed of row 20 failed with followers' payload rows dropped, rule {decide_nothing}"
+        );
+    }
 }
 
 /// A single-page report with no pre-acceptance's payload named present,
@@ -5711,14 +6207,16 @@ fn seeds_from_the_environment() {
             let line = format!(
                 "holders of {} gone (mask {:b}), led after {}, \
                  behind after {} ({} on it, {} with an undecided drop), \
-                 boots after {}",
+                 boots after {}, executed as nothing {}, healed {}",
                 short(&on),
                 s.gone,
                 s.led_after_gone,
                 s.behind_after_gone,
                 s.behind_after_gone_on_it,
                 s.behind_after_gone_undecided,
-                s.boots_after_gone
+                s.boots_after_gone,
+                s.nothing_executed,
+                s.healed
             );
             (stall, keeps, line)
         })
@@ -5742,6 +6240,8 @@ fn seeds_from_the_environment() {
                 totals.unreported_drop_runs += s.unreported_drop_runs;
                 totals.bound_unreported += s.bound_unreported;
                 totals.fenced += s.fenced;
+                totals.nothing_executed += s.nothing_executed;
+                totals.nothing_kept_by_drop += s.nothing_kept_by_drop;
             }
             Err(failed) => {
                 let (e, s) = *failed;
@@ -5762,7 +6262,7 @@ fn seeds_from_the_environment() {
          with an undecided drop {}, of those on a command no voter executed {}), \
          report waits {}, half-initialized {}, \
          unreported drops {} in {} runs, bound past an unreported dependency held decided {}, \
-         fenced {}, failed {}",
+         fenced {}, executed as nothing {}, kept off the rule by a drop {}, failed {}",
         v[2],
         v[3],
         totals.behind,
@@ -5775,6 +6275,8 @@ fn seeds_from_the_environment() {
         totals.unreported_drop_runs,
         totals.bound_unreported,
         totals.fenced,
+        totals.nothing_executed,
+        totals.nothing_kept_by_drop,
         failures.len()
     );
     if knobs.holders_gone.is_some() {
@@ -5808,4 +6310,127 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
     };
     let stats = run_knobs(3, knobs, 3, Some(true)).unwrap();
     assert!(stats.queue_orders > 0, "{stats:?}");
+}
+
+/// Seeds 880 and 9857 (task-d121, traced on #312): row 10 at three
+/// voters under the targeted schedule, with no catch-up. With the rule
+/// off, a command one voter pre-accepted is missing from both reports
+/// the selection counts, task-d120's wait does not bring that voter's
+/// report in, and the campaign gives up as `Behind` on it, a command no
+/// voter executed. Under the rule no campaign gives up: the domain leads
+/// and settles, and no selection is kept off by a drop.
+///
+/// The seeds were chosen when the rule decided that command as nothing.
+/// Since a payload wait asks again for promises and report pages (#335,
+/// `d315938c`), the rule's run sends more and its schedule parts from
+/// the control's early (seed 880: at step 608, a `NewLeader` sent again
+/// during an earlier wait). The command is then re-proposed with its
+/// payload and executed, not decided as nothing. No seed of 0 to 1,999
+/// at this row decides a nothing with the rule where the control gives
+/// up: a nothing takes its holders gone, as in
+/// `a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead`.
+/// A voter that catches up past a command executed as nothing reads the
+/// order its donor executed (task-d121's C5b). Row 10 at three voters,
+/// with catch-up, the rule on and node 0, the only holder of a command,
+/// destroyed: the voters left decide it as nothing and lead, and a voter
+/// behind pulls the commands after it from the other. Each pulled result
+/// must be the one the puller computes for itself. Before the donor's
+/// page read the order without the nothings, as its executor does, seeds
+/// 702 and 942 failed here as a catch-up divergence; with the holder only
+/// marked, or without the rule, neither ever did.
+#[test]
+fn a_voter_catching_up_past_a_nothing_reads_the_order_its_donor_executed() {
+    for seed in [702, 942] {
+        let knobs = Knobs {
+            peer_ack_loss: 750_000,
+            hold: 160_000,
+            campaign: 12_000,
+            crash: 5_000,
+            holders_gone: Some(true),
+            decide_nothing: Some(true),
+            ..Knobs::row(10)
+        };
+        let stats = run_knobs(3, knobs, seed, Some(true)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stats.gone, 0b1, "seed {seed}: {stats:?}");
+        assert!(stats.nothing_executed > 0, "seed {seed}: {stats:?}");
+        assert!(
+            stats.led_after_gone && stats.healed,
+            "seed {seed}: {stats:?}"
+        );
+    }
+}
+
+/// The recovery check owes every decision a voter saw (Astra on #336). A
+/// decision counted at a quorum that no frontend learned and no voter
+/// executed, as one whose submitter was destroyed is, keeps a domain
+/// that is otherwise healed from passing as healed.
+#[test]
+fn a_decision_no_voter_executed_keeps_the_domain_from_healing() {
+    let mut sim = Sim::new(3, Knobs::row(10), 1);
+    assert!(sim.healed(), "a domain that has done nothing is healed");
+    let c = CommandId(Digest32([0x5d; 32]));
+    sim.decide_as(c, false, || "counted at node 1".to_owned());
+    assert!(!sim.healed(), "healed with a decision no voter executed");
+}
+
+/// What the frontend learned is the value the counted votes accepted
+/// (Codex on #336). After a quorum learns a command with its payload, a
+/// stray acknowledgement of it under the marker, which the vote set
+/// refuses (`AdmissionConflict`), is no second decision of it.
+#[test]
+fn an_acknowledgement_the_vote_set_refuses_is_no_second_decision() {
+    let mut sim = Sim::new(3, Knobs::row(10), 1);
+    let b = ballot(1, 0);
+    let c = CommandId(Digest32([0x5e; 32]));
+    let payload = Digest32([0x11; 32]);
+    sim.submitted.insert(c, payload);
+    let ack = |from: u8, admission| FastAck {
+        replica: r(from),
+        ballot: b,
+        command: c,
+        deps: Vec::new(),
+        paths: Vec::new(),
+        path: Digest32([0; 32]),
+        admission,
+        seqnum: None,
+    };
+    sim.at_frontend(
+        0,
+        ProtocolMessage::LeaderReply {
+            ballot: b,
+            command: c,
+            seqnum: 1,
+            deps: Vec::new(),
+            path: Digest32([0; 32]),
+        },
+    );
+    sim.at_frontend(1, ProtocolMessage::FastAck(ack(1, payload)));
+    assert!(sim.learned.contains(&c), "the fast quorum is learned");
+    assert_eq!(sim.decided_as.get(&c).map(|d| d.0), Some(false));
+    sim.at_frontend(
+        2,
+        ProtocolMessage::FastAck(ack(2, coord_consensus::commands::NOTHING_ADMISSION)),
+    );
+    assert_eq!(sim.decided_as.get(&c).map(|d| d.0), Some(false));
+}
+
+#[test]
+fn seeds_880_and_9857_lead_under_the_rule_where_they_gave_up_as_behind() {
+    let knobs = |rule: bool| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        decide_nothing: Some(rule),
+        ..Knobs::row(10)
+    };
+    for seed in [880, 9857] {
+        let ruled = run_knobs(3, knobs(true), seed, Some(false)).unwrap();
+        assert_eq!(ruled.behind, 0, "seed {seed}: {ruled:?}");
+        assert!(ruled.healed, "seed {seed}: {ruled:?}");
+        assert_eq!(ruled.nothing_kept_by_drop, 0, "seed {seed}: {ruled:?}");
+        let off = run_knobs(3, knobs(false), seed, Some(false)).unwrap();
+        assert!(off.behind_unexecuted > 0, "seed {seed}: {off:?}");
+        assert_eq!(off.nothing_executed, 0, "seed {seed}: {off:?}");
+    }
 }

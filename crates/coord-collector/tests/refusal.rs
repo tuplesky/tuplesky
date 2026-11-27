@@ -828,6 +828,69 @@ fn a_decided_nothings_release_answers_an_entry_no_voter_voted_for() {
     }
 }
 
+/// task-d121, C5b: a stray fast acknowledgement of the command under its
+/// digest, from a retry a voter admitted before the nothing's proposal
+/// reached it, reaches the collector before any of the nothing's votes.
+/// The entry's set counts it and refuses the nothing's votes, which come
+/// under the marker; the entry learns the nothing from the leader's
+/// final release of the canonical refusal instead, and a voter's
+/// `DecidedNothing` after it agrees.
+#[test]
+fn a_stray_acknowledgement_under_the_digest_does_not_keep_the_nothing_from_being_answered() {
+    let nothing = coord_storage::retry::decided_nothing_response();
+    let digest = coord_storage::retry::decided_nothing_digest();
+    for marked in [false, true] {
+        let mut c = collector(4);
+        c.set_answer_on_release(marked);
+        let command = submit(&mut c, 1);
+        let fast = |replica: u8, admission: Digest32| {
+            ProtocolMessage::FastAck(coord_consensus::FastAck {
+                replica: r(replica),
+                ballot: ballot(0, 0),
+                command,
+                deps: Vec::new(),
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission,
+                seqnum: None,
+            })
+        };
+        let under_digest = c.admission(&command).expect("outstanding");
+        let stray = c.on_evidence(from(1), fast(1, under_digest));
+        assert!(
+            matches!(stray, Ok(Progress::Held(_))),
+            "marked {marked}: {stray:?}"
+        );
+        let vote = c.on_evidence(from(0), fast(0, coord_consensus::NOTHING_ADMISSION));
+        assert!(
+            matches!(
+                vote,
+                Err(EvidenceError::Vote(
+                    coord_consensus::VoteError::AdmissionConflict { .. }
+                ))
+            ),
+            "marked {marked}: {vote:?}"
+        );
+        let Progress::Released(answer) = release(&mut c, command, digest, nothing.clone()).unwrap()
+        else {
+            panic!("not answered, marked {marked}");
+        };
+        assert_eq!(answer.command, command);
+        assert!(!answer.speculative);
+        match &answer.response.outcome {
+            OutcomeV1::Ok {
+                revision: None,
+                result,
+            } => assert_eq!(result.as_slice(), nothing.as_slice()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            c.on_evidence(from(2), refused(command, SubmissionRefusal::DecidedNothing)),
+            Ok(Progress::Settled)
+        );
+    }
+}
+
 /// A voter's `DecidedNothing` against a final release of other facts the
 /// entry holds is a divergence, not an answer (#328 reviews): the stop a
 /// release gives when it comes second, and the entry stays pending.
