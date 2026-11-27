@@ -7952,11 +7952,21 @@ fn under_the_rule_every_voter_answered_passes_the_wait_at_once() {
             .any(|r| matches!(r, FollowerRejection::Behind { .. })),
         "{rejections:?}"
     );
-    let decision = f
-        .campaign_state()
-        .and_then(|c| c.decision())
-        .expect("selected");
+    let campaign = f.campaign_state().expect("campaigning");
+    let decision = campaign.decision().expect("selected");
     assert!(decision.nothing.contains(&d), "{decision:?}");
+    // Assembled once a majority could be complete, once when the third
+    // report completed, and once after the wait passed: within the
+    // budget `protocol_sim`'s oracle 5 holds a campaign to, once a
+    // majority could be complete and once per supply, a wait's end among
+    // them (seeds 22, 37 and 241 of row 10 under the rule went over).
+    assert_eq!(campaign.assemblies(), 3);
+    assert!(
+        campaign.assemblies() <= 2 + campaign.supply_moves(),
+        "{} assemblies, {} supplies",
+        campaign.assemblies(),
+        campaign.supply_moves()
+    );
 }
 
 /// The payload shape at the campaign: D at ACCEPT with no payload at any

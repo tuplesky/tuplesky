@@ -412,7 +412,8 @@ impl Campaign {
     }
 
     /// How many times something the selection may wait on arrived before
-    /// it was made: each may cost one more assembly (task-d33).
+    /// it was made, or the wait for the reports not read ended (task-d120,
+    /// task-d121): each may cost one more assembly (task-d33).
     pub const fn supply_moves(&self) -> u64 {
         self.supply_moves
     }
@@ -501,8 +502,13 @@ impl Campaign {
     /// dropped, unless it was bound: made again, under the rule, it may
     /// decide as nothing what nobody could send.
     pub fn end_report_wait(&mut self) -> bool {
-        self.report_wait_over = true;
+        let over = core::mem::replace(&mut self.report_wait_over, true);
         let waited = self.report_wait.take().is_some();
+        // The wait ends once, and the selection made after it may cost
+        // one more assembly.
+        if !over && self.bound.is_none() && !self.durable {
+            self.supply_moves += 1;
+        }
         if waited {
             self.supply_moved = true;
             if self.bound.is_none() && !self.durable {
@@ -550,6 +556,9 @@ impl Campaign {
         self.decision = None;
         self.awaited = None;
         self.supply_moved = true;
+        // The wait ends once, and the selection made again costs one
+        // more assembly.
+        self.supply_moves += 1;
         true
     }
 
