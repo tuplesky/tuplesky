@@ -835,6 +835,8 @@ struct Msg {
 struct Shadow {
     set: Option<VoteSet>,
     admission: Option<Digest32>,
+    /// Whether the acknowledgements counted carry the marker (task-d121).
+    nothing: Option<bool>,
     /// Leader replies waiting for an admission to count them under.
     leader: Vec<FastAck>,
 }
@@ -954,6 +956,14 @@ struct Sim {
     /// How each command executed anywhere was executed: as a nothing
     /// (task-d121), or with its payload.
     executed_as_nothing: BTreeMap<CommandId, bool>,
+    /// Each command decided anywhere, as a nothing or with its payload,
+    /// and where that was first seen (task-d121): executed, counted by a
+    /// leader, committed at a follower's acknowledgement, or learned at
+    /// the frontend. A voter destroyed later keeps what it decided here.
+    decided_as: BTreeMap<CommandId, (bool, String)>,
+    /// Commands a submitter was answered as refused, decided as nothing
+    /// (task-d121, #315 review), and how.
+    refused_as_nothing: BTreeMap<CommandId, String>,
     /// Each node's current follower machine's count of selections
     /// task-d121's condition 5 kept the rule off, as last read.
     kept_by_drop_seen: Vec<u64>,
@@ -1313,6 +1323,8 @@ impl Sim {
             reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
             executed_as_nothing: BTreeMap::new(),
+            decided_as: BTreeMap::new(),
+            refused_as_nothing: BTreeMap::new(),
             kept_by_drop_seen: vec![0; usize::from(n)],
             behind_counted: vec![None; usize::from(n)],
             behind_undecided_seen: vec![0; usize::from(n)],
@@ -1589,6 +1601,16 @@ impl Sim {
                 // may.
                 Effect::Released(released) => {
                     let c = released.established().command();
+                    // A final release of the marker answers the command's
+                    // held callers as refused (task-d121's C2b).
+                    if !released.speculative()
+                        && released
+                            .admission()
+                            .as_ref()
+                            .is_some_and(coord_consensus::is_nothing)
+                    {
+                        self.refuse_as_nothing(c, || format!("released by node {i}"));
+                    }
                     if !self.marked.contains(&c) || released.speculative() {
                         continue;
                     }
@@ -1634,6 +1656,14 @@ impl Sim {
                 self.forgotten.insert(*command);
                 return;
             }
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::DecidedNothing,
+                ..
+            } => {
+                self.refuse_as_nothing(*command, || format!("by node {from}"));
+                return;
+            }
             _ => return,
         };
         let n = self.n;
@@ -1652,9 +1682,11 @@ impl Sim {
         }
         match message {
             ProtocolMessage::FastAck(a) => {
+                shadow.nothing = Some(coord_consensus::is_nothing(&a.admission));
                 let _ = set.add(Vote::Fast(a));
             }
             ProtocolMessage::SlowAck(a) => {
+                shadow.nothing = Some(coord_consensus::is_nothing(&a.admission));
                 let _ = set.add(Vote::Slow(a));
             }
             ProtocolMessage::LeaderReply {
@@ -1681,6 +1713,9 @@ impl Sim {
                 let _ = set.add(Vote::Fast(reply));
             }
         }
+        let nothing = shadow
+            .nothing
+            .or_else(|| shadow.admission.as_ref().map(coord_consensus::is_nothing));
         if let Some(learned) = set.learned() {
             let deps = learned.deps().to_vec();
             if self.trace.is_some() && !self.decided.contains_key(&command) {
@@ -1702,6 +1737,11 @@ impl Sim {
                 self.stats.learned += 1;
             }
             self.decide(command, &deps, &format!("learned at the frontend in {b:?}"));
+            if let Some(nothing) = nothing {
+                self.decide_as(command, nothing, || {
+                    format!("learned at the frontend in {}", bn(&b))
+                });
+            }
         }
     }
 
@@ -1715,6 +1755,61 @@ impl Sim {
                 "{command:?} has two dependency sets: {held:?} ({first}) and {set:?} ({source})"
             )),
             Some(_) => {}
+        }
+    }
+
+    /// Note `command` decided as nothing or with its payload, as `how`
+    /// saw it (task-d121): one command has one decision, and one a
+    /// submitter was answered as refused is never decided with its
+    /// payload.
+    fn decide_as(&mut self, command: CommandId, nothing: bool, how: impl FnOnce() -> String) {
+        let value = |nothing: bool| {
+            if nothing {
+                "as nothing"
+            } else {
+                "with its payload"
+            }
+        };
+        match self.decided_as.get(&command) {
+            Some((was, first)) if *was != nothing => {
+                let first = first.clone();
+                self.fail(&format!(
+                    "{} was decided {} ({first}) and {} ({})",
+                    short(&command),
+                    value(*was),
+                    value(nothing),
+                    how()
+                ))
+            }
+            Some(_) => {}
+            None => {
+                let how = how();
+                if !nothing && let Some(refused) = self.refused_as_nothing.get(&command) {
+                    let refused = refused.clone();
+                    self.fail(&format!(
+                        "{} was decided with its payload ({how}) and answered as refused \
+                         ({refused})",
+                        short(&command)
+                    ));
+                }
+                self.decided_as.insert(command, (nothing, how));
+            }
+        }
+    }
+
+    /// Note a submitter answered that `command` was decided as nothing,
+    /// as `how` says (task-d121): it must never take effect.
+    fn refuse_as_nothing(&mut self, command: CommandId, how: impl FnOnce() -> String) {
+        if let Some((false, first)) = self.decided_as.get(&command) {
+            let first = first.clone();
+            self.fail(&format!(
+                "{} was answered as refused ({}) and decided with its payload ({first})",
+                short(&command),
+                how()
+            ));
+        }
+        if !self.refused_as_nothing.contains_key(&command) {
+            self.refused_as_nothing.insert(command, how());
         }
     }
 
@@ -1870,16 +1965,30 @@ impl Sim {
             _ => None,
         };
         let effects = self.nodes[usize::from(i)].step_input(input);
+        // What each command counted here was decided as (task-d121).
+        let mut counted_as: Vec<(CommandId, bool)> = Vec::new();
         match &mut self.nodes[usize::from(i)].role {
-            Some(Role::Leader(l)) => self.counted.extend(l.take_learned()),
+            Some(Role::Leader(l)) => {
+                for c in l.take_learned() {
+                    if let Some(r) = l.table().record(&c) {
+                        counted_as.push((c, r.is_nothing()));
+                    }
+                    self.counted.insert(c);
+                }
+            }
             Some(Role::Follower(f)) => {
                 if let Some(c) = acked
-                    && f.table().phase_of(&c) >= Some(coord_consensus::Phase::Commit)
+                    && let Some(r) = f.table().record(&c)
+                    && r.phase >= coord_consensus::Phase::Commit
                 {
+                    counted_as.push((c, r.is_nothing()));
                     self.counted.insert(c);
                 }
             }
             None => {}
+        }
+        for (c, nothing) in counted_as {
+            self.decide_as(c, nothing, || format!("counted at node {i}"));
         }
         let mut watch_notes: Vec<String> = Vec::new();
         if let Some((c, before, deps_before)) = phase_watch {
@@ -2721,6 +2830,7 @@ impl Sim {
                 self.stats.nothing_executed += u32::from(nothing);
             }
         }
+        self.decide_as(c, nothing, || format!("executed by node {i} at {}", k + 1));
         // Oracle 7 (task-d90): a result is released once its command is
         // executed in memory, and every execution of it anywhere, before
         // a crash or after, gives the same bytes.
