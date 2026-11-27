@@ -3,19 +3,46 @@
 What an operator should know about a build before running it. The
 newest entry comes first.
 
+## Alpha: durability
+
+Acknowledged writes survive process crashes and modeled power loss (fsync semantics, tested with a fault-injecting filesystem). Not validated with real power cuts, lying storage devices or on-disk bit rot. Damage found at recovery is refused rather than repaired, and the node recovers from its peers. No background scrubbing.
+
 ## Alpha: a command whose payload is lost with its holders (task-d121)
 
 When every voter that held a command's payload is lost for good, a
-domain without the rule never elects a leader again: every campaign
-gives up on the command, or waits for a voter that never answers. With
-the rule, the voters left decide that command as nothing and lead.
-Design [4.9](../design/tuplesky-design.md#s4-9) states the rule.
+domain without the rule can stop electing a leader: a campaign whose
+selection must carry the command gives up on it, or waits for a voter
+that never answers. An election still succeeds where the surviving
+selection has nothing to carry for that command. With the rule, the
+voters left usually decide such a command as nothing and lead, but not
+always:
 
-- **Turning it on.** The rule is a feature, on only in a domain whose
-  genesis manifest names both `release-at-execution` and
-  `decided-nothing` (its `features`). It needs every voter, so it can't
-  be switched on in a domain after the loss. A domain whose manifest
-  names neither runs without it.
+- **The rule stays off where the order check can't read the order.**
+  Where a selection's order check dropped a possible fast decision
+  behind a dependency no report holds, the rule stays off for that
+  selection. Such a decision may have been made fast, under dependencies
+  the check couldn't read. A surviving majority then still gives up or
+  waits, as without the rule.
+- **The domain can stay without a leader after the loss.** If every
+  selection after the loss meets that case, no voter leads again until
+  the lost storage, or every voter, is restored. The simulator finds
+  such runs (seeds 363 and 582, after the only holder is destroyed).
+
+Design [4.9](../design/tuplesky-design.md#s4-9) states the rule and this
+limit.
+
+- **Turning it on.** The rule is a feature, on in a domain where both
+  `release-at-execution` and `decided-nothing` are active. There are two
+  ways:
+  - its genesis manifest names both (its `features`);
+  - a running domain activates them live while every voter is up:
+    `coordctl feature activate release-at-execution`, then
+    `coordctl feature activate decided-nothing`. The second is refused
+    until the first is active.
+
+  Either way it needs every voter, so it can't be switched on after the
+  loss. `coordctl feature status` shows a running domain's active set. A
+  domain with neither active runs without the rule.
 - **What a caller sees.** The command takes effect as nothing. Its
   submitter gets a definite refusal, `decided-nothing`, once the
   nothing is decided, never before. A retry of the command meets the
@@ -33,8 +60,8 @@ Design [4.9](../design/tuplesky-design.md#s4-9) states the rule.
 - **The manifest stands in for every voter preparing the feature.**
   In a domain whose genesis names the feature, every voter writes the
   same activation record from the signed manifest at `init`, and no
-  activation round runs. A domain created before manifests named
-  features needs every voter up to activate it.
+  activation round runs. A domain whose genesis doesn't name the
+  feature activates it live, as above.
 
 ## Alpha: clients are trusted (#312 finding 2)
 
