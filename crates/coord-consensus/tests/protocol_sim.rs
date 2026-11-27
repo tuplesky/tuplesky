@@ -395,7 +395,8 @@ struct Knobs {
     /// Whether every donor withholds a drawn command's record, as the
     /// knob did before seed 73's fix (#307 review). A voter behind then
     /// finds no donor to serve it, which `coordd` reaches only below a
-    /// restore's boundary, and stops there; it is the mode the bare window's failures were found
+    /// restore's boundary, and stops there, which the heal allows
+    /// ([`Sim::stopped_at_withheld`]); it is the mode the bare window's failures were found
     /// in, kept so the fixture's lines for them separate a build that
     /// installs such an entry from one that refuses it.
     /// `PROTOCOL_SIM_FORGET_EVERYWHERE=1` sets it.
@@ -1192,6 +1193,9 @@ struct Stats {
     /// machine of the run.
     undecided_served: u64,
     stopped_undecided: u64,
+    /// Entries donors served for commands executed as nothing
+    /// (task-d121): a catch-up past a nothing.
+    nothing_served: u64,
     /// Learning passes a step of storage events passed over, at every
     /// follower (lever 2, step 1).
     storage_passes_skipped: u64,
@@ -2476,11 +2480,18 @@ impl Sim {
             if epoch != Some(b.epoch) {
                 return;
             }
-            let page = self.page(msg.to, b, after);
+            // An empty page is no page: `coordd`'s donor leaves the ask
+            // unanswered and counts why (`Node::serve_catch_up`, Astra on
+            // #336), and the asker asks again.
+            let Some(page) = self.page(msg.to, b, after) else {
+                return;
+            };
             self.stats.catch_up_pages += 1;
             if let ProtocolMessage::CatchUpPage { entries, .. } = &page {
                 self.stats.undecided_served +=
                     entries.iter().filter(|e| e.decided.is_none()).count() as u64;
+                self.stats.nothing_served +=
+                    entries.iter().filter(|e| e.payload.is_none()).count() as u64;
             }
             self.net.push(Msg {
                 from: msg.to,
@@ -2554,7 +2565,9 @@ impl Sim {
     /// and its nothing row, and its result is the canonical refusal; the
     /// result of each command after it reads the order as its executor
     /// did, without the nothings (task-d121, as `complete` executes).
-    fn page(&self, donor: u8, ballot: Ballot, after: ExecutionPosition) -> ProtocolMessage {
+    /// None where it can show no command after `after`, as `coordd`'s
+    /// `catch_up::page` has none.
+    fn page(&self, donor: u8, ballot: Ballot, after: ExecutionPosition) -> Option<ProtocolMessage> {
         let node = &self.nodes[usize::from(donor)];
         let payloads: BTreeMap<CommandId, coord_consensus::PayloadRecordV1> =
             payload_rows(&node.storage).into_iter().collect();
@@ -2598,12 +2611,15 @@ impl Sim {
                 result_digest: digest_of(&response),
             });
         }
-        ProtocolMessage::CatchUpPage {
+        if entries.is_empty() {
+            return None;
+        }
+        Some(ProtocolMessage::CatchUpPage {
             ballot,
             after,
             through: ExecutionPosition::new(executed.len() as u64).unwrap(),
             entries,
-        }
+        })
     }
 
     fn complete(&mut self, i: u8) {
@@ -4287,10 +4303,14 @@ impl Sim {
     /// selection dropped would otherwise pass as settled, and so would
     /// one no frontend learned whose submitter was destroyed (Astra on
     /// #336).
+    ///
+    /// A voter stopped at a record every donor withholds
+    /// ([`Self::stopped_at_withheld`]) is left out, and so are the
+    /// commands of its own clients, as a destroyed voter's are.
     fn healed(&self) -> bool {
         self.leader_index().is_some()
             && (0..self.n)
-                .filter(|i| !self.destroyed.contains(i))
+                .filter(|i| !self.destroyed.contains(i) && !self.stopped_at_withheld(*i))
                 .all(|i| {
                     self.nodes[usize::from(i)].executed.len() == self.order.len()
                         && !self.executable(i)
@@ -4301,7 +4321,24 @@ impl Sim {
                 .keys()
                 .chain(self.decided_as.keys())
                 .all(|c| self.executed_anywhere.contains(c))
-            && self.unsettled().is_empty()
+            && self
+                .unsettled()
+                .iter()
+                .all(|c| self.stopped_at_withheld(self.offers[c].host))
+    }
+
+    /// Whether voter `i` stopped where [`Knobs::forget_everywhere`]
+    /// means a voter behind to stop: the next command of the one order
+    /// is one every donor withholds the record of, so no page can bring
+    /// it, as a `coordd` voter stops below a restore's boundary. Every
+    /// other voter still has to execute the whole order. Without this,
+    /// kept seed 27 (row 10, three voters) passed only while its
+    /// schedule happened to leave no voter behind such a command: with
+    /// the donor sending no empty page (Astra on #336), node 0 stops at
+    /// 38 of 60, before a command both donors withhold.
+    fn stopped_at_withheld(&self, i: u8) -> bool {
+        let next = self.nodes[usize::from(i)].executed.len();
+        self.knobs.forget_everywhere && self.order.get(next).is_some_and(|c| self.withholds(i, c))
     }
 
     /// Oracle 6: stop the faults and admission, and give the domain a
@@ -5800,6 +5837,57 @@ fn seed_2971_decides_both_shapes_as_nothing_at_five_voters_and_the_survivors_lea
         gone.nothing_kept_by_drop, 0,
         "condition 5 kept the rule off a selection"
     );
+    // A voter asking node 0 for what follows the command before `c03a`
+    // (Astra on #336): the page goes on past the nothing, which it
+    // carries with no payload, its nothing row and the refusal's digest,
+    // and the next command's result is the one node 0 executed.
+    let c03a = nothings
+        .iter()
+        .copied()
+        .find(|c| short(c) == "c03a")
+        .expect("c03a");
+    let order = &ruled.nodes[0].executed[..ruled.nodes[0].durable_executed];
+    let at = order
+        .iter()
+        .position(|c| *c == c03a)
+        .expect("node 0 executed c03a");
+    assert_eq!(at, 22, "c03a is not node 0's 23rd execution");
+    let next = order[at + 1];
+    assert_eq!(short(&next), "1037", "the command after c03a");
+    let Some(ProtocolMessage::CatchUpPage { entries, .. }) =
+        ruled.page(0, ballot(1, 0), ExecutionPosition::new(22).unwrap())
+    else {
+        panic!("node 0 served no page after position 22");
+    };
+    assert!(entries.len() >= 2, "the page stops at c03a: {entries:?}");
+    let nothing = &entries[0];
+    assert_eq!(nothing.command, c03a);
+    assert_eq!(nothing.position.get(), 23);
+    assert!(nothing.payload.is_none(), "c03a served with a payload");
+    assert!(
+        nothing
+            .decided
+            .as_ref()
+            .is_some_and(CommandRecord::is_nothing),
+        "c03a served without its nothing row: {:?}",
+        nothing.decided
+    );
+    assert_eq!(nothing.result_digest, digest_of(&nothing_response(&c03a)));
+    let after = &entries[1];
+    assert_eq!(after.command, next);
+    assert_eq!(after.position.get(), 24);
+    assert!(after.payload.is_some(), "1037 served with no payload");
+    assert!(
+        after.decided.as_ref().is_some_and(|d| !d.is_nothing()),
+        "1037 served without its row: {:?}",
+        after.decided
+    );
+    assert_eq!(
+        after.result_digest,
+        digest_of(&ruled.released[&next]),
+        "1037's served result is not the one node 0 executed"
+    );
+    assert_ne!(after.result_digest, digest_of(&nothing_response(&next)));
 
     // Control: the rule off, node 2 destroyed. The campaign waits for
     // the destroyed voter's report and never completes.
@@ -6350,7 +6438,7 @@ fn seeds_from_the_environment() {
                 "holders of {} gone (mask {:b}), led after {}, \
                  behind after {} ({} on it, {} with an undecided drop), \
                  boots after {}, selected as nothing {}, executed as nothing {}, \
-                 healed {}, probe committed in {:?} rounds",
+                 served as nothing {}, healed {}, probe committed in {:?} rounds",
                 short(&on),
                 s.gone,
                 s.led_after_gone,
@@ -6360,6 +6448,7 @@ fn seeds_from_the_environment() {
                 s.boots_after_gone,
                 s.nothing_selected,
                 s.nothing_executed,
+                s.nothing_served,
                 s.healed,
                 s.probe_rounds
             );
@@ -6482,13 +6571,18 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
 /// with catch-up, the rule on and node 0, the only holder of a command,
 /// destroyed: the voters left decide it as nothing and lead, and a voter
 /// behind pulls the commands after it from the other. Each pulled result
-/// must be the one the puller computes for itself. Before the donor's
-/// page read the order without the nothings, as its executor does, seeds
-/// 702 and 942 failed here as a catch-up divergence; with the holder only
-/// marked, or without the rule, neither ever did.
+/// must be the one the puller computes for itself.
+///
+/// With a donor whose page reads the order with the nothings in it, as
+/// it did before `c289ee61`, seeds 254, 681 and 1099 fail here as a
+/// catch-up divergence: of seeds 0 to 1,499, these three alone. Seeds 681
+/// and 1099 pull a nothing in the page, and 254 pulls only the commands
+/// after one. Seeds 702 and 942, which first showed it, no longer reach
+/// the mark since a donor that can show no command sends no page, as
+/// `coordd`'s doesn't (Astra on #336).
 #[test]
 fn a_voter_catching_up_past_a_nothing_reads_the_order_its_donor_executed() {
-    for seed in [702, 942] {
+    for seed in [254, 681, 1099] {
         let knobs = Knobs {
             peer_ack_loss: 750_000,
             hold: 160_000,

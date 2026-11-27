@@ -3,6 +3,47 @@
 What an operator should know about a build before running it. The
 newest entry comes first.
 
+## Alpha: a command whose payload is lost with its holders (task-d121)
+
+When every voter that held a command's payload is lost for good, a
+domain without the rule never elects a leader again: every campaign
+gives up on the command, or waits for a voter that never answers. With
+the rule, the voters left decide that command as nothing and lead.
+Design [4.9](../design/tuplesky-design.md#s4-9) states the rule.
+
+- **Turning it on.** The rule is a feature, on only in a domain whose
+  genesis manifest names both `release-at-execution` and
+  `decided-nothing` (its `features`). It needs every voter, so it can't
+  be switched on in a domain after the loss. A domain whose manifest
+  names neither runs without it.
+- **What a caller sees.** The command takes effect as nothing. Its
+  submitter gets a definite refusal, `decided-nothing`, once the
+  nothing is decided, never before. A retry of the command meets the
+  same refusal once the nothing is committed. Before that it is held,
+  and it is answered with the command's release.
+- **A wiped voter is caught only where another voter recorded it.**
+  Each voter writes a random store identity at `init`. A voter refuses
+  a peer, or a candidate, that comes back under another identity than
+  the one it recorded. A candidate whose store was wiped before any
+  voter the campaign needs had recorded its identity is not caught.
+  A voter restored alone from an old copy of its own store carries
+  that store's identity, and no check finds it (design
+  [5.4](../design/tuplesky-design.md#s5-4)). Restore every voter from
+  the same backup, as the disaster-recovery runbook says.
+- **The manifest stands in for every voter preparing the feature.**
+  In a domain whose genesis names the feature, every voter writes the
+  same activation record from the signed manifest at `init`, and no
+  activation round runs. A domain created before manifests named
+  features needs every voter up to activate it.
+
+## Alpha: clients are trusted (#312 finding 2)
+
+Alpha assumes trusted, authenticated clients. A bound client that stops
+reading its connection can stall the domain loop for about 10 s for
+each frame it blocks. The stall clears when the write times out, or on a
+restart. Connections without a client certificate are bounded before
+they bind (#334).
+
 ## Alpha: a voter's policy is bounded in staleness (#320)
 
 A voter's frontend answers bindings, output and watches from its own
