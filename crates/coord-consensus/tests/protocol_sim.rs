@@ -878,6 +878,11 @@ const KEYS: usize = 4;
 /// every journal completes, and every node executes what it can.
 const HEAL_BUDGET: u32 = 400;
 
+/// The rounds at the end of a heal in which a voter
+/// [`Knobs::forget_everywhere`] stops must have executed nothing
+/// (`Sim::stopped_at_withheld`): a quarter of the budget.
+const HEAL_STALL: u32 = HEAL_BUDGET / 4;
+
 /// The restarts of every live voter while healing after
 /// `Knobs::holders_gone`'s mark, past the one healing starts with.
 const GONE_BOOTS: u32 = 3;
@@ -1135,8 +1140,12 @@ struct Stats {
     /// Commands a selection that led decided as nothing (task-d121),
     /// once for each such selection. A nothing a later selection replaces
     /// with the command's payload counts here and not in
-    /// `nothing_executed`.
+    /// `nothing_executed`. Both kinds: a re-proposal the selection
+    /// proposes as nothing and an adopted entry it marks (Astra on #337).
     nothing_selected: u32,
+    /// Voters a heal left stopped at a record every donor withholds
+    /// (`Knobs::forget_everywhere`, `Sim::stopped_at_withheld`).
+    withheld_stops: u32,
     /// After a run with a mark healed (`Knobs::holders_gone`): the rounds
     /// a command submitted then took to commit at every voter left. The
     /// run fails if it never does.
@@ -1626,19 +1635,32 @@ impl Sim {
                     let c = released.established().command();
                     // A final release of a nothing: the refusal's bytes
                     // under its digest, as the collector knows one
-                    // (`releases_a_nothing`), or the marker's admission. A
-                    // leader names the admission only for a marked
-                    // command, so an unmarked one's refusal is known by
-                    // its bytes alone (Astra on #336).
+                    // (`releases_a_nothing`). A leader names the admission
+                    // only for a marked command, so an unmarked one's
+                    // refusal carries none (Astra on #336).
+                    //
+                    // By its bytes only, marked or not: the collector holds
+                    // a marked caller whose release names the marker but
+                    // carries another result (`ReleaseNotAnswerable`), and
+                    // such a release is a leader's wrong answer, which
+                    // fails the run (Astra on #337).
                     let refusal = nothing_response(&c);
                     let nothing = !released.speculative()
-                        && (released
+                        && released.established().result_digest() == digest_of(&refusal)
+                        && released.response() == refusal.as_slice();
+                    if !released.speculative()
+                        && !nothing
+                        && released
                             .admission()
                             .as_ref()
                             .is_some_and(coord_consensus::is_nothing)
-                            || (released.established().result_digest() == digest_of(&refusal)
-                                && released.response() == refusal.as_slice()));
-                    // A final release of the marker is the leader's
+                    {
+                        self.fail(&format!(
+                            "node {i} released {} under the marker with a result other than the refusal",
+                            short(&c)
+                        ));
+                    }
+                    // A final release of the refusal is the leader's
                     // decision of a nothing, whether or not it reaches
                     // the frontend (task-d121).
                     if nothing {
@@ -1939,8 +1961,19 @@ impl Sim {
                 self.stats.unreported_drops += drops.undecided;
                 self.stats.bound_unreported += drops.bound_decided;
                 self.stats.bound_unreported_undecided += drops.bound_undecided;
+                // Both kinds of selected nothing: a re-proposal proposed
+                // as nothing, and an adopted entry marked (Astra on #337).
+                let marked = decision
+                    .entries
+                    .values()
+                    .filter(|e| {
+                        e.admission
+                            .as_ref()
+                            .is_some_and(coord_consensus::is_nothing)
+                    })
+                    .count();
                 self.stats.nothing_selected +=
-                    u32::try_from(decision.nothing.len()).unwrap_or(u32::MAX);
+                    u32::try_from(decision.nothing.len() + marked).unwrap_or(u32::MAX);
                 let q = f.quorum().clone();
                 let (mut l, effects) = Leader::from_recovered(f.into_recovered(), q, &decision);
                 l.set_learning(LearningMode::Full);
@@ -4303,17 +4336,31 @@ impl Sim {
     /// selection dropped would otherwise pass as settled, and so would
     /// one no frontend learned whose submitter was destroyed (Astra on
     /// #336).
-    ///
-    /// A voter stopped at a record every donor withholds
-    /// ([`Self::stopped_at_withheld`]) is left out, and so are the
-    /// commands of its own clients, as a destroyed voter's are.
     fn healed(&self) -> bool {
+        self.healed_but(&[])
+    }
+
+    /// [`Self::healed`], with the voters in `stopped` left behind where
+    /// they are: each may have executed less than the order, and of its
+    /// own clients' commands, those at or after its stop in the order
+    /// may stay unsettled. Every other voter still executes the whole
+    /// order, and every other command settles.
+    fn healed_but(&self, stopped: &[u8]) -> bool {
+        let blocked = |c: &CommandId| {
+            let host = self.offers[c].host;
+            stopped.contains(&host)
+                && self
+                    .order
+                    .iter()
+                    .position(|x| x == c)
+                    .is_some_and(|at| at >= self.nodes[usize::from(host)].executed.len())
+        };
         self.leader_index().is_some()
             && (0..self.n)
-                .filter(|i| !self.destroyed.contains(i) && !self.stopped_at_withheld(*i))
+                .filter(|i| !self.destroyed.contains(i))
                 .all(|i| {
-                    self.nodes[usize::from(i)].executed.len() == self.order.len()
-                        && !self.executable(i)
+                    let executed = self.nodes[usize::from(i)].executed.len();
+                    (executed == self.order.len() || stopped.contains(&i)) && !self.executable(i)
                 })
             && self.learned.is_subset(&self.executed_anywhere)
             && self
@@ -4321,24 +4368,42 @@ impl Sim {
                 .keys()
                 .chain(self.decided_as.keys())
                 .all(|c| self.executed_anywhere.contains(c))
-            && self
-                .unsettled()
-                .iter()
-                .all(|c| self.stopped_at_withheld(self.offers[c].host))
+            && self.unsettled().iter().all(blocked)
     }
 
-    /// Whether voter `i` stopped where [`Knobs::forget_everywhere`]
-    /// means a voter behind to stop: the next command of the one order
-    /// is one every donor withholds the record of, so no page can bring
-    /// it, as a `coordd` voter stops below a restore's boundary. Every
-    /// other voter still has to execute the whole order. Without this,
-    /// kept seed 27 (row 10, three voters) passed only while its
-    /// schedule happened to leave no voter behind such a command: with
-    /// the donor sending no empty page (Astra on #336), node 0 stops at
-    /// 38 of 60, before a command both donors withhold.
-    fn stopped_at_withheld(&self, i: u8) -> bool {
-        let next = self.nodes[usize::from(i)].executed.len();
-        self.knobs.forget_everywhere && self.order.get(next).is_some_and(|c| self.withholds(i, c))
+    /// The voters stopped where [`Knobs::forget_everywhere`] means a
+    /// voter behind to stop, once a whole heal's budget has run and the
+    /// domain has not healed: each is behind the order, the next command
+    /// of the order is one every donor withholds the record of, so no
+    /// page can bring it, as a `coordd` voter stops below a restore's
+    /// boundary, and it executed nothing in the last [`HEAL_STALL`]
+    /// rounds (`last_moved`, by round). Empty unless the domain is
+    /// healed but for them ([`Self::healed_but`]).
+    ///
+    /// Kept seed 27 (row 10, three voters) passed only while its
+    /// schedule left no voter behind such a command. With the donor
+    /// sending no empty page (Astra on #336), node 0 ends the heal at 38
+    /// of 60, before a command both donors withhold. Judged at the first
+    /// round that looked healed but for a stop, it was at 29 of 51 with
+    /// frames in flight and went on past that command (Astra on #337), so
+    /// the heal is driven to its budget first.
+    fn stopped_at_withheld(&self, last_moved: &[u32]) -> Vec<u8> {
+        if !self.knobs.forget_everywhere {
+            return Vec::new();
+        }
+        let stopped: Vec<u8> = (0..self.n)
+            .filter(|i| !self.destroyed.contains(i))
+            .filter(|i| self.nodes[usize::from(*i)].executed.len() < self.order.len())
+            .collect();
+        let at_withheld = stopped.iter().all(|&i| {
+            let next = self.nodes[usize::from(i)].executed.len();
+            self.order.get(next).is_some_and(|c| self.withholds(i, c))
+                && last_moved[usize::from(i)] + HEAL_STALL <= HEAL_BUDGET
+        });
+        if stopped.is_empty() || !at_withheld || !self.healed_but(&stopped) {
+            return Vec::new();
+        }
+        stopped
     }
 
     /// Oracle 6: stop the faults and admission, and give the domain a
@@ -4362,6 +4427,8 @@ impl Sim {
         }
         let start = self.step + 1;
         self.heal_start = start;
+        // The round each voter last executed in (`stopped_at_withheld`).
+        let mut last_moved = vec![0u32; usize::from(self.n)];
         for k in 0..HEAL_BUDGET {
             self.step = start + k;
             // `Knobs::holders_gone`: every live voter restarts again, and
@@ -4374,7 +4441,13 @@ impl Sim {
                     }
                 }
             }
+            let before: Vec<usize> = self.nodes.iter().map(|n| n.executed.len()).collect();
             self.heal_round(k);
+            for (i, n) in self.nodes.iter().enumerate() {
+                if n.executed.len() != before[i] {
+                    last_moved[i] = k + 1;
+                }
+            }
             if self.healed() {
                 self.stats.healed = true;
                 self.stats.heal_steps = k;
@@ -4400,6 +4473,12 @@ impl Sim {
         // without task-d121's rule: the run reads what it did instead
         // (`Knobs::holders_gone`). With the rule, the voters left must.
         if !self.destroyed.is_empty() && !rules(&self.knobs).decide_nothing {
+            return;
+        }
+        let stopped = self.stopped_at_withheld(&last_moved);
+        if !stopped.is_empty() {
+            self.stats.withheld_stops = stopped.len() as u32;
+            self.note(|| format!("stopped at a withheld record: {stopped:?}"));
             return;
         }
         let unsettled = self.unsettled();
@@ -5795,6 +5874,14 @@ fn seed_2971_decides_both_shapes_as_nothing_at_five_voters_and_the_survivors_lea
         "not {} and the two payloads node 2 alone held executed as nothing: {gone:?}",
         short(&on)
     );
+    // The selection counter's positive control (Astra on #337): the
+    // selection that leads decides `753c` as a re-proposal and marks the
+    // adopted `c03a` and `cf3d`, three in all, which the zero of seeds
+    // 880 and 9857 is read against.
+    assert!(
+        gone.nothing_selected >= 3,
+        "not every selected nothing counted: {gone:?}"
+    );
     // By identity (Astra on #336): `753c`, and `c03a` and `cf3d`, whose
     // payloads node 2 alone held, each executed as nothing at all four
     // voters left.
@@ -6695,6 +6782,62 @@ fn an_unmarked_commands_final_refusal_answers_its_caller() {
     sim.handle(0, vec![release(other, b"ok".to_vec())]);
     assert!(!sim.refused_as_nothing.contains_key(&other));
     assert!(!sim.decided_as.contains_key(&other));
+}
+
+/// A marked command's final release answers its caller as refused only
+/// by the refusal's bytes under its digest, as the collector's
+/// `releases_a_nothing` does: one naming the marker with another result
+/// the collector holds (`ReleaseNotAnswerable`), and it is a leader's
+/// wrong answer, so the run fails (Astra on #337).
+#[test]
+fn a_marked_commands_release_of_the_marker_answers_only_with_the_refusal() {
+    use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
+    let release = |c: CommandId, response: Vec<u8>| {
+        let established = EstablishedResult::establish(EstablishmentEvidence {
+            command: c,
+            epoch: ballot(1, 0).epoch,
+            ballot: ballot(1, 0),
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: digest_of(&response),
+            revision: None,
+            fast_path: false,
+        })
+        .unwrap();
+        Effect::Released(
+            ReleasedResult::from_gate(established, response, false)
+                .with_admission(coord_consensus::commands::NOTHING_ADMISSION),
+        )
+    };
+    let mut sim = Sim::new(3, Knobs::row(10), 1);
+    // Delivered: no frontend loss while healing.
+    sim.healing = true;
+    let c = CommandId(Digest32([0x6c; 32]));
+    sim.marked.insert(c);
+    sim.submitted.insert(c, Digest32([0x01; 32]));
+    sim.handle(0, vec![release(c, nothing_response(&c))]);
+    assert!(
+        sim.refused_as_nothing.contains_key(&c),
+        "the marked caller's refusal left it waiting"
+    );
+    assert_eq!(sim.decided_as.get(&c).map(|d| d.0), Some(true));
+    // The marker with another result: no refusal, and the run fails.
+    let other = CommandId(Digest32([0x6d; 32]));
+    sim.marked.insert(other);
+    sim.submitted.insert(other, Digest32([0x01; 32]));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim.handle(0, vec![release(other, b"ok".to_vec())]);
+    }));
+    let Err(why) = failed else {
+        panic!("a release of the marker with another result passed");
+    };
+    let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        why.contains("under the marker with a result other than the refusal"),
+        "{why}"
+    );
+    assert!(!sim.refused_as_nothing.contains_key(&other));
+    assert!(!sim.answered.contains(&other));
 }
 
 /// Seeds 880 and 9857 (row 10, three voters, task-d119's targeted
