@@ -44,6 +44,41 @@ pub enum FrameError {
     Stream(String),
     /// The frame is larger than the receive budget could ever hold.
     Budget(crate::budget::BudgetError),
+    /// The header named a kind, or a length, the read does not admit
+    /// (task-d122). Nothing past the header was read.
+    Refused {
+        /// The kind the header named.
+        kind: u16,
+        /// The whole length it named, length field included.
+        len: usize,
+    },
+}
+
+/// What a frame's header must say before anything past it is read
+/// (task-d122): its kind, where only one is admitted, and its whole
+/// length, length field included, at most `max_len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admit {
+    /// The one kind admitted, or any kind.
+    pub kind: Option<u16>,
+    /// The longest whole frame admitted.
+    pub max_len: usize,
+}
+
+impl Admit {
+    /// Check a complete header in `reader`, if there is one: `Ok(true)`
+    /// once it is admitted, `Ok(false)` while it is incomplete.
+    fn check(self, reader: &FrameReader) -> Result<bool, FrameError> {
+        let Some(len) = reader.pending_frame_len() else {
+            return Ok(false);
+        };
+        let len = len.map_err(FrameError::Wire)?;
+        let kind = reader.pending_kind().unwrap_or(0);
+        if self.kind.is_some_and(|k| k != kind) || len > self.max_len {
+            return Err(FrameError::Refused { kind, len });
+        }
+        Ok(true)
+    }
 }
 
 /// The receive budget a one-frame stream is read under (task-d26), and
@@ -71,20 +106,44 @@ pub async fn read_frame_within(
     exact_stream: bool,
     budget: ReceiveBudget<'_>,
 ) -> Result<Frame, FrameError> {
-    timeout(deadline, read_frame_inner(recv, exact_stream, budget))
+    timeout(deadline, read_frame_inner(recv, exact_stream, budget, None))
         .await
         .map_err(|_| FrameError::Timeout)?
+}
+
+/// [`read_frame`], reading nothing past the header until the header is
+/// one `admit` takes (task-d122), and holding no receive budget: what a
+/// connection that has not bound may send is small and one to a
+/// connection, so it is bounded by `admit` and by the cap on such
+/// connections rather than by the budget every bound reader shares.
+pub async fn read_admitted(
+    recv: &mut RecvStream,
+    deadline: Duration,
+    exact_stream: bool,
+    admit: Admit,
+) -> Result<Frame, FrameError> {
+    timeout(
+        deadline,
+        read_frame_inner(recv, exact_stream, None, Some(admit)),
+    )
+    .await
+    .map_err(|_| FrameError::Timeout)?
 }
 
 async fn read_frame_inner(
     recv: &mut RecvStream,
     exact_stream: bool,
     budget: ReceiveBudget<'_>,
+    admit: Option<Admit>,
 ) -> Result<Frame, FrameError> {
     let mut reader = FrameReader::new();
     let mut buf = vec![0u8; CHUNK];
     let mut _held = None;
+    let mut admitted = admit.is_none();
     loop {
+        if !admitted && let Some(admit) = admit {
+            admitted = admit.check(&reader)?;
+        }
         if let (None, Some((budget, lane)), Some(len)) =
             (&_held, budget, reader.pending_frame_len())
         {
@@ -102,6 +161,7 @@ async fn read_frame_inner(
         // payload the budget never counted.
         let want = match (&_held, budget) {
             (None, Some(_)) => HEADER_LEN.saturating_sub(reader.pending()).max(1),
+            _ if !admitted => HEADER_LEN.saturating_sub(reader.pending()).max(1),
             _ => CHUNK,
         };
         if let Some(frame) = reader.next_frame().map_err(FrameError::Wire)? {
@@ -239,7 +299,25 @@ impl ControlStream {
     pub async fn next_frame(&mut self, deadline: Duration) -> Result<Frame, FrameError> {
         timeout(
             deadline,
-            Self::inner(&mut self.recv, &mut self.reader, &mut self.buf),
+            Self::inner(&mut self.recv, &mut self.reader, &mut self.buf, None),
+        )
+        .await
+        .map_err(|_| FrameError::Timeout)?
+    }
+
+    /// [`Self::next_frame`], admitting only a frame whose header `admit`
+    /// takes (task-d122). Nothing past a frame's header is read before
+    /// it is admitted, and nothing past the frame after: a peer can keep
+    /// no more than the admitted length buffered here, however long it
+    /// leaves the stream half written.
+    pub async fn next_admitted(
+        &mut self,
+        deadline: Duration,
+        admit: Admit,
+    ) -> Result<Frame, FrameError> {
+        timeout(
+            deadline,
+            Self::inner(&mut self.recv, &mut self.reader, &mut self.buf, Some(admit)),
         )
         .await
         .map_err(|_| FrameError::Timeout)?
@@ -249,12 +327,25 @@ impl ControlStream {
         recv: &mut RecvStream,
         reader: &mut FrameReader,
         buf: &mut [u8],
+        admit: Option<Admit>,
     ) -> Result<Frame, FrameError> {
         loop {
+            let mut want = buf.len();
+            if let Some(admit) = admit {
+                // Read the header alone, then no further than the frame.
+                want = match reader.pending_frame_len() {
+                    None => HEADER_LEN.saturating_sub(reader.pending()).max(1),
+                    Some(_) => {
+                        admit.check(reader)?;
+                        let len = reader.pending_frame_len().and_then(Result::ok).unwrap_or(0);
+                        len.saturating_sub(reader.pending()).clamp(1, buf.len())
+                    }
+                };
+            }
             if let Some(frame) = reader.next_frame().map_err(FrameError::Wire)? {
                 return Ok(frame);
             }
-            match recv.read(buf).await {
+            match recv.read(&mut buf[..want]).await {
                 Ok(Some(n)) => reader.push(&buf[..n]).map_err(FrameError::Wire)?,
                 Ok(None) => return Err(FrameError::Truncated),
                 Err(e) => return Err(FrameError::Stream(e.to_string())),
