@@ -1892,6 +1892,48 @@ fn a_wiped_candidate_is_refused_a_promise() {
     assert!(promised(&sent), "the recorded store was refused: {sent:?}");
 }
 
+/// The check's limit (task-d121, C5b; #312, lead): a voter with no row
+/// for the candidate promises a wiped candidate as before, whatever
+/// store its `NewLeader` names. The check covers a candidate only where
+/// its identity reached a voter the campaign needs, from its own
+/// promises or from a Sync that counted them, and claims nothing more.
+#[test]
+fn a_wiped_candidate_no_voter_recorded_is_promised() {
+    let mut peer = stamped(2);
+    keep_peer_stores(&mut peer);
+    assert_eq!(
+        durable_row(&peer, r(1), inc()),
+        None,
+        "no row for the candidate"
+    );
+    let (campaigned, _) = stamped(1)
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    let ask = coord_consensus::ProtocolMessage::NewLeader {
+        ballot: campaigned,
+        executed: coord_types::ids::ExecutionPosition::ZERO,
+        store: coord_types::ids::StoreInstanceId([0xee; 16]),
+    }
+    .encode();
+    let mut sent = messages(
+        &peer
+            .on_peer(PeerProvenance::from_local_voter(r(1), inc()), ask)
+            .expect("stepped"),
+    );
+    for _ in 0..4 {
+        sent.extend(messages(&peer.flush().expect("flushed")));
+        sent.extend(messages(&peer.finish().expect("finished")));
+    }
+    assert!(
+        sent.iter().any(|(to, m)| *to == r(1)
+            && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == campaigned)),
+        "a voter with no row refused: {sent:?}"
+    );
+    let counts = peer.node().peer_stores().expect("kept").counts;
+    assert_eq!(counts.refused_candidates, 0);
+}
+
 /// A Sync whose leader this voter recorded under another store than the
 /// one the Sync counts as its own is refused before the machine sees it
 /// (task-d121, C4), as that leader's `NewLeader` is; it was installed, and

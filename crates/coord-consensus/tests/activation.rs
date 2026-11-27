@@ -13067,6 +13067,51 @@ fn a_nothing_reproposal_the_leader_holds_no_record_of_is_proposed_and_its_waiter
     }
 }
 
+/// task-d121, C5b: a nothing re-proposal is decided by the leader and
+/// one voter, like any entry. The leader counts its own vote for a
+/// nothing, which writes no payload row: before C5b it counted itself
+/// only where it served or wrote one, so with one voter down `d` and
+/// `x` behind it never committed.
+///
+/// The shape of the test above, with voter 1, the only holder of `d`,
+/// crashed: voters 0 and 2 commit `d` as nothing and execute it, then
+/// `x`.
+#[test]
+fn a_nothing_reproposal_is_decided_by_the_leader_and_one_voter() {
+    let mut c = Cluster::new(3);
+    let a = c.admit(1, 1);
+    c.settle();
+    let d = c.admit_at(2, 2, &[1]);
+    let x = c.admit_at(3, 2, &[2]);
+    c.crash(1);
+    let decision = SyncDecision {
+        ballot: ballot(1, 2),
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, accepted_sync_entry(x, vec![d]))]),
+        reproposed: BTreeSet::from([d]),
+        counted: Default::default(),
+        nothing: BTreeSet::from([d]),
+    };
+    lead_by_hand(&mut c, 2, &decision, |_, leader| {
+        let nothing = leader.proposal(&d).expect("d is proposed");
+        assert_eq!(nothing.admission, coord_consensus::NOTHING_ADMISSION);
+        assert!(nothing.deps.contains(&a), "{:?}", nothing.deps);
+    });
+    c.settle();
+    for i in [0, 2] {
+        assert!(
+            executed_as_nothing(&c, i, &d),
+            "voter {i} did not execute d as nothing"
+        );
+        let executed = &c.nodes[i].executed;
+        let at = |cmd: &CommandId| executed.iter().position(|e| e == cmd);
+        assert!(
+            at(&d) < at(&x) && at(&x).is_some(),
+            "voter {i}: {executed:?}"
+        );
+    }
+}
+
 /// task-d121, C4: a leader holding `d` below COMMIT under facts, whose
 /// payload it holds, proposes the nothing the selection gives it, as an
 /// entry and as a re-proposal. Proposed under its digest, `d` would

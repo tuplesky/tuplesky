@@ -402,11 +402,15 @@ struct Knobs {
     forget_everywhere: bool,
     /// Every holder gone for good (task-d119's third option, #185). At
     /// the first campaign given up as `Behind` on a command no voter
-    /// executed, while no voter leads and every voter that holds that
-    /// command, in its table or its durable rows, is down: with
-    /// `Some(true)` those voters never come back, their storage
-    /// destroyed; with `Some(false)` the moment is only marked, the
-    /// control. From the mark the run counts whether any voter led, the
+    /// executed, or waiting on one (task-d121's build step: a `Behind`
+    /// or `HalfInitialized` wait, or a payload a re-proposal waits for),
+    /// while no voter leads and every voter that holds that command, in
+    /// its table or its durable rows (for a payload wait, its payload),
+    /// is down: with `Some(true)` those voters never come back, their
+    /// storage destroyed, where they are a minority; with `Some(false)`,
+    /// or where they are not a minority, the moment is only marked, the
+    /// control. With task-d121's rule on, the heal check holds for the
+    /// voters left: they must lead and settle. From the mark the run counts whether any voter led, the
     /// campaigns given up as `Behind` and the boots of the voters left,
     /// and while healing it restarts every live voter [`GONE_BOOTS`]
     /// times more, as an operator's restarts would. `None`: neither.
@@ -1077,8 +1081,10 @@ struct Stats {
     catch_up_pages: u32,
     caught_up: u64,
     ballots: u64,
-    /// Steps healing took (the largest, in a total).
+    /// Steps healing took (the largest, in a total), and whether it
+    /// healed.
     heal_steps: u32,
+    healed: bool,
     /// Commands settled as refused for another under their key.
     conflicts: usize,
     /// Peaks of oracle 5, over every node.
@@ -1808,9 +1814,7 @@ impl Sim {
                 how()
             ));
         }
-        if !self.refused_as_nothing.contains_key(&command) {
-            self.refused_as_nothing.insert(command, how());
-        }
+        self.refused_as_nothing.entry(command).or_insert_with(how);
     }
 
     /// Change roles as `coordd`'s driver does (`Node::change_role`).
@@ -3175,6 +3179,23 @@ impl Sim {
         for (missing, undecided) in core::mem::take(&mut self.gave_up) {
             self.holders_gone(missing, undecided);
         }
+        // A campaign waiting on a command (task-d121's build step): the
+        // reports a `Behind` or `HalfInitialized` selection lacks, or,
+        // with its selection kept, the payload a re-proposal waits for.
+        if self.knobs.holders_gone.is_some() && self.gone_mark.is_none() {
+            let waits: Vec<(CommandId, bool)> = self
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.role {
+                    Some(Role::Follower(f)) => f.campaign_state(),
+                    _ => None,
+                })
+                .filter_map(|c| c.report_wait().map(|m| (m, c.decision().is_some())))
+                .collect();
+            for (missing, payload) in waits {
+                self.holders_gone_on(missing, payload);
+            }
+        }
         if self.gone_mark.is_some() && self.leader_index().is_some() {
             self.stats.led_after_gone = true;
         }
@@ -3193,15 +3214,37 @@ impl Sim {
             self.stats.behind_after_gone_undecided += u32::from(undecided);
             return;
         }
-        if self.executed_anywhere.contains(&missing) || self.leader_index().is_some() {
+        let _ = destroy;
+        self.holders_gone_on(missing, false);
+    }
+
+    /// `Knobs::holders_gone`'s moment on `missing`, a command a campaign
+    /// gave up on or waits on: `payload` where it waits for the
+    /// command's payload, whose holders are the voters holding that.
+    fn holders_gone_on(&mut self, missing: CommandId, payload: bool) {
+        let Some(destroy) = self.knobs.holders_gone else {
+            return;
+        };
+        if self.gone_mark.is_some()
+            || self.executed_anywhere.contains(&missing)
+            || self.leader_index().is_some()
+        {
             return;
         }
         let holders: Vec<u8> = (0..self.n)
-            .filter(|v| self.holds_anywhere(*v, &missing))
+            .filter(|v| {
+                if payload {
+                    self.holds_payload_anywhere(*v, &missing)
+                } else {
+                    self.holds_anywhere(*v, &missing)
+                }
+            })
             .collect();
         if holders.is_empty() || holders.iter().any(|v| self.nodes[usize::from(*v)].alive()) {
             return;
         }
+        // Destroyed, the voters left must be a majority.
+        let destroy = destroy && 2 * holders.len() < usize::from(self.n);
         self.gone_mark = Some(missing);
         self.stats.gone_on = Some(missing);
         if destroy {
@@ -3217,6 +3260,20 @@ impl Sim {
                 if destroy { "destroyed" } else { "marked" }
             )
         });
+    }
+
+    /// Whether node `v` holds `command`'s payload: in its machine, or in
+    /// a durable payload row it would restart with.
+    fn holds_payload_anywhere(&self, v: u8, command: &CommandId) -> bool {
+        let node = &self.nodes[usize::from(v)];
+        let held = match &node.role {
+            Some(Role::Leader(m)) => m.payload(command).is_some(),
+            Some(Role::Follower(m)) => m.payload(command).is_some(),
+            None => false,
+        };
+        held || payload_rows(&node.storage)
+            .iter()
+            .any(|(c, _)| c == command)
     }
 
     /// Whether node `v` holds `command`: in its table, or in a durable
@@ -4132,7 +4189,11 @@ impl Sim {
     /// (`settle_conflict_from_record`). What the simulator knows some
     /// other node executed is not an answer.
     fn settled(&self, command: &CommandId) -> bool {
-        if self.learned.contains(command) || self.answered.contains(command) {
+        // Answered as refused, decided as nothing (task-d121).
+        if self.learned.contains(command)
+            || self.answered.contains(command)
+            || self.refused_as_nothing.contains_key(command)
+        {
             return true;
         }
         let from_record = self.reoffered.contains(command)
@@ -4150,8 +4211,11 @@ impl Sim {
     }
 
     fn unsettled(&self) -> Vec<CommandId> {
+        // A destroyed voter's own clients are gone with it.
         self.offers
-            .keys()
+            .iter()
+            .filter(|(_, o)| !self.destroyed.contains(&o.host))
+            .map(|(c, _)| c)
             .filter(|c| !self.settled(c))
             .copied()
             .collect()
@@ -4164,9 +4228,12 @@ impl Sim {
     /// selection dropped would otherwise pass as settled.
     fn healed(&self) -> bool {
         self.leader_index().is_some()
-            && (0..self.n).all(|i| {
-                self.nodes[usize::from(i)].executed.len() == self.order.len() && !self.executable(i)
-            })
+            && (0..self.n)
+                .filter(|i| !self.destroyed.contains(i))
+                .all(|i| {
+                    self.nodes[usize::from(i)].executed.len() == self.order.len()
+                        && !self.executable(i)
+                })
             && self.learned.is_subset(&self.executed_anywhere)
             && self
                 .decided
@@ -4234,6 +4301,7 @@ impl Sim {
             self.check_halts();
             self.check_budgets();
             if self.healed() {
+                self.stats.healed = true;
                 self.stats.heal_steps = k;
                 self.stats.conflicts = self
                     .offers
@@ -4250,9 +4318,10 @@ impl Sim {
         if !self.catch_up {
             return;
         }
-        // With its holders destroyed the domain isn't meant to heal: the
-        // run reads what it did instead (`Knobs::holders_gone`).
-        if !self.destroyed.is_empty() {
+        // With its holders destroyed the domain isn't meant to heal
+        // without task-d121's rule: the run reads what it did instead
+        // (`Knobs::holders_gone`). With the rule, the voters left must.
+        if !self.destroyed.is_empty() && !rules(&self.knobs).decide_nothing {
             return;
         }
         let unsettled = self.unsettled();
@@ -5462,6 +5531,53 @@ fn a_dependency_whose_only_holder_is_destroyed_leaves_the_domain_without_a_leade
     assert_eq!(marked.gone, 0, "the control destroyed storage");
 }
 
+/// The same run under task-d121's rule (its acceptance: the test above
+/// flips). Node 2's storage is destroyed as before; the two voters left
+/// decide the command it alone held as nothing, lead, and settle every
+/// command their own clients submitted. With the storage only marked the
+/// run leads too, and decides nothing as nothing on the marked command
+/// it brings back.
+///
+/// The report wait is on, as it ships. The two voters left decide the
+/// nothing only because the leader counts its own vote for it
+/// (`Leader::adopt_own`): without that, the nothing and the chain
+/// behind it waited for a third vote that never came.
+#[test]
+fn a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead() {
+    let knobs = |destroy| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        decide_nothing: true,
+        ..Knobs::row(10)
+    };
+    let run =
+        |destroy| run_knobs(3, knobs(destroy), 2135, Some(false)).unwrap_or_else(|e| panic!("{e}"));
+    let (gone, marked) = (run(true), run(false));
+    println!("destroyed: {gone:?}");
+    println!("marked: {marked:?}");
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2135 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        gone.led_after_gone,
+        "no voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(
+        gone.nothing_executed > 0,
+        "nothing executed as nothing: {gone:?}"
+    );
+    assert!(gone.healed, "the voters left did not settle: {gone:?}");
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark"
+    );
+}
+
 /// Lever 2, step 1: followers' journals complete runs of batches at
 /// once, each run handed over as one step of storage events, under rows
 /// that crash leaders, repeat elections, fail payload batches with the
@@ -5945,14 +6061,16 @@ fn seeds_from_the_environment() {
             let line = format!(
                 "holders of {} gone (mask {:b}), led after {}, \
                  behind after {} ({} on it, {} with an undecided drop), \
-                 boots after {}",
+                 boots after {}, executed as nothing {}, healed {}",
                 short(&on),
                 s.gone,
                 s.led_after_gone,
                 s.behind_after_gone,
                 s.behind_after_gone_on_it,
                 s.behind_after_gone_undecided,
-                s.boots_after_gone
+                s.boots_after_gone,
+                s.nothing_executed,
+                s.healed
             );
             (stall, keeps, line)
         })
@@ -6049,17 +6167,24 @@ fn row_21_fails_a_commands_vote_and_adoption_batches_in_order() {
 }
 
 /// Seeds 880 and 9857 (task-d121, traced on #312): row 10 at three
-/// voters under the targeted schedule, with no catch-up. In each, a
-/// command one voter pre-accepted is missing from both reports the
-/// selection counts, task-d120's wait does not bring that voter's report
-/// in, and the campaign gives up as `Behind` on it. Under the rule the
-/// command is decided as nothing once the wait passes, every voter
-/// executes it as the canonical refusal, and no campaign gives up.
+/// voters under the targeted schedule, with no catch-up. With the rule
+/// off, a command one voter pre-accepted is missing from both reports
+/// the selection counts, task-d120's wait does not bring that voter's
+/// report in, and the campaign gives up as `Behind` on it, a command no
+/// voter executed. Under the rule no campaign gives up: the domain leads
+/// and settles, and no selection is kept off by a drop.
 ///
-/// The control runs the same schedule with the rule off: each seed
-/// gives up as `Behind` on a command no voter executed.
+/// The seeds were chosen when the rule decided that command as nothing.
+/// Since a payload wait asks again for promises and report pages (#335,
+/// `d315938c`), the rule's run sends more and its schedule parts from
+/// the control's early (seed 880: at step 608, a `NewLeader` sent again
+/// during an earlier wait). The command is then re-proposed with its
+/// payload and executed, not decided as nothing. No seed of 0 to 1,999
+/// at this row decides a nothing with the rule where the control gives
+/// up: a nothing takes its holders gone, as in
+/// `a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_survivors_lead`.
 #[test]
-fn seeds_880_and_9857_decide_the_unreported_command_as_nothing_and_lead() {
+fn seeds_880_and_9857_lead_under_the_rule_where_they_gave_up_as_behind() {
     let knobs = |rule: bool| Knobs {
         peer_ack_loss: 750_000,
         hold: 160_000,
@@ -6071,7 +6196,7 @@ fn seeds_880_and_9857_decide_the_unreported_command_as_nothing_and_lead() {
     for seed in [880, 9857] {
         let ruled = run_knobs(3, knobs(true), seed, Some(false)).unwrap();
         assert_eq!(ruled.behind, 0, "seed {seed}: {ruled:?}");
-        assert!(ruled.nothing_executed > 0, "seed {seed}: {ruled:?}");
+        assert!(ruled.healed, "seed {seed}: {ruled:?}");
         assert_eq!(ruled.nothing_kept_by_drop, 0, "seed {seed}: {ruled:?}");
         // `PROTOCOL_SIM_DECIDE_NOTHING` turns the rule on for every run.
         if decide_nothing_on() {
