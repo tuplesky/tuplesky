@@ -841,6 +841,14 @@ pub struct Follower {
     report_wait: bool,
     /// Waits counted by [`Follower::report_waits`].
     report_waits: u64,
+    /// Whether this replica's forgetting floor is above genesis
+    /// ([`Follower::set_floor_above_genesis`]): its campaigns then decide
+    /// no new nothing (task-d121).
+    floor_above_genesis: bool,
+    /// Commands its bound selections decided as nothing (task-d121).
+    nothing_decided: u64,
+    /// Selections task-d121's condition 5 kept the rule off in.
+    nothing_kept_by_drop: u64,
     /// Set when a selection failed on this replica's own acceptance of a
     /// command with no payload anywhere, every voter answered (task-d79);
     /// cleared when it installs a Sync.
@@ -1405,6 +1413,9 @@ impl Follower {
             behind: None,
             report_wait: true,
             report_waits: 0,
+            floor_above_genesis: false,
+            nothing_decided: 0,
+            nothing_kept_by_drop: 0,
             unbacked: None,
             behind_voters: None,
             report_due: None,
@@ -1651,6 +1662,9 @@ impl Follower {
             behind: None,
             report_wait: true,
             report_waits: 0,
+            floor_above_genesis: false,
+            nothing_decided: 0,
+            nothing_kept_by_drop: 0,
             unbacked: None,
             behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
@@ -1918,7 +1932,7 @@ impl Follower {
             Campaign::new(config)
                 .bounded(crate::recovery::MAX_REPORT_ENTRIES)
                 .knowing(self.config.quorum.clone())
-                .ruled(self.selection_rules),
+                .ruled(self.campaign_rules()),
         );
         let mut out = alloc::vec![effects.persist];
         out.extend(self.release());
@@ -1931,7 +1945,8 @@ impl Follower {
     /// whole ballot. And ask the voters that have not promised for their
     /// promise again (task-d82): a `NewLeader` is published once too.
     /// Driven on an interval while the campaign selects; nothing is asked
-    /// once the selection is made.
+    /// once the selection is made, but for one kept through a payload
+    /// wait (task-d121).
     pub fn request_report_pages(&mut self) -> Vec<Effect> {
         let (Some(campaign), Some(boot)) = (self.campaign.as_ref(), self.boot) else {
             return Vec::new();
@@ -2000,7 +2015,7 @@ impl Follower {
             self.rejections.push(FollowerRejection::CannotLead);
             return Vec::new();
         };
-        self.campaign = Some(Campaign::resumed(config, decision).ruled(self.selection_rules));
+        self.campaign = Some(Campaign::resumed(config, decision).ruled(self.campaign_rules()));
         self.advance_campaign()
     }
 
@@ -2126,16 +2141,30 @@ impl Follower {
             return Vec::new();
         };
         if campaign.decision().is_none() {
-            let table = &self.table;
+            let (table, payloads) = (&self.table, &self.payloads);
             // A payload under other facts than the ones the reporters
             // name supplies nothing the selection can bind: it is fetched
             // like a missing one (task-d14).
-            let supplied = |c: &CommandId, named: Option<Digest32>| match named {
-                Some(d) => {
-                    table.phase_of(c) == Some(Phase::Executed)
-                        || table.record(c).and_then(|r| r.payload) == Some(d)
+            //
+            // Under task-d121's rule what this candidate supplies is read
+            // from the payloads it holds, not from a record's digest: the
+            // rule reads the same answer, and a record whose payload never
+            // arrived supplies nothing (#335 review).
+            let ruled = campaign.rules().ruled();
+            let supplied = |c: &CommandId, named: Option<Digest32>| {
+                if ruled {
+                    return table.phase_of(c) == Some(Phase::Executed)
+                        || payloads
+                            .get(c)
+                            .is_some_and(|p| named.is_none_or(|d| p.admission_digest() == d));
                 }
-                None => table.phase_of(c).is_some(),
+                match named {
+                    Some(d) => {
+                        table.phase_of(c) == Some(Phase::Executed)
+                            || table.record(c).and_then(|r| r.payload) == Some(d)
+                    }
+                    None => table.phase_of(c).is_some(),
+                }
             };
             // What this candidate decided itself, executed long ago and
             // forgotten included: a re-proposal of one is not chained
@@ -2144,11 +2173,32 @@ impl Follower {
                 table,
                 ledger: &self.ledger,
                 rows: &self.executed_rows,
+                payloads: &self.payloads,
             };
+            let waited = campaign.waited();
             let selected = campaign
                 .try_select_decided(crate::recovery::MAX_REPORT_ENTRIES, supplied, decided)
                 .map(|d| d.is_some());
             self.unreported_drops.undecided += campaign.take_unreported_undecided();
+            self.nothing_kept_by_drop += campaign.take_kept_by_drop();
+            // The rule decides no new nothing above a floor.
+            debug_assert!(
+                !self.floor_above_genesis || campaign.decided_nothing() == 0,
+                "a nothing decided above the forgetting floor"
+            );
+            // A selection that failed as `HalfInitialized` waits too, under
+            // task-d121's rule. Where the runtime doesn't wait, that wait
+            // passes at once and the campaign selects again under the
+            // rule, as a `Behind` wait and a payload wait do (#335
+            // review): nothing would end it.
+            if !self.report_wait && campaign.report_wait().is_some() && campaign.pass_report_wait()
+            {
+                return self.advance_campaign();
+            }
+            // Counted once, as a `Behind` one is.
+            self.report_waits = self
+                .report_waits
+                .saturating_add(u64::from(!waited && campaign.waited()));
             match selected {
                 Ok(false) => return Vec::new(),
                 Ok(true) => {}
@@ -2220,6 +2270,32 @@ impl Follower {
             // never from identities alone. The reporting voters hold them
             // durably (they reported the command).
             if waiting {
+                // Under task-d121's rule, a payload nobody can send is
+                // decided as nothing once task-d120's wait has passed: the
+                // wait starts here, and the asks go on meanwhile. With
+                // every voter answered, or the runtime not waiting, it has
+                // passed already.
+                //
+                // A wait already running ends too once the last voter
+                // answers: no report is left that could hold the payload,
+                // and the selection is made again under the rule rather
+                // than wait out the bound (#335 review).
+                if campaign.rules().ruled() && !campaign.report_wait_passed() {
+                    if self.report_wait && !campaign.all_reported() {
+                        if campaign.report_wait().is_none() {
+                            let first = campaign
+                                .awaited()
+                                .and_then(|a| a.iter().next().copied())
+                                .expect("waiting on a payload");
+                            let started = !campaign.waited();
+                            campaign.wait_for_payload_holders(first);
+                            self.report_waits =
+                                self.report_waits.saturating_add(u64::from(started));
+                        }
+                    } else if campaign.pass_report_wait() {
+                        return self.advance_campaign();
+                    }
+                }
                 // Ask for the next batch once the last ask was answered in
                 // full: an ask carries at most `MAX_PAYLOAD_TRANSFER`
                 // payloads back, so a candidate that asked once for
@@ -2257,6 +2333,7 @@ impl Follower {
             );
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
+            self.nothing_decided += campaign.decided_nothing();
             if campaign.selected_past_undecided() {
                 self.unreported_drops.bound_undecided += 1;
             } else if campaign.selected_past_unreported() {
@@ -4241,15 +4318,22 @@ impl Follower {
     ///
     /// A selection from more reports than a quorum is as sound as one
     /// from a quorum: design Section 4.9 says why.
+    ///
+    /// Under task-d121's rule a selection made once the wait has passed
+    /// may decide `missing` as nothing, so where every voter has answered,
+    /// or the runtime doesn't wait, the wait passes at once and the
+    /// campaign selects again before it gives up.
     fn refuse_or_wait(&mut self, refusal: CampaignRefusal) -> Vec<Effect> {
         if let CampaignRefusal::Behind(missing) = refusal
-            && self.report_wait
             && let Some(c) = self.campaign.as_mut()
         {
             let first = !c.waited();
-            if c.wait_for_reports(missing) {
+            if self.report_wait && c.wait_for_reports(missing) {
                 self.report_waits = self.report_waits.saturating_add(u64::from(first));
                 return Vec::new();
+            }
+            if c.pass_report_wait() {
+                return self.advance_campaign();
             }
         }
         self.refuse_campaign(refusal)
@@ -4347,6 +4431,13 @@ impl Follower {
     /// `recovery.rs`); its cost is a stall, since this replica does not
     /// campaign again this boot and no catch-up brings a command no
     /// voter executed.
+    ///
+    /// Where task-d121's rule is on, a selection made once task-d120's
+    /// wait has passed carries such a dependency as a nothing re-proposal
+    /// instead, and finds no gap here: design Section 4.9 argues why no
+    /// ballot decided it. It doesn't where the order check dropped a
+    /// possible-fast candidate it couldn't rule out (condition 5), which
+    /// is the case above, so the give-up still keeps that decision.
     fn selection_gap(table: &CommandTable, decision: &SyncDecision) -> Option<CommandId> {
         decision
             .entries
@@ -4613,6 +4704,7 @@ impl Follower {
     /// says what each rule rests on.
     pub fn set_selection_rules(&mut self, rules: crate::recovery::SelectionRules) {
         self.selection_rules = rules;
+        let rules = self.campaign_rules();
         if let Some(c) = self.campaign.as_mut() {
             c.set_rules(rules);
         }
@@ -4621,6 +4713,44 @@ impl Follower {
     /// The rules this replica's campaigns select under.
     pub const fn selection_rules(&self) -> crate::recovery::SelectionRules {
         self.selection_rules
+    }
+
+    /// Say whether this replica's forgetting floor is above genesis
+    /// (task-d27). Above it, its campaigns decide no new nothing
+    /// (task-d121): the trim drops an executed command's identity with its
+    /// rows, so a missing row there is no evidence that the candidate
+    /// never executed a command, which condition 3 reads it as. Carrying a
+    /// nothing a selection's copy already holds is unaffected. Nothing
+    /// trims yet (`plan_trim` has no caller), so no runtime sets it, and
+    /// alpha's floor stays at genesis.
+    pub fn set_floor_above_genesis(&mut self, above: bool) {
+        self.floor_above_genesis = above;
+        let rules = self.campaign_rules();
+        if let Some(c) = self.campaign.as_mut() {
+            c.set_rules(rules);
+        }
+    }
+
+    /// The rules a campaign of this replica selects under: the domain's,
+    /// without task-d121's rule above a floor.
+    const fn campaign_rules(&self) -> crate::recovery::SelectionRules {
+        let mut rules = self.selection_rules;
+        if self.floor_above_genesis {
+            rules.decide_nothing = false;
+        }
+        rules
+    }
+
+    /// Commands this replica's bound selections decided as nothing
+    /// (task-d121).
+    pub const fn nothing_decided(&self) -> u64 {
+        self.nothing_decided
+    }
+
+    /// Selections in which task-d121's condition 5 kept the rule off: the
+    /// order check dropped a possible-fast candidate it couldn't rule out.
+    pub const fn nothing_kept_by_drop(&self) -> u64 {
+        self.nothing_kept_by_drop
     }
 
     /// Count this replica's executions durable only as its runtime says
@@ -9057,6 +9187,9 @@ struct OwnDecisions<'a> {
     table: &'a CommandTable,
     ledger: &'a DurableLedger,
     rows: &'a BTreeMap<CommandId, Option<CommandRecord>>,
+    /// Its payloads, in memory or durable: task-d121's condition 3 reads
+    /// them, not a record's admission digest.
+    payloads: &'a BTreeMap<CommandId, PayloadRecordV1>,
 }
 
 impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
@@ -9094,6 +9227,12 @@ impl crate::recovery::CandidateDecisions for OwnDecisions<'_> {
             Some(record) if record.payload.is_some() => ExecutedFacts::With(record.clone()),
             _ => ExecutedFacts::WithoutRow,
         }
+    }
+
+    fn holds_payload(&self, command: &CommandId, facts: Option<Digest32>) -> bool {
+        self.payloads
+            .get(command)
+            .is_some_and(|p| facts.is_none_or(|d| p.admission_digest() == d))
     }
 }
 
