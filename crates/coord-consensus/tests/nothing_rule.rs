@@ -210,6 +210,70 @@ fn an_acceptance_whose_payload_no_report_holds_is_decided_as_nothing() {
     assert_eq!(decided.entries[&d].admission, Some(NOTHING_ADMISSION));
 }
 
+/// Condition 3 under the selector's contract (#335 review): a payload its
+/// caller supplies under the facts the reporters name keeps the rule off,
+/// as it supplies the command to the payload check before the rule, and
+/// the entry keeps its facts. One supplied under other facts does not. In
+/// the `Behind` shape `supplied` is asked with no facts, and a dependency
+/// the caller supplies is left as the selection leaves it without the
+/// rule.
+#[test]
+fn a_payload_the_caller_supplies_under_the_named_facts_keeps_the_rule_off() {
+    let (a, d) = (command(1), command(2));
+    let reports = at_source(
+        vec![
+            entry(a, Phase::Accept, &[], FACTS, true),
+            entry(d, Phase::Accept, &[a], FACTS, false),
+        ],
+        vec![entry(a, Phase::Accept, &[], FACTS, true)],
+        Vec::new(),
+    );
+    let supplied_under = |facts: Digest32| {
+        move |c: &CommandId, named: Option<Digest32>| *c == d && named == Some(facts)
+    };
+    let none = Candidate::default();
+    let kept = select_ruled(
+        &five(),
+        &reports,
+        supplied_under(FACTS),
+        |_| None,
+        &none,
+        RULE,
+    )
+    .expect("selected");
+    assert_eq!(kept.entries[&d].admission, Some(FACTS), "{kept:?}");
+    let decided = select_ruled(
+        &five(),
+        &reports,
+        supplied_under(OTHER),
+        |_| None,
+        &none,
+        RULE,
+    )
+    .expect("selected");
+    assert_eq!(decided.entries[&d].admission, Some(NOTHING_ADMISSION));
+    // The `Behind` shape.
+    let (d, x) = (command(3), command(4));
+    let behind = at_source(
+        vec![entry(x, Phase::Accept, &[d], FACTS, true)],
+        vec![entry(x, Phase::Accept, &[d], FACTS, true)],
+        Vec::new(),
+    );
+    let kept = select_ruled(
+        &five(),
+        &behind,
+        |c: &CommandId, _| *c == d,
+        |_| None,
+        &none,
+        RULE,
+    )
+    .expect("selected");
+    assert!(
+        kept.nothing.is_empty() && !kept.reproposed.contains(&d),
+        "{kept:?}"
+    );
+}
+
 /// Condition 1 reads a payload row at any phase under the named facts: a
 /// payload held only at a pre-acceptance supplies the command, which the
 /// selection carries under its facts (row 21, five voters, seed 518).

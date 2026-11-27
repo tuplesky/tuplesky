@@ -2140,16 +2140,30 @@ impl Follower {
             return Vec::new();
         };
         if campaign.decision().is_none() {
-            let table = &self.table;
+            let (table, payloads) = (&self.table, &self.payloads);
             // A payload under other facts than the ones the reporters
             // name supplies nothing the selection can bind: it is fetched
             // like a missing one (task-d14).
-            let supplied = |c: &CommandId, named: Option<Digest32>| match named {
-                Some(d) => {
-                    table.phase_of(c) == Some(Phase::Executed)
-                        || table.record(c).and_then(|r| r.payload) == Some(d)
+            //
+            // Under task-d121's rule what this candidate supplies is read
+            // from the payloads it holds, not from a record's digest: the
+            // rule reads the same answer, and a record whose payload never
+            // arrived supplies nothing (#335 review).
+            let ruled = campaign.rules().decide_nothing;
+            let supplied = |c: &CommandId, named: Option<Digest32>| {
+                if ruled {
+                    return table.phase_of(c) == Some(Phase::Executed)
+                        || payloads
+                            .get(c)
+                            .is_some_and(|p| named.is_none_or(|d| p.admission_digest() == d));
                 }
-                None => table.phase_of(c).is_some(),
+                match named {
+                    Some(d) => {
+                        table.phase_of(c) == Some(Phase::Executed)
+                            || table.record(c).and_then(|r| r.payload) == Some(d)
+                    }
+                    None => table.phase_of(c).is_some(),
+                }
             };
             // What this candidate decided itself, executed long ago and
             // forgotten included: a re-proposal of one is not chained
@@ -2166,16 +2180,24 @@ impl Follower {
                 .map(|d| d.is_some());
             self.unreported_drops.undecided += campaign.take_unreported_undecided();
             self.nothing_kept_by_drop += campaign.take_kept_by_drop();
-            // A selection that failed as `HalfInitialized` waits too, under
-            // task-d121's rule: counted once, as a `Behind` one is.
-            self.report_waits = self
-                .report_waits
-                .saturating_add(u64::from(!waited && campaign.waited()));
             // The rule decides no new nothing above a floor.
             debug_assert!(
                 !self.floor_above_genesis || campaign.decided_nothing() == 0,
                 "a nothing decided above the forgetting floor"
             );
+            // A selection that failed as `HalfInitialized` waits too, under
+            // task-d121's rule. Where the runtime doesn't wait, that wait
+            // passes at once and the campaign selects again under the
+            // rule, as a `Behind` wait and a payload wait do (#335
+            // review): nothing would end it.
+            if !self.report_wait && campaign.report_wait().is_some() && campaign.pass_report_wait()
+            {
+                return self.advance_campaign();
+            }
+            // Counted once, as a `Behind` one is.
+            self.report_waits = self
+                .report_waits
+                .saturating_add(u64::from(!waited && campaign.waited()));
             match selected {
                 Ok(false) => return Vec::new(),
                 Ok(true) => {}
@@ -2252,18 +2274,23 @@ impl Follower {
                 // wait starts here, and the asks go on meanwhile. With
                 // every voter answered, or the runtime not waiting, it has
                 // passed already.
-                if campaign.rules().decide_nothing
-                    && !campaign.report_wait_passed()
-                    && campaign.report_wait().is_none()
-                {
-                    let first = campaign
-                        .awaited()
-                        .and_then(|a| a.iter().next().copied())
-                        .expect("waiting on a payload");
+                //
+                // A wait already running ends too once the last voter
+                // answers: no report is left that could hold the payload,
+                // and the selection is made again under the rule rather
+                // than wait out the bound (#335 review).
+                if campaign.rules().decide_nothing && !campaign.report_wait_passed() {
                     if self.report_wait && !campaign.all_reported() {
-                        let started = !campaign.waited();
-                        campaign.wait_for_payload_holders(first);
-                        self.report_waits = self.report_waits.saturating_add(u64::from(started));
+                        if campaign.report_wait().is_none() {
+                            let first = campaign
+                                .awaited()
+                                .and_then(|a| a.iter().next().copied())
+                                .expect("waiting on a payload");
+                            let started = !campaign.waited();
+                            campaign.wait_for_payload_holders(first);
+                            self.report_waits =
+                                self.report_waits.saturating_add(u64::from(started));
+                        }
                     } else if campaign.pass_report_wait() {
                         return self.advance_campaign();
                     }

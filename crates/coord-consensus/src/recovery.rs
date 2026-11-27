@@ -976,6 +976,7 @@ pub(crate) fn select_counted(
             &mut nothing,
             reports,
             &reported_payload,
+            &supplied,
             decided,
             counts.unreported_undecided.get() > undecided_before,
             counts,
@@ -1025,8 +1026,10 @@ pub(crate) fn select_counted(
 /// facts named, and no copy at COMMIT or executed, since an entry with
 /// one is selected at COMMIT. Condition 3 is the candidate's: it neither
 /// committed `D`, nor executed it, nor holds its payload under those
-/// facts ([`CandidateDecisions::holds_payload`]). An execution whose row
-/// it hasn't read is waited for ([`RecoveryError::ExecutedRowsUnread`]).
+/// facts ([`CandidateDecisions::holds_payload`]), nor can supply it under
+/// them by the selector's `supplied`, the evidence the payload check
+/// before the rule reads (#335 review). An execution whose row it hasn't
+/// read is waited for ([`RecoveryError::ExecutedRowsUnread`]).
 /// Condition 4, task-d120's wait, is the campaign's: it is why this runs
 /// at all. Condition 5: where the order check counted a drop in
 /// `unreported_undecided`, `dropped`, no fast decision behind `D` can be
@@ -1041,6 +1044,7 @@ fn decide_nothing(
     nothing: &mut BTreeSet<CommandId>,
     reports: &[RecoveryReport],
     reported_payload: &BTreeSet<CommandId>,
+    supplied: &impl Fn(&CommandId, Option<Digest32>) -> bool,
     decided: &impl CandidateDecisions,
     dropped: bool,
     counts: &SelectionCounts,
@@ -1055,7 +1059,10 @@ fn decide_nothing(
         .collect();
     let mut unread = Vec::new();
     let mut free = |command: &CommandId, facts: Option<Digest32>| {
-        if decided.decided(command) || decided.holds_payload(command, facts) {
+        if decided.decided(command)
+            || decided.holds_payload(command, facts)
+            || supplied(command, facts)
+        {
             return false;
         }
         match decided.executed(command) {
@@ -1092,6 +1099,7 @@ fn decide_nothing(
                 || reported_payload.contains(&e.command)
                 || decided.decided(&e.command)
                 || decided.holds_payload(&e.command, e.admission)
+                || supplied(&e.command, e.admission)
                 || !matches!(decided.executed(&e.command), ExecutedFacts::No),
             "decided under facts with no payload at any reporter: {:?}",
             e.command
