@@ -7,6 +7,22 @@ newest entry comes first.
 
 Acknowledged writes survive process crashes and modeled power loss (fsync semantics, tested with a fault-injecting filesystem). Not validated with real power cuts, lying storage devices or on-disk bit rot. Damage found at recovery is refused rather than repaired, and the node recovers from its peers. No background scrubbing.
 
+What a damaged voter does, case by case (design
+[Section 5.4](../design/tuplesky-design.md#s5-4) and its failure table):
+
+- **Its journal fails to open.** The voter quarantines its disk and
+  exits with status 2 at start, before it contacts any peer. Waiting
+  doesn't bring it back: an operator acts. It doesn't restart as an
+  empty voter. It comes back as a learner under a new generation,
+  through membership, and catches up from its peers from there.
+- **Its projection is lost or unreadable, and its journal is sound.**
+  Under the default journal profile, `journaled-strict-v1`, the voter
+  refuses to start. Under `journaled-replay-v1`, it discards the
+  projection, installs its local baseline and replays its own journal
+  onto it, then serves.
+
+Either way, the domain goes on serving while a majority of voters is up.
+
 ## Alpha: a command whose payload is lost with its holders (task-d121)
 
 When every voter that held a command's payload is lost for good, a
@@ -35,13 +51,19 @@ limit.
   `release-at-execution` and `decided-nothing` are active. There are two
   ways:
   - its genesis manifest names both (its `features`);
-  - a running domain activates them live while every voter is up:
-    `coordctl feature activate release-at-execution`, then
-    `coordctl feature activate decided-nothing`. The second is refused
-    until the first is active.
+  - a running domain activates them live while every voter is up,
+    through the leader's admin socket (`<state_directory>/admin.sock`,
+    here `$sock`):
+    1. `coordctl feature --socket "$sock" activate release-at-execution`.
+       Success can mean preparation has only started.
+    2. `coordctl feature --socket "$sock" status`, until
+       `release-at-execution` is in the active set.
+    3. `coordctl feature --socket "$sock" activate decided-nothing`,
+       which is refused until the first is active.
 
   Either way it needs every voter, so it can't be switched on after the
-  loss. `coordctl feature status` shows a running domain's active set. A
+  loss. `coordctl feature --socket "$sock" status` shows a running
+  domain's active set, as the leader sees it. A
   domain with neither active runs without the rule.
 - **What a caller sees.** The command takes effect as nothing. Its
   submitter gets a definite refusal, `decided-nothing`, once the
