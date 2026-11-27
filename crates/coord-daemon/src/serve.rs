@@ -92,7 +92,7 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // again, here later or at another node.
         Ingress::Rejected(BindError::Stale) => Step::Close {
             code: CloseCode::Rejected,
-            reason: "bind unavailable",
+            reason: coord_transport::BIND_UNAVAILABLE,
         },
         // A refused, absent or ended binding are three ways of saying the
         // same thing -- this connection has no session -- and the peer
@@ -101,7 +101,7 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // entitled to distinguish.
         Ingress::Rejected(_) => Step::Close {
             code: CloseCode::Rejected,
-            reason: "bind refused",
+            reason: coord_transport::BIND_REFUSED,
         },
         Ingress::NotBound => Step::Close {
             code: CloseCode::Rejected,

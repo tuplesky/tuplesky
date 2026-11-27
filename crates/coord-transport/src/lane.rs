@@ -176,8 +176,12 @@ impl LaneLimits {
             out.receive_window = out.receive_window.min(l.receive_window);
             out.send_window = out.send_window.min(l.send_window);
         }
-        // The control stream itself needs one bidirectional stream.
-        out.max_bidi_streams = out.max_bidi_streams.max(1);
+        // The control stream needs one bidirectional stream, and a
+        // connection without a certificate stays at the floor until its
+        // `BindAck`, so its bind stream needs another (task-d122, #334
+        // review): a lane configured with fewer must not leave anonymous
+        // callers unable to bind.
+        out.max_bidi_streams = out.max_bidi_streams.max(2);
         out
     }
 
