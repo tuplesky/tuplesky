@@ -1130,6 +1130,9 @@ struct Stats {
     fenced: u32,
     /// Commands executed as nothing (task-d121), each counted once.
     nothing_executed: u32,
+    /// Whether the command `Knobs::holders_gone` marked was executed as
+    /// nothing (task-d121).
+    gone_on_nothing: bool,
     /// Selections task-d121's condition 5 kept the rule off: a drop
     /// behind a command no report holds was counted.
     nothing_kept_by_drop: u64,
@@ -2832,6 +2835,9 @@ impl Sim {
             None => {
                 self.executed_as_nothing.insert(c, nothing);
                 self.stats.nothing_executed += u32::from(nothing);
+                if nothing && self.stats.gone_on == Some(c) {
+                    self.stats.gone_on_nothing = true;
+                }
             }
         }
         self.decide_as(c, nothing, || format!("executed by node {i} at {}", k + 1));
@@ -5571,10 +5577,100 @@ fn a_dependency_whose_only_holder_is_destroyed_is_decided_as_nothing_and_the_sur
         gone.nothing_executed > 0,
         "nothing executed as nothing: {gone:?}"
     );
+    assert!(
+        gone.gone_on_nothing,
+        "{} was not executed as nothing: {gone:?}",
+        short(&on)
+    );
     assert!(gone.healed, "the voters left did not settle: {gone:?}");
     assert!(
         marked.led_after_gone,
         "the control never led after the mark"
+    );
+}
+
+/// Seed 2971 at five voters (task-d121's acceptance, the five-voter
+/// flip): both shapes of the stall in one run. Row 10, task-d119's
+/// targeted schedule as above, no catch-up, the report wait on as it
+/// ships. Node 2 alone holds `753c`, a dependency of an entry node 0's
+/// selections carry, when node 0 gives it up as `Behind` and the knob
+/// destroys node 2. Node 2 also alone held durably the payloads of
+/// `c03a` and `cf3d`, which the other four hold at ACCEPT without them
+/// once the faults stop and every voter restarts (the payload shape).
+///
+/// Without the rule, node 0's campaign for b65 waits for ever as
+/// `HalfInitialized` for node 2's report, and the heal check fails it.
+/// With the rule, the four voters left decide all three as nothing, lead
+/// and settle every command their own clients submitted. With node 2
+/// only marked, the run leads either way and decides nothing as nothing.
+#[test]
+fn seed_2971_decides_both_shapes_as_nothing_at_five_voters_and_the_survivors_lead() {
+    let knobs = |destroy, rule| Knobs {
+        peer_ack_loss: 750_000,
+        hold: 160_000,
+        campaign: 12_000,
+        crash: 5_000,
+        holders_gone: Some(destroy),
+        decide_nothing: rule,
+        ..Knobs::row(10)
+    };
+    let run = |destroy, rule| run_knobs_keeping(5, knobs(destroy, rule), 2971, Some(false));
+    let gone = run(true, true).unwrap_or_else(|f| panic!("{}", f.0));
+    let Some(on) = gone.gone_on else {
+        panic!("seed 2971 no longer reaches a moment with every holder down: {gone:?}");
+    };
+    assert_eq!(gone.gone, 0b100, "not node 2 alone destroyed");
+    assert!(
+        gone.gone_on_nothing,
+        "{} was not executed as nothing: {gone:?}",
+        short(&on)
+    );
+    assert_eq!(
+        gone.nothing_executed,
+        3,
+        "not {} and the two payloads node 2 alone held executed as nothing: {gone:?}",
+        short(&on)
+    );
+    assert!(
+        gone.led_after_gone,
+        "no voter led after {}'s only holder was destroyed",
+        short(&on)
+    );
+    assert!(gone.healed, "the voters left did not settle: {gone:?}");
+    assert_eq!(
+        gone.nothing_kept_by_drop, 0,
+        "condition 5 kept the rule off a selection"
+    );
+
+    // Control: the rule off, node 2 destroyed. The campaign waits for
+    // the destroyed voter's report and never completes.
+    let (stall, off) = *run(true, false).expect_err("the run without the rule led");
+    assert!(
+        stall.contains("did not complete"),
+        "the run without the rule failed otherwise: {stall}"
+    );
+    assert_eq!(off.gone_on, Some(on), "the control marks another command");
+    assert!(
+        !off.led_after_gone,
+        "the run without the rule led after the mark"
+    );
+
+    // Control: node 2 only marked. The run leads with the rule, and
+    // decides nothing as nothing.
+    let marked = run(false, true).unwrap_or_else(|f| panic!("{}", f.0));
+    assert_eq!(
+        marked.gone_on,
+        Some(on),
+        "the control marks another command"
+    );
+    assert_eq!(marked.gone, 0, "the control destroyed storage");
+    assert!(
+        marked.led_after_gone,
+        "the control never led after the mark"
+    );
+    assert_eq!(
+        marked.nothing_executed, 0,
+        "the control decided a command as nothing with every holder kept"
     );
 }
 
@@ -5753,18 +5849,31 @@ fn row_22_the_leader_crashed_in_the_gates_window() {
 /// Row 20's negative control (task-d90, point 4): with a follower's
 /// payload rows dropped on their way to its store, some vote leaves on a
 /// payload row that is not there, and oracle 9 says so.
+///
+/// Under task-d121's rule too (C5b, a premise test): the rule reads a
+/// command no report holds a payload row for as one no quorum voted for,
+/// so a voter's record kept without its payload row would let a
+/// selection decide a command executed elsewhere as nothing. Oracle 9
+/// fails such a run before any selection reads the report: with the
+/// vote check alone switched off, every seed of 200 at three and at five
+/// voters still fails, on a follower executing a command whose payload
+/// row is durable nowhere or on a leader's own proposal durable without
+/// it, with the rule and without.
 #[test]
 fn row_20_fails_when_a_vote_does_not_rest_on_its_payload_row() {
-    let knobs = Knobs {
-        drop_payload_rows: true,
-        ..Knobs::row(20)
-    };
-    let found = first_failure(3, knobs).or_else(|| first_failure(5, knobs));
-    println!("row 20 without payload rows: {found:?}");
-    assert!(
-        found.is_some(),
-        "no seed of row 20 failed with followers' payload rows dropped"
-    );
+    for decide_nothing in [false, true] {
+        let knobs = Knobs {
+            drop_payload_rows: true,
+            decide_nothing,
+            ..Knobs::row(20)
+        };
+        let found = first_failure(3, knobs).or_else(|| first_failure(5, knobs));
+        println!("row 20 without payload rows, rule {decide_nothing}: {found:?}");
+        assert!(
+            found.is_some(),
+            "no seed of row 20 failed with followers' payload rows dropped, rule {decide_nothing}"
+        );
+    }
 }
 
 /// A single-page report with no pre-acceptance's payload named present,

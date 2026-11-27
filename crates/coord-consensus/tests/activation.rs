@@ -1996,6 +1996,58 @@ fn a_voter_that_pulls_past_the_window_before_its_cut_refuses_the_candidate() {
     }));
 }
 
+/// The cut under task-d121's rule (C5b, a premise test): the schedule
+/// above with r2 selecting under the rule. r1 executed 41, and 41 left
+/// its window before its cut. Refused at the cut, r1 sends no report, so
+/// no selection of r2's reads 42 naming a 41 no report holds, and r2
+/// decides nothing as nothing, even once the wait for the report r0
+/// never sends passes.
+///
+/// The rule rests on the cut here: a report cut past 41 holds 42 naming
+/// it, and the selection would read the `Behind` shape and decide 41, a
+/// command r1 executed, as nothing. With task-d119's refusal at the cut
+/// switched off (`PendingReport::behind` never refusing), this test
+/// fails on that decision: the sweeps never reached the cut's way (1),
+/// so a sweep alone would pass this premise vacuously.
+#[test]
+fn under_the_rule_a_voter_past_the_window_refuses_at_the_cut_and_decides_nothing_it_executed() {
+    let PulledPastTheWindow {
+        mut r2,
+        sent,
+        forgotten_before_the_cut,
+        ..
+    } = pulled_past_the_window_under(DECIDE_NOTHING);
+    assert!(forgotten_before_the_cut, "41 left r1's window");
+    let executed_by_r1 = chained_commands()[40].0;
+    deliver(&mut r2, r(1), sent_to(&sent, r(2)));
+    for e in durable_events(&r2.end_report_wait()) {
+        settle_collecting(&mut r2, e);
+    }
+    let decision = r2.campaign_state().and_then(|c| c.decision()).cloned();
+    assert!(
+        !decision
+            .as_ref()
+            .is_some_and(|d| d.nothing.contains(&executed_by_r1)),
+        "41, which r1 executed, decided as nothing: {decision:?}"
+    );
+    assert!(!r2.table().decided_nothing(&executed_by_r1));
+    let rejections = r2.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::Behind { .. })),
+        "{rejections:?}"
+    );
+    assert!(
+        rejections.contains(&FollowerRejection::CampaignRefused {
+            by: r(1),
+            executed: ExecutionPosition::new(73).unwrap(),
+        }),
+        "{rejections:?}"
+    );
+    assert!(r2.campaign_state().is_none(), "the campaign was refused");
+}
+
 /// A refusal at the cut that is lost is sent again when its candidate
 /// asks for the report's pages (task-d119; #309's review).
 ///
@@ -2277,6 +2329,11 @@ fn chained_voter(
 }
 
 fn pulled_past_the_window() -> PulledPastTheWindow {
+    pulled_past_the_window_under(coord_consensus::SelectionRules::default())
+}
+
+/// [`pulled_past_the_window`], the candidate r2 selecting under `rules`.
+fn pulled_past_the_window_under(rules: coord_consensus::SelectionRules) -> PulledPastTheWindow {
     let b2 = ballot(2, 0);
     let b3 = cut_past_the_window();
     let pos = |n: u64| ExecutionPosition::new(n).unwrap();
@@ -2285,6 +2342,7 @@ fn pulled_past_the_window() -> PulledPastTheWindow {
     let record = |n: usize| chained_record(&commands, n);
     let mut r1 = chained_voter(1, b2, &commands, 72, 72);
     let mut r2 = chained_voter(2, b2, &commands, 40, 40);
+    r2.set_selection_rules(rules);
     assert!(!r1.table().forgotten(&id(41)));
     assert_eq!(catch_up_asks(&r1.request_catch_up(r(0))), vec![pos(72)]);
 
@@ -13283,7 +13341,10 @@ fn a_leader_holding_its_own_nothing_below_the_source_proposes_the_payload() {
 /// it, reaches the leader and a follower before any of the nothing's
 /// votes. The leader's set starts with its own proposal of the nothing,
 /// so the stray vote is the one refused; `d` is decided as nothing and
-/// executes as a refusal at every voter.
+/// executes as a refusal at every voter, and a retry of `d` is answered
+/// as refused at each of them (C5b). The collector's side, where the
+/// stray vote reaches the frontend first, is `coord-collector`'s
+/// `a_stray_acknowledgement_under_the_digest_does_not_keep_the_nothing_from_being_answered`.
 #[test]
 fn a_stray_acknowledgement_under_the_digest_does_not_keep_the_nothing_from_being_decided() {
     let mut c = Cluster::new(3);
@@ -13329,4 +13390,20 @@ fn a_stray_acknowledgement_under_the_digest_does_not_keep_the_nothing_from_being
     for i in 0..3 {
         assert!(executed_as_nothing(&c, i, &d), "voter {i}");
     }
+    c.frontend.clear();
+    assert_eq!(c.admit_at(1, 1, &[0, 1, 2]), d, "a retry of d");
+    let mut refused: Vec<ReplicaId> = c
+        .frontend
+        .iter()
+        .filter_map(|(from, m)| match m {
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::DecidedNothing,
+                ..
+            } if *command == d => Some(*from),
+            _ => None,
+        })
+        .collect();
+    refused.sort();
+    assert_eq!(refused, vec![r(0), r(1), r(2)], "{:?}", c.frontend);
 }

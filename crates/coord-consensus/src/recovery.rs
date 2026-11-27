@@ -3157,6 +3157,196 @@ mod tests {
         assert!(decision.entries.contains_key(&id(0)), "A adopted");
     }
 
+    /// How the order check settles the known gap's candidate C in
+    /// [`beside_a_nothing`], each by a walk that counts no undecided
+    /// drop (task-d121's "the rule changes no drop").
+    #[derive(Clone, Copy, Debug)]
+    enum Walk {
+        /// The other reporter holds D undecided, so C waits on D's
+        /// re-proposal and is judged on the `lasts` branch. Y, at ACCEPT
+        /// at both after D, conflicts with C and waits last on D too, so
+        /// C is dropped, and its walk stops at D, which a report holds.
+        Lasts,
+        /// No report holds D, and the candidate executed it: the walk
+        /// stops at a command the candidate holds decided. Where it also
+        /// executed A before D, `executed_before` keeps C.
+        ExecutedBefore { a_first: bool },
+        /// No report holds D, and the candidate holds it undecided: the
+        /// drop condition 5 reads.
+        Unreported,
+    }
+
+    /// The known gap's shape, C settled by `walk`, with D2 beside it on
+    /// a key of its own: an acceptance at the member whose payload no
+    /// report holds (the payload shape), which the rule decides as
+    /// nothing unless `supply` supplies its payload.
+    fn beside_a_nothing(
+        walk: Walk,
+        supply: bool,
+        rules: SelectionRules,
+        counts: &SelectionCounts,
+    ) -> Result<SyncDecision, RecoveryError> {
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let source =
+            BallotConfiguration::c2_default(epoch, ballot(0, 0), (0..3).map(r).collect()).unwrap();
+        let member = (1u8..3)
+            .find(|v| source.fast_set().contains(&r(*v)))
+            .unwrap();
+        let other = 3 - member;
+        let config =
+            BallotConfiguration::c2_default(epoch, ballot(1, other), (0..3).map(r).collect())
+                .unwrap();
+        // A, D, X, C and Y on one key; D2 on another.
+        let (a, d, x, c, y, d2) = (0u64, 5, 10, 15, 20, 31);
+        let mut held = alloc::vec![
+            entry(a, Phase::Accept, Vec::new(), 1),
+            entry(x, Phase::Accept, alloc::vec![id(d)], 1),
+        ];
+        if let Walk::Lasts = walk {
+            held.push(entry(y, Phase::Accept, alloc::vec![id(d)], 1));
+        }
+        let mut of_member = held.clone();
+        of_member.push(entry(c, Phase::PreAccept, alloc::vec![id(x)], 1));
+        of_member.push(ReportEntry {
+            payload_present: false,
+            ..entry(d2, Phase::Accept, Vec::new(), 3)
+        });
+        let mut of_other = held;
+        if let Walk::Lasts = walk {
+            of_other.push(entry(d, Phase::PreAccept, Vec::new(), 4));
+        }
+        let executed = match walk {
+            Walk::ExecutedBefore { a_first: true } => alloc::vec![id(a), id(d)],
+            Walk::ExecutedBefore { a_first: false } => alloc::vec![id(d)],
+            Walk::Lasts | Walk::Unreported => Vec::new(),
+        };
+        let report = |replica: u8, entries: Vec<ReportEntry>| RecoveryReport {
+            replica: r(replica),
+            ballot: ballot(1, other),
+            committed_ballot: ballot(0, 0),
+            entries,
+        };
+        select_counted(
+            &config,
+            &[report(member, of_member), report(other, of_other)],
+            |command, _| supply && *command == id(d2),
+            |_| None,
+            &ExecutedInOrder(executed),
+            rules,
+            rules.decide_nothing,
+            counts,
+        )
+    }
+
+    /// The rule changes no drop (task-d121, C5b). Where the rule decides
+    /// D2 as nothing while the order check settles C by a walk that
+    /// counts no undecided drop, the selection drops and keeps the same
+    /// candidates, with the same dependencies, as the same reports with
+    /// D2's payload supplied, which the rule leaves alone: C dropped on
+    /// the `lasts` branch, dropped behind a command the candidate holds
+    /// decided, and kept by `executed_before`. Only D2's admission
+    /// differs. The rule runs after the order check, and these pin that
+    /// it leaves what the check decided as it was.
+    #[test]
+    fn the_rule_changes_no_drop_of_the_order_check() {
+        let rules = SelectionRules {
+            leave_out_unheld: true,
+            decide_nothing: true,
+        };
+        let (c, d2) = (id(15), id(31));
+        for (walk, kept) in [
+            (Walk::Lasts, false),
+            (Walk::ExecutedBefore { a_first: false }, false),
+            (Walk::ExecutedBefore { a_first: true }, true),
+        ] {
+            let counts = SelectionCounts::default();
+            let ruled = beside_a_nothing(walk, false, rules, &counts)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e:?}"));
+            assert_eq!(
+                ruled.entries[&d2].admission,
+                Some(NOTHING_ADMISSION),
+                "{walk:?}: D2 not decided as nothing"
+            );
+            assert_eq!(
+                (
+                    counts.unreported_undecided.get(),
+                    counts.kept_by_drop.get(),
+                    counts.decided_nothing.get()
+                ),
+                (0, 0, 1),
+                "{walk:?}"
+            );
+            assert_eq!(
+                ruled.entries.get(&c).map(|e| e.deps.clone()),
+                kept.then(|| alloc::vec![id(10)]),
+                "{walk:?}: C"
+            );
+            assert_eq!(ruled.reproposed.contains(&c), !kept, "{walk:?}: C");
+            let supplied_counts = SelectionCounts::default();
+            let supplied = beside_a_nothing(walk, true, rules, &supplied_counts)
+                .unwrap_or_else(|e| panic!("{walk:?}, supplied: {e:?}"));
+            assert_ne!(
+                supplied.entries[&d2].admission,
+                Some(NOTHING_ADMISSION),
+                "{walk:?}: D2 decided as nothing with its payload supplied"
+            );
+            assert_eq!(supplied_counts.decided_nothing.get(), 0, "{walk:?}");
+            assert_eq!(
+                (
+                    supplied_counts.unreported.get(),
+                    supplied_counts.unreported_undecided.get()
+                ),
+                (counts.unreported.get(), counts.unreported_undecided.get()),
+                "{walk:?}: the drops counted"
+            );
+            let mut as_supplied = ruled.entries.clone();
+            as_supplied.get_mut(&d2).expect("D2 selected").admission =
+                supplied.entries[&d2].admission;
+            assert_eq!(as_supplied, supplied.entries, "{walk:?}: the entries");
+            assert_eq!(ruled.reproposed, supplied.reproposed, "{walk:?}");
+            assert_eq!(ruled.nothing, supplied.nothing, "{walk:?}");
+        }
+    }
+
+    /// What condition 5 reads is there because the rule moves the
+    /// `HalfInitialized` check after the order check (task-d121). Where
+    /// it stands without the rule, the known gap's selection with D2's
+    /// payload held by no report fails before the order check runs, and
+    /// counts no drop. With the rule it fails as well, condition 5
+    /// keeping the rule off, but only once the drop is counted.
+    #[test]
+    fn the_half_initialized_check_where_it_stood_counts_no_drop() {
+        let d2 = id(31);
+        for (rules, counted) in [
+            (
+                SelectionRules {
+                    leave_out_unheld: true,
+                    decide_nothing: false,
+                },
+                (0, 0),
+            ),
+            (
+                SelectionRules {
+                    leave_out_unheld: true,
+                    decide_nothing: true,
+                },
+                (1, 1),
+            ),
+        ] {
+            let counts = SelectionCounts::default();
+            match beside_a_nothing(Walk::Unreported, false, rules, &counts) {
+                Err(RecoveryError::HalfInitialized { command, .. }) => assert_eq!(command, d2),
+                other => panic!("{rules:?}: {other:?}"),
+            }
+            assert_eq!(
+                (counts.unreported_undecided.get(), counts.kept_by_drop.get()),
+                counted,
+                "{rules:?}"
+            );
+            assert_eq!(counts.decided_nothing.get(), 0, "{rules:?}");
+        }
+    }
+
     /// A takeover whose candidates are all dropped, the counting walk's
     /// worst shape (#309 review): `accepted` commands at ACCEPT chained on
     /// one key, X at ACCEPT after all but the last of them and naming a D
